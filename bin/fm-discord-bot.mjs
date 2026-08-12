@@ -30,7 +30,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -46,6 +46,7 @@ const ENABLED_FILE = join(STATE, "discord-bot.enabled");
 const READY_FILE = join(STATE, "discord-bot.ready");
 const ERROR_FILE = join(STATE, "discord-bot.error");
 const ERROR_NOTIFIED_FILE = join(STATE, "discord-bot.error.notified");
+const WAKE_DEDUP_DIR = join(STATE, ".wake-dedup");
 const NOTIFIER = join(ROOT, "bin", "fm-discord-notify.sh");
 const TEST_MODE = process.env.FM_DISCORD_TEST_MODE === "1";
 const API_BASE = TEST_MODE && process.env.FM_DISCORD_TEST_API_BASE
@@ -54,6 +55,7 @@ const API_BASE = TEST_MODE && process.env.FM_DISCORD_TEST_API_BASE
 const TEST_GATEWAY_URL = TEST_MODE ? process.env.FM_DISCORD_TEST_GATEWAY_URL || "" : "";
 const MAX_REPLY_CHARS = 1900;
 const RETENTION_SECONDS = 7 * 24 * 60 * 60;
+const DEDUP_RETENTION_SECONDS = RETENTION_SECONDS + 24 * 60 * 60;
 const RECONCILE_INTERVAL_MS = TEST_MODE && /^[0-9]+$/.test(process.env.FM_DISCORD_TEST_RECONCILE_MS || "")
   ? Math.max(10, Math.min(1000, Number(process.env.FM_DISCORD_TEST_RECONCILE_MS)))
   : 30_000;
@@ -424,10 +426,67 @@ async function linkedRequests() {
   return linked;
 }
 
+function discordDeduplicationKey(kind, identity) {
+  return createHash("sha256").update(`${kind}:${identity}`).digest("hex");
+}
+
+async function retainedDiscordDeduplication() {
+  const messages = new Set();
+  for (const directory of [INBOX_DIR, CONTEXT_DIR]) {
+    for (const name of await readdir(directory)) {
+      const match = name.match(/^([0-9]{15,22})\.json$/);
+      if (match) messages.add(discordDeduplicationKey("message", match[1]));
+    }
+  }
+
+  const errors = new Set();
+  let preserveAllErrors = false;
+  try {
+    const info = await assertPrivateFile(ERROR_FILE);
+    if (info.size > 4096) throw new ConfigError("private diagnostic record is too large");
+    const record = JSON.parse(await readFile(ERROR_FILE, "utf8"));
+    if (!SAFE_CODE_RE.test(record?.code || "") || !INCIDENT_ID_RE.test(record?.incident_id || "")) {
+      throw new ConfigError("private diagnostic record is invalid");
+    }
+    errors.add(discordDeduplicationKey("error", record.incident_id));
+  } catch (error) {
+    if (error?.code !== "ENOENT") preserveAllErrors = true;
+  }
+  return { messages, errors, preserveAllErrors };
+}
+
+async function pruneDiscordDeduplication(retained, now) {
+  try {
+    await assertPlainDirectory(WAKE_DEDUP_DIR, 0o700);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  for (const name of await readdir(WAKE_DEDUP_DIR)) {
+    const match = name.match(/^([0-9a-f]{64})\.accepted$/);
+    if (!match) continue;
+    const path = join(WAKE_DEDUP_DIR, name);
+    try {
+      const info = await assertPrivateFile(path);
+      if (info.size > 256 || now - info.mtimeMs / 1000 <= DEDUP_RETENTION_SECONDS) continue;
+      const digest = match[1];
+      const key = await readFile(path, "utf8");
+      if (key === `discord-message-${digest}\n`) {
+        if (!retained.messages.has(digest)) await unlink(path);
+      } else if (key === `discord-error-${digest}\n`) {
+        if (!retained.preserveAllErrors && !retained.errors.has(digest)) await unlink(path);
+      }
+    } catch {
+      continue;
+    }
+  }
+}
+
 async function pruneContexts() {
   try {
     await ensurePrivateDirectory(CONTEXT_DIR);
     await ensurePrivateDirectory(INBOX_DIR);
+    const retainedDeduplication = await retainedDiscordDeduplication();
     const inbox = new Set((await readdir(INBOX_DIR)).filter((name) => name.endsWith(".json")));
     const linked = await linkedRequests();
     const now = Date.now() / 1000;
@@ -444,6 +503,7 @@ async function pruneContexts() {
         // Unsafe artifacts are preserved for an operator to inspect.
       }
     }
+    await pruneDiscordDeduplication(retainedDeduplication, now);
   } catch {
     safeLog("context pruning was skipped because its private state is unsafe");
   }
@@ -1069,6 +1129,11 @@ async function main() {
       if (args.length) throw new ConfigError("context-check accepts one message id");
       const config = await loadConfig();
       await loadBoundContext(messageId, config);
+      return;
+    }
+    case "prune": {
+      if (!TEST_MODE || args.length) throw new ConfigError("prune is available only in hermetic test mode");
+      await pruneContexts();
       return;
     }
     case "ingest": {

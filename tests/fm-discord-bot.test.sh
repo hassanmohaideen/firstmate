@@ -120,6 +120,10 @@ run_ingest() {
     "$NODE_BIN" "$BOT" ingest "$event"
 }
 
+discord_digest() {
+  "$NODE_BIN" -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' "$1"
+}
+
 make_api_server() {
   local dir=$1 mode=${2:-ok} script
   script="$dir/fake-api.mjs"
@@ -275,6 +279,57 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$NOTIFY" message "$MESSAGE"
 [ "$(find "$home/state/.wake-dedup" -name '*.accepted' -type f | wc -l | tr -d ' ')" -eq 1 ] \
   || fail "wake drain did not recover the idempotent Discord acceptance receipt"
 pass "Discord notification acceptance remains idempotent across process death"
+
+home=$(new_home notification-retention)
+mkdir -p "$home/state/discord-inbox" "$home/state/discord-context"
+chmod 700 "$home/state/discord-inbox" "$home/state/discord-context"
+old_orphan="${MESSAGE%?}1"
+recent_orphan="${MESSAGE%?}2"
+pending_old="${MESSAGE%?}3"
+unsafe_old="${MESSAGE%?}6"
+for id in "$old_orphan" "$recent_orphan" "$pending_old" "$unsafe_old"; do
+  printf '{}\n' > "$home/state/discord-inbox/$id.json"
+  printf '{}\n' > "$home/state/discord-context/$id.json"
+  chmod 600 "$home/state/discord-inbox/$id.json" "$home/state/discord-context/$id.json"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$NOTIFY" message "$id"
+done
+rm -f "$home/state/discord-inbox/$old_orphan.json" "$home/state/discord-context/$old_orphan.json"
+rm -f "$home/state/discord-inbox/$recent_orphan.json" "$home/state/discord-context/$recent_orphan.json"
+rm -f "$home/state/discord-inbox/$unsafe_old.json" "$home/state/discord-context/$unsafe_old.json"
+old_receipt="$home/state/.wake-dedup/$(discord_digest "message:$old_orphan").accepted"
+recent_receipt="$home/state/.wake-dedup/$(discord_digest "message:$recent_orphan").accepted"
+pending_receipt="$home/state/.wake-dedup/$(discord_digest "message:$pending_old").accepted"
+unsafe_receipt="$home/state/.wake-dedup/$(discord_digest "message:$unsafe_old").accepted"
+foreign_digest=$(printf 'a%.0s' {1..64})
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" bash -c \
+  '. "$1/bin/fm-wake-lib.sh"; fm_wake_append_idempotent check foreign-producer "check: foreign producer" "$2"' \
+  _ "$ROOT" "$foreign_digest"
+foreign_receipt="$home/state/.wake-dedup/$foreign_digest.accepted"
+"$NODE_BIN" -e '
+  const fs = require("node:fs");
+  const now = Date.now() / 1000;
+  for (const path of process.argv.slice(1)) fs.utimesSync(path, now - 9 * 86400, now - 9 * 86400);
+' "$old_receipt" "$pending_receipt" "$unsafe_receipt" "$foreign_receipt"
+"$NODE_BIN" -e '
+  const fs = require("node:fs");
+  const age = Date.now() / 1000 - 7.5 * 86400;
+  fs.utimesSync(process.argv[1], age, age);
+' "$recent_receipt"
+chmod 644 "$unsafe_receipt"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 "$NODE_BIN" "$BOT" prune
+assert_absent "$old_receipt" "expired orphaned Discord receipt was not pruned"
+assert_present "$recent_receipt" "Discord receipt was pruned before the retry-overlap day elapsed"
+assert_present "$pending_receipt" "Discord receipt was pruned while its pending source remained retryable"
+assert_present "$foreign_receipt" "Discord pruning removed another queue producer's receipt"
+assert_present "$unsafe_receipt" "Discord pruning removed an unsafe receipt instead of preserving it"
+"$NODE_BIN" -e '
+  const fs = require("node:fs");
+  const age = Date.now() / 1000 - 9 * 86400;
+  fs.utimesSync(process.argv[1], age, age);
+' "$recent_receipt"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 "$NODE_BIN" "$BOT" prune
+assert_absent "$recent_receipt" "orphaned Discord receipt survived beyond its retention window"
+pass "Discord wake receipts retain seven-day sources plus retry overlap and prune only owned safe files"
 home=$intake_home
 
 for scenario in wrong-owner wrong-guild wrong-channel no-mention bot-authored; do
