@@ -144,7 +144,8 @@ A bounded, idempotent REST retry uses the same Discord nonce, and a private per-
 
 Private request context is pruned after seven days once the pending inbox is gone and no task still carries its terminal-return binding.
 Discord-owned durable wake deduplication receipts are retained for at least eight days: the full seven-day context horizon plus one day of crash and reconciliation overlap.
-A receipt remains beyond that window while its pending inbox, conversation context, or current diagnostic can still be retried; pruning ignores other queue producers' receipts and preserves unsafe artifacts for operator inspection.
+Accepted and pending receipts remain beyond that window while their pending inbox, conversation context, or current diagnostic can still be retried; stale pending receipts are removed only after that source is absent.
+Pruning ignores other queue producers' receipts and preserves unsafe artifacts for operator inspection.
 Pending inbox records and context still owed by linked work are not pruned merely because they are old.
 A successful reply removes the pending inbox only after Discord accepts the post, while the context remains available for an owed terminal reply.
 

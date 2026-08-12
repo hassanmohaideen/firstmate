@@ -285,51 +285,75 @@ mkdir -p "$home/state/discord-inbox" "$home/state/discord-context"
 chmod 700 "$home/state/discord-inbox" "$home/state/discord-context"
 old_orphan="${MESSAGE%?}1"
 recent_orphan="${MESSAGE%?}2"
-pending_old="${MESSAGE%?}3"
-unsafe_old="${MESSAGE%?}6"
-for id in "$old_orphan" "$recent_orphan" "$pending_old" "$unsafe_old"; do
+retained_source="${MESSAGE%?}3"
+stale_pending_orphan="${MESSAGE%?}6"
+recent_pending_orphan="${MESSAGE%?}7"
+retained_pending_source="${MESSAGE%?}8"
+unsafe_pending_orphan="${MESSAGE%?}9"
+for id in "$old_orphan" "$recent_orphan" "$retained_source" "$stale_pending_orphan" \
+  "$recent_pending_orphan" "$retained_pending_source" "$unsafe_pending_orphan"; do
   printf '{}\n' > "$home/state/discord-inbox/$id.json"
   printf '{}\n' > "$home/state/discord-context/$id.json"
   chmod 600 "$home/state/discord-inbox/$id.json" "$home/state/discord-context/$id.json"
+done
+for id in "$old_orphan" "$recent_orphan" "$retained_source"; do
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$NOTIFY" message "$id"
 done
-rm -f "$home/state/discord-inbox/$old_orphan.json" "$home/state/discord-context/$old_orphan.json"
-rm -f "$home/state/discord-inbox/$recent_orphan.json" "$home/state/discord-context/$recent_orphan.json"
-rm -f "$home/state/discord-inbox/$unsafe_old.json" "$home/state/discord-context/$unsafe_old.json"
+for id in "$stale_pending_orphan" "$recent_pending_orphan" "$retained_pending_source" "$unsafe_pending_orphan"; do
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WAKE_TEST_CRASH_AFTER_IDEMPOTENT_APPEND=1 \
+    "$NOTIFY" message "$id" >/dev/null 2>&1 || true
+done
+for id in "$old_orphan" "$recent_orphan" "$stale_pending_orphan" "$recent_pending_orphan" "$unsafe_pending_orphan"; do
+  rm -f "$home/state/discord-inbox/$id.json" "$home/state/discord-context/$id.json"
+done
 old_receipt="$home/state/.wake-dedup/$(discord_digest "message:$old_orphan").accepted"
 recent_receipt="$home/state/.wake-dedup/$(discord_digest "message:$recent_orphan").accepted"
-pending_receipt="$home/state/.wake-dedup/$(discord_digest "message:$pending_old").accepted"
-unsafe_receipt="$home/state/.wake-dedup/$(discord_digest "message:$unsafe_old").accepted"
+retained_receipt="$home/state/.wake-dedup/$(discord_digest "message:$retained_source").accepted"
+stale_pending_receipt="$home/state/.wake-dedup/$(discord_digest "message:$stale_pending_orphan").pending"
+recent_pending_receipt="$home/state/.wake-dedup/$(discord_digest "message:$recent_pending_orphan").pending"
+retained_pending_receipt="$home/state/.wake-dedup/$(discord_digest "message:$retained_pending_source").pending"
+unsafe_pending_receipt="$home/state/.wake-dedup/$(discord_digest "message:$unsafe_pending_orphan").pending"
 foreign_digest=$(printf 'a%.0s' {1..64})
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" bash -c \
   '. "$1/bin/fm-wake-lib.sh"; fm_wake_append_idempotent check foreign-producer "check: foreign producer" "$2"' \
   _ "$ROOT" "$foreign_digest"
 foreign_receipt="$home/state/.wake-dedup/$foreign_digest.accepted"
+foreign_pending_digest=$(printf 'b%.0s' {1..64})
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WAKE_TEST_CRASH_AFTER_IDEMPOTENT_APPEND=1 bash -c \
+  '. "$1/bin/fm-wake-lib.sh"; fm_wake_append_idempotent check foreign-pending "check: foreign pending" "$2"' \
+  _ "$ROOT" "$foreign_pending_digest" >/dev/null 2>&1 || true
+foreign_pending_receipt="$home/state/.wake-dedup/$foreign_pending_digest.pending"
 "$NODE_BIN" -e '
   const fs = require("node:fs");
   const now = Date.now() / 1000;
   for (const path of process.argv.slice(1)) fs.utimesSync(path, now - 9 * 86400, now - 9 * 86400);
-' "$old_receipt" "$pending_receipt" "$unsafe_receipt" "$foreign_receipt"
+' "$old_receipt" "$retained_receipt" "$stale_pending_receipt" "$retained_pending_receipt" \
+  "$unsafe_pending_receipt" "$foreign_receipt" "$foreign_pending_receipt"
 "$NODE_BIN" -e '
   const fs = require("node:fs");
   const age = Date.now() / 1000 - 7.5 * 86400;
-  fs.utimesSync(process.argv[1], age, age);
-' "$recent_receipt"
-chmod 644 "$unsafe_receipt"
+  for (const path of process.argv.slice(1)) fs.utimesSync(path, age, age);
+' "$recent_receipt" "$recent_pending_receipt"
+chmod 644 "$unsafe_pending_receipt"
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 "$NODE_BIN" "$BOT" prune
 assert_absent "$old_receipt" "expired orphaned Discord receipt was not pruned"
+assert_absent "$stale_pending_receipt" "expired orphaned Discord pending receipt was not pruned"
 assert_present "$recent_receipt" "Discord receipt was pruned before the retry-overlap day elapsed"
-assert_present "$pending_receipt" "Discord receipt was pruned while its pending source remained retryable"
+assert_present "$recent_pending_receipt" "Discord pending receipt was pruned before retry overlap elapsed"
+assert_present "$retained_receipt" "Discord receipt was pruned while its source remained retryable"
+assert_present "$retained_pending_receipt" "Discord pending receipt was pruned while its source remained retryable"
 assert_present "$foreign_receipt" "Discord pruning removed another queue producer's receipt"
-assert_present "$unsafe_receipt" "Discord pruning removed an unsafe receipt instead of preserving it"
+assert_present "$foreign_pending_receipt" "Discord pruning removed another producer's pending receipt"
+assert_present "$unsafe_pending_receipt" "Discord pruning removed an unsafe pending receipt"
 "$NODE_BIN" -e '
   const fs = require("node:fs");
   const age = Date.now() / 1000 - 9 * 86400;
-  fs.utimesSync(process.argv[1], age, age);
-' "$recent_receipt"
+  for (const path of process.argv.slice(1)) fs.utimesSync(path, age, age);
+' "$recent_receipt" "$recent_pending_receipt"
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 "$NODE_BIN" "$BOT" prune
 assert_absent "$recent_receipt" "orphaned Discord receipt survived beyond its retention window"
-pass "Discord wake receipts retain seven-day sources plus retry overlap and prune only owned safe files"
+assert_absent "$recent_pending_receipt" "orphaned pending receipt survived beyond its retention window"
+pass "Discord wake receipts retain sources and safely prune accepted and pending artifacts"
 home=$intake_home
 
 for scenario in wrong-owner wrong-guild wrong-channel no-mention bot-authored; do

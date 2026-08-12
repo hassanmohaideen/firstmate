@@ -463,7 +463,7 @@ async function pruneDiscordDeduplication(retained, now) {
     throw error;
   }
   for (const name of await readdir(WAKE_DEDUP_DIR)) {
-    const match = name.match(/^([0-9a-f]{64})\.accepted$/);
+    const match = name.match(/^([0-9a-f]{64})\.(?:accepted|pending)$/);
     if (!match) continue;
     const path = join(WAKE_DEDUP_DIR, name);
     try {
