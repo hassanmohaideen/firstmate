@@ -73,6 +73,7 @@ config/calm     Pi Calm presentation preference; LOCAL, gitignored, and not inhe
 config/startup-memory-budget     primary-authoritative per-home startup-memory budget; LOCAL, gitignored, materialized as 7,500 estimated tokens by locked primary bootstrap and inherited into secondmate homes; see docs/configuration.md "Startup memory budget"
 config/herdr-presentation-spaces  optional "off" opt-out from, or "on" opt-in to, Herdr's default-on disposable single-task visual projection, which is unconfigured-default-on only at or above a Herdr version floor; LOCAL, gitignored; inherited by secondmate homes; see docs/herdr-backend.md "Presentation spaces"
 config/trace-context  optional presence flag enabling default-off native W3C trace-context propagation to spawned agents; LOCAL, gitignored; inherited by secondmate homes; see docs/configuration.md "Trace context propagation" and docs/trace-context.md
+config/discord-bot.env  optional private owner/guild/channel-bound self-hosted Discord bot configuration; LOCAL, gitignored, mode 0600, and not inherited; see docs/discord-bot.md
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated Relay watcher cadence; LOCAL, gitignored; source before arming watcher when present
@@ -107,6 +108,8 @@ state/               runtime records and signals; gitignored
   procevent/         registered process-to-event sources, one private record per canonical source id; written only by bin/fm-procevent.sh, and their presence alone keeps supervision required (section 13)
   procevent-inbox/   private captured results and their durable handled-acknowledgement markers; source output lives here and never in an event line
   when/              private condition->action watch specs, their trust bindings, and single-fire markers; written only by bin/fm-procevent-when.sh (section 13's process-event-sources trigger)
+  discord-inbox/     private self-hosted Discord messages; discord-respond drains them
+  discord-context/   private direct-Discord reply bindings and one-wake markers, retained for at most seven days after answer
   x-inbox/           generated Relay pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated Relay durable per-request reply context and one-wake offer markers, keyed by request_id; survives inbox cleanup and expires within seven days (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated Relay dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
@@ -375,7 +378,7 @@ The promoted worker must inventory scratch state, return to a clean default-bran
 Fleet supervision is an always-loaded operational contract; `docs/architecture.md`, `docs/turnend-guard.md`, the emitted session-start block, and script help own mechanisms and harness-specific recipes.
 
 Whenever work is under way, keep exactly one live supervision cycle using the emitted protocol for this primary harness.
-Relay may require that same live cycle with no fleet work.
+Relay or the self-hosted Discord inbox may require that same live cycle with no fleet work.
 Do not substitute another harness's wait shape, use shell `&`, or create a second cycle when a healthy one already exists.
 For every actionable wake, follow the ordinary-wake continuation in the emitted protocol; use its repair action only when the live cycle is missing or failed.
 No turn ends blind while work is under way, including turns described as holding or waiting.
@@ -391,11 +394,12 @@ Handle actionable wakes as follows:
 
 1. For `signal:`, read the listed event lines first, then reconcile current state only where action depends on it.
 2. For `stale:`, inspect the recorded endpoint and load `stuck-crewmate-recovery` for a stopped, looping, confused, or unresponsive worker; a deep-inspection reason also requires current-state and validation-log inspection.
-3. For `check:`, act on the named poll result, including merges, Relay events, and process-to-event source results.
+3. For `check:`, act on the named result, including merges, Relay events, self-hosted Discord events, and process-to-event source results.
 4. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.
 When Relay-linked work reaches a milestone or terminal state, load `fmx-respond`; before terminal teardown, use its promised-final reconciliation when a typed public commitment exists, otherwise post the final completion follow-up so the link clears even if earlier follow-ups were spent.
+When self-hosted Discord-linked work reaches a terminal state, load `discord-respond` and deliver its one bound public-safe outcome before cleanup.
 
 A secondmate's idle endpoint is healthy, and parent supervision relies on its routed status rather than treating a quiet pane as stale.
 Waiting on a healthy supervision cycle is silent; empty polls, elapsed time, and no-change updates are not captain-facing progress.
@@ -528,6 +532,7 @@ These skills are not captain-invocable; load them only at their precise triggers
 - `process-event-sources` - load before arming a long-polling source, before registering a deterministic condition->action watch (do X as soon as Y is true), and on any `procevent <adapter> <source-id> <sequence>` check wake.
   Never run a registered source's blocking command yourself in a conversational turn.
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the Relay configuration blocker, on a `public-followup ...` `check:` wake or a startup-surfaced public commitment, and on any milestone or terminal wake for a Relay-linked task before posting its completion follow-up; relevant only when Relay is on.
+- `discord-respond` - load on a `discord-message <message-id>` or `discord-error <safe-code>` `check:` wake, and before completing work whose metadata carries `discord_request=`; relevant only when the self-hosted Discord service is configured.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 

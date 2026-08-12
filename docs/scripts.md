@@ -11,6 +11,11 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-sessionstart-nudge.sh` | Print the native session-start hook nudge when the primary has not already run the digest |
 | `fm-sessionstart-run.sh` | Route a native session-open hook to the full digest, a context re-emit, or the nudge |
 | `fm-operational-input.sh` | Construct and parse the canonical cross-language operational-input protocol |
+| `fm-discord-bot.sh`      | Configure and operate the optional per-home self-hosted Discord service |
+| `fm-discord-bot.mjs`     | Own direct Discord Gateway/REST, authorization, private artifacts, reconnects, and safe diagnostics |
+| `fm-discord-notify.sh`   | Publish a committed Discord inbox or diagnostic through the existing durable wake queue |
+| `fm-discord-reply.sh`    | Send one public-safe answer to the exact accepted Discord conversation binding |
+| `fm-discord-followup.sh` | Bind longer work to one direct Discord request and deliver its terminal outcome |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
 | `fm-startup-network.sh`  | Run session start's network checks off its blocking path in a bounded detached worker, and publish the result inline or as a wake |
 | `fm-fleet-sync.sh`       | Refresh project clones with safe fast-forwards, self-heals, `STUCK:` reports, branch pruning, and bounded recovery from an orphaned `.git/packed-refs.lock` |
