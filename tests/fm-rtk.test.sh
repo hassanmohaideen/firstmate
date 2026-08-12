@@ -13,9 +13,11 @@ OBSERVER_LOG=$CONTROL/observer.log
 OUT=$TMP_ROOT/out
 ERR=$TMP_ROOT/err
 HELPER=$TMP_ROOT/fm-rtk-test-driver.sh
+TASK_COPY=$TMP_ROOT/task-copy
 LAST_RC=0
-mkdir -p "$SYSTEM_ROOT/usr/bin" "$SYSTEM_ROOT/bin" "$SYSTEM_ROOT/usr/sbin" "$SYSTEM_ROOT/sbin" \
+mkdir -p "$TASK_COPY" "$SYSTEM_ROOT/usr/bin" "$SYSTEM_ROOT/bin" "$SYSTEM_ROOT/usr/sbin" "$SYSTEM_ROOT/sbin" \
   "$SYSTEM_ROOT/opt/homebrew/opt/ripgrep/bin" "$AMBIENT" "$CONTROL"
+TASK_COPY=$(cd "$TASK_COPY" && pwd -P)
 cp "$ROOT/lib/Firstmate/rtk-run" "$HELPER"
 chmod +x "$HELPER"
 
@@ -89,7 +91,8 @@ printf '%s\n' "\$0" > '$CONTROL/executed-path'
 printf '%s\n' "\$@" > '$CONTROL/compact-args'
 printf '%s\n' "HOME=\$HOME" "PATH=\$PATH" "DB=\$RTK_DB_PATH" \
   "TELEMETRY=\$RTK_TELEMETRY_DISABLED" "TEE=\$RTK_TEE" "TOML=\$RTK_NO_TOML" \
-  "PAGER=\$PAGER" "GIT_PAGER=\$GIT_PAGER" > '$CONTROL/compact-env'
+  "PAGER=\$PAGER" "GIT_PAGER=\$GIT_PAGER" "OPTIONAL_LOCKS=\$GIT_OPTIONAL_LOCKS" \
+  "GLOBAL_CONFIG=\$GIT_CONFIG_GLOBAL" "SYSTEM_CONFIG=\$GIT_CONFIG_NOSYSTEM" > '$CONTROL/compact-env'
 case "\$mode" in
   compact-fail) printf 'compact stdout\n'; printf 'compact stderr\n' >&2; exit 23 ;;
   compact-hang) trap 'exit 143' TERM; while :; do /bin/sleep 1; done ;;
@@ -113,9 +116,9 @@ reset_evidence() {
     "$CONTROL/executed-path" "$CONTROL/compact-args" "$CONTROL/compact-env"
 }
 
-run_helper() {
-  local home=$1 sha
-  shift
+run_helper_at() {
+  local directory=$1 home=$2 sha
+  shift 2
   reset_evidence
   if [ -f "$(artifact_path "$home")" ] && [ ! -L "$(artifact_path "$home")" ]; then
     sha=$(artifact_sha "$home")
@@ -123,9 +126,15 @@ run_helper() {
     sha=unavailable
   fi
   printf '%s\n' "${RTK_TEST_MODE:-ok}" > "$CONTROL/mode"
-  PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
-    FM_RTK_TEST_SHA256="$sha" "$HELPER" "$@" > "$OUT" 2> "$ERR"
+  (cd "$directory" && PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    FM_RTK_TEST_SHA256="$sha" "$HELPER" "$@") > "$OUT" 2> "$ERR"
   LAST_RC=$?
+}
+
+run_helper() {
+  local home=$1
+  shift
+  run_helper_at "$TASK_COPY" "$home" "$@"
 }
 
 assert_raw() {
@@ -169,7 +178,7 @@ test_admission_and_trusted_raw() {
   rm -f "$home/config/rtk"
   RAW_FAIL=37 run_helper "$home" git-status
   expect_code 37 "$LAST_RC" "raw status was not preserved"
-  assert_raw 'git|status '
+  assert_raw 'git|-c core.fsmonitor=false'
   assert_grep 'raw stdout' "$OUT" "raw stdout was lost"
   assert_grep 'raw stderr' "$ERR" "raw stderr was lost"
   assert_no_ambient
@@ -181,7 +190,7 @@ test_spoofing_and_private_execution() {
   home=$(make_home compact)
   # shellcheck disable=SC2016 # The command substitution is hostile literal test data.
   hostile='needle;$(touch LEAK)|private/path'
-  run_helper "$home" search "$hostile" "$TMP_ROOT"
+  run_helper "$home" search "$hostile" "$TASK_COPY"
   expect_code 0 "$LAST_RC" "compact search failed"
   assert_no_ambient
   assert_absent "$RAW_LOG" "successful compact command also ran raw"
@@ -199,12 +208,16 @@ test_spoofing_and_private_execution() {
   assert_grep 'TELEMETRY=1' "$CONTROL/compact-env" "telemetry was not disabled"
   assert_grep 'TEE=0' "$CONTROL/compact-env" "tee was not disabled"
   assert_grep 'TOML=1' "$CONTROL/compact-env" "project filters were not disabled"
+  assert_grep 'OPTIONAL_LOCKS=0' "$CONTROL/compact-env" "Git optional locks were not disabled"
+  assert_grep 'GLOBAL_CONFIG=/dev/null' "$CONTROL/compact-env" "global Git config was not isolated"
+  assert_grep 'SYSTEM_CONFIG=1' "$CONTROL/compact-env" "system Git config was not isolated"
   pass "fm-rtk: spoofed PATH is ignored and only a private verified copy executes"
 }
 
 test_fixed_semantic_verbs() {
-  local home expected actual
+  local home expected actual git_config
   home=$(make_home verbs)
+  git_config='-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat -c pager.log=false -c pager.diff=false -c pager.status=false -c diff.external= -c diff.trustExitCode=false -c interactive.diffFilter= -c status.submoduleSummary=false -c protocol.allow=never'
   while IFS='|' read -r invocation expected; do
     # shellcheck disable=SC2086 # Fixture rows intentionally encode the public argv.
     run_helper "$home" $invocation
@@ -214,12 +227,12 @@ test_fixed_semantic_verbs() {
     [ "$actual" = "$expected" ] || fail "$invocation mapped to unexpected compact argv: $actual"
     assert_absent "$RAW_LOG" "$invocation also ran raw"
   done <<ROWS
-git-log|git log -n 50 --decorate
-git-diff|git diff
-git-diff --cached|git diff --cached
-git-status|git status
-list $TMP_ROOT|ls $TMP_ROOT
-search needle $TMP_ROOT|rg needle $TMP_ROOT
+git-log|git $git_config log --no-ext-diff --no-textconv -n 50 --decorate
+git-diff|git $git_config diff --no-ext-diff --no-textconv
+git-diff --cached|git $git_config diff --no-ext-diff --no-textconv --cached
+git-status|git $git_config status
+list $TASK_COPY|ls $TASK_COPY
+search needle $TASK_COPY|rg needle $TASK_COPY
 ROWS
 
   reset_evidence
@@ -231,6 +244,75 @@ ROWS
   pass "fm-rtk: every fixed semantic verb maps exactly and generic execution is refused"
 }
 
+test_path_confinement() {
+  local home rc symlink
+  home=$(make_home confinement)
+  symlink=$TASK_COPY/link
+  ln -s "$TMP_ROOT" "$symlink"
+
+  for invocation in "list $TMP_ROOT" "list $symlink" "search needle $TMP_ROOT" \
+    "search needle $symlink" "list ../control"; do
+    reset_evidence
+    # shellcheck disable=SC2086 # Fixture rows intentionally encode denied public argv.
+    (cd "$TASK_COPY" && PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" \
+      FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" $invocation) > "$OUT" 2> "$ERR"
+    rc=$?
+    expect_code 64 "$rc" "$invocation should be refused"
+    assert_absent "$RAW_LOG" "$invocation ran a raw utility"
+    assert_absent "$CONTROL/version.count" "$invocation ran RTK"
+  done
+
+  mkdir -p "$TASK_COPY/.ssh"
+  run_helper "$home" list "$TASK_COPY/.ssh"
+  expect_code 64 "$LAST_RC" "credential directory should be refused"
+  assert_absent "$RAW_LOG" "credential refusal ran a raw utility"
+  assert_absent "$CONTROL/version.count" "credential refusal ran RTK"
+  pass "fm-rtk: paths are confined without symlink or credential traversal"
+}
+
+test_git_configuration_cannot_execute_or_write() {
+  local home repo marker before after real_git
+  home=$(make_home git-safety)
+  rm "$home/config/rtk"
+  repo=$TASK_COPY/repo
+  marker=$CONTROL/git-config-executed
+  real_git=$(command -v git)
+  mkdir -p "$repo"
+  "$real_git" -C "$repo" init -q
+  "$real_git" -C "$repo" config user.name fixture
+  "$real_git" -C "$repo" config user.email fixture@example.invalid
+  printf 'one\n' > "$repo/tracked"
+  printf 'tracked filter=hostile\n' > "$repo/.gitattributes"
+  "$real_git" -C "$repo" add tracked .gitattributes
+  "$real_git" -C "$repo" commit -qm initial
+  printf 'two\n' >> "$repo/tracked"
+  cat > "$CONTROL/git-attacker" <<SH
+#!/bin/bash
+touch '$marker'
+cat
+SH
+  chmod +x "$CONTROL/git-attacker"
+  "$real_git" -C "$repo" config core.fsmonitor "$CONTROL/git-attacker"
+  "$real_git" -C "$repo" config diff.external "$CONTROL/git-attacker"
+  "$real_git" -C "$repo" config diff.hostile.textconv "$CONTROL/git-attacker"
+  printf '#!/bin/bash\nexec %q "$@"\n' "$real_git" > "$SYSTEM_ROOT/usr/bin/git"
+  chmod +x "$SYSTEM_ROOT/usr/bin/git"
+
+  before=$(find "$repo" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  run_helper_at "$repo" "$home" git-diff
+  expect_code 0 "$LAST_RC" "safe raw git diff failed"
+  assert_grep 'diff --git ' "$OUT" "safe raw git diff lost ordinary output"
+  assert_absent "$marker" "Git diff executed repository-configured code"
+  run_helper_at "$repo" "$home" git-status
+  expect_code 0 "$LAST_RC" "safe raw git status failed"
+  assert_grep 'Changes not staged for commit' "$OUT" "safe raw git status lost ordinary output"
+  assert_absent "$marker" "Git status executed repository-configured code"
+  after=$(find "$repo" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  [ "$before" = "$after" ] || fail "observational Git commands changed project or index bytes"
+  make_raw_tool "$SYSTEM_ROOT/usr/bin/git" git
+  pass "fm-rtk: Git orientation disables configured execution and all writes"
+}
+
 test_artifact_and_version_failures() {
   local home artifact mode started
   home=$(make_home failures)
@@ -238,27 +320,27 @@ test_artifact_and_version_failures() {
 
   mv "$artifact" "$artifact.real"; ln -s rtk.real "$artifact"
   run_helper "$home" git-status
-  assert_raw 'git|status '
+  assert_raw 'git|-c core.fsmonitor=false'
   assert_absent "$CONTROL/version.count" "symlink artifact executed"
   rm "$artifact"; mv "$artifact.real" "$artifact"
 
   rm "$artifact"; mkfifo "$artifact"
   run_helper "$home" git-status
-  assert_raw 'git|status '
+  assert_raw 'git|-c core.fsmonitor=false'
   assert_absent "$CONTROL/version.count" "FIFO artifact executed"
   rm "$artifact"; home=$(make_home failures)
 
   for mode in wrong nonzero noisy second-wrong; do
     RTK_TEST_MODE=$mode run_helper "$home" git-status
     expect_code 0 "$LAST_RC" "$mode preflight should fall back"
-    assert_raw 'git|status '
+    assert_raw 'git|-c core.fsmonitor=false'
     assert_absent "$CONTROL/executed-path" "$mode preflight started compact execution"
   done
 
   started=$(date +%s)
   RTK_TEST_MODE=hang run_helper "$home" git-status
   [ $(( $(date +%s) - started )) -lt 9 ] || fail "version preflight was not bounded"
-  assert_raw 'git|status '
+  assert_raw 'git|-c core.fsmonitor=false'
   assert_absent "$CONTROL/executed-path" "hanging version started compact execution"
   pass "fm-rtk: invalid artifacts and bounded version failures fall back once"
 }
@@ -286,7 +368,7 @@ SH
     FM_RTK_TEST_SHA256="$sha" REPLACE_AFTER_HASH=1 "$HELPER" git-status > "$OUT" 2> "$ERR"
   LAST_RC=$?
   expect_code 0 "$LAST_RC" "replacement race should fall back"
-  assert_raw 'git|status '
+  assert_raw 'git|-c core.fsmonitor=false'
   assert_absent "$CONTROL/malicious-ran" "replacement artifact executed"
   assert_absent "$CONTROL/executed-path" "replacement reached compact execution"
   mv "$real_shasum" "$SYSTEM_ROOT/usr/bin/shasum"
@@ -296,7 +378,7 @@ SH
   printf '#!/bin/bash\nexit 1\n' > "$SYSTEM_ROOT/bin/cp"
   chmod +x "$SYSTEM_ROOT/bin/cp"
   run_helper "$home" git-status
-  assert_raw 'git|status '
+  assert_raw 'git|-c core.fsmonitor=false'
   assert_absent "$CONTROL/version.count" "copy failure executed RTK"
   mv "$SYSTEM_ROOT/bin/cp.real" "$SYSTEM_ROOT/bin/cp"
 
@@ -304,7 +386,7 @@ SH
   mv "$SYSTEM_ROOT/usr/bin/shasum" "$SYSTEM_ROOT/usr/bin/shasum.missing"
   run_helper "$home" git-status
   expect_code 0 "$LAST_RC" "missing compact-only utility should fall back"
-  assert_raw 'git|status '
+  assert_raw 'git|-c core.fsmonitor=false'
   assert_absent "$CONTROL/version.count" "missing compact-only utility executed RTK"
   mv "$SYSTEM_ROOT/usr/bin/shasum.missing" "$SYSTEM_ROOT/usr/bin/shasum"
   pass "fm-rtk: replacement races and setup failures fall back without executing candidates"
@@ -340,6 +422,8 @@ test_public_launcher_sanitizes_startup_environment
 test_admission_and_trusted_raw
 test_spoofing_and_private_execution
 test_fixed_semantic_verbs
+test_path_confinement
+test_git_configuration_cannot_execute_or_write
 test_artifact_and_version_failures
 test_copy_race_and_copy_failure
 test_post_start_no_rerun_and_signal_cleanup

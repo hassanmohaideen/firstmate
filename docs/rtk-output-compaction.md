@@ -15,6 +15,8 @@ No worker runtime adapter, backend, shell startup file, global prompt, project i
 The helper exposes semantic verbs instead of accepting a command string.
 The supported classes are bounded Git history, unstaged or staged Git diff orientation, plain Git status orientation, unstructured `rg` search, and one-directory listing.
 Arguments remain argv data and are never evaluated by a shell.
+Search and list targets are resolved against the current physical task-copy root and refused when they leave it, traverse symlinks or parent components, enter credential/private metadata directories, or do not already exist.
+Git invocations use fixed command-scoped configuration with external diff, text conversion, fsmonitor, hooks, pagers, protocols, and optional index locks disabled.
 Option passthrough, standalone shell operators, and arbitrary command execution are refused before either RTK or the raw program starts.
 
 Compact output is never sufficient for a safety, mutation, validation, final-review, cleanliness, landing, or approval decision.
@@ -36,7 +38,7 @@ A positive result from an exploratory compact view therefore never widens the al
 ## Privacy and failure model
 
 The helper verifies the selected artifact before each compact use and never runs an artifact that fails its type, platform, checksum, executable, or exact-version check.
-Each accepted RTK preflight and invocation receives a clean private temporary home, configuration, data, cache, and history location with telemetry, tee recovery, and project filters disabled.
+Each accepted RTK preflight and invocation receives a clean private temporary home, configuration, data, cache, and history location with telemetry, tee recovery, project filters, system/global Git configuration, terminal prompting, and optional Git locks disabled.
 The caller cannot weaken those privacy values through ambient environment variables.
 The private temporary root is removed after normal completion and caught termination.
 The helper logs only its fixed semantic class, selected pin, or a non-sensitive fallback reason, never arguments, patterns, paths, output, command history, or analytics.

@@ -16,13 +16,11 @@
 #   fm-rtk.sh search <pattern> [path...]
 #   fm-rtk.sh list <directory>
 #
-# The verbs map to fixed, read-only, human-oriented argv:
-#   git-log          -> git log -n 50 --decorate
-#   git-diff         -> git diff
-#   git-diff --cached -> git diff --cached
-#   git-status       -> git status
-#   search ...       -> rg <pattern> [path...]
-#   list <directory> -> ls <directory>
+# The verbs map to fixed, read-only, human-oriented Git, rg, and ls argv.
+# Git argv include fixed command-scoped configuration, no external diff or
+# textconv, no fsmonitor, no hooks, no pager, and no optional index locks.
+# Search and list targets are canonicalized and confined to the current physical
+# task-copy root without symlink, credential-directory, or parent traversal.
 # No arbitrary command, command string, shell syntax, option passthrough, machine
 # mode, RTK proxy, project filter, or mutation escape hatch exists.
 # Standalone shell-operator arguments and option-like search/list arguments are
@@ -43,8 +41,8 @@
 #
 # Every RTK preflight and compact execution receives a fresh mode-0700 temporary
 # HOME/XDG/data/cache root, a private RTK_DB_PATH, RTK_TELEMETRY_DISABLED=1,
-# RTK_TEE=0, RTK_NO_TOML=1, NO_COLOR=1, PAGER=cat, and GIT_PAGER=cat through a
-# clean environment with a fixed trusted PATH.
+# RTK_TEE=0, RTK_NO_TOML=1, NO_COLOR=1, controlled Git configuration and pagers,
+# GIT_OPTIONAL_LOCKS=0, and a clean environment with a fixed trusted PATH.
 # Caller values cannot override those settings.
 # The temporary root is removed after normal completion and caught termination.
 # The helper logs only its fixed semantic verb and non-sensitive fallback reason,
@@ -68,6 +66,19 @@ RTK_CHILD_PID=
 VERB=
 RAW_ARGV=()
 RTK_ARGV=()
+GIT_FIXED_CONFIG=(
+  -c core.fsmonitor=false
+  -c core.hooksPath=/dev/null
+  -c core.pager=cat
+  -c pager.log=false
+  -c pager.diff=false
+  -c pager.status=false
+  -c diff.external=
+  -c diff.trustExitCode=false
+  -c interactive.diffFilter=
+  -c status.submoduleSummary=false
+  -c protocol.allow=never
+)
 TEST_SYSTEM_ROOT=
 if [ "$SOURCE_NAME" = fm-rtk-test-driver.sh ] && [ ! -L "$SOURCE_PATH" ] && [ -n "${FM_RTK_TEST_SYSTEM_ROOT:-}" ]; then
   case "$FM_RTK_TEST_SYSTEM_ROOT" in
@@ -139,6 +150,40 @@ validate_data_arg() {
     -*) admission_error 'option-like arguments are not supported' ;;
   esac
   is_shell_operator "$1" && admission_error 'standalone shell operators are not supported'
+}
+
+TASK_ROOT=$(pwd -P 2>/dev/null) || admission_error 'task copy cannot be resolved'
+[ -d "$TASK_ROOT" ] || admission_error 'task copy cannot be resolved'
+
+canonicalize_task_path() {
+  local input=$1 remainder component resolved=$TASK_ROOT
+  [ -n "$input" ] || admission_error 'empty paths are not supported'
+  case "$input" in
+    /*)
+      case "$input" in
+        "$TASK_ROOT") remainder= ;;
+        "$TASK_ROOT"/*) remainder=${input#"$TASK_ROOT"/} ;;
+        *) admission_error 'paths must stay inside the current task copy' ;;
+      esac
+      ;;
+    *) remainder=$input ;;
+  esac
+  while [ -n "$remainder" ]; do
+    case "$remainder" in
+      */*) component=${remainder%%/*}; remainder=${remainder#*/} ;;
+      *) component=$remainder; remainder= ;;
+    esac
+    case "$component" in
+      ''|.) continue ;;
+      ..) admission_error 'parent traversal is not supported' ;;
+      .ssh|.gnupg|.aws|.azure|.kube|.docker|.git|.netrc|.git-credentials|.npmrc|.pypirc)
+        admission_error 'credential and private metadata paths are not supported' ;;
+    esac
+    resolved=$resolved/$component
+    [ ! -L "$resolved" ] || admission_error 'symlink traversal is not supported'
+    [ -e "$resolved" ] || admission_error 'targets must already exist'
+  done
+  printf '%s\n' "$resolved"
 }
 
 cleanup_tmp() {
@@ -243,29 +288,36 @@ shift
 case "$VERB" in
   git-log)
     [ "$#" -eq 0 ] || admission_error 'git-log accepts no arguments'
-    RTK_ARGV=(git log -n 50 --decorate)
+    RTK_ARGV=(git "${GIT_FIXED_CONFIG[@]}" log --no-ext-diff --no-textconv -n 50 --decorate)
     ;;
   git-diff)
     case "$#:${1:-}" in
-      0:) RTK_ARGV=(git diff) ;;
-      1:--cached) RTK_ARGV=(git diff --cached) ;;
+      0:) RTK_ARGV=(git "${GIT_FIXED_CONFIG[@]}" diff --no-ext-diff --no-textconv) ;;
+      1:--cached) RTK_ARGV=(git "${GIT_FIXED_CONFIG[@]}" diff --no-ext-diff --no-textconv --cached) ;;
       *) admission_error 'git-diff accepts only an optional --cached' ;;
     esac
     ;;
   git-status)
     [ "$#" -eq 0 ] || admission_error 'git-status accepts no arguments'
-    RTK_ARGV=(git status)
+    RTK_ARGV=(git "${GIT_FIXED_CONFIG[@]}" status)
     ;;
   search)
     [ "$#" -ge 1 ] || admission_error 'search requires a pattern'
-    for arg in "$@"; do validate_data_arg "$arg"; done
-    RTK_ARGV=(rg "$@")
+    validate_data_arg "$1"
+    RTK_ARGV=(rg "$1")
+    shift
+    for arg in "$@"; do
+      validate_data_arg "$arg"
+      RESOLVED_TARGET=$(canonicalize_task_path "$arg") || exit $?
+      RTK_ARGV+=("$RESOLVED_TARGET")
+    done
     ;;
   list)
     [ "$#" -eq 1 ] || admission_error 'list requires exactly one directory'
     validate_data_arg "$1"
-    [ -d "$1" ] || admission_error 'list target must be a directory'
-    RTK_ARGV=(ls "$1")
+    LIST_TARGET=$(canonicalize_task_path "$1") || exit $?
+    [ -d "$LIST_TARGET" ] || admission_error 'list target must be a directory'
+    RTK_ARGV=(ls "$LIST_TARGET")
     ;;
   *) admission_error 'unknown semantic verb' ;;
 esac
@@ -335,6 +387,10 @@ ISOLATED_ENV=(
   'NO_COLOR=1'
   'PAGER=cat'
   'GIT_PAGER=cat'
+  'GIT_OPTIONAL_LOCKS=0'
+  'GIT_TERMINAL_PROMPT=0'
+  'GIT_CONFIG_NOSYSTEM=1'
+  'GIT_CONFIG_GLOBAL=/dev/null'
   "PATH=$TRUSTED_PATH"
 )
 
