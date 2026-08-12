@@ -166,6 +166,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 const portFile=process.argv[2], countFile=process.argv[3], token=process.argv[4], self=process.argv[5], mode=process.argv[6];
 let connections=0;
+const sockets=new Set();
 function frame(opcode,payload) {
   const data=Buffer.from(payload);
   if (data.length < 126) return Buffer.concat([Buffer.from([0x80|opcode,data.length]),data]);
@@ -173,6 +174,31 @@ function frame(opcode,payload) {
 }
 function text(socket,value) { socket.write(frame(1,JSON.stringify(value))); }
 function close(socket,code) { const data=Buffer.alloc(2); data.writeUInt16BE(code); socket.write(frame(8,data)); socket.end(); }
+function decodeFrames(buffer) {
+  const packets=[];
+  let offset=0;
+  while (buffer.length-offset >= 2) {
+    const opcode=buffer[offset] & 0x0f;
+    const masked=(buffer[offset+1] & 0x80) !== 0;
+    let length=buffer[offset+1] & 0x7f;
+    let header=2;
+    if (length === 126) {
+      if (buffer.length-offset < 4) break;
+      length=buffer.readUInt16BE(offset+2); header=4;
+    } else if (length === 127) {
+      if (buffer.length-offset < 10) break;
+      length=Number(buffer.readBigUInt64BE(offset+2)); header=10;
+    }
+    const maskLength=masked ? 4 : 0;
+    if (buffer.length-offset < header+maskLength+length) break;
+    const mask=masked ? buffer.subarray(offset+header,offset+header+4) : null;
+    const payload=Buffer.from(buffer.subarray(offset+header+maskLength,offset+header+maskLength+length));
+    if (mask) for (let i=0;i<payload.length;i+=1) payload[i]^=mask[i%4];
+    packets.push({opcode,payload});
+    offset+=header+maskLength+length;
+  }
+  return {packets,remainder:buffer.subarray(offset)};
+}
 const server=http.createServer((req,res)=>{
   if (req.url === "/gateway/bot") {
     if (mode === "auth-fail") { res.writeHead(401); res.end("{}"); return; }
@@ -182,26 +208,56 @@ const server=http.createServer((req,res)=>{
   res.writeHead(404); res.end();
 });
 server.on("upgrade",(req,socket)=>{
+  sockets.add(socket);
+  socket.once("close",()=>sockets.delete(socket));
   const accept=crypto.createHash("sha1").update(req.headers["sec-websocket-key"]+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+accept+"\r\n\r\n");
-  socket.on("data",data=>{ if ((data[0] & 0x0f) === 8) socket.end(); });
   connections+=1; fs.writeFileSync(countFile,String(connections));
-  const url=`ws://127.0.0.1:${server.address().port}`;
+  const connection=connections;
+  const localUrl=`ws://127.0.0.1:${server.address().port}`;
+  const resumeUrl=mode === "regional-resume"
+    ? "wss://gateway-us-east1-b.discord.gg"
+    : mode === "untrusted-resume"
+      ? "wss://gateway.discord.gg.attacker.invalid"
+      : localUrl;
+  let pending=Buffer.alloc(0);
+  let handshakeComplete=false;
+  socket.on("data",data=>{
+    pending=Buffer.concat([pending,data]);
+    const decoded=decodeFrames(pending);
+    pending=decoded.remainder;
+    for (const received of decoded.packets) {
+      if (received.opcode === 8) { socket.end(); continue; }
+      if (received.opcode !== 1 || handshakeComplete) continue;
+      let packet;
+      try { packet=JSON.parse(received.payload.toString("utf8")); } catch { continue; }
+      if (mode === "diagnostic-recurrence" && connection > 2) continue;
+      if (packet.op === 2 && packet.d?.token === token && packet.d?.intents === 33281) {
+        handshakeComplete=true;
+        fs.writeFileSync(countFile.replace(/connections$/, "identify.json"), JSON.stringify({token_ok:true,intents:packet.d.intents,properties:packet.d.properties}));
+        text(socket,{op:0,t:"READY",s:connection,d:{user:{id:self},session_id:`session-${connection}`,resume_gateway_url:resumeUrl}});
+      } else if (packet.op === 6 && packet.d?.token === token && packet.d?.session_id) {
+        handshakeComplete=true;
+        text(socket,{op:0,t:"RESUMED",s:connection,d:{}});
+      }
+      if (handshakeComplete && mode === "reconnect" && connection === 1) setTimeout(()=>close(socket,1001),50);
+      if (handshakeComplete && mode === "diagnostic-recurrence") setTimeout(()=>close(socket,4004),100);
+    }
+  });
   text(socket,{op:10,d:{heartbeat_interval:5000}});
-  if (mode !== "diagnostic-recurrence" || connections <= 2) {
-    setTimeout(()=>text(socket,{op:0,t:"READY",s:connections,d:{user:{id:self},session_id:`session-${connections}`,resume_gateway_url:url}}),20);
-  }
-  if (mode === "reconnect" && connections === 1) setTimeout(()=>close(socket,1001),100);
-  if (mode === "diagnostic-recurrence" && connections <= 2) setTimeout(()=>close(socket,4004),50);
 });
 server.listen(0,"127.0.0.1",()=>fs.writeFileSync(portFile,String(server.address().port)));
-for (const signal of ["SIGTERM","SIGINT"]) process.on(signal,()=>server.close(()=>process.exit(0)));
+for (const signal of ["SIGTERM","SIGINT"]) process.on(signal,()=>{
+  for (const socket of sockets) socket.destroy();
+  server.close(()=>process.exit(0));
+});
 JS
   "$NODE_BIN" "$script" "$dir/port" "$dir/connections" "$TOKEN" "$SELF" "$mode" > "$dir/server.log" 2>&1 &
   GATEWAY_SERVER_PID=$!
   SERVER_PIDS+=("$GATEWAY_SERVER_PID")
   wait_for_file "$dir/port" || fail "fake Discord Gateway did not start"
   GATEWAY_API_BASE="http://127.0.0.1:$(cat "$dir/port")"
+  GATEWAY_URL="ws://127.0.0.1:$(cat "$dir/port")"
 }
 
 # Disabled-by-default and strict configuration.
@@ -508,6 +564,50 @@ assert_absent "$home/state/discord-bot.ready" "clean shutdown left the ready mar
 assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "Gateway logs exposed the bot token"
 pass "the Gateway reconnects, remains single-instance, and shuts down cleanly"
 
+# Discord can issue a regional resume endpoint in READY while the transport
+# connection itself remains hermetic.
+home=$(new_home gateway-regional-resume)
+write_config "$home"
+mkdir "$home/state/.wake-dedup"
+chmod 755 "$home/state/.wake-dedup"
+make_gateway_server "$home/gateway" regional-resume
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_GATEWAY_URL="$GATEWAY_URL" FM_DISCORD_TEST_ENFORCE_PRODUCTION_GATEWAY=1 \
+  FM_DISCORD_TEST_BACKOFF_MS=20 "$CONTROL" run > "$home/bot.log" 2>&1 &
+regional_worker=$!
+WORKER_PIDS+=("$regional_worker")
+wait_for_file "$home/state/discord-bot.ready" \
+  || fail "foreground service rejected Discord's regional resume endpoint"
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" check)
+assert_contains "$out" "is connected" "foreground health did not report the accepted regional Gateway handshake"
+assert_contains "$(cat "$home/bot.log")" "context pruning was skipped" \
+  "foreground fixture did not disconfirm the nearby pruning warning"
+[ "$(jq -r .intents "$home/gateway/identify.json")" -eq 33281 ] \
+  || fail "foreground service changed its minimum Discord intent bitset"
+[ "$(jq -r .token_ok "$home/gateway/identify.json")" = true ] \
+  || fail "foreground service did not authenticate its Gateway identify"
+kill -TERM "$regional_worker"
+wait "$regional_worker" || true
+WORKER_PIDS=()
+pass "foreground service accepts Discord's regional resume endpoint independently of private-state pruning"
+
+home=$(new_home gateway-untrusted-resume)
+write_config "$home"
+make_gateway_server "$home/gateway" untrusted-resume
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_GATEWAY_URL="$GATEWAY_URL" FM_DISCORD_TEST_ENFORCE_PRODUCTION_GATEWAY=1 \
+  FM_DISCORD_TEST_BACKOFF_MS=20 "$CONTROL" run > "$home/bot.log" 2>&1 &
+untrusted_worker=$!
+WORKER_PIDS+=("$untrusted_worker")
+wait_for_file "$home/gateway/connections" || fail "untrusted resume fixture did not reach the Gateway"
+sleep 0.2
+assert_absent "$home/state/discord-bot.ready" "an untrusted lookalike resume endpoint was accepted"
+kill -0 "$untrusted_worker" 2>/dev/null || fail "untrusted resume endpoint stopped bounded reconnect"
+kill -TERM "$untrusted_worker"
+wait "$untrusted_worker" || true
+WORKER_PIDS=()
+pass "Gateway resume remains limited to Discord-owned endpoints"
+
 # Authentication failure wakes once with a safe code despite a transient publication failure.
 home=$(new_home gateway-auth)
 write_config "$home"
@@ -573,7 +673,8 @@ while [ "$i" -lt 200 ] && [ "$diagnostic_wakes" -lt 2 ]; do
   sleep 0.05
   i=$((i + 1))
   diagnostic_wakes=$(awk '/check: discord-error authentication-rejected/ { count += 1 } END { print count + 0 }' \
-    "$home/state/.wake-queue" 2>/dev/null)
+    "$home/state/.wake-queue" 2>/dev/null || printf '0')
+  diagnostic_wakes=${diagnostic_wakes:-0}
 done
 [ "$diagnostic_wakes" -eq 2 ] \
   || fail "same-code failures after recovery did not publish two incidents: $(cat "$home/bot.log")"
@@ -589,6 +690,8 @@ case "$incident_id" in
     case "$incident_id" in *[!0-9a-f]*) fail "diagnostic incident identity was not opaque hexadecimal" ;; esac
     ;;
 esac
+wait_for_file "$home/state/discord-bot.error.notified" \
+  || fail "current Discord diagnostic did not publish its notification receipt"
 [ "$(jq -r .incident_id "$home/state/discord-bot.error.notified")" = "$incident_id" ] \
   || fail "diagnostic publication receipt was not bound to the current incident"
 kill -TERM "$diagnostic_worker"
@@ -610,23 +713,8 @@ cat > "$fakebin/uname" <<'SH'
 #!/usr/bin/env bash
 echo Darwin
 SH
-service_node="$fakebin/node"
-cat > "$service_node" <<'SH'
-#!/usr/bin/env bash
-case "$1" in
-  -e) exit 0 ;;
-esac
-case "${2:-}" in
-  validate) exit 0 ;;
-  run)
-    printf 'connected\n' > "$FM_STATE_OVERRIDE/discord-bot.ready"
-    chmod 600 "$FM_STATE_OVERRIDE/discord-bot.ready"
-    trap 'exit 0' TERM INT
-    while :; do sleep 1; done
-    ;;
-esac
-exit 1
-SH
+service_node="$NODE_BIN"
+make_gateway_server "$home/gateway" regional-resume
 cat > "$fakebin/launchctl" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_LAUNCHCTL_LOG"
@@ -648,13 +736,15 @@ case "$1" in
 esac
 exit 1
 SH
-chmod +x "$fakebin/uname" "$fakebin/launchctl" "$service_node"
+chmod +x "$fakebin/uname" "$fakebin/launchctl"
 mkdir -p "$home/account/Library/LaunchAgents"
 HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchctl.log" \
   FM_LAUNCHCTL_KICKSTART_DELAY=0.2 FM_CONTROL_PATH="$CONTROL" \
   FM_DISCORD_NODE_BIN="$service_node" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$custom_state" FM_CONFIG_OVERRIDE="$custom_config" \
-  FM_DISCORD_CONFIG_FILE="$custom_config_file" "$CONTROL" start > "$home/start.out" 2>&1 &
+  FM_DISCORD_CONFIG_FILE="$custom_config_file" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_GATEWAY_URL="$GATEWAY_URL" FM_DISCORD_TEST_ENFORCE_PRODUCTION_GATEWAY=1 \
+  "$CONTROL" start > "$home/start.out" 2>&1 &
 starter=$!
 wait_for_file "$home/kickstart-entered" || fail "persistent startup did not reach its ownership handoff"
 out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$home/contender-state" \
@@ -665,7 +755,16 @@ assert_contains "$out" "startup is already claiming this home" \
   "foreground handoff contention did not fail safely"
 wait "$starter" || fail "persistent startup failed after refusing its foreground contender"
 out=$(cat "$home/start.out")
-assert_contains "$out" "restart automatically" "macOS start did not report persistent service behavior"
+case "$out" in
+  *"restart automatically"*|*"running and reconnecting"*) ;;
+  *) fail "macOS start did not report persistent service behavior: $out" ;;
+esac
+wait_for_file "$custom_state/discord-bot.ready" \
+  || fail "macOS persistent service rejected Discord's regional resume endpoint"
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$custom_state" \
+  FM_CONFIG_OVERRIDE="$custom_config" FM_DISCORD_CONFIG_FILE="$custom_config_file" \
+  FM_DISCORD_NODE_BIN="$service_node" "$CONTROL" check)
+assert_contains "$out" "is connected" "macOS persistent-service health did not reach connected"
 plist=$(find "$home/account/Library/LaunchAgents" -name 'dev.firstmate.discord.*.plist' -print | head -n1)
 assert_present "$plist" "macOS start did not install a per-home LaunchAgent"
 assert_present "$custom_state/discord-bot.config-path" "persistent start did not publish the shared configuration selection"
@@ -733,7 +832,7 @@ out=$(HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchc
   FM_DISCORD_CONFIG_FILE="$custom_config_file" "$CONTROL" stop)
 assert_contains "$out" "configuration is unchanged" "macOS stop did not preserve private configuration"
 assert_absent "$plist" "macOS stop left a restart-on-login LaunchAgent"
-pass "the macOS service path persists safely without copying credentials or deployment ids"
+pass "the macOS service path reaches connected without copying credentials or deployment ids"
 
 # Reply and context helpers discover a persisted custom config selection.
 home=$(new_home shared-config-path)
