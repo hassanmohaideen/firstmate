@@ -35,7 +35,7 @@ It resolves every repeated `blocked-by:` edge against structured Done records, k
 Its secondmate-home summary classifies an actionable captain hold as `captain_decision` and preserves blocked captain holds as queued work in the owning home.
 
 `bin/fm-bearings-snapshot.sh` projects actionable captain holds into `decisions_open` and leaves blocked captain holds in ordinary queued gates.
-It excludes completed kind `captain` records from Recently Landed.
+It excludes completed kind `captain` records from the Bearings completed bucket.
 The projection remains read-only and does not inspect historical prose.
 
 ## Verification record
