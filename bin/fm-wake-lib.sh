@@ -416,8 +416,18 @@ _fm_recovery_marker_write_locked() {
   fi
 }
 
+# A downtime publication reuses the generation of an outstanding handling
+# episode instead of minting a fresh one. Every watcher close and every queue
+# append publishes downtime, so minting here would invalidate the exact
+# acknowledgement the drain just printed for the episode the caller is still
+# handling. That acknowledgement then retired nothing, which left the marker
+# pending and made the next armed watcher spend its whole cycle re-announcing
+# the same recovery - the livelock this reuse removes.
+# Retirement stays correct because the acknowledgement clears the marker only
+# once the remaining queue is empty: a wake appended after the drain carries a
+# higher sequence, so it keeps the queue non-empty and the episode pending.
 _fm_recovery_marker_publish() {
-  local marker=$1 kind=${2:-downtime} lock
+  local marker=$1 kind=${2:-downtime} lock saved_token generation=''
   case "$kind" in handling|downtime) ;; *) return 1 ;; esac
   lock="${marker}.lock"
   fm_lock_acquire_wait "$lock" || return 1
@@ -425,7 +435,19 @@ _fm_recovery_marker_publish() {
     fm_lock_release "$lock"
     return 1
   fi
-  if ! _fm_recovery_marker_write_locked "$marker" "$kind"; then
+  if [ "$kind" = downtime ]; then
+    # Read inline rather than in a command substitution: this runs inside the
+    # marker-lock critical section, so it must not add a subshell fork there.
+    # The token is restored because publishing owns no snapshot of its own.
+    saved_token=$FM_RECOVERY_MARKER_TOKEN
+    if fm_recovery_marker_read "$marker"; then
+      case "$FM_RECOVERY_MARKER_TOKEN" in
+        pending:handling:*) generation=${FM_RECOVERY_MARKER_TOKEN##*:} ;;
+      esac
+    fi
+    FM_RECOVERY_MARKER_TOKEN=$saved_token
+  fi
+  if ! _fm_recovery_marker_write_locked "$marker" "$kind" "$generation"; then
     fm_lock_release "$lock"
     return 1
   fi
