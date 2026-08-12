@@ -846,6 +846,10 @@ families_for_changed_path() {
       printf '%s\n' real-herdr-gated
       printf '%s\n' backend-dispatch
       ;;
+    tests/helpers/fs-event-monitor.py)
+      printf '%s\n' "__script__:fm-rtk-fs-events.test.sh"
+      printf '%s\n' "__script__:fm-rtk-exec-trace.test.sh"
+      ;;
     tests/*.test.sh)
       # A single test file change selects only that script via basename family
       # resolution in the caller; emit a marker family of __script__
