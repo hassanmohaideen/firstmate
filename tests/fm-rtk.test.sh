@@ -111,6 +111,16 @@ test_types_and_symlinks_fail_closed() {
   run_verify "$home"
   expect_code 65 "$LAST_RC" "non-executable artifact was accepted"
 
+  home=$(make_home owner-not-executable)
+  chmod 401 "$(artifact_path "$home")"
+  run_verify "$home"
+  expect_code 65 "$LAST_RC" "caller-owned artifact without owner execute was accepted"
+
+  home=$(make_home owner-executable)
+  chmod 500 "$(artifact_path "$home")"
+  run_verify "$home" "$(artifact_sha "$home")"
+  expect_code 0 "$LAST_RC" "caller-owned artifact with owner execute was rejected"
+
   home=$(make_home directory-artifact)
   target=$(artifact_path "$home")
   rm "$target"; mkdir "$target"
@@ -154,6 +164,20 @@ test_public_launcher_ignores_hostile_environment() {
   module_dir=$CONTROL/perl-modules
   mkdir -p "$module_dir"
   FM_HOME="$home" run_public_launcher
+  case "$(/usr/bin/uname -s):$(/usr/bin/uname -m)" in
+    Darwin:arm64)
+      expect_code 65 "$LAST_RC" "known-good launcher did not report the pinned-hash refusal"
+      [ ! -s "$OUT" ] || fail "known-good launcher emitted unexpected stdout"
+      [ "$(cat "$ERR")" = 'fm-rtk: artifact verification failed' ] \
+        || fail "known-good launcher emitted unexpected verification refusal"
+      ;;
+    *)
+      expect_code 69 "$LAST_RC" "known-good launcher did not report unsupported platform"
+      [ ! -s "$OUT" ] || fail "known-good launcher emitted unexpected stdout"
+      [ "$(cat "$ERR")" = 'fm-rtk: unsupported platform (requires Darwin arm64)' ] \
+        || fail "known-good launcher emitted unexpected platform refusal"
+      ;;
+  esac
   PUBLIC_RC=$LAST_RC
   PUBLIC_OUT=$CONTROL/public.stdout
   PUBLIC_ERR=$CONTROL/public.stderr
@@ -250,6 +274,12 @@ exit 97
 EOF
     chmod +x "$fakebin/$tool"
   done
+  cat > "$fakebin/git" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$*" >> '$CONTROL/lifecycle-git-calls'
+exec /usr/bin/git "\$@"
+EOF
+  chmod +x "$fakebin/git"
 }
 
 assert_lifecycle_inert() {
@@ -259,16 +289,28 @@ assert_lifecycle_inert() {
   [ "$project_before" = "$project_after" ] || fail "$name changed project bytes"
   [ "$config_before" = "$config_after" ] || fail "$name changed private config bytes"
   assert_absent "$CONTROL/lifecycle-calls" "$name called an RTK, installer, network, hook, or activation command"
+  if [ -f "$CONTROL/lifecycle-git-calls" ] && /usr/bin/grep -E '(^| )(status|diff|log)( |$)' "$CONTROL/lifecycle-git-calls" >/dev/null; then
+    fail "$name ran a forbidden project-orientation git command"
+  fi
+  assert_absent "$CONTROL/verifier-called" "$name called the tracked RTK verifier"
   assert_absent "$CONTROL/artifact-executed" "$name executed the private artifact"
 }
 
 # Bootstrap and session start are driven as public commands with executable
 # traps; source-level absence is not used as evidence for lifecycle inertness.
 test_lifecycle_never_activates_rtk() {
-  local home fakebin project_before config_before rc
+  local home fakebin project_before config_before rc lifecycle_root
   home=$CONTROL/lifecycle-home
   fakebin=$CONTROL/lifecycle-fakebin
-  mkdir -p "$home/config" "$home/state/.lock" "$home/data" "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin"
+  lifecycle_root=$CONTROL/lifecycle-root
+  mkdir -p "$lifecycle_root" "$home/config" "$home/state/.lock" "$home/data" "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin"
+  cp -R "$ROOT/bin" "$ROOT/lib" "$lifecycle_root/"
+  cat > "$lifecycle_root/lib/Firstmate/rtk-run" <<EOF
+#!/bin/sh
+/usr/bin/touch '$CONTROL/verifier-called'
+exit 97
+EOF
+  chmod +x "$lifecycle_root/lib/Firstmate/rtk-run"
   printf 'disabled\n' > "$home/config/rtk"
   printf 'private-config\n' > "$home/config/sentinel"
   cat > "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk" <<EOF
@@ -280,16 +322,18 @@ EOF
   project_before=$(find "$PROJECT" -mindepth 1 -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
   config_before=$(find "$home/config" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
 
-  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/artifact-executed"
+  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/lifecycle-git-calls" \
+    "$CONTROL/verifier-called" "$CONTROL/artifact-executed"
   (cd "$PROJECT" && FM_HOME="$home" FM_BOOTSTRAP_DETECT_ONLY=1 FM_BOOTSTRAP_NETWORK=skip \
-    PATH="$fakebin:/usr/bin:/bin" "$ROOT/bin/fm-bootstrap.sh") >"$OUT" 2>"$ERR"
+    PATH="$fakebin:/usr/bin:/bin" "$lifecycle_root/bin/fm-bootstrap.sh") >"$OUT" 2>"$ERR"
   rc=$?
   expect_code 0 "$rc" "detect-only bootstrap failed"
   assert_lifecycle_inert bootstrap "$project_before" "$config_before"
 
-  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/artifact-executed"
+  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/lifecycle-git-calls" \
+    "$CONTROL/verifier-called" "$CONTROL/artifact-executed"
   (cd "$PROJECT" && FM_HOME="$home" FM_SESSION_START_TIMEOUT=20 \
-    PATH="$fakebin:/usr/bin:/bin" "$ROOT/bin/fm-session-start.sh") >"$OUT" 2>"$ERR"
+    PATH="$fakebin:/usr/bin:/bin" "$lifecycle_root/bin/fm-session-start.sh") >"$OUT" 2>"$ERR"
   rc=$?
   expect_code 0 "$rc" "read-only session start failed"
   assert_lifecycle_inert session-start "$project_before" "$config_before"

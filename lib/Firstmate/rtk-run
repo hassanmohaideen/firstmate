@@ -89,7 +89,15 @@ case "$EFFECTIVE_HOME" in /*) ;; *) printf 'fm-rtk: invalid absolute FM_HOME\n' 
   }
   my $artifact = enter($directory, "rtk", $file_flags);
   my @identity = stat($artifact);
-  exit 1 unless @identity && -f _ && ($identity[2] & 0111);
+  exit 1 unless @identity && -f _;
+  my $mode = $identity[2];
+  my $euid = $>;
+  my %effective_groups = map { $_ => 1 } grep { length } split /\s+/, "$)";
+  my $executable = $euid == 0 ? ($mode & 0111)
+    : $euid == $identity[4] ? ($mode & 0100)
+    : $effective_groups{$identity[5]} ? ($mode & 0010)
+    : ($mode & 0001);
+  exit 1 unless $executable;
   binmode($artifact) or exit 1;
   my $digest = Digest::SHA->new(256);
   $digest->addfile($artifact);
