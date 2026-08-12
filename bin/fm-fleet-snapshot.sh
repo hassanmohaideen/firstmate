@@ -37,8 +37,8 @@
 #     main-home current-inventory checks shared with secondmate_home_summary_json
 #     (orphan structured in-flight ids with no state/<id>.meta, and unstructured
 #     current backlog rows). Does not invent live tasks; meta remains truth for
-#     workers. Bearings maps failures into omitted[] disclosure (and a Charted
-#     Next gate line) rather than silent empty Underway.
+#     workers. Bearings maps failures into omitted[] disclosure (and a queued-
+#     bucket gate line) rather than a silently empty in-progress bucket.
 #   secondmate_current: {records[],total,shown,truncated} - bounded current summaries
 #     for registered secondmates, selected from validated structured state inside
 #     each home with explicit provenance, freshness, endpoint evidence, and unknown

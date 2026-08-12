@@ -25,8 +25,8 @@
 #
 # Main-home inventory validity comes from the canonical snapshot's main_inventory
 # object (orphan structured in-flight without meta, unstructured current rows).
-# Bearings never invents Underway rows from backlog-only ids; it discloses those
-# gaps in omitted[] and, when invalid, a Charted Next gate line so the four-section
+# Bearings never invents in-progress rows from backlog-only ids; it discloses those
+# gaps in omitted[] and, when invalid, a queued-bucket gate line so the four-section
 # chat cannot claim an empty fleet while main current state is broken.
 #
 # The landed section merges this home's Done with the canonical snapshot's
