@@ -25,6 +25,9 @@ RTK_BINARY_SHA256=17d00d61a533a442c61f1be49d8a9321225557f64021d5b70fd8eb75ed8fb0
 UNAME_TOOL=/usr/bin/uname
 PERL_TOOL=/usr/bin/perl
 
+PERMISSION_TEST=
+PERMISSION_MODE= PERMISSION_EUID= PERMISSION_UID=
+PERMISSION_GID= PERMISSION_GROUPS= PERMISSION_EXPECTED=
 if [ "$SOURCE_NAME" = fm-rtk-test-driver.sh ]; then
   case "${FM_RTK_TEST_SYSTEM_ROOT:-}" in
     /*) UNAME_TOOL=$FM_RTK_TEST_SYSTEM_ROOT/usr/bin/uname ;;
@@ -32,6 +35,15 @@ if [ "$SOURCE_NAME" = fm-rtk-test-driver.sh ]; then
   TEST_SHA=${FM_RTK_TEST_SHA256:-}
   case "$TEST_SHA" in *[!0-9a-f]*) TEST_SHA= ;; esac
   if [ "${#TEST_SHA}" -eq 64 ]; then RTK_BINARY_SHA256=$TEST_SHA; fi
+  if [ "${1:-}" = test-effective-executable ] && [ "$#" -eq 7 ]; then
+    PERMISSION_TEST=1
+    PERMISSION_MODE=$2
+    PERMISSION_EUID=$3
+    PERMISSION_UID=$4
+    PERMISSION_GID=$5
+    PERMISSION_GROUPS=$6
+    PERMISSION_EXPECTED=$7
+  fi
 fi
 
 trusted_tool() { [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ]; }
@@ -48,14 +60,16 @@ refuse() {
 }
 
 case "${1:-}" in -h|--help) [ "$#" -eq 1 ] || refuse 'help accepts no arguments'; usage; exit 0 ;; esac
-[ "$#" -eq 1 ] && [ "$1" = verify ] || refuse 'only the argument verify is accepted'
+if [ -z "$PERMISSION_TEST" ]; then
+  [ "$#" -eq 1 ] && [ "$1" = verify ] || refuse 'only the argument verify is accepted'
+fi
 trusted_tool "$UNAME_TOOL" && trusted_tool "$PERL_TOOL" || {
   printf 'fm-rtk: trusted system utility unavailable\n' >&2
   exit 69
 }
 OS_NAME=$($UNAME_TOOL -s 2>/dev/null) || OS_NAME=
 ARCH_NAME=$($UNAME_TOOL -m 2>/dev/null) || ARCH_NAME=
-if [ "$OS_NAME" != Darwin ] || [ "$ARCH_NAME" != arm64 ]; then
+if [ -z "$PERMISSION_TEST" ] && { [ "$OS_NAME" != Darwin ] || [ "$ARCH_NAME" != arm64 ]; }; then
   printf 'fm-rtk: unsupported platform (requires Darwin arm64)\n' >&2
   exit 69
 fi
@@ -65,7 +79,25 @@ case "$EFFECTIVE_HOME" in /*) ;; *) printf 'fm-rtk: invalid absolute FM_HOME\n' 
 "$PERL_TOOL" -MDigest::SHA -MFcntl=:DEFAULT -e '
   use strict;
   use warnings;
-  my ($home, $pin, $platform, $expected) = @ARGV;
+  my ($home, $pin, $platform, $expected, $permission_test, @permission_args) = @ARGV;
+
+  sub effectively_executable {
+    my ($mode, $euid, $uid, $gid, $groups) = @_;
+    my %effective_groups = map { $_ => 1 } grep { length } split /,/, $groups;
+    return $euid == 0 ? !!($mode & 0111)
+      : $euid == $uid ? !!($mode & 0100)
+      : $effective_groups{$gid} ? !!($mode & 0010)
+      : !!($mode & 0001);
+  }
+
+  if ($permission_test) {
+    exit 2 unless @permission_args == 6 && !grep { !/^\d+(?:,\d+)*$/ } @permission_args;
+    my ($mode, $euid, $uid, $gid, $groups, $expected_result) = @permission_args;
+    my $actual = effectively_executable(oct($mode), $euid, $uid, $gid, $groups) ? 1 : 0;
+    exit 2 unless $expected_result eq "0" || $expected_result eq "1";
+    exit($actual == $expected_result ? 0 : 1);
+  }
+
   my $directory_flags = O_RDONLY | O_NOFOLLOW | O_DIRECTORY;
   my $file_flags = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
   sysopen(my $directory, "/", $directory_flags) or exit 1;
@@ -90,21 +122,19 @@ case "$EFFECTIVE_HOME" in /*) ;; *) printf 'fm-rtk: invalid absolute FM_HOME\n' 
   my $artifact = enter($directory, "rtk", $file_flags);
   my @identity = stat($artifact);
   exit 1 unless @identity && -f _;
-  my $mode = $identity[2];
-  my $euid = $>;
-  my %effective_groups = map { $_ => 1 } grep { length } split /\s+/, "$)";
-  my $executable = $euid == 0 ? ($mode & 0111)
-    : $euid == $identity[4] ? ($mode & 0100)
-    : $effective_groups{$identity[5]} ? ($mode & 0010)
-    : ($mode & 0001);
-  exit 1 unless $executable;
+  my $groups = join ",", grep { length } split /\s+/, "$)";
+  exit 1 unless effectively_executable($identity[2], $>, $identity[4], $identity[5], $groups);
   binmode($artifact) or exit 1;
   my $digest = Digest::SHA->new(256);
   $digest->addfile($artifact);
   exit 1 unless $digest->hexdigest eq $expected;
   exit 0;
-' "$EFFECTIVE_HOME" "$RTK_PIN" "$RTK_PLATFORM" "$RTK_BINARY_SHA256"
-case $? in
+' "$EFFECTIVE_HOME" "$RTK_PIN" "$RTK_PLATFORM" "$RTK_BINARY_SHA256" "$PERMISSION_TEST" \
+  "$PERMISSION_MODE" "$PERMISSION_EUID" "$PERMISSION_UID" "$PERMISSION_GID" \
+  "$PERMISSION_GROUPS" "$PERMISSION_EXPECTED"
+PERL_STATUS=$?
+if [ -n "$PERMISSION_TEST" ]; then exit "$PERL_STATUS"; fi
+case $PERL_STATUS in
   0) printf 'fm-rtk: verified RTK v0.45.0 artifact (not executed)\n'; exit 0 ;;
   *) printf 'fm-rtk: artifact verification failed\n' >&2; exit 65 ;;
 esac

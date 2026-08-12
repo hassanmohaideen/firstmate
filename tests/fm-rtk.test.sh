@@ -50,6 +50,21 @@ assert_project_unchanged() {
   after=$(find "$PROJECT" -mindepth 1 -print | LC_ALL=C sort)
   [ -z "$after" ] || fail "verifier wrote inside the project: $after"
 }
+assert_private_output() {
+  local name=$1 content secret
+  content=$(cat "$OUT" "$ERR")
+  for secret in "$TMP_ROOT" needle-private-search private-fixture-name; do
+    case "$content" in *"$secret"*) fail "$name disclosed private input: $secret" ;; esac
+  done
+}
+assert_verification_failure() {
+  local name=$1
+  expect_code 65 "$LAST_RC" "$name was accepted"
+  [ ! -s "$OUT" ] || fail "$name emitted stdout"
+  [ "$(cat "$ERR")" = 'fm-rtk: artifact verification failed' ] \
+    || fail "$name emitted an unexpected diagnostic"
+  assert_private_output "$name"
+}
 
 # The public verifier has one exact non-executing operation and deterministic output.
 test_exact_verification_contract() {
@@ -64,13 +79,30 @@ test_exact_verification_contract() {
   assert_absent "$CONTROL/artifact-executed" "verifier executed the artifact"
   assert_project_unchanged
 
-  for args in '' 'git-status' 'verify extra' 'search token .'; do
+  for args in '' 'git-status' 'verify extra' 'search needle-private-search private-fixture-name'; do
     rm -f "$CONTROL/artifact-executed"
     # shellcheck disable=SC2086 # Fixture rows intentionally encode public argv.
     FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" $args >"$OUT" 2>"$ERR"
     expect_code 64 "$?" "non-verifier request was admitted: $args"
+    [ ! -s "$OUT" ] || fail "refused request emitted stdout"
+    [ "$(cat "$ERR")" = 'fm-rtk: refused request: only the argument verify is accepted' ] \
+      || fail "refused request emitted an unexpected diagnostic"
+    assert_private_output "refused request"
     assert_absent "$CONTROL/artifact-executed" "refused request executed the artifact"
   done
+  FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" --help private-fixture-name >"$OUT" 2>"$ERR"
+  expect_code 64 "$?" "help accepted an extra argument"
+  [ ! -s "$OUT" ] || fail "help refusal emitted stdout"
+  [ "$(cat "$ERR")" = 'fm-rtk: refused request: help accepts no arguments' ] \
+    || fail "help refusal emitted an unexpected diagnostic"
+  assert_private_output "help refusal"
+
+  FM_HOME=private-fixture-name FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" verify >"$OUT" 2>"$ERR"
+  expect_code 65 "$?" "relative FM_HOME was accepted"
+  [ ! -s "$OUT" ] || fail "relative-home refusal emitted stdout"
+  [ "$(cat "$ERR")" = 'fm-rtk: invalid absolute FM_HOME' ] \
+    || fail "relative-home refusal emitted an unexpected diagnostic"
+  assert_private_output "relative-home refusal"
   pass "fm-rtk: exact verification contract is non-executing"
 }
 
@@ -86,35 +118,35 @@ test_types_and_symlinks_fail_closed() {
   outside=$TMP_ROOT/real-parent/home
   ln -s "$TMP_ROOT/real-parent" "$TMP_ROOT/linked-parent"
   run_verify "$TMP_ROOT/linked-parent/home" "$(artifact_sha "$outside")"
-  expect_code 65 "$LAST_RC" "intermediate home symlink was accepted"
+  assert_verification_failure "intermediate home symlink"
 
   home=$TMP_ROOT/final-home-link
   ln -s "$outside" "$home"
   run_verify "$home" "$(artifact_sha "$outside")"
-  expect_code 65 "$LAST_RC" "final home symlink was accepted"
+  assert_verification_failure "final home symlink"
 
   home=$TMP_ROOT/data-link
   mkdir -p "$home"
   ln -s "$outside/data" "$home/data"
   run_verify "$home" "$(artifact_sha "$outside")"
-  expect_code 65 "$LAST_RC" "artifact parent symlink was accepted"
+  assert_verification_failure "artifact parent symlink"
 
   home=$(make_home final-link)
   target=$(artifact_path "$home")
   mv "$target" "$target.real"
   ln -s rtk.real "$target"
   run_verify "$home" "$(/usr/bin/shasum -a 256 "$target.real" | /usr/bin/awk '{print $1}')"
-  expect_code 65 "$LAST_RC" "artifact symlink was accepted"
+  assert_verification_failure "artifact symlink"
 
   home=$(make_home non-executable)
   chmod 600 "$(artifact_path "$home")"
   run_verify "$home"
-  expect_code 65 "$LAST_RC" "non-executable artifact was accepted"
+  assert_verification_failure "non-executable artifact"
 
   home=$(make_home owner-not-executable)
   chmod 401 "$(artifact_path "$home")"
   run_verify "$home"
-  expect_code 65 "$LAST_RC" "caller-owned artifact without owner execute was accepted"
+  assert_verification_failure "caller-owned artifact without owner execute"
 
   home=$(make_home owner-executable)
   chmod 500 "$(artifact_path "$home")"
@@ -125,19 +157,34 @@ test_types_and_symlinks_fail_closed() {
   target=$(artifact_path "$home")
   rm "$target"; mkdir "$target"
   run_verify "$home" unavailable
-  expect_code 65 "$LAST_RC" "directory artifact was accepted"
+  assert_verification_failure "directory artifact"
 
   home=$(make_home fifo-artifact)
   target=$(artifact_path "$home")
   rm "$target"; mkfifo "$target"
   run_verify "$home" unavailable
-  expect_code 65 "$LAST_RC" "FIFO artifact was accepted"
+  assert_verification_failure "FIFO artifact"
 
   run_verify "$valid" 0000000000000000000000000000000000000000000000000000000000000000
-  expect_code 65 "$LAST_RC" "hash mismatch was accepted"
+  assert_verification_failure "hash mismatch"
   assert_absent "$CONTROL/artifact-executed" "failed identity check executed an artifact"
   assert_project_unchanged
   pass "fm-rtk: path, type, mode, and hash checks fail closed"
+}
+
+test_effective_permission_branches() {
+  local row
+  for row in \
+    '0100 501 501 20 20,80 1' '0001 501 501 20 20,80 0' \
+    '0010 501 777 80 20,80 1' '0001 501 777 80 20,80 0' \
+    '0010 501 777 90 20,80 0' '0001 501 777 90 20,80 1' \
+    '0001 0 777 90 0 1' '0000 0 777 90 0 0'; do
+    # shellcheck disable=SC2086 # Rows are deterministic synthetic identities.
+    FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" test-effective-executable $row >"$OUT" 2>"$ERR"
+    expect_code 0 "$?" "effective execute permission branch failed for $row"
+    [ ! -s "$OUT" ] && [ ! -s "$ERR" ] || fail "permission branch emitted output"
+  done
+  pass "fm-rtk: effective owner, group, other, and root permissions are exact"
 }
 
 run_public_launcher() {
@@ -282,6 +329,20 @@ EOF
   chmod +x "$fakebin/git"
 }
 
+assert_trace_has_no_orientation_exec() {
+  local home=$1 fakebin=$2 lifecycle_root=$3 probe=$CONTROL/dtruss-probe trace=$CONTROL/dtruss-trace
+  [ "$(/usr/bin/uname -s)" = Darwin ] && [ -x /usr/bin/dtruss ] || return 0
+  /usr/bin/dtruss -f -t execve /usr/bin/printf '%s' fm-rtk-argv-probe >/dev/null 2>"$probe" || return 0
+  /usr/bin/grep -F fm-rtk-argv-probe "$probe" >/dev/null || return 0
+  (cd "$PROJECT" && /usr/bin/dtruss -f -t execve /usr/bin/env \
+    FM_HOME="$home" FM_SESSION_START_TIMEOUT=20 PATH="$fakebin:/usr/bin:/bin" \
+    "$lifecycle_root/bin/fm-session-start.sh") >/dev/null 2>"$trace" || \
+    fail "execution-traced session start failed"
+  if /usr/bin/grep -E 'execve\([^)]*(/git|fm-rtk)[^)]*(status|diff|log|verify)' "$trace" >/dev/null; then
+    fail "session-start trace observed forbidden verifier or project-orientation execution"
+  fi
+}
+
 assert_lifecycle_inert() {
   local name=$1 project_before=$2 config_before=$3 project_after config_after
   project_after=$(find "$PROJECT" -mindepth 1 -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
@@ -337,6 +398,8 @@ EOF
   rc=$?
   expect_code 0 "$rc" "read-only session start failed"
   assert_lifecycle_inert session-start "$project_before" "$config_before"
+  assert_trace_has_no_orientation_exec "$home" "$fakebin" "$lifecycle_root"
+  assert_lifecycle_inert traced-session-start "$project_before" "$config_before"
   pass "fm-rtk: bootstrap and session start remain lifecycle-inert"
 }
 
@@ -344,6 +407,14 @@ EOF
 test_platform_rejection() {
   local home
   home=$(make_home platform)
+  mv "$SYSTEM_ROOT/usr/bin/uname" "$SYSTEM_ROOT/usr/bin/uname.saved"
+  run_verify "$home"
+  expect_code 69 "$LAST_RC" "missing trusted utility was accepted"
+  [ ! -s "$OUT" ] || fail "trusted-utility refusal emitted stdout"
+  [ "$(cat "$ERR")" = 'fm-rtk: trusted system utility unavailable' ] \
+    || fail "trusted-utility refusal output changed"
+  assert_private_output "trusted-utility refusal"
+  mv "$SYSTEM_ROOT/usr/bin/uname.saved" "$SYSTEM_ROOT/usr/bin/uname"
   cat > "$SYSTEM_ROOT/usr/bin/uname" <<'SH'
 #!/bin/bash
 case "$1" in -s) printf 'Linux\n' ;; -m) printf 'x86_64\n' ;; esac
@@ -351,8 +422,10 @@ SH
   chmod +x "$SYSTEM_ROOT/usr/bin/uname"
   run_verify "$home"
   expect_code 69 "$LAST_RC" "unsupported platform was accepted"
+  [ ! -s "$OUT" ] || fail "platform refusal emitted stdout"
   [ "$(cat "$ERR")" = 'fm-rtk: unsupported platform (requires Darwin arm64)' ] \
     || fail "platform refusal output changed"
+  assert_private_output "platform refusal"
   assert_absent "$CONTROL/artifact-executed" "platform rejection executed artifact"
   assert_project_unchanged
   pass "fm-rtk: unsupported platform fails before inspection"
@@ -360,6 +433,7 @@ SH
 
 test_exact_verification_contract
 test_types_and_symlinks_fail_closed
+test_effective_permission_branches
 test_public_launcher_ignores_hostile_environment
 test_lifecycle_never_activates_rtk
 test_platform_rejection
