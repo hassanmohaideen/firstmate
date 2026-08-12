@@ -483,13 +483,8 @@ test_legacy_generationless_wake_is_adopted() {
   pass "wake drain: generation-less legacy wakes are adopted and acknowledged"
 }
 
-# The two facts an acknowledgement carries, pinned at the library level.
-# A publication while an episode is being handled keeps that episode's
-# generation, so the acknowledgement the caller was just given stays valid. Once
-# an episode is retired the next publication opens its own generation, and an
-# acknowledgement for the retired one may neither retire nor consume the newer
-# episode's work - it consumes only what its own sequence covers and names the
-# remedy for the rest.
+# Pin the recovery acknowledgement contract from docs/watcher-continuity.md at
+# the queue-library boundary.
 test_stale_recovery_generation_cannot_touch_a_newer_episode() {
   local dir state first_err replay_err sequence generation handling_marker
   local newer_marker newer_sequence newer_generation rc

@@ -631,12 +631,8 @@ test_markerless_legacy_queue_is_recovered_on_arm() {
   pass "watch-arm: markerless legacy queues are adopted and recovered"
 }
 
-# Every watcher close and every queue append publishes downtime, so a watcher
-# cycle that opens and closes while the model handles its drained wakes used to
-# mint a fresh recovery generation and invalidate the acknowledgement that drain
-# had just printed. That acknowledgement then consumed nothing and left the
-# marker pending, which made every later arm spend its whole cycle re-announcing
-# the same recovery instead of supervising - a livelock the home could not leave.
+# Exercise the handling-window recovery invariant owned by
+# docs/watcher-continuity.md through real watcher processes.
 test_handling_window_close_keeps_the_acknowledgement_valid() {
   local dir home state fakebin pair sequence generation
   dir=$(make_case handling-window-close-acknowledgement)
@@ -703,11 +699,8 @@ test_handling_window_close_keeps_the_acknowledgement_valid() {
   pass "watch-arm: a watcher close during handling keeps the printed acknowledgement valid"
 }
 
-# The acknowledgement carries two separable facts. Queue-row consumption is bound
-# to the monotonic --ack-through sequence the caller was given, so it is safe
-# under any marker state; only retiring the recovery episode is bound to
-# --recovery-generation. A generation that moved on must therefore consume the
-# handled rows and name its own remedy, never refuse and consume nothing.
+# Exercise the moved-generation recovery invariant owned by
+# docs/watcher-continuity.md through real watcher processes.
 test_moved_generation_acknowledgement_is_self_healing() {
   local dir home state fakebin pair first_sequence first_generation second_generation
   dir=$(make_case moved-generation-acknowledgement)

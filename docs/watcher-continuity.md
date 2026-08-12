@@ -45,10 +45,13 @@ The turn-end guard remains the final backstop rather than the normal continuity 
 ## Recovery episode acknowledgement
 
 A recovery episode is one generation of `state/.watcher-down`, and it is retired only by the generation-bound acknowledgement the drain prints as `WAKE_ACK_REQUIRED`.
-Every watcher close and every durable queue append publishes downtime, so a republication reuses the generation of an episode that is already being handled instead of minting a new one.
-Without that reuse, a watcher cycle that opened and closed inside the handling window invalidated the acknowledgement the model had just been given, that acknowledgement then consumed nothing, and the still-pending marker made every later arm spend its whole cycle re-announcing the same recovery instead of supervising.
-An acknowledgement carries two separable facts and `bin/fm-wake-drain.sh` keeps them separate: queue-row consumption is bound to the monotonic `--ack-through` sequence and always happens, while only retiring the episode is bound to `--recovery-generation`.
-A generation that moved on is therefore a non-fatal result that still consumes the handled rows and names its own remedy - re-drain, then acknowledge the newer episode - rather than a refusal that consumes nothing.
+Every watcher close and every durable queue append publishes downtime, so a downtime republication of any pending episode reuses its generation instead of minting a new one.
+That reuse keeps a watcher close inside the handling window from orphaning the acknowledgement already presented and trapping later arms in repeated recovery presentation.
+An acknowledgement carries two separable facts: queue-row consumption is bound to the monotonic `--ack-through` sequence, while only retiring the episode is bound to `--recovery-generation`.
+A generation mismatch therefore does not block consumption of rows through that sequence; it is a non-fatal result that names its own remedy - re-drain, then acknowledge the newer episode.
+The acknowledgement retires the marker only when no rows remain after sequence-bound consumption.
+A concurrently appended wake has a higher sequence, remains queued, and keeps the episode pending for presentation.
+Consequently, an empty-queue downtime publication during handling can be retired by the outstanding acknowledgement without a dedicated recovery turn.
 An acknowledged episode does not freeze the generation, because the next downtime after it opens an episode of its own.
 
 ## Arm-layer cycle contract

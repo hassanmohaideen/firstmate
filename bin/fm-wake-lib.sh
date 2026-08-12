@@ -416,16 +416,9 @@ _fm_recovery_marker_write_locked() {
   fi
 }
 
-# A downtime publication reuses the generation of an outstanding handling
-# episode instead of minting a fresh one. Every watcher close and every queue
-# append publishes downtime, so minting here would invalidate the exact
-# acknowledgement the drain just printed for the episode the caller is still
-# handling. That acknowledgement then retired nothing, which left the marker
-# pending and made the next armed watcher spend its whole cycle re-announcing
-# the same recovery - the livelock this reuse removes.
-# Retirement stays correct because the acknowledgement clears the marker only
-# once the remaining queue is empty: a wake appended after the drain carries a
-# higher sequence, so it keeps the queue non-empty and the episode pending.
+# Preserve a pending episode's generation across downtime republication so its
+# outstanding acknowledgement remains usable; docs/watcher-continuity.md owns
+# the recovery contract and sequence-safety rationale.
 _fm_recovery_marker_publish() {
   local marker=$1 kind=${2:-downtime} lock saved_token generation=''
   case "$kind" in handling|downtime) ;; *) return 1 ;; esac

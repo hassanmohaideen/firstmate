@@ -2,16 +2,8 @@
 # Present durable watcher wake records, optionally acknowledge handled records,
 # annotate validated signal status keys, then assert liveness.
 #
-# An acknowledgement carries two separable facts, and this script keeps them
-# separate. Queue-row consumption is bound to the monotonic --ack-through
-# sequence the caller was given, so it is safe under any marker state and always
-# happens. Only retiring the recovery episode is bound to --recovery-generation.
-# A generation that moved on while this turn handled its wakes is therefore a
-# non-fatal result: the handled rows are still consumed, and the message names
-# its own remedy (re-drain, then acknowledge the new generation). It is never a
-# failure that consumes nothing and leaves behind the exact pending state that
-# makes the next armed watcher spend its whole cycle re-announcing the same
-# recovery. See docs/watcher-continuity.md for the contract.
+# Keep sequence-bound row consumption independent from generation-bound episode
+# retirement; docs/watcher-continuity.md owns the recovery contract.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
