@@ -32,6 +32,27 @@ The `/calm` command replaces the file atomically before changing live presentati
 The extension reloads this preference on every Pi `session_start`, including startup, new, resume, fork, and reload reasons.
 This preference is local to each Firstmate home and is not part of secondmate inherited configuration.
 
+## Optional RTK output compaction (config/rtk)
+
+RTK output compaction is an optional, disabled-by-default pilot for supplemental orientation in explicitly selected ordinary ship and scout briefs.
+An absent `config/rtk` keeps the feature off and causes no session-start, bootstrap, network, install, staging, update, or worker-runtime action.
+The only accepted v1 file content is exactly `v0.45.0` followed by one newline in a regular non-symlink file.
+This local selection is not inherited into secondmate homes.
+It does not authorize a secondmate charter, and `fm-brief.sh --rtk-compact` refuses that scaffold kind.
+
+The only supported v1 host is Darwin arm64.
+The selected private artifact path is `$FM_HOME/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk`.
+The artifact must be a regular non-symlink executable whose SHA-256 is `17d00d61a533a442c61f1be49d8a9321225557f64021d5b70fd8eb75ed8fb0be` and whose exact version output is `rtk 0.45.0`.
+The tracked pilot does not download, install, discover, stage, activate, or update that artifact.
+Placing the artifact and writing `config/rtk` are separate operator actions that require their own authorization outside a tracked-code update.
+Removing `config/rtk` immediately disables compact execution without changing worker runtimes, prompts, hooks, shell startup files, or `PATH`.
+
+A selected home still exposes compaction to no task by default.
+An ordinary task receives the bounded helper instruction only when its brief is explicitly scaffolded with `bin/fm-brief.sh --rtk-compact`.
+[`bin/fm-rtk.sh`](../bin/fm-rtk.sh) and its `--help` output own the exact semantic verbs, argv mappings, artifact checks, private invocation environment, raw fallback, and exit behavior.
+[`rtk-output-compaction.md`](rtk-output-compaction.md) owns the maintained architecture, denial boundary, update review, rollback policy, and pilot criteria.
+RTK is not part of the universal or backend-specific toolchain and must never become a bootstrap or dispatch requirement.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.

@@ -281,6 +281,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/rtk-output-compaction.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/scripts.md",
       "audience": "operator-current"
     },

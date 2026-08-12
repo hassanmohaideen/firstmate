@@ -141,6 +141,7 @@ family_for_basename() {
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-muse-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
+    fm-rtk.test.sh|fm-rtk-fs-events.test.sh|fm-rtk-exec-trace.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-task-delivery.test.sh|\
@@ -844,6 +845,10 @@ families_for_changed_path() {
     tests/fm-backend-herdr-eventwait.test.py)
       printf '%s\n' real-herdr-gated
       printf '%s\n' backend-dispatch
+      ;;
+    tests/helpers/fs-event-monitor.py)
+      printf '%s\n' "__script__:fm-rtk-fs-events.test.sh"
+      printf '%s\n' "__script__:fm-rtk-exec-trace.test.sh"
       ;;
     tests/*.test.sh)
       # A single test file change selects only that script via basename family

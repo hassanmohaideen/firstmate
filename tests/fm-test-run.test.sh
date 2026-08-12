@@ -103,6 +103,8 @@ init_changed_fixture_repo() {
     fm-session-start.test.sh \
     fm-afk-pi-herdr-return-e2e.test.sh \
     fm-backend.test.sh \
+    fm-rtk-fs-events.test.sh \
+    fm-rtk-exec-trace.test.sh \
     fm-pr-merge.test.sh \
     fm-pi-watch-extension.test.sh \
     fm-afk-return.test.sh \
@@ -114,6 +116,8 @@ init_changed_fixture_repo() {
     chmod +x "$repo/tests/$script"
   done
   : >"$repo/tests/lib.sh"
+  mkdir -p "$repo/tests/helpers"
+  : >"$repo/tests/helpers/fs-event-monitor.py"
   : >"$repo/tests/fm-backend-herdr-eventwait.test.py"
   : >"$repo/bin/fm-supervisor-target-lib.sh"
   : >"$repo/bin/unmapped-source.sh"
@@ -151,6 +155,13 @@ test_changed_dependency_selection_and_unmapped_failure() {
   assert_contains "$listed" "tests/fm-backend.test.sh" "eventwait test selects backend coverage"
   git -C "$repo" add tests/fm-backend-herdr-eventwait.test.py
   git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm eventwait-change
+
+  printf '\n' >>"$repo/tests/helpers/fs-event-monitor.py"
+  listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
+  assert_contains "$listed" "tests/fm-rtk-fs-events.test.sh" "event monitor selects filesystem-event coverage"
+  assert_contains "$listed" "tests/fm-rtk-exec-trace.test.sh" "event monitor selects execution-trace coverage"
+  git -C "$repo" add tests/helpers/fs-event-monitor.py
+  git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm event-monitor-change
 
   printf '\n' >>"$repo/bin/fm-supervisor-target-lib.sh"
   listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)

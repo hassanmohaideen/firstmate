@@ -6,8 +6,8 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab]
-#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab] [--rtk-compact]
+#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab] [--rtk-compact]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
@@ -27,6 +27,10 @@
 #   The flag must be explicit because {TASK} is filled after scaffolding and the
 #   caller-supplied repo string cannot reliably identify this repo. Briefs made
 #   without it carry a loud declaration so an omitted contract cannot be silent.
+#   --rtk-compact adds the optional fixed-verb RTK orientation contract to an
+#   ordinary ship or scout brief. It never installs, stages, activates, or invokes
+#   RTK and is refused for persistent secondmate charters.
+#   bin/fm-rtk.sh owns the exact allowed verbs, pin, privacy, and fallback mechanics.
 # For ship tasks, --mode is REQUIRED and shapes the definition of done. Firstmate
 # resolves it per task at intake (AGENTS.md section 7); data/projects.md holds the
 # captain's standing posture as context, and this script never reads it:
@@ -103,6 +107,7 @@ else
 fi
 KIND=ship
 HERDR_LAB=0
+RTK_COMPACT=0
 NO_PROJECTS=0
 MODE=
 MODE_SET=0
@@ -124,6 +129,8 @@ for a in "$@"; do
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
     --herdr-lab) HERDR_LAB=1 ;;
+    --rtk-compact) RTK_COMPACT=1 ;;
+    --rtk-compact=*) echo "error: --rtk-compact is a boolean flag and accepts no value" >&2; exit 1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     --mode) want_value=mode ;;
     --mode=*) MODE=${a#--mode=}; MODE_SET=1 ;;
@@ -158,6 +165,11 @@ ID=${POS[0]}
 
 if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
   echo "error: --herdr-lab applies only to crewmate ship or scout briefs" >&2
+  exit 1
+fi
+
+if [ "$KIND" = secondmate ] && [ "$RTK_COMPACT" -eq 1 ]; then
+  echo "error: --rtk-compact applies only to ordinary ship or scout briefs" >&2
   exit 1
 fi
 
@@ -298,6 +310,29 @@ EOF
 HERDR_SECTION=${HERDR_SECTION%$'\n'}
 fi
 
+RTK_SECTION=
+if [ "$RTK_COMPACT" -eq 1 ]; then
+  RTK_HELPER=$(shell_quote "$FM_ROOT/bin/fm-rtk.sh")
+  RTK_HOME=$(shell_quote "$FM_HOME")
+  RTK_INVOKE="FM_HOME=$RTK_HOME $RTK_HELPER"
+  IFS= read -r -d '' RTK_BODY <<EOF || true
+# Supplemental compact orientation - EXPLICIT TASK OPT-IN
+This ordinary task was explicitly scaffolded with \`--rtk-compact\`.
+Use only the Firstmate-owned helper through its fixed semantic verbs:
+- \`$RTK_INVOKE git-log\`
+- \`$RTK_INVOKE git-diff\` or \`$RTK_INVOKE git-diff --cached\`
+- \`$RTK_INVOKE git-status\`
+- \`$RTK_INVOKE search <pattern> [path...]\`
+- \`$RTK_INVOKE list <directory>\`
+The helper call is the only exception to the stay-inside rule: it may read the selected home-private config and artifact, and it writes only an invocation-private temporary root that it removes.
+Every compact result is supplemental orientation, never authoritative evidence.
+Before any safety, mutation, validation, final-review, cleanliness, landing, or approval decision, run the corresponding raw command and use that raw result.
+Never invoke \`rtk\` directly, add options outside these verbs, pipe or redirect helper output, or install, stage, activate, update, patch, hook, or configure RTK from this task.
+EOF
+  RTK_BODY=${RTK_BODY%$'\n'}
+  RTK_SECTION=$'\n\n'$RTK_BODY
+fi
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -305,7 +340,7 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 # Task
 {TASK}
 
-$HERDR_SECTION
+${HERDR_SECTION}${RTK_SECTION}
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
@@ -415,7 +450,7 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 # Task
 {TASK}
 
-$HERDR_SECTION
+${HERDR_SECTION}${RTK_SECTION}
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
