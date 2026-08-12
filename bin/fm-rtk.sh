@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2016 # Perl owns the dollar expressions in its literal program.
 exec /usr/bin/env -i \
   PATH=/usr/bin:/bin LC_ALL=C FM_HOME="${FM_HOME-}" \
   /usr/bin/perl -MCwd=abs_path -e '

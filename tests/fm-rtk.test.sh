@@ -179,6 +179,7 @@ test_admission_and_trusted_raw() {
 test_spoofing_and_private_execution() {
   local home path root hostile
   home=$(make_home compact)
+  # shellcheck disable=SC2016 # The command substitution is hostile literal test data.
   hostile='needle;$(touch LEAK)|private/path'
   run_helper "$home" search "$hostile" "$TMP_ROOT"
   expect_code 0 "$LAST_RC" "compact search failed"
