@@ -442,7 +442,7 @@ _fm_recovery_marker_publish() {
     saved_token=$FM_RECOVERY_MARKER_TOKEN
     if fm_recovery_marker_read "$marker"; then
       case "$FM_RECOVERY_MARKER_TOKEN" in
-        pending:handling:*) generation=${FM_RECOVERY_MARKER_TOKEN##*:} ;;
+        pending:handling:*|pending:downtime:*) generation=${FM_RECOVERY_MARKER_TOKEN##*:} ;;
       esac
     fi
     FM_RECOVERY_MARKER_TOKEN=$saved_token

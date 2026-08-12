@@ -175,14 +175,22 @@ if [ -n "$ACK_THROUGH" ]; then
   awk -F '\t' -v cutoff="$ACK_THROUGH" '
     NF < 5 || $2 !~ /^[0-9]+$/ || $2 > cutoff { print }
   ' "$FM_WAKE_QUEUE" > "$DRAIN_TMP" || exit 1
-  fm_recovery_marker_snapshot "$RECOVERY_MARKER" || exit 1
-  RECOVERY_MARKER_TOKEN=$FM_RECOVERY_MARKER_TOKEN
-  if [ "${RECOVERY_MARKER_TOKEN##*:}" != "$ACK_GENERATION" ]; then
-    RECOVERY_ACK_MOVED=true
-  elif [ ! -s "$DRAIN_TMP" ]; then
-    if ! fm_recovery_marker_ack "$RECOVERY_MARKER" "$ACK_GENERATION"; then
-      echo "wake drain: recovery episode could not be retired safely; re-run bin/fm-wake-drain.sh and use the new WAKE_ACK_REQUIRED command" >&2
-      exit 1
+  if [ ! -s "$DRAIN_TMP" ]; then
+    fm_recovery_marker_ack "$RECOVERY_MARKER" "$ACK_GENERATION"
+    RECOVERY_ACK_STATUS=$?
+    case "$RECOVERY_ACK_STATUS" in
+      0) ;;
+      3) RECOVERY_ACK_MOVED=true ;;
+      *)
+        echo "wake drain: recovery episode could not be retired safely; re-run bin/fm-wake-drain.sh and use the new WAKE_ACK_REQUIRED command" >&2
+        exit 1
+        ;;
+    esac
+  else
+    fm_recovery_marker_snapshot "$RECOVERY_MARKER" || exit 1
+    RECOVERY_MARKER_TOKEN=$FM_RECOVERY_MARKER_TOKEN
+    if [ "${RECOVERY_MARKER_TOKEN##*:}" != "$ACK_GENERATION" ]; then
+      RECOVERY_ACK_MOVED=true
     fi
   fi
   if ! _fm_atomic_replace "$DRAIN_TMP" "$FM_WAKE_QUEUE"; then

@@ -638,7 +638,7 @@ test_markerless_legacy_queue_is_recovered_on_arm() {
 # marker pending, which made every later arm spend its whole cycle re-announcing
 # the same recovery instead of supervising - a livelock the home could not leave.
 test_handling_window_close_keeps_the_acknowledgement_valid() {
-  local dir home state fakebin pair sequence generation handling_watcher_pid
+  local dir home state fakebin pair sequence generation
   dir=$(make_case handling-window-close-acknowledgement)
   home="$dir/home"
   state="$dir/state"
@@ -659,21 +659,32 @@ test_handling_window_close_keeps_the_acknowledgement_valid() {
   sequence=${pair%%$'\t'*}
   generation=${pair##*$'\t'}
 
-  # One full watcher cycle opens and closes inside the handling window.
+  # One full watcher cycle appends a wake and then closes inside the handling window.
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/handling-window-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "handling-window watcher did not stay live"
-  handling_watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
-  [ -n "$handling_watcher_pid" ] || fail "handling-window watcher did not take the lock"
-  kill -TERM "$handling_watcher_pid" 2>/dev/null \
-    || fail "could not close the handling-window watcher"
-  wait_for_exit "$ARM_PID" 120
+  printf 'done: wake published during handling\n' > "$state/during-handling.status"
+  wait_for_exit "$ARM_PID" 120 || fail "handling-window watcher did not deliver its wake"
+  grep "$(printf '\tsignal\tduring-handling.status\t')" "$state/.wake-queue" >/dev/null \
+    || fail "handling-window watcher did not durably append its wake"
 
   [ "$(cat "$state/.watcher-down" 2>/dev/null || true)" = "pending:downtime:$generation" ] \
-    || fail "a watcher close during handling replaced the outstanding recovery generation"
+    || fail "repeated publications during handling replaced the outstanding recovery generation"
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
     --recovery-generation "$generation" 2> "$dir/ack.err" \
-    || fail "the printed acknowledgement was rejected after a handling-window close: $(cat "$dir/ack.err")"
-  [ ! -s "$state/.wake-queue" ] || fail "the acknowledged wake was not consumed"
+    || fail "the printed acknowledgement was rejected after repeated publications: $(cat "$dir/ack.err")"
+  ! grep "$(printf '\tsignal\thandled.status\t')" "$state/.wake-queue" >/dev/null \
+    || fail "the acknowledged wake was not consumed"
+  grep "$(printf '\tsignal\tduring-handling.status\t')" "$state/.wake-queue" >/dev/null \
+    || fail "the newer handling-window wake was over-consumed"
+
+  FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/remaining-drain.out" \
+    2> "$dir/remaining-drain.err" || fail "remaining wake could not be re-drained"
+  pair=$(drain_ack_pair "$dir/remaining-drain.err") \
+    || fail "remaining drain did not print an acknowledgement command"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "${pair%%$'\t'*}" \
+    --recovery-generation "${pair##*$'\t'}" \
+    || fail "remaining handling-window wake could not be acknowledged"
+  [ ! -s "$state/.wake-queue" ] || fail "remaining wake was not consumed"
   case "$(cat "$state/.watcher-down" 2>/dev/null || true)" in
     acked:*) ;;
     *) fail "the handled recovery episode was not retired" ;;

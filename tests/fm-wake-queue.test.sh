@@ -507,10 +507,12 @@ test_stale_recovery_generation_cannot_touch_a_newer_episode() {
     || fail "first drain did not emit a generation-bound acknowledgement"
 
   append_wake "$state" check second 'check: same episode' \
-    || fail "same-episode wake append failed"
+    || fail "first same-episode wake append failed"
+  append_wake "$state" check third 'check: same episode again' \
+    || fail "second same-episode wake append failed"
   handling_marker=$(cat "$state/.watcher-down")
   [ "${handling_marker##*:}" = "$generation" ] \
-    || fail "a publication during handling replaced the outstanding recovery generation"
+    || fail "repeated publications replaced the outstanding recovery generation"
 
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$sequence" \
     --recovery-generation "$generation" > "$dir/handled-ack.out" 2> "$dir/handled-ack.err" \
@@ -519,6 +521,8 @@ test_stale_recovery_generation_cannot_touch_a_newer_episode() {
     || fail "the handled row was not consumed"
   grep "$(printf '\tcheck\tsecond\t')" "$state/.wake-queue" >/dev/null \
     || fail "a row above the acknowledged sequence was consumed"
+  grep "$(printf '\tcheck\tthird\t')" "$state/.wake-queue" >/dev/null \
+    || fail "the second row above the acknowledged sequence was consumed"
   case "$(cat "$state/.watcher-down")" in
     pending:*) ;;
     *) fail "an episode with rows still queued was retired" ;;
@@ -530,6 +534,8 @@ test_stale_recovery_generation_cannot_touch_a_newer_episode() {
   replay_err="$dir/replay.err"
   grep "$(printf '\tcheck\tsecond\t')" "$dir/replay.out" >/dev/null \
     || fail "remaining wake did not re-surface"
+  grep "$(printf '\tcheck\tthird\t')" "$dir/replay.out" >/dev/null \
+    || fail "second remaining wake did not re-surface"
   newer_sequence=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$replay_err")
   newer_generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$replay_err")
   FM_STATE_OVERRIDE="$state" "$DRAIN" --ack-through "$newer_sequence" \
@@ -537,7 +543,7 @@ test_stale_recovery_generation_cannot_touch_a_newer_episode() {
     || fail "the handled episode could not be acknowledged"
   [ ! -s "$state/.wake-queue" ] || fail "acknowledgement left durable wakes queued"
 
-  append_wake "$state" check third 'check: newer recovery generation' \
+  append_wake "$state" check fourth 'check: newer recovery generation' \
     || fail "newer generation wake append failed"
   newer_marker=$(cat "$state/.watcher-down")
   [ "${newer_marker##*:}" != "$generation" ] \
@@ -554,7 +560,7 @@ test_stale_recovery_generation_cannot_touch_a_newer_episode() {
   fi
   [ "$(cat "$state/.watcher-down")" = "$newer_marker" ] \
     || fail "a stale acknowledgement retired the newer recovery episode"
-  grep "$(printf '\tcheck\tthird\t')" "$state/.wake-queue" >/dev/null \
+  grep "$(printf '\tcheck\tfourth\t')" "$state/.wake-queue" >/dev/null \
     || fail "a stale acknowledgement consumed the newer durable wake"
   pass "wake drain: a stale acknowledgement cannot retire or consume a newer recovery episode"
 }
