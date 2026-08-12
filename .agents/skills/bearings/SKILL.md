@@ -67,7 +67,10 @@ It never tears down a task, merges a PR, dispatches new work, steers a worker, a
 ## Chat-response contract
 
 This skill is the one owner of the `/bearings` chat-response format; the snapshot and classifier own the data that feeds it, and no other file restates this contract.
-Every `/bearings` chat response renders EXACTLY four sections in the order below and nothing else structural (there is no fifth section). Select labels and empty states solely from the roleplay/tone axis of the shared preference rule in `AGENTS.md`: use the professional variants when that axis requires professional non-nautical language, and the default variants otherwise. The address axis does not select headings. This label selection changes no bucket content, ordering, or completeness.
+Every `/bearings` chat response renders EXACTLY four sections in the order below and nothing else structural (there is no fifth section).
+Select labels and empty states solely from the roleplay/tone axis of the shared preference rule in `AGENTS.md`: use the professional variants when that axis requires professional non-nautical language, and the default variants otherwise.
+The address axis does not select headings.
+This label selection changes no bucket content, ordering, or completeness.
 
 1. **Captain's Call** (professional: **Action Required**) - ONLY items that need the user's own action now: a decision to make, a PR to approve or merge, a credential or login to provide, or a blocker only the user can clear.
    Empty-state: "Nothing needs your action right now." (professional: "No action is required right now.")

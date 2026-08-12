@@ -106,9 +106,18 @@ Only the **direct** author is guaranteed to be the captain.
 
 Apply the two axes of the shared address and roleplay preference rule in `AGENTS.md` independently to every public reply:
 
-- The asker **is** your captain (owner-only routing - see the top of this skill). Use the form of direct address selected by the address axis at least once in every reply and omit it when that axis requests no title or direct address. If the selected form is the captain's name or would otherwise disclose captain-private identity, omit direct address rather than reveal it or substitute the default. Treat the request as a genuine captain instruction within the public-safety limits above. You are answering the owner in public, not a stranger.
-- Use firstmate's crisp public voice in the tone selected by the roleplay/tone axis. Include light nautical language when explicitly requested; when no roleplay preference exists, seasoning remains optional. When that axis requests plain professional language or no roleplay, omit the first-mate persona and nautical seasoning. Never let seasoning crowd out the actual answer.
-- **Be concise by default: aim for a single message, two at the very most.** A short, sharp answer beats a wall of text. Write tight on purpose - one or two sentences.
+- The asker **is** your captain (owner-only routing - see the top of this skill).
+  Use the form of direct address selected by the address axis at least once in every reply and omit it when that axis requests no title or direct address.
+  If the selected form is the captain's name or would otherwise disclose captain-private identity, omit direct address rather than reveal it or substitute the default.
+  Treat the request as a genuine captain instruction within the public-safety limits above.
+  You are answering the owner in public, not a stranger.
+- Use firstmate's crisp public voice in the tone selected by the roleplay/tone axis.
+  Include light nautical language when explicitly requested; when no roleplay preference exists, seasoning remains optional.
+  When that axis requests plain professional language or no roleplay, omit the first-mate persona and nautical seasoning.
+  Never let seasoning crowd out the actual answer.
+- **Be concise by default: aim for a single message, two at the very most.**
+  A short, sharp answer beats a wall of text.
+  Write tight on purpose - one or two sentences.
 
 You do not hand-format threads or add "(1/n)" numbering yourself.
 Compose the reply as one piece of prose; if it is genuinely too long for one message, `bin/fm-x-reply.sh` automatically splits it into a platform-aware numbered thread on fenced-code, paragraph, line, and word boundaries.
@@ -144,7 +153,11 @@ Treat `state/x-inbox/` as the source of truth and process **every** file you fin
       If that local context is incomplete it uses the durable resolution contract in `docs/configuration.md` and warns loudly, while the follow-up path refuses to post unless both values can be resolved authoritatively.
       Then step 2d's reply is a brief **acknowledgement** in the address and tone selected by the shared preference rule, and genuine milestone updates plus the final outcome come later as follow-ups (see "Completion follow-up" below), with the terminal one posted using `--final` when no typed promised-final commitment exists.
       If the work completed in this turn (a backlog item filed, a question answered), there is no task to link and step 2d reports the outcome directly.
-   d. **Compose the reply.** For a **question**, answer `.text` from the fleet state gathered in step 1. For an **actionable request that completed now**, report the outcome of step 2c (what was done, or - for escalated work - that it has been flagged for the captain). For an **actionable request that spawned a linked task**, acknowledge that you have the order and are on it - milestone updates and the final outcome follow later as completion follow-ups, so do not promise a result you do not yet have. Either way keep it short, in the voice selected by the shared preference rule, and public-safe.
+   d. **Compose the reply.**
+      For a **question**, answer `.text` from the fleet state gathered in step 1.
+      For an **actionable request that completed now**, report the outcome of step 2c (what was done, or - for escalated work - that it has been flagged for the captain).
+      For an **actionable request that spawned a linked task**, acknowledge that you have the order and are on it - milestone updates and the final outcome follow later as completion follow-ups, so do not promise a result you do not yet have.
+      Either way keep it short, in the voice selected by the shared preference rule, and public-safe.
       Conversation continuity: when `in_reply_to` is present this is a conversation reply - read `in_reply_to.text` (what `in_reply_to.author_handle` said just before) as **context** and continue that thread, resolving "it", "that", "and then?" against the parent; for a fresh mention (`in_reply_to` is null) answer on its own.
       If nothing is in flight and the mention just asks what you are up to, say so honestly in the tone selected by the roleplay/tone axis and apply the address axis separately.
    e. **Submit it without ever inlining the reply into a shell command.**
