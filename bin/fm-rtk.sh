@@ -1,4 +1,21 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
+if [ "${_FM_RTK_CLEAN_ENV:-}" != 'firstmate-rtk-verifier-v1' ]; then
+  exec /usr/bin/env -i \
+    _FM_RTK_CLEAN_ENV=firstmate-rtk-verifier-v1 \
+    PATH=/usr/bin:/bin LC_ALL=C \
+    FM_HOME="${FM_HOME:-}" \
+    FM_RTK_TEST_SYSTEM_ROOT="${FM_RTK_TEST_SYSTEM_ROOT:-}" \
+    FM_RTK_TEST_OS="${FM_RTK_TEST_OS:-}" \
+    FM_RTK_TEST_ARCH="${FM_RTK_TEST_ARCH:-}" \
+    FM_RTK_TEST_SHA256="${FM_RTK_TEST_SHA256:-}" \
+    /bin/bash -p "$0" "$@"
+  exit 70
+fi
+unset _FM_RTK_CLEAN_ENV BASH_ENV ENV CDPATH GLOBIGNORE
+PATH=/usr/bin:/bin
+LC_ALL=C
+export PATH LC_ALL
+
 # fm-rtk.sh - inspect the reviewed RTK pilot artifact without executing it.
 #
 # This command only verifies the manually staged scout candidate and never runs

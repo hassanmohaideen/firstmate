@@ -92,6 +92,40 @@ test_public_interface_and_static_verification() {
   pass "fm-rtk: public interface only inspects reviewed artifact bytes"
 }
 
+test_hostile_shell_environment_is_removed() {
+  local home artifact attacker marker sha rc=0
+  home=$(make_home hostile-shell-environment)
+  artifact=$(artifact_path "$home")
+  attacker=$TMP_ROOT/attacker-shell-startup
+  marker=$CONTROL/shell-injected.log
+  sha=$(artifact_sha "$home")
+  cat > "$attacker" <<SH
+#!/bin/bash
+/bin/echo injected >> '$marker'
+'$artifact'
+/bin/echo 'fm-rtk: reviewed v0.45.0 artifact bytes verified; execution remains disabled'
+exit 0
+SH
+  chmod +x "$attacker"
+  rm -f "$OUT" "$ERR" "$marker" "$CONTROL/ambient.log" "$CONTROL/executed.log"
+
+  (
+    function printf() { /usr/bin/touch "$marker"; return 91; }
+    export -f printf
+    /usr/bin/env \
+      PATH="$AMBIENT" BASH_ENV="$attacker" ENV="$attacker" CDPATH="$TMP_ROOT" \
+      SHELLOPTS=xtrace BASHOPTS=extdebug GLOBIGNORE='*' \
+      FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+      FM_RTK_TEST_SHA256="$sha" "$HELPER" verify > "$OUT" 2> "$ERR"
+  ) || rc=$?
+
+  expect_code 0 "$rc" "hostile shell environment changed verification"
+  assert_absent "$marker" "caller shell startup code or function executed"
+  assert_grep "execution remains disabled" "$OUT" "sanitized shell verification output changed"
+  assert_never_executed "$home"
+  pass "fm-rtk: hostile shell startup environment is removed"
+}
+
 test_hostile_perl_environment_is_removed() {
   local home attacker marker sha
   home=$(make_home hostile-perl-environment)
@@ -189,6 +223,7 @@ test_type_mode_and_config_nonactivation() {
 }
 
 test_public_interface_and_static_verification
+test_hostile_shell_environment_is_removed
 test_hostile_perl_environment_is_removed
 test_platform_path_and_hash_boundaries
 test_type_mode_and_config_nonactivation
