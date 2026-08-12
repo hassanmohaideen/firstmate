@@ -216,8 +216,108 @@ test_intermediate_symlinks_are_rejected() {
   pass "fm-rtk: every intermediate symlink is rejected"
 }
 
+expect_value() {
+  [ "$1" = "$2" ] || fail "$3: expected '$1', got '$2'"
+}
+
+module_digest() {
+  /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/perl -MDigest::SHA=sha256_hex -e '
+    open(my $fh, "<", $ARGV[0]) or die;
+    binmode($fh);
+    local $/;
+    print sha256_hex(<$fh>);
+  ' "$1"
+}
+
+run_module_verify() {
+  local home=$1 sha=$2 euid=$3 owner=$4 group=$5 groups=$6
+  MODULE_RESULT=$(/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/perl -I "$ROOT/lib" \
+    -MFirstmate::RTKVerifier=success_message,verify_artifact -e '
+      my ($home, $sha, $euid, $owner, $group, $groups) = @ARGV;
+      my $result = verify_artifact(
+        home => $home,
+        expected_sha => $sha,
+        expected_os => "Darwin",
+        expected_arch => "arm64",
+        observed_os => "Darwin",
+        observed_arch => "arm64",
+        effective_uid => $euid,
+        effective_groups => [split(/,/, $groups)],
+        artifact_uid => $owner,
+        artifact_gid => $group,
+        parts => [qw(data tools rtk v0.45.0 aarch64-apple-darwin)],
+        filename => "rtk",
+        timeout => 1,
+      );
+      print $result eq "verified" ? success_message("v0.45.0") : $result;
+    ' "$home" "$sha" "$euid" "$owner" "$group" "$groups") || fail "module verifier failed"
+}
+
+test_verifier_acceptance_and_permission_branches() {
+  local home artifact sha expected
+  expected='fm-rtk: reviewed v0.45.0 artifact bytes verified; execution remains disabled'
+  home=$(make_home module-valid)
+  artifact=$(artifact_path "$home")
+  sha=$(module_digest "$artifact")
+
+  chmod 500 "$artifact"
+  run_module_verify "$home" "$sha" 1001 1001 2001 3001
+  expect_value "$expected" "$MODULE_RESULT" "owner execute permission was not admitted"
+
+  chmod 410 "$artifact"
+  run_module_verify "$home" "$sha" 1001 2001 3001 3001
+  expect_value "$expected" "$MODULE_RESULT" "group execute permission was not admitted"
+
+  chmod 401 "$artifact"
+  run_module_verify "$home" "$sha" 1001 2001 3001 4001
+  expect_value "$expected" "$MODULE_RESULT" "other execute permission was not admitted"
+
+  chmod 400 "$artifact"
+  run_module_verify "$home" "$sha" 1001 2001 3001 4001
+  expect_value not-executable "$MODULE_RESULT" "ineffective execute permission was admitted"
+
+  chmod 500 "$artifact"
+  run_module_verify "$home" "0$sha" 1001 1001 3001 4001
+  expect_value hash-mismatch "$MODULE_RESULT" "wrong digest was admitted"
+  assert_never_executed "$home"
+  pass "fm-rtk: valid digest and effective permission branches are verified"
+}
+
+test_module_path_and_type_rejections() {
+  local home artifact sha escaped
+  home=$(make_home module-final-symlink)
+  artifact=$(artifact_path "$home")
+  sha=$(module_digest "$artifact")
+  mv "$artifact" "$artifact.real"
+  ln -s rtk.real "$artifact"
+  run_module_verify "$home" "$sha" 1001 1001 3001 4001
+  expect_value invalid-artifact "$MODULE_RESULT" "module accepted a final symlink"
+  assert_never_executed "$home"
+
+  home=$(make_home module-intermediate-symlink)
+  artifact=$(artifact_path "$home")
+  sha=$(module_digest "$artifact")
+  escaped=$TMP_ROOT/module-escaped-data
+  mv "$home/data" "$escaped"
+  ln -s "$escaped" "$home/data"
+  run_module_verify "$home" "$sha" 1001 1001 3001 4001
+  expect_value invalid-artifact "$MODULE_RESULT" "module accepted an intermediate symlink"
+  assert_never_executed "$home"
+
+  home=$(make_home module-fifo)
+  artifact=$(artifact_path "$home")
+  rm "$artifact"
+  mkfifo "$artifact"
+  run_module_verify "$home" deadbeef 1001 1001 3001 4001
+  expect_value invalid-artifact "$MODULE_RESULT" "module accepted a non-regular artifact"
+  assert_never_executed "$home"
+  pass "fm-rtk: module rejects symlink and non-regular artifacts"
+}
+
 test_public_nonexecuting_interface
 test_caller_named_test_driver_cannot_inject_tools
 test_hostile_startup_environments_are_removed
 test_exact_path_type_and_permission_boundaries
 test_intermediate_symlinks_are_rejected
+test_verifier_acceptance_and_permission_branches
+test_module_path_and_type_rejections
