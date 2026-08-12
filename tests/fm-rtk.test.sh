@@ -16,11 +16,12 @@ cp "$ROOT/bin/fm-rtk.sh" "$HELPER"
 chmod +x "$HELPER"
 
 printf '#!/bin/bash\nexec /usr/bin/perl "$@"\n' > "$SYSTEM_ROOT/usr/bin/perl"
+printf '#!/bin/bash\nexec /usr/bin/env "$@"\n' > "$SYSTEM_ROOT/usr/bin/env"
 cat > "$SYSTEM_ROOT/usr/bin/uname" <<'SH'
 #!/bin/bash
 case "$1" in -s) printf '%s\n' "${TEST_OS:-Darwin}" ;; -m) printf '%s\n' "${TEST_ARCH:-arm64}" ;; *) exit 2 ;; esac
 SH
-chmod +x "$SYSTEM_ROOT/usr/bin/perl" "$SYSTEM_ROOT/usr/bin/uname"
+chmod +x "$SYSTEM_ROOT/usr/bin/perl" "$SYSTEM_ROOT/usr/bin/env" "$SYSTEM_ROOT/usr/bin/uname"
 
 for name in uname perl shasum env git rg ls; do
   cat > "$AMBIENT/$name" <<SH
@@ -89,6 +90,31 @@ test_public_interface_and_static_verification() {
   expect_code 64 "$rc" "verification argument passthrough was not refused"
   assert_never_executed "$home"
   pass "fm-rtk: public interface only inspects reviewed artifact bytes"
+}
+
+test_hostile_perl_environment_is_removed() {
+  local home attacker marker sha
+  home=$(make_home hostile-perl-environment)
+  attacker=$TMP_ROOT/attacker-perl
+  marker=$CONTROL/perl-injected.log
+  mkdir -p "$attacker"
+  cat > "$attacker/Attacker.pm" <<SH
+package Attacker;
+BEGIN { open(my \$fh, '>>', '$marker') or die; print \$fh "injected\\n"; }
+1;
+SH
+
+  sha=$(artifact_sha "$home")
+  rm -f "$marker"
+  PERL5OPT=-MAttacker PERL5LIB="$attacker" PERLLIB="$attacker" \
+    PERL_LOCAL_LIB_ROOT="$attacker" PERL_MB_OPT="--install_base $attacker" \
+    PERL_MM_OPT="INSTALL_BASE=$attacker" PERLIO=scalar PERL_UNICODE=S \
+    PERL_USE_UNSAFE_INC=1 run_verify "$home" "$sha"
+  expect_code 0 "$LAST_RC" "hostile Perl environment changed verification"
+  assert_absent "$marker" "caller Perl startup module executed"
+  assert_grep "execution remains disabled" "$OUT" "sanitized verification output changed"
+  assert_never_executed "$home"
+  pass "fm-rtk: hostile Perl startup environment is removed"
 }
 
 test_platform_path_and_hash_boundaries() {
@@ -163,5 +189,6 @@ test_type_mode_and_config_nonactivation() {
 }
 
 test_public_interface_and_static_verification
+test_hostile_perl_environment_is_removed
 test_platform_path_and_hash_boundaries
 test_type_mode_and_config_nonactivation

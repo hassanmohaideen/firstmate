@@ -44,6 +44,7 @@ else
   SYS_USR_BIN=/usr/bin
 fi
 PERL_TOOL=$SYS_USR_BIN/perl
+ENV_TOOL=$SYS_USR_BIN/env
 
 trusted_executable() {
   [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ]
@@ -70,10 +71,10 @@ case "${1:-}" in
   *) printf 'fm-rtk: unknown inspection request\n' >&2; exit 64 ;;
 esac
 
-trusted_executable "$PERL_TOOL" || {
+if ! trusted_executable "$PERL_TOOL" || ! trusted_executable "$ENV_TOOL"; then
   printf 'fm-rtk: trusted inspection utility unavailable\n' >&2
   exit 69
-}
+fi
 
 REQUESTED_HOME=${FM_HOME:-$FM_ROOT}
 EFFECTIVE_HOME=$(CDPATH='' cd -- "$REQUESTED_HOME" 2>/dev/null && pwd -P) || {
@@ -82,7 +83,7 @@ EFFECTIVE_HOME=$(CDPATH='' cd -- "$REQUESTED_HOME" 2>/dev/null && pwd -P) || {
 }
 ARTIFACT=$EFFECTIVE_HOME/data/tools/rtk/$RTK_PIN/$RTK_PLATFORM/rtk
 
-"$PERL_TOOL" -MDigest::SHA -MFcntl=:DEFAULT -MPOSIX -e '
+"$ENV_TOOL" -i PATH=/usr/bin:/bin "$PERL_TOOL" -MDigest::SHA -MFcntl=:DEFAULT -MPOSIX -e '
   use strict;
   use warnings;
   $SIG{ALRM} = sub { exit 68 };
