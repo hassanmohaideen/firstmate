@@ -1,0 +1,69 @@
+use strict;
+use warnings;
+use Cwd qw(abs_path);
+use FindBin;
+use lib "$FindBin::Bin/..";
+use Firstmate::RTKVerifier qw(success_message verify_artifact);
+
+my $rtk_pin = 'v0.45.0';
+my $rtk_platform = 'aarch64-apple-darwin';
+my $rtk_binary_sha256 = '17d00d61a533a442c61f1be49d8a9321225557f64021d5b70fd8eb75ed8fb0be';
+my $root = abs_path("$FindBin::Bin/../..") // exit 70;
+
+sub usage {
+  print "fm-rtk.sh - inspect the reviewed RTK pilot artifact without executing it.\n\n";
+  print "Usage:\n  fm-rtk.sh verify\n";
+}
+
+if (@ARGV == 1 && ($ARGV[0] eq '-h' || $ARGV[0] eq '--help')) {
+  usage();
+  exit 0;
+}
+if (!@ARGV) {
+  print STDERR "fm-rtk: verify is required\n";
+  exit 64;
+}
+if ($ARGV[0] ne 'verify') {
+  print STDERR "fm-rtk: unknown inspection request\n";
+  exit 64;
+}
+if (@ARGV != 1) {
+  print STDERR "fm-rtk: verify accepts no arguments\n";
+  exit 64;
+}
+
+my $requested_home = length($ENV{FM_HOME} // '') ? $ENV{FM_HOME} : $root;
+my $effective_home = abs_path($requested_home);
+if (!defined $effective_home || !-d $effective_home) {
+  print STDERR "fm-rtk: home unavailable\n";
+  exit 69;
+}
+
+my $result = eval {
+  verify_artifact(
+    home => $effective_home,
+    expected_sha => $rtk_binary_sha256,
+    expected_os => 'Darwin',
+    expected_arch => 'arm64',
+    parts => [qw(data tools rtk), $rtk_pin, $rtk_platform],
+    filename => 'rtk',
+  );
+};
+$result = 'invalid-artifact' unless defined $result;
+
+if ($result eq 'verified') {
+  print success_message($rtk_pin), "\n";
+  exit 0;
+}
+if ($result eq 'unsupported-platform') {
+  print STDERR "fm-rtk: unsupported platform\n";
+} elsif ($result eq 'not-executable') {
+  print STDERR "fm-rtk: artifact is not executable\n";
+} elsif ($result eq 'timeout') {
+  print STDERR "fm-rtk: artifact inspection timed out\n";
+} elsif ($result eq 'hash-mismatch') {
+  print STDERR "fm-rtk: artifact hash mismatch\n";
+} else {
+  print STDERR "fm-rtk: invalid artifact\n";
+}
+exit 69;

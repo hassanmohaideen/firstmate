@@ -139,6 +139,7 @@ SH
     function printf() { /usr/bin/touch "$marker"; return 91; }
     export -f printf
     /usr/bin/env PATH="$AMBIENT" BASH_ENV="$shell_attacker" ENV="$shell_attacker" \
+      _FM_RTK_CLEAN_ENV=firstmate-rtk-verifier-v1 \
       CDPATH="$TMP_ROOT" SHELLOPTS=xtrace BASHOPTS=extdebug GLOBIGNORE='*' \
       PERL5OPT=-MAttacker PERL5LIB="$perl_attacker" PERLLIB="$perl_attacker" \
       PERL_LOCAL_LIB_ROOT="$perl_attacker" PERL_MB_OPT="--install_base $perl_attacker" \
@@ -149,7 +150,7 @@ SH
   assert_real_platform_result "hostile-environment verification"
   assert_absent "$marker" "caller startup code or exported function executed"
   assert_never_executed "$home"
-  pass "fm-rtk: hostile shell and Perl startup state is removed"
+  pass "fm-rtk: spoofed sentinel and hostile startup state are removed"
 }
 
 test_exact_path_type_and_permission_boundaries() {
