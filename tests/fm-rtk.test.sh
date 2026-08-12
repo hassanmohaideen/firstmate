@@ -201,6 +201,35 @@ test_spoofing_and_private_execution() {
   pass "fm-rtk: spoofed PATH is ignored and only a private verified copy executes"
 }
 
+test_fixed_semantic_verbs() {
+  local home expected actual
+  home=$(make_home verbs)
+  while IFS='|' read -r invocation expected; do
+    # shellcheck disable=SC2086 # Fixture rows intentionally encode the public argv.
+    run_helper "$home" $invocation
+    expect_code 0 "$LAST_RC" "$invocation failed"
+    actual=$(tr '\n' ' ' < "$CONTROL/compact-args")
+    actual=${actual% }
+    [ "$actual" = "$expected" ] || fail "$invocation mapped to unexpected compact argv: $actual"
+    assert_absent "$RAW_LOG" "$invocation also ran raw"
+  done <<ROWS
+git-log|git log -n 50 --decorate
+git-diff|git diff
+git-diff --cached|git diff --cached
+git-status|git status
+list $TMP_ROOT|ls $TMP_ROOT
+search needle $TMP_ROOT|rg needle $TMP_ROOT
+ROWS
+
+  reset_evidence
+  PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$HELPER" exec git status > "$OUT" 2> "$ERR"; LAST_RC=$?
+  expect_code 64 "$LAST_RC" "generic command escape should be refused"
+  assert_absent "$RAW_LOG" "generic command refusal ran raw"
+  assert_absent "$CONTROL/version.count" "generic command refusal ran RTK"
+  pass "fm-rtk: every fixed semantic verb maps exactly and generic execution is refused"
+}
+
 test_artifact_and_version_failures() {
   local home artifact mode started
   home=$(make_home failures)
@@ -269,7 +298,15 @@ SH
   assert_raw 'git|status '
   assert_absent "$CONTROL/version.count" "copy failure executed RTK"
   mv "$SYSTEM_ROOT/bin/cp.real" "$SYSTEM_ROOT/bin/cp"
-  pass "fm-rtk: replacement races and copy failures never execute candidates"
+
+  home=$(make_home utility-fail)
+  mv "$SYSTEM_ROOT/usr/bin/shasum" "$SYSTEM_ROOT/usr/bin/shasum.missing"
+  run_helper "$home" git-status
+  expect_code 0 "$LAST_RC" "missing compact-only utility should fall back"
+  assert_raw 'git|status '
+  assert_absent "$CONTROL/version.count" "missing compact-only utility executed RTK"
+  mv "$SYSTEM_ROOT/usr/bin/shasum.missing" "$SYSTEM_ROOT/usr/bin/shasum"
+  pass "fm-rtk: replacement races and setup failures fall back without executing candidates"
 }
 
 test_post_start_no_rerun_and_signal_cleanup() {
@@ -301,6 +338,7 @@ test_post_start_no_rerun_and_signal_cleanup() {
 test_public_launcher_sanitizes_startup_environment
 test_admission_and_trusted_raw
 test_spoofing_and_private_execution
+test_fixed_semantic_verbs
 test_artifact_and_version_failures
 test_copy_race_and_copy_failure
 test_post_start_no_rerun_and_signal_cleanup

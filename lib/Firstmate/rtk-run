@@ -270,10 +270,6 @@ case "$VERB" in
   *) admission_error 'unknown semantic verb' ;;
 esac
 
-for tool in "$ENV_TOOL" "$UNAME_TOOL" "$SHASUM_TOOL" "$WC_TOOL" "$TR_TOOL" "$MKTEMP_TOOL" \
-  "$RM_TOOL" "$CHMOD_TOOL" "$MKDIR_TOOL" "$CP_TOOL" "$SLEEP_TOOL"; do
-  require_tool "$tool"
-done
 case "$VERB" in
   git-*) require_tool "$GIT_TOOL"; RAW_ARGV=("$GIT_TOOL" "${RTK_ARGV[@]:1}") ;;
   list) require_tool "$LS_TOOL"; RAW_ARGV=("$LS_TOOL" "${RTK_ARGV[@]:1}") ;;
@@ -282,6 +278,10 @@ case "$VERB" in
     RAW_ARGV=("$RG_TOOL" "${RTK_ARGV[@]:1}")
     ;;
 esac
+for tool in "$ENV_TOOL" "$UNAME_TOOL" "$SHASUM_TOOL" "$WC_TOOL" "$TR_TOOL" "$MKTEMP_TOOL" \
+  "$RM_TOOL" "$CHMOD_TOOL" "$MKDIR_TOOL" "$CP_TOOL" "$SLEEP_TOOL"; do
+  trusted_executable "$tool" || raw_fallback 'trusted utility unavailable'
+done
 
 EFFECTIVE_HOME=$(resolve_home) || raw_fallback 'home unavailable'
 CONFIG_FILE=$EFFECTIVE_HOME/config/rtk
