@@ -130,24 +130,170 @@ test_types_and_symlinks_fail_closed() {
   pass "fm-rtk: path, type, mode, and hash checks fail closed"
 }
 
-# Production launch sanitizes startup, PATH, Perl, test-seam, and temporary overrides.
+run_public_launcher() {
+  rm -f "$OUT" "$ERR"
+  /usr/bin/env "$@" "$ROOT/bin/fm-rtk.sh" verify >"$OUT" 2>"$ERR"
+  LAST_RC=$?
+}
+
+assert_launcher_baseline() {
+  local name=$1 marker=$2
+  expect_code "$PUBLIC_RC" "$LAST_RC" "$name changed launcher status"
+  cmp -s "$PUBLIC_OUT" "$OUT" || fail "$name changed launcher stdout"
+  cmp -s "$PUBLIC_ERR" "$ERR" || fail "$name changed launcher stderr"
+  assert_absent "$marker" "$name executed attacker code"
+  assert_absent "$CONTROL/artifact-executed" "$name executed the artifact"
+  assert_project_unchanged
+}
+
+# Each caller-controlled environment boundary is exercised independently so an
+# early interpreter failure cannot mask a later sanitization regression.
 test_public_launcher_ignores_hostile_environment() {
-  local home before after rc
+  local home marker module_dir
   home=$(make_home hostile-env)
-  printf 'touch %q\n' "$CONTROL/startup-ran" > "$CONTROL/startup"
-  before=$(find "$PROJECT" -mindepth 1 -print | LC_ALL=C sort)
-  FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" FM_RTK_TEST_SHA256="$(artifact_sha "$home")" \
-    TMPDIR="$PROJECT" PATH="$CONTROL" PERL5OPT='-e system("touch '$CONTROL'/perl-ran")' \
-    BASH_ENV="$CONTROL/startup" ENV="$CONTROL/startup" \
-    "$ROOT/bin/fm-rtk.sh" verify >"$OUT" 2>"$ERR"
+  module_dir=$CONTROL/perl-modules
+  mkdir -p "$module_dir"
+  FM_HOME="$home" run_public_launcher
+  PUBLIC_RC=$LAST_RC
+  PUBLIC_OUT=$CONTROL/public.stdout
+  PUBLIC_ERR=$CONTROL/public.stderr
+  cp "$OUT" "$PUBLIC_OUT"
+  cp "$ERR" "$PUBLIC_ERR"
+
+  marker=$CONTROL/path-ran
+  mkdir -p "$CONTROL/hostile-path"
+  for tool in env perl bash uname; do
+    printf '#!/bin/sh\ntouch %q\nexit 99\n' "$marker" > "$CONTROL/hostile-path/$tool"
+    chmod +x "$CONTROL/hostile-path/$tool"
+  done
+  FM_HOME="$home" run_public_launcher PATH="$CONTROL/hostile-path"
+  assert_launcher_baseline PATH "$marker"
+
+  for variable in BASH_ENV ENV; do
+    case "$variable" in BASH_ENV) marker=$CONTROL/bash-env-ran ;; ENV) marker=$CONTROL/env-ran ;; esac
+    printf 'touch %q\n' "$marker" > "$CONTROL/$variable"
+    FM_HOME="$home" run_public_launcher "$variable=$CONTROL/$variable"
+    assert_launcher_baseline "$variable" "$marker"
+  done
+
+  marker=$CONTROL/perl5opt-ran
+  cat > "$module_dir/Hostile.pm" <<EOF
+package Hostile;
+BEGIN { system('/usr/bin/touch', '$marker') }
+1;
+EOF
+  FM_HOME="$home" run_public_launcher "PERL5OPT=-I$module_dir -MHostile"
+  assert_launcher_baseline PERL5OPT "$marker"
+
+  for variable in PERL5LIB PERLLIB; do
+    case "$variable" in PERL5LIB) marker=$CONTROL/perl5lib-ran ;; PERLLIB) marker=$CONTROL/perllib-ran ;; esac
+    cat > "$module_dir/Cwd.pm" <<EOF
+package Cwd;
+BEGIN { system('/usr/bin/touch', '$marker') }
+sub import { }
+1;
+EOF
+    FM_HOME="$home" run_public_launcher "$variable=$module_dir"
+    assert_launcher_baseline "$variable" "$marker"
+  done
+
+  marker=$CONTROL/shellopts-ran
+  FM_HOME="$home" run_public_launcher SHELLOPTS=xtrace "PS4=\$(/usr/bin/touch '$marker')"
+  assert_launcher_baseline SHELLOPTS "$marker"
+
+  marker=$CONTROL/bashopts-ran
+  FM_HOME="$home" run_public_launcher BASHOPTS=extdebug "BASH_COMPAT=\$(/usr/bin/touch '$marker')"
+  assert_launcher_baseline BASHOPTS "$marker"
+
+  marker=$CONTROL/function-ran
+  eval "cd() { /usr/bin/touch '$marker'; builtin cd \"\$@\"; }"
+  export -f cd
+  FM_HOME="$home" run_public_launcher
+  export -n -f cd
+  unset -f cd
+  assert_launcher_baseline exported-function "$marker"
+
+  marker=$CONTROL/sentinel-ran
+  FM_HOME="$home" run_public_launcher "FM_RTK_STARTED=$marker"
+  assert_launcher_baseline former-sentinel "$marker"
+
+  marker=$CONTROL/system-seam-ran
+  cat > "$SYSTEM_ROOT/usr/bin/uname" <<EOF
+#!/bin/sh
+/usr/bin/touch '$marker'
+printf 'Darwin\n'
+EOF
+  chmod +x "$SYSTEM_ROOT/usr/bin/uname"
+  FM_HOME="$home" run_public_launcher "FM_RTK_TEST_SYSTEM_ROOT=$SYSTEM_ROOT"
+  assert_launcher_baseline system-test-seam "$marker"
+
+  marker=$CONTROL/hash-seam-ran
+  FM_HOME="$home" run_public_launcher "FM_RTK_TEST_SHA256=$(artifact_sha "$home")" \
+    "FM_RTK_TEST_MARKER=$marker"
+  assert_launcher_baseline hash-test-seam "$marker"
+
+  marker=$CONTROL/tmpdir-ran
+  FM_HOME="$home" run_public_launcher "TMPDIR=$PROJECT" "FM_RTK_TEST_MARKER=$marker"
+  assert_launcher_baseline TMPDIR "$marker"
+  pass "fm-rtk: public launcher independently sanitizes caller environment"
+}
+
+make_trap_tools() {
+  local fakebin=$1 tool
+  mkdir -p "$fakebin"
+  for tool in rtk fm-rtk.sh git-status git-log git-diff search list brew npm installer \
+    curl wget activate pre-commit post-checkout rtk-hook; do
+    cat > "$fakebin/$tool" <<EOF
+#!/bin/sh
+printf '%s\\n' '$tool' >> '$CONTROL/lifecycle-calls'
+exit 97
+EOF
+    chmod +x "$fakebin/$tool"
+  done
+}
+
+assert_lifecycle_inert() {
+  local name=$1 project_before=$2 config_before=$3 project_after config_after
+  project_after=$(find "$PROJECT" -mindepth 1 -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  config_after=$(find "$CONTROL/lifecycle-home/config" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  [ "$project_before" = "$project_after" ] || fail "$name changed project bytes"
+  [ "$config_before" = "$config_after" ] || fail "$name changed private config bytes"
+  assert_absent "$CONTROL/lifecycle-calls" "$name called an RTK, installer, network, hook, or activation command"
+  assert_absent "$CONTROL/artifact-executed" "$name executed the private artifact"
+}
+
+# Bootstrap and session start are driven as public commands with executable
+# traps; source-level absence is not used as evidence for lifecycle inertness.
+test_lifecycle_never_activates_rtk() {
+  local home fakebin project_before config_before rc
+  home=$CONTROL/lifecycle-home
+  fakebin=$CONTROL/lifecycle-fakebin
+  mkdir -p "$home/config" "$home/state/.lock" "$home/data" "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin"
+  printf 'disabled\n' > "$home/config/rtk"
+  printf 'private-config\n' > "$home/config/sentinel"
+  cat > "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk" <<EOF
+#!/bin/sh
+/usr/bin/touch '$CONTROL/artifact-executed'
+EOF
+  chmod +x "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk"
+  make_trap_tools "$fakebin"
+  project_before=$(find "$PROJECT" -mindepth 1 -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  config_before=$(find "$home/config" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+
+  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/artifact-executed"
+  (cd "$PROJECT" && FM_HOME="$home" FM_BOOTSTRAP_DETECT_ONLY=1 FM_BOOTSTRAP_NETWORK=skip \
+    PATH="$fakebin:/usr/bin:/bin" "$ROOT/bin/fm-bootstrap.sh") >"$OUT" 2>"$ERR"
   rc=$?
-  [ "$rc" -ne 0 ] || fail "test seams bypassed the production platform or hash pin"
-  after=$(find "$PROJECT" -mindepth 1 -print | LC_ALL=C sort)
-  [ "$before" = "$after" ] || fail "caller TMPDIR caused a project write"
-  assert_absent "$CONTROL/startup-ran" "launcher sourced hostile shell startup"
-  assert_absent "$CONTROL/perl-ran" "launcher honored hostile Perl startup"
-  assert_absent "$CONTROL/artifact-executed" "launcher executed the artifact"
-  pass "fm-rtk: public launcher sanitizes hostile caller overrides"
+  expect_code 0 "$rc" "detect-only bootstrap failed"
+  assert_lifecycle_inert bootstrap "$project_before" "$config_before"
+
+  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/artifact-executed"
+  (cd "$PROJECT" && FM_HOME="$home" FM_SESSION_START_TIMEOUT=20 \
+    PATH="$fakebin:/usr/bin:/bin" "$ROOT/bin/fm-session-start.sh") >"$OUT" 2>"$ERR"
+  rc=$?
+  expect_code 0 "$rc" "read-only session start failed"
+  assert_lifecycle_inert session-start "$project_before" "$config_before"
+  pass "fm-rtk: bootstrap and session start remain lifecycle-inert"
 }
 
 # Platform rejection occurs before any artifact access.
@@ -171,4 +317,5 @@ SH
 test_exact_verification_contract
 test_types_and_symlinks_fail_closed
 test_public_launcher_ignores_hostile_environment
+test_lifecycle_never_activates_rtk
 test_platform_rejection
