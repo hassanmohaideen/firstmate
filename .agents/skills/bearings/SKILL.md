@@ -56,7 +56,7 @@ It never tears down a task, merges a PR, dispatches new work, steers a worker, a
    If today's file already exists, delete it first, then create a new file from scratch.
    This is the only write allowed by the skill.
    The detailed report includes:
-   - **Title** - `# Bearings - <day> <YYYY-MM-DD>` by default, or `# Status Report - <day> <YYYY-MM-DD>` when the roleplay/tone axis of the shared preference rule requires professional non-nautical language (use "Morning status" only when the user specifically asks for a morning brief), followed by two or three sentences framing where things stand.
+   - **Title** - `# Bearings - <day> <YYYY-MM-DD>` by default, or `# Status Report - <day> <YYYY-MM-DD>` when the roleplay/tone axis of the shared preference rule requires professional non-nautical language or the report concerns serious bad news, security, privacy, or escalation (use "Morning status" only when the user specifically asks for a morning brief), followed by two or three sentences framing where things stand.
    - **Action bucket** - every open decision summarized with its options from the structured decision record, plus each PR ready to merge and each needed credential or login, every PR with the full `https://...` URL, never a bare `#number`.
    - **Completed bucket** - the bounded current recent-completions baseline from structured state across the main fleet and every registered secondmate home, rendered in full on every run.
    - **In-progress bucket** - each live direct report making progress, with its current state, and the plans or main pickup pointers worth reopening (`data/<id>/report.md` files, `.lavish/*.html` boards).
@@ -68,7 +68,8 @@ It never tears down a task, merges a PR, dispatches new work, steers a worker, a
 
 This skill is the one owner of the `/bearings` chat-response format; the snapshot and classifier own the data that feeds it, and no other file restates this contract.
 Every `/bearings` chat response renders EXACTLY four sections in the order below and nothing else structural (there is no fifth section).
-Select labels and empty states solely from the roleplay/tone axis of the shared preference rule in `AGENTS.md`: use the professional variants when that axis requires professional non-nautical language, and the default variants otherwise.
+Select labels and empty states from the roleplay/tone axis of the shared preference rule in `AGENTS.md`: use the professional variants when that axis requires professional non-nautical language, and the default variants otherwise.
+As required by that shared rule, a digest concerning serious bad news, security, privacy, or escalation always uses the professional variants regardless of the requested tone.
 The address axis does not select headings.
 This label selection changes no bucket content, ordering, or completeness.
 

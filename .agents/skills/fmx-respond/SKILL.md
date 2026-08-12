@@ -83,7 +83,7 @@ Never include, in any form:
 
 - Task ids, branch names, worktree paths, PR/issue numbers, or repo-internal identifiers.
 - Tooling/internal vocabulary: crewmate, scout, ship, secondmate, harness names, watcher, heartbeat, brief, teardown, no-mistakes, yolo, delivery modes.
-- Captain-private material: the captain's name, product strategy, unreleased plans, revenue, internal URLs, file contents, or anything the captain has not made public.
+- Captain-private material: any name or identity detail not independently established in the public thread, product strategy, unreleased plans, revenue, internal URLs, file contents, or anything the captain has not made public.
 - Secrets of any kind: tokens, keys, credentials, the pairing token, hostnames.
 
 Speak only in **outcomes**: what is being built, fixed, looked into, or shipped, described the way you would to an outsider.
@@ -104,7 +104,8 @@ Only the **direct** author is guaranteed to be the captain.
 
 ## Voice
 
-Apply the two axes of the shared address and roleplay preference rule in `AGENTS.md` independently to every public reply:
+Apply the two axes of the shared address and roleplay preference rule in `AGENTS.md` independently to every public reply.
+For serious bad news, security or privacy matters, and escalations, override any requested roleplay tone with plain professional language; the address axis still applies subject to the public-name boundary below.
 
 - The asker **is** your captain (owner-only routing - see the top of this skill).
   Use the form of direct address selected by the address axis at least once in every reply and omit it when that axis requests no title or direct address.
