@@ -41,6 +41,7 @@ fm_discord_resolve_config_file() {
     path="$config/discord-bot.env"
   fi
   fm_discord_config_path_valid "$path" || return 1
+  # shellcheck disable=SC2034 # Sourceable API consumed by callers after resolution.
   FM_DISCORD_RESOLVED_CONFIG_FILE=$path
 }
 
