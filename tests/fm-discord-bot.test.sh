@@ -15,6 +15,8 @@ set -u
 TMP_ROOT=$(fm_test_tmproot fm-discord-bot)
 NODE_BIN=$(command -v node 2>/dev/null || true)
 [ -n "$NODE_BIN" ] || fail "Node.js is required for the Discord behavior suite"
+PYTHON_BIN=$(command -v python3 2>/dev/null || true)
+[ -n "$PYTHON_BIN" ] || fail "Python 3 is required for semantic plist validation"
 BOT="$ROOT/bin/fm-discord-bot.mjs"
 CONTROL="$ROOT/bin/fm-discord-bot.sh"
 REPLY="$ROOT/bin/fm-discord-reply.sh"
@@ -329,11 +331,29 @@ write_config "$home"
 make_gateway_server "$home/gateway" reconnect
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=20 \
+  FM_DISCORD_TEST_RECONCILE_MS=20 \
   "$CONTROL" run > "$home/bot.log" 2>&1 &
 worker=$!
 WORKER_PIDS+=("$worker")
 wait_for_value "$home/gateway/connections" 2 || fail "Discord Gateway did not reconnect after the first disconnect"
 wait_for_file "$home/state/discord-bot.ready" || fail "Discord Gateway did not republish ready state after reconnect"
+stranded="$home/state/discord-inbox/$MESSAGE.json"
+jq -cn --arg id "$MESSAGE" --arg guild "$GUILD" --arg channel "$CHANNEL" '
+  {
+    schema:"firstmate.discord-inbox.v1", request_id:$id, text:"committed request",
+    direct_author:"configured-owner", in_reply_to:null,
+    binding:{message_id:$id,guild_id:$guild,channel_id:$channel}, recorded_at:1
+  }
+' > "$stranded.tmp"
+chmod 600 "$stranded.tmp"
+mv "$stranded.tmp" "$stranded"
+wait_for_file "$home/state/discord-context/$MESSAGE.json" \
+  || fail "the connected service did not reconcile a committed inbox record"
+wait_for_file "$home/state/.wake-queue" \
+  || fail "the connected service did not wake for a reconciled inbox record"
+sleep 0.1
+[ "$(grep -c "discord-message-$MESSAGE" "$home/state/.wake-queue")" -eq 1 ] \
+  || fail "in-process inbox reconciliation emitted duplicate durable notifications"
 out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=20 \
   "$CONTROL" run 2>&1); rc=$?
@@ -395,13 +415,52 @@ out=$(HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchc
 assert_contains "$out" "restart automatically" "macOS start did not report persistent service behavior"
 plist=$(find "$home/account/Library/LaunchAgents" -name 'dev.firstmate.discord.*.plist' -print | head -n1)
 assert_present "$plist" "macOS start did not install a per-home LaunchAgent"
-assert_grep '<key>KeepAlive</key>' "$plist" "Discord LaunchAgent is not kept alive"
-assert_grep '<key>RunAtLoad</key>' "$plist" "Discord LaunchAgent does not run after machine login"
-assert_grep '<key>ThrottleInterval</key>' "$plist" "Discord LaunchAgent lacks bounded restart throttling"
-assert_no_grep "$TOKEN" "$plist" "Discord LaunchAgent contains the bot token"
-assert_no_grep "$OWNER" "$plist" "Discord LaunchAgent contains the owner id"
-assert_no_grep "$GUILD" "$plist" "Discord LaunchAgent contains the guild id"
-assert_no_grep "$CHANNEL" "$plist" "Discord LaunchAgent contains the channel id"
+"$PYTHON_BIN" - "$plist" "$CONTROL" "$home/account" "$home" "$ROOT" "$NODE_BIN" \
+  "$TOKEN" "$OWNER" "$GUILD" "$CHANNEL" <<'PY' || fail "Discord LaunchAgent semantic validation failed"
+import plistlib
+import sys
+
+path, control, account_home, fm_home, root, node, *private_values = sys.argv[1:]
+with open(path, "rb") as stream:
+    model = plistlib.load(stream)
+expected_environment = {
+    "HOME": account_home,
+    "FM_HOME": fm_home,
+    "FM_ROOT_OVERRIDE": root,
+    "FM_DISCORD_NODE_BIN": node,
+}
+assert isinstance(model, dict)
+assert isinstance(model.get("Label"), str) and model["Label"].startswith("dev.firstmate.discord.")
+assert model.get("ProgramArguments") == [control, "worker"]
+assert model.get("EnvironmentVariables") == expected_environment
+assert model.get("RunAtLoad") is True
+assert model.get("KeepAlive") is True
+assert type(model.get("ThrottleInterval")) is int and model["ThrottleInterval"] == 15
+assert model.get("LimitLoadToSessionType") == "Aqua"
+assert model.get("ProcessType") == "Background"
+expected_log = fm_home + "/state/discord-bot.log"
+assert model.get("StandardOutPath") == expected_log
+assert model.get("StandardErrorPath") == expected_log
+serialized_values = []
+def collect(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            serialized_values.append(str(key))
+            collect(child)
+    elif isinstance(value, list):
+        for child in value:
+            collect(child)
+    else:
+        serialized_values.append(str(value))
+collect(model)
+assert not any(private in value for private in private_values for value in serialized_values)
+assert not ({
+    "FM_DISCORD_BOT_TOKEN",
+    "FM_DISCORD_OWNER_USER_ID",
+    "FM_DISCORD_GUILD_ID",
+    "FM_DISCORD_CHANNEL_ID",
+} & set(model["EnvironmentVariables"]))
+PY
 out=$(HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchctl.log" \
   FM_DISCORD_NODE_BIN="$NODE_BIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" stop)
 assert_contains "$out" "configuration is unchanged" "macOS stop did not preserve private configuration"

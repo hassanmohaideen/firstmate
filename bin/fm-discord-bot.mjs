@@ -52,6 +52,9 @@ const API_BASE = TEST_MODE && process.env.FM_DISCORD_TEST_API_BASE
 const TEST_GATEWAY_URL = TEST_MODE ? process.env.FM_DISCORD_TEST_GATEWAY_URL || "" : "";
 const MAX_REPLY_CHARS = 1900;
 const RETENTION_SECONDS = 7 * 24 * 60 * 60;
+const RECONCILE_INTERVAL_MS = TEST_MODE && /^[0-9]+$/.test(process.env.FM_DISCORD_TEST_RECONCILE_MS || "")
+  ? Math.max(10, Math.min(1000, Number(process.env.FM_DISCORD_TEST_RECONCILE_MS)))
+  : 30_000;
 const CONFIG_KEYS = [
   "FM_DISCORD_BOT_TOKEN",
   "FM_DISCORD_OWNER_USER_ID",
@@ -770,6 +773,18 @@ class GatewayRunner {
     await reconcileInbox(this.config);
     const pruneTimer = setInterval(() => pruneContexts(), 6 * 60 * 60 * 1000);
     pruneTimer.unref?.();
+    let reconciliationRunning = false;
+    const reconcileTimer = setInterval(() => {
+      if (reconciliationRunning || this.stopping) return;
+      reconciliationRunning = true;
+      this.inbound = this.inbound
+        .then(() => reconcileInbox(this.config))
+        .catch(() => safeLog("pending Discord inbox reconciliation will be retried"));
+      void this.inbound.then(() => {
+        reconciliationRunning = false;
+      });
+    }, RECONCILE_INTERVAL_MS);
+    reconcileTimer.unref?.();
     safeLog("service started");
     while (!this.stopping) {
       let url;
@@ -795,6 +810,7 @@ class GatewayRunner {
       if (!this.stopping) await this.waitForReconnect(backoffMilliseconds(this.attempt));
     }
     clearInterval(pruneTimer);
+    clearInterval(reconcileTimer);
     await this.inbound;
     safeLog("service stopped");
   }
