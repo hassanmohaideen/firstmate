@@ -299,9 +299,12 @@ done
 for id in "$old_orphan" "$recent_orphan" "$retained_source"; do
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$NOTIFY" message "$id"
 done
+# Materialize the durable post-append/pre-rename crash state deterministically;
+# the preceding case separately exercises actual process-death recovery.
 for id in "$stale_pending_orphan" "$recent_pending_orphan" "$retained_pending_source" "$unsafe_pending_orphan"; do
-  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WAKE_TEST_CRASH_AFTER_IDEMPOTENT_APPEND=1 \
-    "$NOTIFY" message "$id" >/dev/null 2>&1 || true
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$NOTIFY" message "$id"
+  digest=$(discord_digest "message:$id")
+  mv "$home/state/.wake-dedup/$digest.accepted" "$home/state/.wake-dedup/$digest.pending"
 done
 for id in "$old_orphan" "$recent_orphan" "$stale_pending_orphan" "$recent_pending_orphan" "$unsafe_pending_orphan"; do
   rm -f "$home/state/discord-inbox/$id.json" "$home/state/discord-context/$id.json"
@@ -319,10 +322,11 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" bash -c \
   _ "$ROOT" "$foreign_digest"
 foreign_receipt="$home/state/.wake-dedup/$foreign_digest.accepted"
 foreign_pending_digest=$(printf 'b%.0s' {1..64})
-FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_WAKE_TEST_CRASH_AFTER_IDEMPOTENT_APPEND=1 bash -c \
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" bash -c \
   '. "$1/bin/fm-wake-lib.sh"; fm_wake_append_idempotent check foreign-pending "check: foreign pending" "$2"' \
-  _ "$ROOT" "$foreign_pending_digest" >/dev/null 2>&1 || true
+  _ "$ROOT" "$foreign_pending_digest"
 foreign_pending_receipt="$home/state/.wake-dedup/$foreign_pending_digest.pending"
+mv "$home/state/.wake-dedup/$foreign_pending_digest.accepted" "$foreign_pending_receipt"
 "$NODE_BIN" -e '
   const fs = require("node:fs");
   const now = Date.now() / 1000;
