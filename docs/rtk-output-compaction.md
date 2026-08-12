@@ -27,4 +27,4 @@ Rollback is deletion of the private artifact or removal of this tracked verifier
 
 ## Ownership and evaluation
 
-This document is the maintainer architecture record. `docs/scripts.md` inventories the operator entrypoint, and `tests/fm-rtk.test.sh` owns executable boundary coverage. The pilot can graduate only after a separately approved architecture can bind verified artifact identity through execution while preserving project, privacy, and evidence boundaries. Until then there is no runtime pilot to evaluate and no compact output to treat as evidence.
+This document is the maintainer architecture record. `docs/scripts.md` inventories the operator entrypoint. `tests/fm-rtk.test.sh` owns portable executable boundary coverage, while `tests/fm-rtk-fs-events.test.sh` and `tests/fm-rtk-exec-trace.test.sh` own facility-gated write-event and absolute-execution coverage. The pilot can graduate only after a separately approved architecture can bind verified artifact identity through execution while preserving project, privacy, and evidence boundaries. Until then there is no runtime pilot to evaluate and no compact output to treat as evidence.

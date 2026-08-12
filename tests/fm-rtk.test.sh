@@ -14,8 +14,7 @@ OUT=$TMP_ROOT/out
 ERR=$TMP_ROOT/err
 LAST_RC=0
 PYTHON3=$(command -v python3 2>/dev/null || true)
-EVENT_MONITOR=$ROOT/tests/helpers/fs-event-monitor.py
-MONITOR_AVAILABLE=0
+SNAPSHOT_HELPER=$ROOT/tests/helpers/fs-event-monitor.py
 mkdir -p "$SYSTEM_ROOT/usr/bin" "$CONTROL" "$PROJECT"
 cp "$ROOT/lib/Firstmate/rtk-run" "$HELPER"
 chmod +x "$HELPER"
@@ -332,107 +331,9 @@ EOF
   chmod +x "$fakebin/git"
 }
 
-begin_write_monitor() {
-  local name=$1
-  shift
-  MONITOR_READY=$CONTROL/monitor-$name.ready
-  MONITOR_EVENTS=$CONTROL/monitor-$name.events
-  MONITOR_STOP=$CONTROL/monitor-$name.stop
-  rm -f "$MONITOR_READY" "$MONITOR_EVENTS" "$MONITOR_STOP" "$MONITOR_STOP.observed"
-  "$PYTHON3" "$EVENT_MONITOR" --ready "$MONITOR_READY" --events "$MONITOR_EVENTS" \
-    --stop "$MONITOR_STOP" "$@" >"$CONTROL/monitor-$name.out" \
-    2>"$CONTROL/monitor-$name.err" &
-  MONITOR_PID=$!
-  local attempts=0
-  while [ ! -e "$MONITOR_READY" ] && [ "$attempts" -lt 200 ]; do
-    kill -0 "$MONITOR_PID" 2>/dev/null || break
-    sleep 0.01
-    attempts=$((attempts + 1))
-  done
-  [ -e "$MONITOR_READY" ] || fail "$name filesystem monitor did not become ready"
-}
-
-end_write_monitor() {
-  local name=$1 expectation=$2 rc
-  : > "$MONITOR_STOP"
-  wait "$MONITOR_PID"
-  rc=$?
-  expect_code 0 "$rc" "$name filesystem monitor failed"
-  case "$expectation" in
-    clean) [ ! -s "$MONITOR_EVENTS" ] || fail "$name emitted a filesystem write event" ;;
-    changed) [ -s "$MONITOR_EVENTS" ] || fail "$name filesystem mutation was not observed" ;;
-  esac
-}
-
-self_test_write_monitor() {
-  local root=$CONTROL/monitor-self-root
-  [ "$MONITOR_AVAILABLE" -eq 1 ] || {
-    pass "fm-rtk: transient-write monitor unavailable # SKIP no kqueue/inotify facility"
-    return
-  }
-  mkdir -p "$root"
-  printf 'same bytes\n' > "$root/file"
-  begin_write_monitor same-byte-rewrite "$root"
-  printf 'same bytes\n' > "$root/file"
-  end_write_monitor same-byte-rewrite changed
-
-  begin_write_monitor equivalent-replacement "$root"
-  printf 'same bytes\n' > "$root/replacement"
-  mv "$root/replacement" "$root/file"
-  end_write_monitor equivalent-replacement changed
-
-  begin_write_monitor transient-entry "$root"
-  : > "$root/transient"
-  rm "$root/transient"
-  end_write_monitor transient-entry changed
-
-  begin_write_monitor stop-time-mutation "$root"
-  : > "$MONITOR_STOP"
-  local attempts=0
-  while [ ! -e "$MONITOR_STOP.observed" ] && [ "$attempts" -lt 200 ]; do
-    kill -0 "$MONITOR_PID" 2>/dev/null || break
-    sleep 0.01
-    attempts=$((attempts + 1))
-  done
-  [ -e "$MONITOR_STOP.observed" ] || fail "stop-time monitor handshake was not observed"
-  printf 'same bytes\n' > "$root/file"
-  end_write_monitor stop-time-mutation changed
-  pass "fm-rtk: transient-write monitor detects restored and stop-time mutations"
-}
-
-assert_trace_has_no_orientation_exec() {
-  local home=$1 fakebin=$2 lifecycle_root=$3 probe=$CONTROL/dtruss-probe trace=$CONTROL/dtruss-trace rc
-  if [ "$(/usr/bin/uname -s)" != Darwin ]; then
-    pass "fm-rtk: absolute execution tracing # SKIP dtruss requires Darwin"
-    return
-  fi
-  if [ ! -x /usr/bin/dtruss ]; then
-    pass "fm-rtk: absolute execution tracing # SKIP dtruss facility unavailable"
-    return
-  fi
-  if ! /usr/bin/dtruss -f -t execve /usr/bin/printf '%s' fm-rtk-argv-probe >/dev/null 2>"$probe"; then
-    pass "fm-rtk: absolute execution tracing # SKIP dtruss permission unavailable"
-    return
-  fi
-  if ! /usr/bin/grep -F fm-rtk-argv-probe "$probe" >/dev/null; then
-    pass "fm-rtk: absolute execution tracing # SKIP dtruss argv visibility unavailable"
-    return
-  fi
-  [ "$MONITOR_AVAILABLE" -eq 0 ] || begin_write_monitor traced-session "$PROJECT" "$home/config"
-  (cd "$PROJECT" && /usr/bin/dtruss -f -t execve /usr/bin/env \
-    FM_HOME="$home" FM_SESSION_START_TIMEOUT=20 PATH="$fakebin:/usr/bin:/bin" \
-    "$lifecycle_root/bin/fm-session-start.sh") >/dev/null 2>"$trace"
-  rc=$?
-  [ "$MONITOR_AVAILABLE" -eq 0 ] || end_write_monitor traced-session clean
-  expect_code 0 "$rc" "execution-traced session start failed"
-  if /usr/bin/grep -E 'execve\([^)]*(/git|fm-rtk)[^)]*(status|diff|log|verify)' "$trace" >/dev/null; then
-    fail "session-start trace observed forbidden verifier or project-orientation execution"
-  fi
-}
-
 snapshot_tree() {
   if [ -n "$PYTHON3" ]; then
-    "$PYTHON3" "$EVENT_MONITOR" --snapshot "$1"
+    "$PYTHON3" "$SNAPSHOT_HELPER" --snapshot "$1"
     return
   fi
   /usr/bin/perl -MDigest::SHA -MFile::Find -MFcntl=:mode -MTime::HiRes=lstat -e '
@@ -501,10 +402,6 @@ assert_lifecycle_inert() {
 # traps; source-level absence is not used as evidence for lifecycle inertness.
 test_lifecycle_never_activates_rtk() {
   local home fakebin project_before config_before rc lifecycle_root
-  if [ -n "$PYTHON3" ] && "$PYTHON3" "$EVENT_MONITOR" --probe >/dev/null 2>&1; then
-    MONITOR_AVAILABLE=1
-  fi
-  self_test_write_monitor
   home=$CONTROL/lifecycle-home
   fakebin=$CONTROL/lifecycle-fakebin
   lifecycle_root=$CONTROL/lifecycle-root
@@ -529,25 +426,19 @@ EOF
 
   rm -f "$CONTROL/lifecycle-calls" "$CONTROL/lifecycle-git-calls" \
     "$CONTROL/verifier-called" "$CONTROL/artifact-executed"
-  [ "$MONITOR_AVAILABLE" -eq 0 ] || begin_write_monitor bootstrap "$PROJECT" "$home/config"
   (cd "$PROJECT" && FM_HOME="$home" FM_BOOTSTRAP_DETECT_ONLY=1 FM_BOOTSTRAP_NETWORK=skip \
     PATH="$fakebin:/usr/bin:/bin" "$lifecycle_root/bin/fm-bootstrap.sh") >"$OUT" 2>"$ERR"
   rc=$?
-  [ "$MONITOR_AVAILABLE" -eq 0 ] || end_write_monitor bootstrap clean
   expect_code 0 "$rc" "detect-only bootstrap failed"
   assert_lifecycle_inert bootstrap "$project_before" "$config_before"
 
   rm -f "$CONTROL/lifecycle-calls" "$CONTROL/lifecycle-git-calls" \
     "$CONTROL/verifier-called" "$CONTROL/artifact-executed"
-  [ "$MONITOR_AVAILABLE" -eq 0 ] || begin_write_monitor session-start "$PROJECT" "$home/config"
   (cd "$PROJECT" && FM_HOME="$home" FM_SESSION_START_TIMEOUT=20 \
     PATH="$fakebin:/usr/bin:/bin" "$lifecycle_root/bin/fm-session-start.sh") >"$OUT" 2>"$ERR"
   rc=$?
-  [ "$MONITOR_AVAILABLE" -eq 0 ] || end_write_monitor session-start clean
   expect_code 0 "$rc" "read-only session start failed"
   assert_lifecycle_inert session-start "$project_before" "$config_before"
-  assert_trace_has_no_orientation_exec "$home" "$fakebin" "$lifecycle_root"
-  assert_lifecycle_inert traced-session-start "$project_before" "$config_before"
   pass "fm-rtk: bootstrap and session start remain lifecycle-inert"
 }
 
