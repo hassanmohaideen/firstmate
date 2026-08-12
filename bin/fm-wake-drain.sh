@@ -145,6 +145,10 @@ trap 'exit 143' TERM
 
 fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
 DRAIN_LOCK_HELD=true
+fm_wake_finalize_idempotent_locked || {
+  echo "wake drain: idempotent wake receipts could not be recovered safely" >&2
+  exit 1
+}
 
 if [ -n "$ACK_THROUGH" ]; then
   fm_recovery_marker_snapshot "$RECOVERY_MARKER" || exit 1

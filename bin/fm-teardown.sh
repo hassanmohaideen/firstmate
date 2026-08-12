@@ -2325,6 +2325,16 @@ if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# A self-hosted Discord task binding means this home owes one terminal outcome
+# through the original accepted message. Cleanup would remove the only task-side
+# trigger for that return, so preserve it unless the exact final was delivered or
+# explicit discard authority reached --force.
+if [ "$FORCE" != "--force" ] && grep -q '^discord_request=' "$META" 2>/dev/null; then
+  echo "REFUSED: task $ID still owes its terminal reply through the self-hosted Discord bot." >&2
+  echo "Deliver it with bin/fm-discord-followup.sh final $ID --text-file <path>, or use --force after explicit discard approval." >&2
+  exit 1
+fi
+
 # A public commitment is not kept until its final reply lands in the ORIGINAL
 # thread, and this cleanup removes the task records that make the promise
 # reconcilable. Refuse while this home still owes a public reply for exactly this

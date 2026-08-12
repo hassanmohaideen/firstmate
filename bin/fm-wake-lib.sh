@@ -800,22 +800,13 @@ fm_wake_clean_field() {
   LC_ALL=C tr '\t\r\n' '   '
 }
 
-fm_wake_append() {
-  local kind=$1 key=$2 payload=$3 clean_key clean_payload epoch seq seq_file status
-  local recovery_marker
-  case "$kind" in
-    signal|stale|check|heartbeat) ;;
-    *) printf 'fm_wake_append: invalid wake kind: %s\n' "$kind" >&2; return 2 ;;
-  esac
-
-  clean_key=$(printf '%s' "$key" | fm_wake_clean_field)
-  clean_payload=$(printf '%s' "$payload" | fm_wake_clean_field)
+fm_wake_append_locked() {
+  local kind=$1 clean_key=$2 clean_payload=$3 epoch seq seq_file status recovery_marker
   epoch=$(date +%s)
   seq_file="$STATE/.wake-queue.seq"
   recovery_marker="$STATE/.watcher-down"
   status=0
 
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
   _fm_recovery_marker_publish "$recovery_marker" downtime || status=$?
   if [ "$status" -eq 0 ]; then
     seq=$(cat "$seq_file" 2>/dev/null || echo 0)
@@ -827,6 +818,102 @@ fm_wake_append() {
   fi
   if [ "$status" -eq 0 ]; then
     printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$seq" "$kind" "$clean_key" "$clean_payload" >> "$FM_WAKE_QUEUE" || status=$?
+  fi
+  return "$status"
+}
+
+fm_wake_append() {
+  local kind=$1 key=$2 payload=$3 clean_key clean_payload status
+  case "$kind" in
+    signal|stale|check|heartbeat) ;;
+    *) printf 'fm_wake_append: invalid wake kind: %s\n' "$kind" >&2; return 2 ;;
+  esac
+
+  clean_key=$(printf '%s' "$key" | fm_wake_clean_field)
+  clean_payload=$(printf '%s' "$payload" | fm_wake_clean_field)
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  fm_wake_append_locked "$kind" "$clean_key" "$clean_payload"
+  status=$?
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  return "$status"
+}
+
+fm_wake_dedup_file_safe() {
+  local path=$1 links mode
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  if [ "$_FM_UNAME" = Darwin ]; then
+    links=$(stat -f %l "$path" 2>/dev/null) || return 1
+    mode=$(stat -f %Lp "$path" 2>/dev/null) || return 1
+  else
+    links=$(stat -c %h "$path" 2>/dev/null) || return 1
+    mode=$(stat -c %a "$path" 2>/dev/null) || return 1
+  fi
+  [ "$links" = 1 ] && [ "$mode" = 600 ]
+}
+
+fm_wake_finalize_idempotent_locked() {
+  local directory="$STATE/.wake-dedup" pending accepted key dedupe
+  [ -d "$directory" ] && [ ! -L "$directory" ] || return 0
+  for pending in "$directory"/*.pending; do
+    [ -e "$pending" ] || continue
+    fm_wake_dedup_file_safe "$pending" || continue
+    key=$(cat "$pending" 2>/dev/null || true)
+    case "$key" in ''|*[$'\t\r\n']*) continue ;; esac
+    dedupe=${pending##*/}
+    dedupe=${dedupe%.pending}
+    case "$dedupe" in ''|*[!0-9a-f]*) continue ;; esac
+    [ "${#dedupe}" -ge 32 ] && [ "${#dedupe}" -le 64 ] || continue
+    awk -F '\t' -v key="$key" 'NF >= 5 && $4 == key { found=1 } END { exit !found }' \
+      "$FM_WAKE_QUEUE" 2>/dev/null || continue
+    accepted="$directory/$dedupe.accepted"
+    mv -f -- "$pending" "$accepted" || return 1
+  done
+}
+
+fm_wake_append_idempotent() {
+  local kind=$1 key=$2 payload=$3 dedupe=$4 clean_key clean_payload directory pending accepted tmp status=0
+  case "$kind" in
+    signal|stale|check|heartbeat) ;;
+    *) printf 'fm_wake_append_idempotent: invalid wake kind: %s\n' "$kind" >&2; return 2 ;;
+  esac
+  case "$dedupe" in ''|*[!0-9a-f]*) return 2 ;; esac
+  [ "${#dedupe}" -ge 32 ] && [ "${#dedupe}" -le 64 ] || return 2
+  clean_key=$(printf '%s' "$key" | fm_wake_clean_field)
+  clean_payload=$(printf '%s' "$payload" | fm_wake_clean_field)
+  [ "$clean_key" = "$key" ] || return 2
+  directory="$STATE/.wake-dedup"
+  mkdir -p "$directory" || return 1
+  [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+  chmod 700 "$directory" || return 1
+  pending="$directory/$dedupe.pending"
+  accepted="$directory/$dedupe.accepted"
+
+  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if [ -e "$accepted" ] || [ -L "$accepted" ]; then
+    fm_wake_dedup_file_safe "$accepted" || status=1
+  else
+    if [ -e "$pending" ] || [ -L "$pending" ]; then
+      fm_wake_dedup_file_safe "$pending" || status=1
+      [ "$status" -ne 0 ] || [ "$(cat "$pending" 2>/dev/null)" = "$clean_key" ] || status=1
+    else
+      tmp=$(umask 077; mktemp "$directory/.$dedupe.XXXXXX") || status=1
+      if [ "$status" -eq 0 ]; then
+        printf '%s\n' "$clean_key" > "$tmp" && chmod 600 "$tmp" && mv -- "$tmp" "$pending" || status=1
+        [ "$status" -eq 0 ] || rm -f -- "$tmp"
+      fi
+    fi
+    if [ "$status" -eq 0 ]; then
+      if awk -F '\t' -v key="$clean_key" 'NF >= 5 && $4 == key { found=1 } END { exit !found }' \
+        "$FM_WAKE_QUEUE" 2>/dev/null; then
+        :
+      else
+        fm_wake_append_locked "$kind" "$clean_key" "$clean_payload" || status=$?
+      fi
+    fi
+    if [ "$status" -eq 0 ] && [ "${FM_WAKE_TEST_CRASH_AFTER_IDEMPOTENT_APPEND:-0}" = 1 ]; then
+      kill -KILL "$(fm_current_pid)"
+    fi
+    [ "$status" -ne 0 ] || mv -f -- "$pending" "$accepted" || status=1
   fi
   fm_lock_release "$FM_WAKE_QUEUE_LOCK"
   return "$status"

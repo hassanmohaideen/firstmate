@@ -11,12 +11,12 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 This section is the single owner of the top-level operational-home layout; producer script headers and their help own exact child-file fields and mutation contracts.
 The tracked code root contains the shared instruction, skill, documentation, workflow, and `bin/` surfaces, while each effective `FM_HOME` contains private operational directories.
 `data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, and scout reports.
-`state/` holds runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, away-mode state, generated Relay artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
+`state/` holds runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, away-mode state, generated Relay artifacts, optional self-hosted Discord inbox/context/service artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
 The producing PR and Relay helpers own the fields they append, `bin/fm-classify-lib.sh` owns status-event vocabulary, and `bin/fm-crew-state.sh` owns current-state reconciliation.
-Wake, watcher, away-mode, and Relay-specific state mechanics remain with their named scripts and reference sections rather than being duplicated into one exhaustive state tree here.
+Wake, watcher, away-mode, Relay-specific, and self-hosted Discord state mechanics remain with their named scripts and reference sections rather than being duplicated into one exhaustive state tree here.
 
 `bin/fm-session-start.sh`'s header is the single owner of session-start ordering, composed commands, digest contents, and the digest's startup mechanism.
 `bin/fm-startup-network.sh`'s header owns the deferred network stage that keeps every external-network call off that digest's blocking path, including its state files and the safety argument for running them later.
@@ -350,6 +350,59 @@ The locked bootstrap inheritance pass uses the same placement-specific behavior;
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
+## Self-hosted Discord (config/discord-bot.env)
+
+The optional self-hosted Discord transport connects one Firstmate home directly to Discord and is disabled by default.
+It is separate from Relay and never reads `FMX_PAIRING_TOKEN`, calls `FMX_RELAY_URL`, or consumes Relay quotas.
+[`discord-bot.md`](discord-bot.md) owns the operator and Discord Developer Portal procedure, current permissions, and public-channel safety behavior.
+This section is the single owner of the local configuration and runtime-state schema.
+
+The default configuration path is the gitignored regular file `$FM_HOME/config/discord-bot.env`, or `$FM_CONFIG_OVERRIDE/discord-bot.env` when that existing specialized override is active.
+The file must be regular, non-symlinked, single-linked, and mode `0600` beneath a genuine non-symlinked configuration directory.
+It accepts blank lines and comments plus exactly one unquoted assignment for each required key:
+
+```text
+FM_DISCORD_BOT_TOKEN=<secret bot token>
+FM_DISCORD_OWNER_USER_ID=<owner user id>
+FM_DISCORD_GUILD_ID=<allowed guild id>
+FM_DISCORD_CHANNEL_ID=<allowed channel or thread id>
+```
+
+Unknown keys, duplicate keys, missing or empty values, whitespace or control characters in values, a surprising token length, and any id that is not a 15-to-22-digit Discord snowflake are refused.
+An explicit process environment value for any of those four names overrides that key from the file for foreground operation.
+All four values must still resolve together, so a partial environment cannot accidentally activate the transport.
+The macOS `start` path requires the private file and validates it without ambient overrides before loading the LaunchAgent, which never copies any of the four values into its property list.
+A worker using a custom configuration path records only that absolute path in the mode-`0600`, single-linked `state/discord-bot.config-path` runtime record.
+Reply and follow-up helpers use this record when no explicit path is supplied and refuse symlinks, extra lines, non-absolute paths, unsafe modes, or a configuration target that is not itself private; no credential or Discord id is copied into the record.
+
+`bin/fm-discord-bot.sh configure` is the supported interactive writer.
+It reads the token with terminal echo disabled, writes a mode-`0600` temporary, validates all four values through the runtime owner, and replaces the configured file atomically only after validation succeeds.
+`start`, `stop`, `check`, and `run` own service lifecycle and safe diagnostics; their exact mechanics and flags live in the script header and `--help` output.
+The runtime requires Node.js with built-in `fetch` and `WebSocket` support, currently Node.js 22 or newer, and the operator command refuses before service mutation when that feature is unavailable.
+This optional requirement does not change the universal bootstrap toolchain for homes that never enable the transport.
+
+The runtime publishes private message bodies under `state/discord-inbox/<message-id>.json` and durable reply bindings under `state/discord-context/<message-id>.json`.
+Public-safe reply prose files passed by path must remain inside that home's private `state/` directory; stdin is the path-free alternative.
+Both directories are mode `0700`; each artifact is regular, single-linked, and mode `0600`.
+A successful notification adds `state/discord-context/<message-id>.notified`, so a Gateway replay or service restart does not intentionally append another notification after the first durable queue publication.
+A successful initial or terminal post adds `<message-id>.initial.sent` or `<message-id>.final.sent` before inbox or task-binding cleanup, so a retry after local cleanup failure confirms the exact phase instead of posting again.
+Structural Discord wakes use an opaque deterministic SHA-256 key and a private queue acceptance receipt.
+The append and receipt are recovered under the queue lock, so a crash between them cannot duplicate message or diagnostic publication; inbox reconciliation still repairs publication attempts that failed before queue acceptance.
+Answered context and notification records are pruned after seven days, while a still-pending inbox or a task metadata file carrying that `discord_request=` prevents its context from being pruned.
+
+`state/discord-bot.enabled` is a private service-liveness presence marker, `state/discord-bot.ready` records a currently connected Gateway session, and `state/discord-bot.error` carries one safe diagnostic code without credentials, ids, payloads, or remote response bodies.
+The service removes enabled/ready markers on a clean stop.
+`bin/fm-supervision-lib.sh` treats either a genuine enabled marker or any pending private inbox record as supervision need, so stopping the service cannot strand an already accepted message.
+The durable event is an ordinary `check` row whose payload is only `discord-message <message-id>` or `discord-error <safe-code>`; raw Discord text never enters the queue.
+
+A task in the service-owning home that owes one terminal Discord outcome may carry `discord_request=<message-id>` and `discord_request_ts=<epoch>` in its existing metadata.
+`bin/fm-discord-followup.sh` is the single writer and clearer of those fields.
+Ordinary task cleanup refuses while the binding remains; only a successful exact final or explicitly authorized discard clears that obligation.
+This binding neither changes task lifecycle nor shares the Relay `x_request=` vocabulary.
+
+Production network destinations are fixed inside `bin/fm-discord-bot.mjs` to Discord's authenticated REST API and Gateway.
+The only alternate endpoint inputs are `FM_DISCORD_TEST_*` seams that the runtime refuses unless `FM_DISCORD_TEST_MODE=1`; they exist solely for hermetic executable tests and are not supported operator configuration.
+
 ## Relay (.env)
 
 Relay lets a firstmate instance answer public mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
@@ -560,6 +613,10 @@ FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-
 FM_TEARDOWN_NM_TIMEOUT=10    # seconds allowed per no-mistakes query or abort inside fm-teardown.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
+FM_DISCORD_BOT_TOKEN=          # optional foreground override for the private self-hosted Discord bot token; all four FM_DISCORD_* values must resolve
+FM_DISCORD_OWNER_USER_ID=       # optional foreground override for the one authorized direct Discord author
+FM_DISCORD_GUILD_ID=            # optional foreground override for the one allowed Discord guild
+FM_DISCORD_CHANNEL_ID=          # optional foreground override for the one allowed Discord channel or thread
 FMX_PAIRING_TOKEN=      # Relay pairing token; .env opt-in authorizes replies and eligible lifecycle actions
 FMX_RELAY_URL=https://myfirstmate.io   # optional Relay endpoint override, mainly for local relay development
 FMX_ENV_FILE=           # optional alternate .env file for direct Relay client invocations; bootstrap still checks $FM_HOME/.env

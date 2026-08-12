@@ -70,10 +70,10 @@ It suppresses failed-looking closes when the same identity-matched watcher is he
 [`watcher-continuity.md`](watcher-continuity.md) owns Claude's residual active-turn coverage and watcher-status command-gating boundary.
 The existing turn-end guard remains the final backstop for all five harness-engine protocols, with pi-signed sharing Pi's protocol and the `--claude` mode cooperating with the auto-arm claim.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
-A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, if work, process-event sources, or Relay polling has an unhealthy model-aware supervision verdict, or if queued wakes are waiting to be drained.
+A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, if work, process-event sources, or external messaging through Relay or direct Discord has an unhealthy model-aware supervision verdict, or if queued wakes are waiting to be drained.
 The drain script calls that guard after presenting the queue; records remain durable, and may keep the queued-wakes warning visible, until the exact generation-bound acknowledgement printed by the drain succeeds after handling.
 It leads with a prominent bordered tangle banner, while `bin/fm-guard.sh` owns the watcher-down banner and reminder policy so repeated guarded commands stay noisy without reprinting the full banner in the same episode.
-On every verified primary harness, tracked hook integration gives the primary session a push-based backstop: when work, a process-event source, or Relay polling needs supervision and no identity-matched watcher lock with a fresh beacon is live, direct Stop hooks block and passive turn-end hooks force one bounded follow-up.
+On every verified primary harness, tracked hook integration gives the primary session a push-based backstop: when work, a process-event source, Relay polling, or direct Discord messaging needs supervision and no identity-matched watcher lock with a fresh beacon is live, direct Stop hooks block and passive turn-end hooks force one bounded follow-up.
 The guard covers the main primary and genuinely marked secondmate homes, exempts child crewmate/scout worktrees, is loop-safe per harness, and is documented in [turnend-guard.md](turnend-guard.md).
 
 A presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) extends this for walk-away supervision: the `/afk` skill starts it through the tracked foreground helper `bin/fm-afk-start.sh`, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
@@ -242,6 +242,35 @@ PR-based task merges go through `bin/fm-pr-merge.sh`, which records `pr=` and an
 The helper requires a full `https://github.com/<owner>/<repo>/pull/<n>` URL, invokes `gh-axi pr merge <n> --repo <owner>/<repo>`, defaults to `--squash`, preserves explicit merge-method flags, and rejects malformed URLs or repo override flags before recording merge state; a well-formed GitLab merge request URL (see [docs/gitlab-merge-watch.md](gitlab-merge-watch.md)) is refused too, explicitly, rather than sent to the wrong forge.
 Teardown is fail-closed for ship worktrees: dirty worktrees refuse, and committed work must be landed before the worktree is returned.
 [`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the landed-work proofs, PR-discovery fallback, and stale-lock recovery procedure.
+
+## Optional self-hosted Discord
+
+The self-hosted Discord transport is a separate opt-in path for a captain who wants one local Firstmate home to connect directly to Discord without myfirstmate.io or Relay quotas.
+[`discord-bot.md`](discord-bot.md) owns current operator setup and security behavior, while [`configuration.md`](configuration.md#self-hosted-discord-configdiscord-botenv) owns the local schema and state surfaces.
+
+`bin/fm-discord-bot.mjs` is the narrow protocol runtime.
+It validates the private owner/guild/channel configuration, maintains one Discord Gateway session with resume and bounded reconnect backoff, rejects ineligible message events before model context, publishes private inbox and conversation-binding artifacts, and posts bound replies through Discord REST with mention expansion disabled.
+Production API and Gateway endpoints are fixed to Discord; local endpoint overrides exist only behind the hermetic test mode.
+The token is read at the authenticated connection boundary and is never copied into the LaunchAgent, queue, inbox, context, task metadata, or logs.
+
+An admitted message is committed under `state/discord-inbox/` and `state/discord-context/` before `bin/fm-discord-notify.sh` calls the queue's idempotent append path with a structural `discord-message` check event.
+Raw message or thread text never enters the durable queue or canonical operational-input protocol.
+The existing watcher recovery marker and queue therefore own crash recovery and delivery exactly as they do for every other actionable check, and the away-mode daemon already escalates check events without a Discord-specific branch.
+A mode-`0600` `state/discord-bot.enabled` marker keeps ordinary supervision live while the Gateway service runs; a pending private inbox independently keeps supervision needed after a deliberate service stop.
+`bin/fm-supervision-lib.sh` is the shared predicate owner, so every supported primary harness consumes the same need through its existing session-start protocol and turn-end integration.
+
+The conditional `discord-respond` skill owns public-safe composition, direct-author authority, untrusted surrounding context, and lifecycle action.
+Immediate replies go through `bin/fm-discord-reply.sh`, which delegates strict binding and REST mechanics back to the Node owner.
+Longer-running work in the service-owning home may record one `discord_request=` terminal-return binding through `bin/fm-discord-followup.sh`; it uses the existing task metadata and lifecycle rather than creating a second task or commitment state machine, successful final delivery clears only the exact binding it sent, and ordinary cleanup refuses while that binding remains.
+Cross-home terminal return is not inferred or copied by this narrow v1 path.
+
+`bin/fm-discord-bot.sh` owns local lifecycle and the per-home macOS LaunchAgent.
+The service property list carries only home and code paths, uses `RunAtLoad`, `KeepAlive`, and launchd throttling, and enters the same worker path as foreground operation.
+That worker holds a recoverable home-local lock before starting the Node child, which makes service/manual overlap and restart races single-instance.
+
+This transport is independent of both primary harness and task runtime backend.
+It neither injects into a harness-specific composer nor calls a backend adapter; it writes the existing queue and lets the active primary's established supervision protocol deliver the structural event.
+[`verification/discord-bot.md`](verification/discord-bot.md) records the maintained primary-harness and runtime-backend applicability review plus the hermetic protocol evidence.
 
 ## Optional Relay
 

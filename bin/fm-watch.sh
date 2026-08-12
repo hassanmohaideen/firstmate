@@ -759,7 +759,7 @@ watcher_cleanup() {
     owns_lock=1
     if [ "${WATCHER_RECOVERY_PENDING:-0}" -eq 1 ] \
       && [ "${FM_WATCH_DELIVERED_REASON:-}" = "check: rearm-resurface" ]; then
-      transition=release-lock-existing
+      transition='release-lock-existing'
     fi
   fi
   fm_active_check_stop || cleanup_status=1
