@@ -404,7 +404,8 @@ A task in the service-owning home that owes one terminal Discord outcome may car
 Ordinary task cleanup refuses while the binding remains; only a successful exact final or explicitly authorized discard clears that obligation.
 This binding neither changes task lifecycle nor shares the Relay `x_request=` vocabulary.
 
-Production network destinations are fixed inside `bin/fm-discord-bot.mjs` to Discord's authenticated REST API and Gateway.
+Production network destinations are fixed inside `bin/fm-discord-bot.mjs` to Discord's authenticated REST API, canonical Gateway, and Discord-owned regional resume Gateway hosts.
+The exact endpoint policy and safety rationale are owned by [`architecture.md`](architecture.md#optional-self-hosted-discord).
 The only alternate endpoint inputs are `FM_DISCORD_TEST_*` seams that the runtime refuses unless `FM_DISCORD_TEST_MODE=1`; they exist solely for hermetic executable tests and are not supported operator configuration.
 
 ## Relay (.env)

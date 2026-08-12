@@ -155,6 +155,7 @@ A successful reply removes the pending inbox only after Discord accepts the post
 Run `bin/fm-discord-bot.sh check` first.
 Then inspect `state/discord-bot.log` only for the safe lifecycle or diagnostic code it names.
 The log should never contain a token, id, or message body.
+A `context pruning was skipped` line concerns private local cleanup and does not diagnose Gateway authentication or connection health; use the `check` outcome for that.
 
 An `authentication-rejected` diagnostic means the stored token is invalid or revoked.
 Rotate the token in the trusted Developer Portal session, rerun `configure`, and restart the service.

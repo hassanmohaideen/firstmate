@@ -53,6 +53,8 @@ const API_BASE = TEST_MODE && process.env.FM_DISCORD_TEST_API_BASE
   ? process.env.FM_DISCORD_TEST_API_BASE.replace(/\/$/, "")
   : "https://discord.com/api/v10";
 const TEST_GATEWAY_URL = TEST_MODE ? process.env.FM_DISCORD_TEST_GATEWAY_URL || "" : "";
+const TEST_ENFORCE_PRODUCTION_GATEWAY = TEST_MODE
+  && process.env.FM_DISCORD_TEST_ENFORCE_PRODUCTION_GATEWAY === "1";
 const MAX_REPLY_CHARS = 1900;
 const RETENTION_SECONDS = 7 * 24 * 60 * 60;
 const DEDUP_RETENTION_SECONDS = RETENTION_SECONDS + 24 * 60 * 60;
@@ -254,13 +256,19 @@ async function loadConfig() {
 
 function validateProductionEndpoint(url, kind) {
   const parsed = new URL(url);
-  if (TEST_MODE) return parsed;
+  if (TEST_MODE && !(TEST_ENFORCE_PRODUCTION_GATEWAY && kind === "gateway" && url !== TEST_GATEWAY_URL)) {
+    return parsed;
+  }
   if (kind === "api") {
     if (parsed.protocol !== "https:" || parsed.hostname !== "discord.com") {
       throw new ConfigError("Discord API endpoint is not the fixed authenticated Discord endpoint");
     }
-  } else if (parsed.protocol !== "wss:" || parsed.hostname !== "gateway.discord.gg") {
-    throw new ConfigError("Discord Gateway endpoint is not the fixed Discord Gateway endpoint");
+  } else {
+    const isDiscordGateway = parsed.hostname === "gateway.discord.gg"
+      || /^gateway(?:-[a-z0-9]+)+\.discord\.gg$/.test(parsed.hostname);
+    if (parsed.protocol !== "wss:" || !isDiscordGateway) {
+      throw new ConfigError("Discord Gateway endpoint is not a fixed Discord Gateway endpoint");
+    }
   }
   return parsed;
 }
