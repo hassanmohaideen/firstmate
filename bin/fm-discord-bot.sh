@@ -202,8 +202,6 @@ run_worker() {
   local lock child='' rc=0 terminating=0
   validate_config >/dev/null
   mkdir -p "$STATE" || die "cannot create $STATE"
-  fm_discord_persist_config_file "$STATE" "$CONFIG_FILE" \
-    || die "cannot persist the selected Discord configuration path safely"
   # shellcheck source=/dev/null
   . "$SCRIPT_DIR/fm-wake-lib.sh"
   lock="$STATE/.discord-bot.lock"
@@ -226,6 +224,8 @@ run_worker() {
   }
   trap terminate_child HUP INT TERM
   trap cleanup_worker EXIT
+  fm_discord_persist_config_file "$STATE" "$CONFIG_FILE" \
+    || die "cannot persist the selected Discord configuration path safely"
   FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
     FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
     "$NODE_BIN" "$NODE_SCRIPT" run &
@@ -240,7 +240,7 @@ run_worker() {
 }
 
 start_service() {
-  local uid domain tmp out i=0
+  local uid domain tmp out i=0 lock start_lock_held=0
   [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] \
     || die "persistent start requires the private file written by bin/fm-discord-bot.sh configure"
   validate_config_file_only >/dev/null
@@ -254,6 +254,20 @@ start_service() {
   mkdir -p "$STATE" "$LAUNCH_AGENT_DIR" || die "cannot create the service state or LaunchAgents directory"
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || die "service state directory is unsafe"
   [ -d "$LAUNCH_AGENT_DIR" ] && [ ! -L "$LAUNCH_AGENT_DIR" ] || die "LaunchAgents directory is unsafe"
+  # shellcheck source=/dev/null
+  . "$SCRIPT_DIR/fm-wake-lib.sh"
+  lock="$STATE/.discord-bot.lock"
+  if ! fm_lock_try_acquire "$lock"; then
+    die "another self-hosted Discord bot already owns this home${FM_LOCK_HELD_PID:+ (pid $FM_LOCK_HELD_PID)}"
+  fi
+  start_lock_held=1
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+  cleanup_start_lock() {
+    local cleanup_rc=$?
+    [ "$start_lock_held" -eq 0 ] || fm_lock_release "$lock"
+    return "$cleanup_rc"
+  }
+  trap cleanup_start_lock EXIT
   fm_discord_persist_config_file "$STATE" "$CONFIG_FILE" \
     || die "cannot persist the selected Discord configuration path safely"
   tmp="$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.tmp.$$"
@@ -272,6 +286,9 @@ start_service() {
     rm -f -- "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
     die "launchctl bootstrap refused the Discord service: ${out:-no diagnostic}; the inactive LaunchAgent was removed"
   fi
+  fm_lock_release "$lock"
+  start_lock_held=0
+  trap - EXIT
   if ! out=$(launchctl kickstart -k "$domain/$LAUNCH_AGENT_LABEL" 2>&1); then
     launchctl bootout "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
     rm -f -- "$LAUNCH_AGENT_PLIST" 2>/dev/null || true

@@ -270,6 +270,7 @@ async function notify(kind, key) {
       FM_HOME: HOME,
       FM_ROOT_OVERRIDE: ROOT,
       FM_STATE_OVERRIDE: STATE,
+      FM_DISCORD_NODE_BIN: process.execPath,
     },
     stdio: ["ignore", "ignore", "ignore"],
   });
@@ -331,26 +332,20 @@ async function publishDiagnostic(record) {
 function reportDiagnostic(code) {
   return enqueueDiagnostic(async () => {
     if (!SAFE_CODE_RE.test(code)) code = "discord-service-error";
-    let previous;
     try {
-      previous = await readDiagnostic(ERROR_FILE);
-    } catch {
-      safeLog("cannot inspect the existing diagnostic safely");
-      return;
-    }
-    let record = previous;
-    if (previous?.code !== code || !previous.incidentId) {
-      record = { code, incidentId: randomBytes(32).toString("hex") };
-      await atomicReplacePrivate(ERROR_FILE, `${JSON.stringify({
-        code: record.code,
-        incident_id: record.incidentId,
-        recorded_at: diagnosticEpochSeconds(),
-      })}\n`);
-    }
-    try {
+      const previous = await readDiagnostic(ERROR_FILE);
+      let record = previous;
+      if (previous?.code !== code || !previous.incidentId) {
+        record = { code, incidentId: randomBytes(32).toString("hex") };
+        await atomicReplacePrivate(ERROR_FILE, `${JSON.stringify({
+          code: record.code,
+          incident_id: record.incidentId,
+          recorded_at: diagnosticEpochSeconds(),
+        })}\n`);
+      }
       await publishDiagnostic(record);
     } catch {
-      safeLog("cannot publish the Discord diagnostic to Firstmate");
+      safeLog("cannot persist or publish the Discord diagnostic safely");
     }
   });
 }

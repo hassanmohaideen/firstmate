@@ -364,6 +364,27 @@ worker=$!
 WORKER_PIDS+=("$worker")
 wait_for_value "$home/gateway/connections" 2 || fail "Discord Gateway did not reconnect after the first disconnect"
 wait_for_file "$home/state/discord-bot.ready" || fail "Discord Gateway did not republish ready state after reconnect"
+contender_config="$home/config/discord-bot-contender.env"
+cp "$home/config/discord-bot.env" "$contender_config"
+chmod 600 "$contender_config"
+fakebin=$(fm_fakebin "$home/competing-start")
+cat > "$fakebin/uname" <<'SH'
+#!/usr/bin/env bash
+echo Darwin
+SH
+cat > "$fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = print ] && exit 0
+exit 1
+SH
+chmod +x "$fakebin/uname" "$fakebin/launchctl"
+mkdir -p "$home/competing-account/Library/LaunchAgents"
+out=$(HOME="$home/competing-account" PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_DISCORD_NODE_BIN="$NODE_BIN" FM_DISCORD_CONFIG_FILE="$contender_config" "$CONTROL" start 2>&1); rc=$?
+[ "$rc" -ne 0 ] || fail "persistent start replaced a live foreground Discord worker"
+assert_contains "$out" "another self-hosted Discord bot" "persistent start did not report the live worker conflict"
+[ "$(cat "$home/state/discord-bot.config-path")" = "$home/config/discord-bot.env" ] \
+  || fail "a rejected persistent start changed the active configuration selection"
 stranded="$home/state/discord-inbox/$MESSAGE.json"
 jq -cn --arg id "$MESSAGE" --arg guild "$GUILD" --arg channel "$CHANNEL" '
   {
@@ -401,7 +422,7 @@ make_gateway_server "$home/gateway" auth-fail
 mkdir "$home/state/.wake-queue"
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
-  FM_DISCORD_TEST_RECONCILE_MS=20 \
+  FM_DISCORD_TEST_RECONCILE_MS=20 FM_DISCORD_NODE_BIN=/unavailable/node \
   "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1 &
 auth_worker=$!
 WORKER_PIDS+=("$auth_worker")
@@ -421,6 +442,26 @@ kill -TERM "$auth_worker"
 wait "$auth_worker" || true
 WORKER_PIDS=()
 pass "Discord diagnostics retry transient publication failures without duplicate wakes"
+
+home=$(new_home gateway-diagnostic-persistence)
+write_config "$home"
+make_gateway_server "$home/gateway" auth-fail
+mkdir "$home/state/discord-bot.error"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1 &
+persistence_worker=$!
+WORKER_PIDS+=("$persistence_worker")
+sleep 0.2
+kill -0 "$persistence_worker" 2>/dev/null \
+  || fail "diagnostic persistence failure terminated Gateway reconnect"
+assert_contains "$(cat "$home/bot.log")" "cannot persist or publish the Discord diagnostic safely" \
+  "diagnostic persistence failure did not emit its fixed safe diagnostic"
+assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "diagnostic persistence failure exposed the bot token"
+kill -TERM "$persistence_worker"
+wait "$persistence_worker" || true
+WORKER_PIDS=()
+pass "diagnostic persistence failures remain contained during reconnect"
 
 home=$(new_home gateway-diagnostic-order)
 write_config "$home"
