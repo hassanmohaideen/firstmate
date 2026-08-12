@@ -42,7 +42,7 @@ It never tears down a task, merges a PR, dispatches new work, steers a worker, a
    A queued item under `gates` only becomes "next work" when its blocker is gone and its time/date gate has arrived.
    Until then it stays queued with the reason.
    The `(main-inventory)` gate is an action-free integrity warning rather than queued work.
-   Render it under Charted Next with the related `omitted` disclosure, never invent an Underway row from backlog-only state, and never move it into Captain's Call.
+   Render it in the queued bucket with the related `omitted` disclosure, never invent an in-progress row from backlog-only state, and never move it into the action bucket.
 
 2. **Compose the four-section chat digest from the fresh snapshot.**
    The gather step is deterministic; your judgment is scoped to ranking the command's facts by what matters right now and writing scannable captain-facing prose.
@@ -56,38 +56,38 @@ It never tears down a task, merges a PR, dispatches new work, steers a worker, a
    If today's file already exists, delete it first, then create a new file from scratch.
    This is the only write allowed by the skill.
    The detailed report includes:
-   - **Title** - `# Bearings - <day> <YYYY-MM-DD>` (use "Morning status" only when the captain specifically asks for a morning brief), followed by two or three sentences framing where things stand.
-   - **Captain's Call** - every open decision summarized with its options from the structured decision record, plus each PR ready to merge and each needed credential or login, every PR with the full `https://...` URL, never a bare `#number`.
-   - **Recently Landed** - the bounded current recent-completions baseline from structured state across the main fleet and every registered secondmate home, rendered in full on every run.
-   - **Underway** - each live direct report making progress, with its current state, and the plans or main pickup pointers worth reopening (`data/<id>/report.md` files, `.lavish/*.html` boards).
-   - **Charted Next** - queued or gated work, including any main-inventory integrity warning, with each item's blocker, date, or integrity reason.
+   - **Title** - `# Bearings - <day> <YYYY-MM-DD>` by default, or `# Status Report - <day> <YYYY-MM-DD>` when the shared preference rule requires professional non-nautical language (use "Morning status" only when the user specifically asks for a morning brief), followed by two or three sentences framing where things stand.
+   - **Action bucket** - every open decision summarized with its options from the structured decision record, plus each PR ready to merge and each needed credential or login, every PR with the full `https://...` URL, never a bare `#number`.
+   - **Completed bucket** - the bounded current recent-completions baseline from structured state across the main fleet and every registered secondmate home, rendered in full on every run.
+   - **In-progress bucket** - each live direct report making progress, with its current state, and the plans or main pickup pointers worth reopening (`data/<id>/report.md` files, `.lavish/*.html` boards).
+   - **Queued bucket** - queued or gated work, including any main-inventory integrity warning, with each item's blocker, date, or integrity reason.
    After writing the file, return the concise four-section chat digest and include the report path or link without adding a fifth section.
    For a richer review surface, optionally offer a Lavish board with `lavish-axi` when the report has enough structure to deserve one, but only after the required digest is ready.
 
 ## Chat-response contract
 
 This skill is the one owner of the `/bearings` chat-response format; the snapshot and classifier own the data that feeds it, and no other file restates this contract.
-Every `/bearings` chat response renders EXACTLY these four sections, in THIS order, and nothing else structural (there is no At Anchor section):
+Every `/bearings` chat response renders EXACTLY four sections in the order below and nothing else structural (there is no fifth section). Use the default labels and empty states unless the shared address and roleplay preference rule in `AGENTS.md` requires professional non-nautical language; in that case use the professional labels and empty states. This label selection changes no bucket content, ordering, or completeness.
 
-1. **Captain's Call** - ONLY items that need the captain's own action now: a decision to make, a PR to approve or merge, a credential or login to provide, or a blocker only the captain can clear.
-   Empty-state: "Nothing needs your action right now."
-2. **Recently Landed** - the bounded current recent-completions baseline: merged PRs, completed scouts, and finished local-only merges across the main fleet and every registered secondmate home.
+1. **Captain's Call** (professional: **Action Required**) - ONLY items that need the user's own action now: a decision to make, a PR to approve or merge, a credential or login to provide, or a blocker only the user can clear.
+   Empty-state: "Nothing needs your action right now." (professional: "No action is required right now.")
+2. **Recently Landed** (professional: **Recently Completed**) - the bounded current recent-completions baseline: merged PRs, completed scouts, and finished local-only merges across the main fleet and every registered secondmate home.
    Empty-state: "No recent completions are in the current baseline."
-3. **Underway** - live work progressing on its own, one line of current state per direct report.
-   Empty-state: "Nothing is underway."
-4. **Charted Next** - queued or gated work waiting on the fleet or a date, plus action-free fleet-integrity warnings, never on the captain.
+3. **Underway** (professional: **In Progress**) - live work progressing on its own, one line of current state per direct report.
+   Empty-state: "Nothing is underway." (professional: "Nothing is in progress.")
+4. **Charted Next** (professional: **Upcoming**) - queued or gated work waiting on the fleet or a date, plus action-free fleet-integrity warnings, never on the user.
    Empty-state: "Nothing is queued."
 
 Rules that keep the contract unambiguous:
 
 - Every section ALWAYS renders, even when empty, with its short empty-state sentence; never omit a section.
 - Every chat digest and file-mode report is a complete current snapshot, never a delta against a prior report.
-- Recently Landed always renders the bounded current baseline, even when the same completions appeared in an earlier report.
-- The four buckets are mutually exclusive, so every item is forced into exactly one: needs-your-action is Captain's Call, done is Recently Landed, self-progressing is Underway, and not-yet-started work or an action-free fleet-integrity warning is Charted Next.
-- The strict boundary keeps action-free items OUT of Captain's Call: a working or validating task, a queued item blocked on another task or a date, landed work, a completed scout's report pointer, a declared `paused:` external wait, and a bare recorded PR with no merge-ready signal each belong to one of the other three sections, never Captain's Call.
-- A secondmate's own row appears Underway only for `active_child_work`; `externally_held` belongs in Charted Next, and `unknown` belongs there as an unavailable-state gate unless its reason requires the captain's action.
+- The completed bucket always renders the bounded current baseline, even when the same completions appeared in an earlier report.
+- The four buckets are mutually exclusive, so every item is forced into exactly one: needs-your-action is the action bucket, done is the completed bucket, self-progressing is the in-progress bucket, and not-yet-started work or an action-free fleet-integrity warning is the queued bucket.
+- The strict boundary keeps action-free items OUT of the action bucket: a working or validating task, a queued item blocked on another task or a date, landed work, a completed scout's report pointer, a declared `paused:` external wait, and a bare recorded PR with no merge-ready signal each belong to one of the other three sections, never the action bucket.
+- A secondmate's own row appears in the in-progress bucket only for `active_child_work`; `externally_held` belongs in the queued bucket, and `unknown` belongs there as an unavailable-state gate unless its reason requires the user's action.
 - Do not suppress separately projected decisions, landed records, or gates from a `partial-structured` home merely because that secondmate's own row is `unknown`.
-- Honor the user's explicit address and roleplay preferences; absent an explicit preference, include the default direct address to the captain inside one item or empty-state sentence.
+- Apply the shared address and roleplay preference rule in `AGENTS.md`; include its default direct address inside one item or empty-state sentence only when that rule permits it.
 - Every PR appears as the full `https://...` URL; a shorthand `#number` is fine only as a back-reference after the full URL has already appeared in the same digest.
 - The chat follows `AGENTS.md` section 9 and carries one scannable line per item.
 - Detailed decisions, plans, full gate reasons, and evidence belong in the file only when file mode is explicit, so plain chat stays concise and file-mode chat stays materially shorter than that file.
