@@ -13,11 +13,11 @@ The generated instruction binds the exact Firstmate home and helper path instead
 No worker runtime adapter, backend, shell startup file, global prompt, project instruction file, hook, plugin, or project filter is changed.
 
 The helper exposes semantic verbs instead of accepting a command string.
-The supported classes are bounded Git history, unstaged or staged Git diff orientation, plain Git status orientation, unstructured `rg` search, and one-directory listing.
+The supported classes are bounded Git history, unstaged or staged Git diff orientation, and plain Git status orientation.
 Arguments remain argv data and are never evaluated by a shell.
-Search and list targets are resolved against the current physical task-copy root and refused when they leave it, traverse symlinks or parent components, enter credential/private metadata directories, or do not already exist.
-Git invocations use fixed command-scoped configuration with external diff, text conversion, fsmonitor, hooks, pagers, protocols, and optional index locks disabled.
-Option passthrough, standalone shell operators, and arbitrary command execution are refused before either RTK or the raw program starts.
+Search and directory-listing verbs are not exposed because pathname-oriented shell utilities cannot preserve confinement across an independent path open.
+Git invocations use a clean fixed environment and command-scoped configuration with external diff, text conversion, fsmonitor, hooks, pagers, lazy fetch, protocols, and optional index locks disabled.
+Option passthrough and arbitrary command execution are refused before either RTK or raw Git starts.
 
 Compact output is never sufficient for a safety, mutation, validation, final-review, cleanliness, landing, or approval decision.
 The worker must run the corresponding raw command before making one of those decisions.
@@ -37,8 +37,10 @@ A positive result from an exploratory compact view therefore never widens the al
 
 ## Privacy and failure model
 
-The helper verifies the selected artifact before each compact use and never runs an artifact that fails its type, platform, checksum, executable, or exact-version check.
-Each accepted RTK preflight and invocation receives a clean private temporary home, configuration, data, cache, and history location with telemetry, tee recovery, project filters, system/global Git configuration, terminal prompting, and optional Git locks disabled.
+The helper opens the effective home without following a symlink, walks every config and artifact component from opened directories with no-follow semantics, and copies the artifact from that opened identity into its private root.
+It never runs an artifact that fails its type, platform, checksum, executable, or exact-version check.
+Each raw Git fallback uses the same clean fixed Git environment as compact execution, including disabled system/global configuration, terminal prompting, lazy fetch, and optional Git locks.
+Each accepted RTK preflight and invocation additionally receives a clean private temporary home, configuration, data, cache, and history location with telemetry, tee recovery, and project filters disabled.
 The caller cannot weaken those privacy values through ambient environment variables.
 The private temporary root is removed after normal completion and caught termination.
 The helper logs only its fixed semantic class, selected pin, or a non-sensitive fallback reason, never arguments, patterns, paths, output, command history, or analytics.

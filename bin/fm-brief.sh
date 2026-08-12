@@ -322,8 +322,6 @@ Use only the Firstmate-owned helper through its fixed semantic verbs:
 - \`$RTK_INVOKE git-log\`
 - \`$RTK_INVOKE git-diff\` or \`$RTK_INVOKE git-diff --cached\`
 - \`$RTK_INVOKE git-status\`
-- \`$RTK_INVOKE search <pattern> [path...]\`
-- \`$RTK_INVOKE list <directory>\`
 The helper call is the only exception to the stay-inside rule: it may read the selected home-private config and artifact, and it writes only an invocation-private temporary root that it removes.
 Every compact result is supplemental orientation, never authoritative evidence.
 Before any safety, mutation, validation, final-review, cleanliness, landing, or approval decision, run the corresponding raw command and use that raw result.
