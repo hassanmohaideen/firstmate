@@ -104,6 +104,9 @@ render_launchagent() {
   plist_safe "$SCRIPT_DIR/fm-discord-bot.sh" \
     && plist_safe "$FM_HOME" \
     && plist_safe "$FM_ROOT" \
+    && plist_safe "$STATE" \
+    && plist_safe "$CONFIG" \
+    && plist_safe "$CONFIG_FILE" \
     && plist_safe "$NODE_BIN" \
     && plist_safe "${HOME:-}" \
     && plist_safe "$LAUNCH_AGENT_LOG" || return 1
@@ -127,6 +130,12 @@ render_launchagent() {
 		<string>$FM_HOME</string>
 		<key>FM_ROOT_OVERRIDE</key>
 		<string>$FM_ROOT</string>
+		<key>FM_STATE_OVERRIDE</key>
+		<string>$STATE</string>
+		<key>FM_CONFIG_OVERRIDE</key>
+		<string>$CONFIG</string>
+		<key>FM_DISCORD_CONFIG_FILE</key>
+		<string>$CONFIG_FILE</string>
 		<key>FM_DISCORD_NODE_BIN</key>
 		<string>$NODE_BIN</string>
 	</dict>

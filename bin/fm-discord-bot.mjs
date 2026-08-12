@@ -44,6 +44,7 @@ const CONTEXT_DIR = join(STATE, "discord-context");
 const ENABLED_FILE = join(STATE, "discord-bot.enabled");
 const READY_FILE = join(STATE, "discord-bot.ready");
 const ERROR_FILE = join(STATE, "discord-bot.error");
+const ERROR_NOTIFIED_FILE = join(STATE, "discord-bot.error.notified");
 const NOTIFIER = join(ROOT, "bin", "fm-discord-notify.sh");
 const TEST_MODE = process.env.FM_DISCORD_TEST_MODE === "1";
 const API_BASE = TEST_MODE && process.env.FM_DISCORD_TEST_API_BASE
@@ -282,30 +283,59 @@ async function removeMarker(path) {
   }
 }
 
+async function diagnosticCode(path) {
+  try {
+    await assertPrivateFile(path);
+    const code = JSON.parse(await readFile(path, "utf8")).code || "";
+    return SAFE_CODE_RE.test(code) ? code : "";
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return "";
+    throw error;
+  }
+}
+
+async function publishDiagnostic(code) {
+  if (await diagnosticCode(ERROR_NOTIFIED_FILE) === code) return;
+  await notify("error", code);
+  await atomicReplacePrivate(
+    ERROR_NOTIFIED_FILE,
+    `${JSON.stringify({ code, notified_at: Math.floor(Date.now() / 1000) })}\n`,
+  );
+}
+
 async function reportDiagnostic(code) {
   if (!SAFE_CODE_RE.test(code)) code = "discord-service-error";
-  let previous = "";
+  let previous;
   try {
-    await assertPrivateFile(ERROR_FILE);
-    previous = JSON.parse(await readFile(ERROR_FILE, "utf8")).code || "";
-  } catch (error) {
-    if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) {
-      safeLog("cannot inspect the existing diagnostic safely");
-      return;
-    }
+    previous = await diagnosticCode(ERROR_FILE);
+  } catch {
+    safeLog("cannot inspect the existing diagnostic safely");
+    return;
   }
-  if (previous === code) return;
-  await atomicReplacePrivate(ERROR_FILE, `${JSON.stringify({ code, recorded_at: Math.floor(Date.now() / 1000) })}\n`);
+  if (previous !== code) {
+    await atomicReplacePrivate(ERROR_FILE, `${JSON.stringify({ code, recorded_at: Math.floor(Date.now() / 1000) })}\n`);
+  }
   try {
-    await notify("error", code);
+    await publishDiagnostic(code);
   } catch {
     safeLog("cannot publish the Discord diagnostic to Firstmate");
+  }
+}
+
+async function reconcileDiagnostic() {
+  let code;
+  try {
+    code = await diagnosticCode(ERROR_FILE);
+    if (code) await publishDiagnostic(code);
+  } catch {
+    safeLog("a pending Discord diagnostic could not be reconciled safely");
   }
 }
 
 async function clearDiagnostic() {
   try {
     await removeMarker(ERROR_FILE);
+    await removeMarker(ERROR_NOTIFIED_FILE);
   } catch {
     safeLog("cannot clear the recovered Discord diagnostic");
   }
@@ -500,6 +530,7 @@ async function ingestMessage(message, config, selfUserId) {
 }
 
 async function reconcileInbox(config) {
+  await reconcileDiagnostic();
   await ensurePrivateDirectory(INBOX_DIR);
   await ensurePrivateDirectory(CONTEXT_DIR);
   for (const name of await readdir(INBOX_DIR)) {

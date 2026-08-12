@@ -367,29 +367,43 @@ assert_absent "$home/state/discord-bot.ready" "clean shutdown left the ready mar
 assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "Gateway logs exposed the bot token"
 pass "the Gateway reconnects, remains single-instance, and shuts down cleanly"
 
-# Authentication failure wakes once with a safe code despite repeated retries.
+# Authentication failure wakes once with a safe code despite a transient publication failure.
 home=$(new_home gateway-auth)
 write_config "$home"
 make_gateway_server "$home/gateway" auth-fail
+mkdir "$home/state/.wake-queue"
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_RECONCILE_MS=20 \
   "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1 &
 auth_worker=$!
 WORKER_PIDS+=("$auth_worker")
-wait_for_file "$home/state/.wake-queue" || fail "Discord authentication failure did not wake Firstmate"
+wait_for_file "$home/state/discord-bot.error" || fail "Discord authentication failure did not persist its safe diagnostic"
+assert_absent "$home/state/discord-bot.error.notified" "failed diagnostic publication wrote a success receipt"
+rmdir "$home/state/.wake-queue"
+wait_for_file "$home/state/.wake-queue" || fail "Discord authentication diagnostic was not retried"
+wait_for_file "$home/state/discord-bot.error.notified" || fail "retried diagnostic did not persist its notification receipt"
 sleep 0.15
 [ "$(grep -c 'discord-error-authentication-rejected' "$home/state/.wake-queue")" -eq 1 ] \
   || fail "repeated authentication failures emitted duplicate durable notifications"
+[ "$(jq -r .code "$home/state/discord-bot.error.notified")" = authentication-rejected ] \
+  || fail "diagnostic receipt was not bound to the published safe code"
 assert_grep 'check: discord-error authentication-rejected' "$home/state/.wake-queue" "authentication failure wake exposed the wrong diagnostic"
 assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "authentication failure log exposed the bot token"
 kill -TERM "$auth_worker"
 wait "$auth_worker" || true
 WORKER_PIDS=()
-pass "Discord authentication failures reconnect with bounded cadence and one secret-safe diagnostic"
+pass "Discord diagnostics retry transient publication failures without duplicate wakes"
 
 # macOS LaunchAgent rendering contains no credential or deployment id.
 home=$(new_home launchagent)
+custom_state="$home/service-state"
+custom_config="$home/service-config"
+custom_config_file="$custom_config/private-discord.env"
+mkdir -p "$custom_state" "$custom_config"
+chmod 700 "$custom_state" "$custom_config"
 write_config "$home"
+mv "$home/config/discord-bot.env" "$custom_config_file"
 fakebin=$(fm_fakebin "$home")
 cat > "$fakebin/uname" <<'SH'
 #!/usr/bin/env bash
@@ -400,8 +414,8 @@ cat > "$fakebin/launchctl" <<'SH'
 printf '%s\n' "$*" >> "$FM_LAUNCHCTL_LOG"
 case "$1" in
   kickstart)
-    printf 'connected\n' > "$FM_HOME/state/discord-bot.ready"
-    chmod 600 "$FM_HOME/state/discord-bot.ready"
+    printf 'connected\n' > "${FM_STATE_OVERRIDE:-$FM_HOME/state}/discord-bot.ready"
+    chmod 600 "${FM_STATE_OVERRIDE:-$FM_HOME/state}/discord-bot.ready"
     exit 0
     ;;
   print|bootstrap|bootout) exit 0 ;;
@@ -411,22 +425,31 @@ SH
 chmod +x "$fakebin/uname" "$fakebin/launchctl"
 mkdir -p "$home/account/Library/LaunchAgents"
 out=$(HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchctl.log" \
-  FM_DISCORD_NODE_BIN="$NODE_BIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" start)
+  FM_DISCORD_NODE_BIN="$NODE_BIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$custom_state" FM_CONFIG_OVERRIDE="$custom_config" \
+  FM_DISCORD_CONFIG_FILE="$custom_config_file" "$CONTROL" start)
 assert_contains "$out" "restart automatically" "macOS start did not report persistent service behavior"
 plist=$(find "$home/account/Library/LaunchAgents" -name 'dev.firstmate.discord.*.plist' -print | head -n1)
 assert_present "$plist" "macOS start did not install a per-home LaunchAgent"
 "$PYTHON_BIN" - "$plist" "$CONTROL" "$home/account" "$home" "$ROOT" "$NODE_BIN" \
+  "$custom_state" "$custom_config" "$custom_config_file" \
   "$TOKEN" "$OWNER" "$GUILD" "$CHANNEL" <<'PY' || fail "Discord LaunchAgent semantic validation failed"
 import plistlib
 import sys
 
-path, control, account_home, fm_home, root, node, *private_values = sys.argv[1:]
+(
+    path, control, account_home, fm_home, root, node, state, config,
+    config_file, *private_values
+) = sys.argv[1:]
 with open(path, "rb") as stream:
     model = plistlib.load(stream)
 expected_environment = {
     "HOME": account_home,
     "FM_HOME": fm_home,
     "FM_ROOT_OVERRIDE": root,
+    "FM_STATE_OVERRIDE": state,
+    "FM_CONFIG_OVERRIDE": config,
+    "FM_DISCORD_CONFIG_FILE": config_file,
     "FM_DISCORD_NODE_BIN": node,
 }
 assert isinstance(model, dict)
@@ -438,7 +461,7 @@ assert model.get("KeepAlive") is True
 assert type(model.get("ThrottleInterval")) is int and model["ThrottleInterval"] == 15
 assert model.get("LimitLoadToSessionType") == "Aqua"
 assert model.get("ProcessType") == "Background"
-expected_log = fm_home + "/state/discord-bot.log"
+expected_log = state + "/discord-bot.log"
 assert model.get("StandardOutPath") == expected_log
 assert model.get("StandardErrorPath") == expected_log
 serialized_values = []
@@ -462,7 +485,9 @@ assert not ({
 } & set(model["EnvironmentVariables"]))
 PY
 out=$(HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchctl.log" \
-  FM_DISCORD_NODE_BIN="$NODE_BIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" stop)
+  FM_DISCORD_NODE_BIN="$NODE_BIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$custom_state" FM_CONFIG_OVERRIDE="$custom_config" \
+  FM_DISCORD_CONFIG_FILE="$custom_config_file" "$CONTROL" stop)
 assert_contains "$out" "configuration is unchanged" "macOS stop did not preserve private configuration"
 assert_absent "$plist" "macOS stop left a restart-on-login LaunchAgent"
 pass "the macOS service path persists safely without copying credentials or deployment ids"
