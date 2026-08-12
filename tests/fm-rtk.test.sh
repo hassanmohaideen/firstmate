@@ -189,6 +189,22 @@ test_effective_permission_branches() {
   pass "fm-rtk: effective owner, group, other, and root permissions are exact"
 }
 
+test_hash_snapshot_rejects_mutation() {
+  local before after
+  before=1,2,33261,1,501,20,0,100,0,1000.123456789,1000.123456789,4096,8
+  FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" test-stable-metadata \
+    "$before" "$before" 1 >"$OUT" 2>"$ERR"
+  expect_code 0 "$?" "an unchanged hash snapshot was rejected"
+  [ ! -s "$OUT" ] && [ ! -s "$ERR" ] || fail "metadata seam emitted output"
+
+  after=1,2,33188,1,501,20,0,100,0,1000.123456789,1000.223456789,4096,8
+  FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" test-stable-metadata \
+    "$before" "$after" 0 >"$OUT" 2>"$ERR"
+  expect_code 0 "$?" "mode and ctime mutation during hashing was not rejected"
+  [ ! -s "$OUT" ] && [ ! -s "$ERR" ] || fail "metadata mutation seam emitted output"
+  pass "fm-rtk: hashing rejects concurrent identity and metadata mutation"
+}
+
 run_public_launcher() {
   rm -f "$OUT" "$ERR"
   /usr/bin/env "$@" "$ROOT/bin/fm-rtk.sh" verify >"$OUT" 2>"$ERR"
@@ -473,6 +489,7 @@ SH
 test_exact_verification_contract
 test_types_and_symlinks_fail_closed
 test_effective_permission_branches
+test_hash_snapshot_rejects_mutation
 test_public_launcher_ignores_hostile_environment
 test_lifecycle_never_activates_rtk
 test_platform_rejection

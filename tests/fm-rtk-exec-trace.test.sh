@@ -61,15 +61,15 @@ exec /usr/bin/git "\$@"
 EOF
 chmod +x "$FAKEBIN/git"
 
-assert_trace_clean() {
-  local name=$1 trace=$2
-  if ! /usr/bin/python3 - "$trace" "$VERIFIER" "$ARTIFACT" <<'PY'
+check_trace() {
+  /usr/bin/python3 - "$1" "$VERIFIER" "$ARTIFACT" <<'PY'
 import os
 import re
 import sys
 
 trace_path, verifier, artifact = sys.argv[1:]
 quoted = re.compile(r'"((?:\\.|[^"\\])*)"')
+records = []
 for line in open(trace_path, encoding="utf-8", errors="replace"):
     if "execve(" not in line:
         continue
@@ -77,22 +77,50 @@ for line in open(trace_path, encoding="utf-8", errors="replace"):
     for raw in quoted.findall(line):
         value = re.sub(r"\\0+$", "", raw)
         value = value.replace(r'\\"', '"').replace(r"\\\\", "\\")
-        values.append(value)
-    if not values:
-        continue
-    argv = [os.path.normpath(value) if value.startswith("/") else value for value in values]
+        values.append(os.path.normpath(value) if value.startswith("/") else value)
+    if values:
+        records.append((values[0], values[1:]))
+
+if not records or not any(argv for _, argv in records):
+    raise SystemExit(2)
+
+for executable, argv in records:
+    argv0 = argv[0] if argv else executable
     forbidden_paths = {os.path.normpath(verifier), os.path.normpath(artifact)}
-    if any(value in forbidden_paths for value in argv):
+    if executable in forbidden_paths or any(value in forbidden_paths for value in argv):
         raise SystemExit(1)
-    if any(os.path.basename(value) == "rtk" for value in argv):
+    if os.path.basename(executable) == "rtk" or os.path.basename(argv0) == "rtk":
         raise SystemExit(1)
-    git_positions = [index for index, value in enumerate(argv) if os.path.basename(value) == "git"]
-    if any(any(arg in {"status", "diff", "log"} for arg in argv[index + 1:]) for index in git_positions):
-        raise SystemExit(1)
+    if os.path.basename(executable) == "git" or os.path.basename(argv0) == "git":
+        arguments = argv[1:] if argv else []
+        if any(argument in {"status", "diff", "log"} for argument in arguments):
+            raise SystemExit(1)
 PY
-  then
-    fail "$name trace observed verifier, artifact, RTK, or project-orientation Git execution"
+}
+
+printf '%s\n' 'execve("/bin/echo\0", "echo\0", "/private/harmless/rtk\0") = 0' \
+  >"$CONTROL/parser-harmless.trace"
+printf '%s\n' 'execve("/private/tools/rtk\0", "rtk\0") = 0' \
+  >"$CONTROL/parser-rtk.trace"
+printf '%s\n' 'execve("/usr/bin/git\0", "git\0", "status\0") = 0' \
+  >"$CONTROL/parser-git.trace"
+check_trace "$CONTROL/parser-harmless.trace"
+expect_code 0 "$?" "trace parser rejected a harmless argument ending in /rtk"
+check_trace "$CONTROL/parser-rtk.trace"
+expect_code 1 "$?" "trace parser missed RTK as the executed program"
+check_trace "$CONTROL/parser-git.trace"
+expect_code 1 "$?" "trace parser missed a forbidden Git command tuple"
+
+assert_trace_clean() {
+  local name=$1 trace=$2 rc
+  check_trace "$trace"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    printf 'skip: RTK absolute-exec gate lacks parseable dtruss argv records\n'
+    exit 0
   fi
+  [ "$rc" -eq 0 ] \
+    || fail "$name trace observed verifier, artifact, RTK, or project-orientation Git execution"
   assert_absent "$CONTROL/verifier-called" "$name invoked the tracked verifier"
   assert_absent "$CONTROL/artifact-called" "$name invoked the private artifact"
   if [ -s "$CONTROL/git-calls" ] && /usr/bin/grep -E '(^| )(status|diff|log)( |$)' "$CONTROL/git-calls" >/dev/null; then
