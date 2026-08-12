@@ -48,6 +48,19 @@ private_file() {
   [ "$links" = 1 ]
 }
 
+opaque_key() {
+  local value=$1 digest
+  if command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | shasum -a 256 | awk '{print $1}') || return 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | sha256sum | awk '{print $1}') || return 1
+  else
+    return 1
+  fi
+  case "$digest" in *[!0-9a-f]*|'') return 1 ;; esac
+  printf '%s\n' "$digest"
+}
+
 [ "$#" -eq 2 ] || usage
 kind=$1
 key=$2
@@ -63,7 +76,12 @@ case "$kind" in
       echo "fm-discord-notify: private reply binding is missing or unsafe" >&2
       exit 1
     }
-    fm_wake_append check "discord-message-$key" "check: discord-message $key"
+    dedupe=$(opaque_key "$kind:$key") || {
+      echo "fm-discord-notify: SHA-256 is required for durable deduplication" >&2
+      exit 1
+    }
+    wake_key="discord-$kind-$dedupe"
+    fm_wake_append_idempotent check "$wake_key" "check: discord-message $key" "$dedupe"
     ;;
   error)
     case "$key" in ''|*[!a-z0-9-]*) usage ;; esac
@@ -72,7 +90,18 @@ case "$kind" in
       echo "fm-discord-notify: private diagnostic record is missing or unsafe" >&2
       exit 1
     }
-    fm_wake_append check "discord-error-$key" "check: discord-error $key"
+    diagnostic_record=$(cat "$STATE/discord-bot.error") || exit 1
+    case "$diagnostic_record" in *[$'\t\r\n']*)
+      echo "fm-discord-notify: private diagnostic record is invalid" >&2
+      exit 1
+      ;;
+    esac
+    dedupe=$(opaque_key "$kind:$diagnostic_record") || {
+      echo "fm-discord-notify: SHA-256 is required for durable deduplication" >&2
+      exit 1
+    }
+    wake_key="discord-$kind-$dedupe"
+    fm_wake_append_idempotent check "$wake_key" "check: discord-error $key" "$dedupe"
     ;;
   *) usage ;;
 esac

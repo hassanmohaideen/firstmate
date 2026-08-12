@@ -37,6 +37,9 @@ NODE_SCRIPT="$SCRIPT_DIR/fm-discord-bot.mjs"
 NODE_BIN="${FM_DISCORD_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
 LABEL_PREFIX=dev.firstmate.discord
 
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/fm-discord-config-lib.sh"
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -199,6 +202,8 @@ run_worker() {
   local lock child='' rc=0 terminating=0
   validate_config >/dev/null
   mkdir -p "$STATE" || die "cannot create $STATE"
+  fm_discord_persist_config_file "$STATE" "$CONFIG_FILE" \
+    || die "cannot persist the selected Discord configuration path safely"
   # shellcheck source=/dev/null
   . "$SCRIPT_DIR/fm-wake-lib.sh"
   lock="$STATE/.discord-bot.lock"
@@ -249,6 +254,8 @@ start_service() {
   mkdir -p "$STATE" "$LAUNCH_AGENT_DIR" || die "cannot create the service state or LaunchAgents directory"
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || die "service state directory is unsafe"
   [ -d "$LAUNCH_AGENT_DIR" ] && [ ! -L "$LAUNCH_AGENT_DIR" ] || die "LaunchAgents directory is unsafe"
+  fm_discord_persist_config_file "$STATE" "$CONFIG_FILE" \
+    || die "cannot persist the selected Discord configuration path safely"
   tmp="$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.tmp.$$"
   render_launchagent > "$tmp" || {
     rm -f -- "$tmp"

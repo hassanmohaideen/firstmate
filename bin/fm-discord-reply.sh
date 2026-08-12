@@ -21,6 +21,10 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 NODE_BIN="${FM_DISCORD_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
 NODE_SCRIPT="$SCRIPT_DIR/fm-discord-bot.mjs"
+CONFIG_FILE_OVERRIDE=${FM_DISCORD_CONFIG_FILE:-}
+
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/fm-discord-config-lib.sh"
 
 usage() {
   echo "Usage: bin/fm-discord-reply.sh <message-id> [--final] --text-file <path|->" >&2
@@ -53,6 +57,12 @@ case "$message_id" in ''|*[!0-9]*) usage ;; esac
   echo "fm-discord-reply: Node.js 22 or newer is required" >&2
   exit 1
 }
+fm_discord_resolve_config_file "$STATE" "$CONFIG" "$CONFIG_FILE_OVERRIDE" || {
+  echo "fm-discord-reply: Discord configuration path is missing or unsafe" >&2
+  exit 1
+}
+CONFIG_FILE=$FM_DISCORD_RESOLVED_CONFIG_FILE
+
 if [ "$text_file" != - ]; then
   [ -f "$text_file" ] && [ ! -L "$text_file" ] && [ -r "$text_file" ] || {
     echo "fm-discord-reply: reply text path must be a readable regular non-symlink file" >&2
@@ -68,6 +78,6 @@ if [ "$text_file" != - ]; then
 fi
 
 FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
-  FM_CONFIG_OVERRIDE="$CONFIG" \
+  FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
   "$NODE_BIN" "$NODE_SCRIPT" send "$message_id" \
     --nonce-scope "$scope" --text-file "$text_file"

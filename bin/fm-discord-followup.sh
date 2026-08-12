@@ -21,9 +21,12 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 NODE_BIN="${FM_DISCORD_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
+CONFIG_FILE_OVERRIDE=${FM_DISCORD_CONFIG_FILE:-}
 
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=/dev/null
+. "$SCRIPT_DIR/fm-discord-config-lib.sh"
 
 usage() {
   cat >&2 <<'EOF'
@@ -101,8 +104,9 @@ meta_rewrite_binding() { # <meta> <request-or-empty> [expected-current]
 context_check() {
   local message=$1
   [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ] || return 1
+  fm_discord_resolve_config_file "$STATE" "$CONFIG" "$CONFIG_FILE_OVERRIDE" || return 1
   FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
-    FM_CONFIG_OVERRIDE="$CONFIG" \
+    FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$FM_DISCORD_RESOLVED_CONFIG_FILE" \
     "$NODE_BIN" "$SCRIPT_DIR/fm-discord-bot.mjs" context-check "$message"
 }
 
