@@ -36,6 +36,11 @@ CONFIG_FILE="${FM_DISCORD_CONFIG_FILE:-$CONFIG/discord-bot.env}"
 NODE_SCRIPT="$SCRIPT_DIR/fm-discord-bot.mjs"
 NODE_BIN="${FM_DISCORD_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
 LABEL_PREFIX=dev.firstmate.discord
+OWNERSHIP_STATE="$FM_HOME/state"
+OWNERSHIP_DIR="$OWNERSHIP_STATE/.discord-bot-service"
+OWNERSHIP_LOCK="$OWNERSHIP_DIR/owner.lock"
+START_LOCK="$OWNERSHIP_DIR/start.lock"
+OWNER_READY="$OWNERSHIP_DIR/owner.ready"
 
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/fm-discord-config-lib.sh"
@@ -87,6 +92,62 @@ home_hash() {
 
 service_label() {
   printf '%s.%s\n' "$LABEL_PREFIX" "$(home_hash)"
+}
+
+prepare_ownership_boundary() {
+  if [ -e "$OWNERSHIP_STATE" ] || [ -L "$OWNERSHIP_STATE" ]; then
+    [ -d "$OWNERSHIP_STATE" ] && [ ! -L "$OWNERSHIP_STATE" ] \
+      || die "canonical service state is unsafe: $OWNERSHIP_STATE"
+  else
+    (umask 077; mkdir -p "$OWNERSHIP_STATE") \
+      || die "cannot create canonical service state: $OWNERSHIP_STATE"
+  fi
+  if [ -e "$OWNERSHIP_DIR" ] || [ -L "$OWNERSHIP_DIR" ]; then
+    [ -d "$OWNERSHIP_DIR" ] && [ ! -L "$OWNERSHIP_DIR" ] \
+      || die "canonical Discord ownership boundary is unsafe"
+  else
+    (umask 077; mkdir "$OWNERSHIP_DIR") \
+      || die "cannot create canonical Discord ownership boundary"
+  fi
+  chmod 700 "$OWNERSHIP_DIR" \
+    || die "cannot protect canonical Discord ownership boundary"
+}
+
+ownership_fingerprint() {
+  if command -v shasum >/dev/null 2>&1; then
+    { printf '%s\n' "$CONFIG_FILE"; printf '%s\n' "$STATE"; } | shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    { printf '%s\n' "$CONFIG_FILE"; printf '%s\n' "$STATE"; } | sha256sum | awk '{print $1}'
+  else
+    die "shasum or sha256sum is required for Discord service ownership"
+  fi
+}
+
+publish_owner_ready() {
+  local tmp fingerprint
+  fingerprint=$(ownership_fingerprint) || return 1
+  tmp=$(umask 077; mktemp "$OWNERSHIP_DIR/.owner.ready.XXXXXX") || return 1
+  if ! printf '%s\n%s\n' "${BASHPID:-$$}" "$fingerprint" > "$tmp" \
+    || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$OWNER_READY"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+owner_ready_matches() {
+  local lock_pid ready_pid ready_fingerprint expected
+  [ -f "$OWNER_READY" ] && [ ! -L "$OWNER_READY" ] || return 1
+  lock_pid=$(cat "$OWNERSHIP_LOCK/pid" 2>/dev/null || true)
+  ready_pid=$(sed -n '1p' "$OWNER_READY" 2>/dev/null || true)
+  ready_fingerprint=$(sed -n '2p' "$OWNER_READY" 2>/dev/null || true)
+  case "$lock_pid:$ready_pid:$ready_fingerprint" in
+    *[!0-9a-f:]*) return 1 ;;
+  esac
+  [ -n "$lock_pid" ] && [ "$ready_pid" = "$lock_pid" ] || return 1
+  expected=$(ownership_fingerprint) || return 1
+  [ "$ready_fingerprint" = "$expected" ] || return 1
+  kill -0 "$lock_pid" 2>/dev/null || return 1
+  [ "$(cat "$OWNERSHIP_LOCK/pid" 2>/dev/null || true)" = "$lock_pid" ]
 }
 
 launchagent_paths() {
@@ -199,13 +260,21 @@ configure() {
 }
 
 run_worker() {
-  local lock child='' rc=0 terminating=0
+  local lock child='' rc=0 terminating=0 start_guard_held=0
   validate_config >/dev/null
   mkdir -p "$STATE" || die "cannot create $STATE"
+  prepare_ownership_boundary
   # shellcheck source=/dev/null
   . "$SCRIPT_DIR/fm-wake-lib.sh"
-  lock="$STATE/.discord-bot.lock"
+  lock="$OWNERSHIP_LOCK"
+  if [ "$command" = run ]; then
+    if ! fm_lock_try_acquire "$START_LOCK"; then
+      die "persistent Discord service startup is already claiming this home"
+    fi
+    start_guard_held=1
+  fi
   if ! fm_lock_try_acquire "$lock"; then
+    [ "$start_guard_held" -eq 0 ] || fm_lock_release "$START_LOCK"
     die "another self-hosted Discord bot already owns this home${FM_LOCK_HELD_PID:+ (pid $FM_LOCK_HELD_PID)}"
   fi
   # shellcheck disable=SC2329 # Invoked by the signal traps below.
@@ -219,18 +288,27 @@ run_worker() {
     [ -z "$child" ] || kill -TERM "$child" 2>/dev/null || true
     [ -z "$child" ] || wait "$child" 2>/dev/null || true
     rm -f "$STATE/discord-bot.enabled" "$STATE/discord-bot.ready" 2>/dev/null || true
+    if [ "$(sed -n '1p' "$OWNER_READY" 2>/dev/null || true)" = "${BASHPID:-$$}" ]; then
+      rm -f -- "$OWNER_READY" 2>/dev/null || true
+    fi
     fm_lock_release "$lock"
+    [ "$start_guard_held" -eq 0 ] || fm_lock_release "$START_LOCK"
     return "$cleanup_rc"
   }
   trap terminate_child HUP INT TERM
   trap cleanup_worker EXIT
   fm_discord_persist_config_file "$STATE" "$CONFIG_FILE" \
     || die "cannot persist the selected Discord configuration path safely"
+  publish_owner_ready || die "cannot publish Discord service ownership safely"
+  if [ "$start_guard_held" -eq 1 ]; then
+    fm_lock_release "$START_LOCK"
+    start_guard_held=0
+  fi
+  [ "$terminating" -eq 0 ] || exit 0
   FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
     FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
     "$NODE_BIN" "$NODE_SCRIPT" run &
   child=$!
-  printf '%s\n' "$child" > "$lock/child-pid" 2>/dev/null || true
   wait "$child" || rc=$?
   if [ "$terminating" -eq 1 ] && kill -0 "$child" 2>/dev/null; then
     wait "$child" || rc=$?
@@ -240,7 +318,7 @@ run_worker() {
 }
 
 start_service() {
-  local uid domain tmp out i=0 lock start_lock_held=0
+  local uid domain tmp out i=0 lock start_lock_held=0 owner_proven=0
   [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] \
     || die "persistent start requires the private file written by bin/fm-discord-bot.sh configure"
   validate_config_file_only >/dev/null
@@ -254,11 +332,12 @@ start_service() {
   mkdir -p "$STATE" "$LAUNCH_AGENT_DIR" || die "cannot create the service state or LaunchAgents directory"
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || die "service state directory is unsafe"
   [ -d "$LAUNCH_AGENT_DIR" ] && [ ! -L "$LAUNCH_AGENT_DIR" ] || die "LaunchAgents directory is unsafe"
+  prepare_ownership_boundary
   # shellcheck source=/dev/null
   . "$SCRIPT_DIR/fm-wake-lib.sh"
-  lock="$STATE/.discord-bot.lock"
+  lock="$START_LOCK"
   if ! fm_lock_try_acquire "$lock"; then
-    die "another self-hosted Discord bot already owns this home${FM_LOCK_HELD_PID:+ (pid $FM_LOCK_HELD_PID)}"
+    die "another Discord service startup is already claiming this home${FM_LOCK_HELD_PID:+ (pid $FM_LOCK_HELD_PID)}"
   fi
   start_lock_held=1
   # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
@@ -268,8 +347,11 @@ start_service() {
     return "$cleanup_rc"
   }
   trap cleanup_start_lock EXIT
-  fm_discord_persist_config_file "$STATE" "$CONFIG_FILE" \
-    || die "cannot persist the selected Discord configuration path safely"
+  if ! fm_lock_try_acquire "$OWNERSHIP_LOCK"; then
+    die "another self-hosted Discord bot already owns this home${FM_LOCK_HELD_PID:+ (pid $FM_LOCK_HELD_PID)}"
+  fi
+  fm_lock_release "$OWNERSHIP_LOCK"
+  rm -f -- "$OWNER_READY" 2>/dev/null || true
   tmp="$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.tmp.$$"
   render_launchagent > "$tmp" || {
     rm -f -- "$tmp"
@@ -286,22 +368,31 @@ start_service() {
     rm -f -- "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
     die "launchctl bootstrap refused the Discord service: ${out:-no diagnostic}; the inactive LaunchAgent was removed"
   fi
-  fm_lock_release "$lock"
-  start_lock_held=0
-  trap - EXIT
   if ! out=$(launchctl kickstart -k "$domain/$LAUNCH_AGENT_LABEL" 2>&1); then
     launchctl bootout "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
     rm -f -- "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
     die "launchctl kickstart refused the Discord service: ${out:-no diagnostic}; the LaunchAgent was unloaded and removed"
   fi
   while [ "$i" -lt 50 ]; do
-    [ -f "$STATE/discord-bot.ready" ] && {
-      echo "self-hosted Discord bot is connected and will restart automatically"
-      return 0
-    }
+    if owner_ready_matches; then
+      owner_proven=1
+      break
+    fi
     sleep 0.1
     i=$((i + 1))
   done
+  if [ "$owner_proven" -ne 1 ]; then
+    launchctl bootout "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+    rm -f -- "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
+    die "the launched Discord service did not claim this home's ownership safely"
+  fi
+  fm_lock_release "$lock"
+  start_lock_held=0
+  trap - EXIT
+  if [ -f "$STATE/discord-bot.ready" ] && [ ! -L "$STATE/discord-bot.ready" ]; then
+    echo "self-hosted Discord bot is connected and will restart automatically"
+    return 0
+  fi
   launchctl print "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 \
     || die "the Discord service did not remain loaded; run check for the safe diagnostic"
   echo "self-hosted Discord bot is running and reconnecting; run check for current health"
@@ -319,11 +410,12 @@ stop_service() {
     fi
   fi
   rm -f -- "$LAUNCH_AGENT_PLIST" || die "cannot remove $LAUNCH_AGENT_PLIST"
-  while [ "$i" -lt 50 ] && [ -e "$STATE/.discord-bot.lock" ]; do
+  prepare_ownership_boundary
+  while [ "$i" -lt 50 ] && { [ -e "$OWNERSHIP_LOCK" ] || [ -L "$OWNERSHIP_LOCK" ]; }; do
     sleep 0.1
     i=$((i + 1))
   done
-  [ ! -e "$STATE/.discord-bot.lock" ] && [ ! -L "$STATE/.discord-bot.lock" ] \
+  [ ! -e "$OWNERSHIP_LOCK" ] && [ ! -L "$OWNERSHIP_LOCK" ] \
     || die "the Discord service is still stopping; rerun check before starting another instance"
   rm -f "$STATE/discord-bot.enabled" "$STATE/discord-bot.ready" 2>/dev/null || true
   echo "self-hosted Discord bot stopped; its private configuration is unchanged"
@@ -340,8 +432,9 @@ check_service() {
     printf '%s\n' "$validate_out" >&2
     return 1
   fi
-  if [ -e "$STATE/.discord-bot.lock" ] || [ -L "$STATE/.discord-bot.lock" ]; then
-    pid=$(cat "$STATE/.discord-bot.lock/pid" 2>/dev/null || true)
+  prepare_ownership_boundary
+  if [ -e "$OWNERSHIP_LOCK" ] || [ -L "$OWNERSHIP_LOCK" ]; then
+    pid=$(cat "$OWNERSHIP_LOCK/pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*) ;; *) kill -0 "$pid" 2>/dev/null && stopped=0 ;; esac
   fi
   if [ "$stopped" -eq 1 ]; then

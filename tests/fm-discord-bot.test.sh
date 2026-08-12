@@ -407,6 +407,16 @@ out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   "$CONTROL" run 2>&1); rc=$?
 [ "$rc" -ne 0 ] || fail "a second Discord worker was allowed to start"
 assert_contains "$out" "another self-hosted Discord bot" "single-instance refusal was not actionable"
+mkdir -p "$home/alternate-state"
+chmod 700 "$home/alternate-state"
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$home/alternate-state" \
+  FM_DISCORD_TEST_MODE=1 FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=20 "$CONTROL" run 2>&1); rc=$?
+[ "$rc" -ne 0 ] || fail "a state override created a second Discord Gateway owner"
+assert_contains "$out" "another self-hosted Discord bot" \
+  "state-override contention did not report canonical home ownership"
+assert_absent "$home/alternate-state/discord-bot.config-path" \
+  "a rejected state-override contender published its configuration selection"
 kill -TERM "$worker"
 wait "$worker" || true
 WORKER_PIDS=()
@@ -517,25 +527,61 @@ cat > "$fakebin/uname" <<'SH'
 #!/usr/bin/env bash
 echo Darwin
 SH
+service_node="$fakebin/node"
+cat > "$service_node" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  -e) exit 0 ;;
+esac
+case "${2:-}" in
+  validate) exit 0 ;;
+  run)
+    printf 'connected\n' > "$FM_STATE_OVERRIDE/discord-bot.ready"
+    chmod 600 "$FM_STATE_OVERRIDE/discord-bot.ready"
+    trap 'exit 0' TERM INT
+    while :; do sleep 1; done
+    ;;
+esac
+exit 1
+SH
 cat > "$fakebin/launchctl" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_LAUNCHCTL_LOG"
 case "$1" in
   kickstart)
-    printf 'connected\n' > "${FM_STATE_OVERRIDE:-$FM_HOME/state}/discord-bot.ready"
-    chmod 600 "${FM_STATE_OVERRIDE:-$FM_HOME/state}/discord-bot.ready"
+    printf 'entered\n' > "$FM_HOME/kickstart-entered"
+    sleep "${FM_LAUNCHCTL_KICKSTART_DELAY:-0}"
+    "$FM_CONTROL_PATH" worker > "$FM_HOME/service-worker.log" 2>&1 &
+    printf '%s\n' "$!" > "$FM_HOME/service-worker.pid"
     exit 0
     ;;
-  print|bootstrap|bootout) exit 0 ;;
+  bootout)
+    if [ -f "$FM_HOME/service-worker.pid" ]; then
+      kill -TERM "$(cat "$FM_HOME/service-worker.pid")" 2>/dev/null || true
+    fi
+    exit 0
+    ;;
+  print|bootstrap) exit 0 ;;
 esac
 exit 1
 SH
-chmod +x "$fakebin/uname" "$fakebin/launchctl"
+chmod +x "$fakebin/uname" "$fakebin/launchctl" "$service_node"
 mkdir -p "$home/account/Library/LaunchAgents"
-out=$(HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchctl.log" \
-  FM_DISCORD_NODE_BIN="$NODE_BIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchctl.log" \
+  FM_LAUNCHCTL_KICKSTART_DELAY=0.2 FM_CONTROL_PATH="$CONTROL" \
+  FM_DISCORD_NODE_BIN="$service_node" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$custom_state" FM_CONFIG_OVERRIDE="$custom_config" \
-  FM_DISCORD_CONFIG_FILE="$custom_config_file" "$CONTROL" start)
+  FM_DISCORD_CONFIG_FILE="$custom_config_file" "$CONTROL" start > "$home/start.out" 2>&1 &
+starter=$!
+wait_for_file "$home/kickstart-entered" || fail "persistent startup did not reach its ownership handoff"
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$home/contender-state" \
+  FM_CONFIG_OVERRIDE="$custom_config" FM_DISCORD_CONFIG_FILE="$custom_config_file" \
+  FM_DISCORD_NODE_BIN="$service_node" "$CONTROL" run 2>&1); rc=$?
+[ "$rc" -ne 0 ] || fail "a foreground contender entered the persistent startup handoff"
+assert_contains "$out" "startup is already claiming this home" \
+  "foreground handoff contention did not fail safely"
+wait "$starter" || fail "persistent startup failed after refusing its foreground contender"
+out=$(cat "$home/start.out")
 assert_contains "$out" "restart automatically" "macOS start did not report persistent service behavior"
 plist=$(find "$home/account/Library/LaunchAgents" -name 'dev.firstmate.discord.*.plist' -print | head -n1)
 assert_present "$plist" "macOS start did not install a per-home LaunchAgent"
@@ -545,7 +591,7 @@ assert_present "$custom_state/discord-bot.config-path" "persistent start did not
 [ "$(path_mode "$custom_state/discord-bot.config-path")" = 600 ] \
   || fail "shared Discord configuration selection is not mode 600"
 assert_no_grep "$TOKEN" "$custom_state/discord-bot.config-path" "shared configuration selection persisted a secret value"
-"$PYTHON_BIN" - "$plist" "$CONTROL" "$home/account" "$home" "$ROOT" "$NODE_BIN" \
+"$PYTHON_BIN" - "$plist" "$CONTROL" "$home/account" "$home" "$ROOT" "$service_node" \
   "$custom_state" "$custom_config" "$custom_config_file" \
   "$TOKEN" "$OWNER" "$GUILD" "$CHANNEL" <<'PY' || fail "Discord LaunchAgent semantic validation failed"
 import plistlib
@@ -599,7 +645,7 @@ assert not ({
 } & set(model["EnvironmentVariables"]))
 PY
 out=$(HOME="$home/account" PATH="$fakebin:$PATH" FM_LAUNCHCTL_LOG="$home/launchctl.log" \
-  FM_DISCORD_NODE_BIN="$NODE_BIN" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_CONTROL_PATH="$CONTROL" FM_DISCORD_NODE_BIN="$service_node" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$custom_state" FM_CONFIG_OVERRIDE="$custom_config" \
   FM_DISCORD_CONFIG_FILE="$custom_config_file" "$CONTROL" stop)
 assert_contains "$out" "configuration is unchanged" "macOS stop did not preserve private configuration"
