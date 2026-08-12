@@ -5,491 +5,425 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-rtk)
-TMP_ROOT=$(CDPATH='' cd -- "$TMP_ROOT" && pwd -P)
 SYSTEM_ROOT=$TMP_ROOT/system
+AMBIENT=$TMP_ROOT/ambient
 CONTROL=$TMP_ROOT/control
-PROJECT=$TMP_ROOT/project
-HELPER=$TMP_ROOT/fm-rtk-test-driver.sh
+RAW_LOG=$CONTROL/raw.log
+OBSERVER_LOG=$CONTROL/observer.log
 OUT=$TMP_ROOT/out
 ERR=$TMP_ROOT/err
+HELPER=$TMP_ROOT/fm-rtk-test-driver.sh
+TASK_COPY=$TMP_ROOT/task-copy
 LAST_RC=0
-PYTHON3=$(command -v python3 2>/dev/null || true)
-SNAPSHOT_HELPER=$ROOT/tests/helpers/fs-event-monitor.py
-mkdir -p "$SYSTEM_ROOT/usr/bin" "$CONTROL" "$PROJECT"
+mkdir -p "$TASK_COPY" "$SYSTEM_ROOT/usr/bin" "$SYSTEM_ROOT/bin" "$SYSTEM_ROOT/usr/sbin" "$SYSTEM_ROOT/sbin" \
+  "$SYSTEM_ROOT/opt/homebrew/opt/ripgrep/bin" "$AMBIENT" "$CONTROL"
+TASK_COPY=$(cd "$TASK_COPY" && pwd -P)
 cp "$ROOT/lib/Firstmate/rtk-run" "$HELPER"
 chmod +x "$HELPER"
+
+for pair in \
+  /usr/bin/awk:usr/bin/awk /usr/bin/env:usr/bin/env /usr/bin/wc:usr/bin/wc \
+  /usr/bin/tr:usr/bin/tr /usr/bin/mktemp:usr/bin/mktemp /usr/bin/shasum:usr/bin/shasum \
+  /bin/rm:bin/rm /bin/chmod:bin/chmod /bin/mkdir:bin/mkdir /bin/cp:bin/cp /bin/sleep:bin/sleep; do
+  original=${pair%%:*}
+  wrapper=$SYSTEM_ROOT/${pair#*:}
+  printf '#!/bin/bash\nexec %q "$@"\n' "$original" > "$wrapper"
+  chmod +x "$wrapper"
+done
+
 cat > "$SYSTEM_ROOT/usr/bin/uname" <<'SH'
 #!/bin/bash
 case "$1" in -s) printf 'Darwin\n' ;; -m) printf 'arm64\n' ;; *) exit 2 ;; esac
 SH
+
+make_raw_tool() {
+  local path=$1 name=$2
+  cat > "$path" <<SH
+#!/bin/bash
+printf '%s|' '$name' >> '$RAW_LOG'
+printf '%q ' "\$@" >> '$RAW_LOG'
+printf '\n' >> '$RAW_LOG'
+printf 'raw stdout\n'
+printf 'raw stderr\n' >&2
+[ "\${RAW_FAIL:-0}" = 0 ] || exit "\$RAW_FAIL"
+SH
+  chmod +x "$path"
+}
+make_raw_tool "$SYSTEM_ROOT/usr/bin/git" git
+make_raw_tool "$SYSTEM_ROOT/bin/ls" ls
+make_raw_tool "$SYSTEM_ROOT/opt/homebrew/opt/ripgrep/bin/rg" rg
 chmod +x "$SYSTEM_ROOT/usr/bin/uname"
 
-artifact_path() { printf '%s/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk' "$1"; }
+for name in uname shasum env git rg ls; do
+  cat > "$AMBIENT/$name" <<SH
+#!/bin/bash
+printf '%s\n' '$name' >> '$OBSERVER_LOG'
+exit 91
+SH
+  chmod +x "$AMBIENT/$name"
+done
+
 make_home() {
-  local home=$TMP_ROOT/$1 artifact
-  mkdir -p "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin"
-  artifact=$(artifact_path "$home")
+  local name=$1 home artifact
+  home=$TMP_ROOT/$name
+  mkdir -p "$home/config" "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin"
+  printf 'v0.45.0\n' > "$home/config/rtk"
+  artifact=$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk
   cat > "$artifact" <<SH
 #!/bin/bash
-touch '$CONTROL/artifact-executed'
-printf 'hostile artifact ran\n'
+count=0
+mode=ok
+[ ! -f '$CONTROL/version.count' ] || read -r count < '$CONTROL/version.count'
+[ ! -f '$CONTROL/mode' ] || read -r mode < '$CONTROL/mode'
+if [ "\${1:-}" = --version ]; then
+  count=\$((count + 1))
+  printf '%s\n' "\$count" > '$CONTROL/version.count'
+  case "\$mode:\$count" in
+    nonzero:*) exit 42 ;;
+    wrong:*|second-wrong:2) printf 'rtk 9.9.9\n'; exit 0 ;;
+    noisy:*) printf 'rtk 0.45.0\n'; printf 'noise\n' >&2; exit 0 ;;
+    hang:*) while :; do /bin/sleep 1; done ;;
+  esac
+  printf 'rtk 0.45.0\n'
+  exit 0
+fi
+printf '%s\n' "\$0" > '$CONTROL/executed-path'
+printf '%s\n' "\$@" > '$CONTROL/compact-args'
+printf '%s\n' "HOME=\$HOME" "PATH=\$PATH" "DB=\$RTK_DB_PATH" \
+  "TELEMETRY=\$RTK_TELEMETRY_DISABLED" "TEE=\$RTK_TEE" "TOML=\$RTK_NO_TOML" \
+  "PAGER=\$PAGER" "GIT_PAGER=\$GIT_PAGER" "OPTIONAL_LOCKS=\$GIT_OPTIONAL_LOCKS" \
+  "GLOBAL_CONFIG=\$GIT_CONFIG_GLOBAL" "SYSTEM_CONFIG=\$GIT_CONFIG_NOSYSTEM" > '$CONTROL/compact-env'
+case "\$mode" in
+  compact-fail) printf 'compact stdout\n'; printf 'compact stderr\n' >&2; exit 23 ;;
+  compact-hang) trap 'exit 143' TERM; while :; do /bin/sleep 1; done ;;
+  *) printf 'compact stdout\n'; printf 'compact stderr\n' >&2 ;;
+esac
 SH
   chmod +x "$artifact"
   printf '%s\n' "$home"
 }
-artifact_sha() { /usr/bin/shasum -a 256 "$(artifact_path "$1")" | /usr/bin/awk '{print $1}'; }
-run_verify() {
-  local home=$1 sha=${2:-}
-  rm -f "$OUT" "$ERR" "$CONTROL/artifact-executed"
-  [ -n "$sha" ] || sha=$(artifact_sha "$home" 2>/dev/null || printf unavailable)
-  (cd "$PROJECT" && FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
-    FM_RTK_TEST_SHA256="$sha" TMPDIR="$PROJECT" PATH=/usr/bin:/bin \
-    "$HELPER" verify) >"$OUT" 2>"$ERR"
-  LAST_RC=$?
-}
-assert_project_unchanged() {
-  local after
-  after=$(find "$PROJECT" -mindepth 1 -print | LC_ALL=C sort)
-  [ -z "$after" ] || fail "verifier wrote inside the project: $after"
-}
-assert_private_output() {
-  local name=$1 content secret
-  content=$(cat "$OUT" "$ERR")
-  for secret in "$TMP_ROOT" needle-private-search private-fixture-name; do
-    case "$content" in *"$secret"*) fail "$name disclosed private input: $secret" ;; esac
-  done
-}
-assert_verification_failure() {
-  local name=$1
-  expect_code 65 "$LAST_RC" "$name was accepted"
-  [ ! -s "$OUT" ] || fail "$name emitted stdout"
-  [ "$(cat "$ERR")" = 'fm-rtk: artifact verification failed' ] \
-    || fail "$name emitted an unexpected diagnostic"
-  assert_private_output "$name"
+
+artifact_path() {
+  printf '%s/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk' "$1"
 }
 
-# The public verifier has one exact non-executing operation and deterministic output.
-test_exact_verification_contract() {
-  local home sha
-  home=$(make_home accepted)
-  sha=$(artifact_sha "$home")
-  run_verify "$home" "$sha"
-  expect_code 0 "$LAST_RC" "valid pinned artifact was rejected"
-  [ "$(cat "$OUT")" = 'fm-rtk: verified RTK v0.45.0 artifact (not executed)' ] \
-    || fail "verification success output changed"
-  [ ! -s "$ERR" ] || fail "verification success emitted stderr"
-  assert_absent "$CONTROL/artifact-executed" "verifier executed the artifact"
-  assert_project_unchanged
-
-  for args in '' 'git-status' 'verify extra' 'search needle-private-search private-fixture-name'; do
-    rm -f "$CONTROL/artifact-executed"
-    # shellcheck disable=SC2086 # Fixture rows intentionally encode public argv.
-    FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" $args >"$OUT" 2>"$ERR"
-    expect_code 64 "$?" "non-verifier request was admitted: $args"
-    [ ! -s "$OUT" ] || fail "refused request emitted stdout"
-    [ "$(cat "$ERR")" = 'fm-rtk: refused request: only the argument verify is accepted' ] \
-      || fail "refused request emitted an unexpected diagnostic"
-    assert_private_output "refused request"
-    assert_absent "$CONTROL/artifact-executed" "refused request executed the artifact"
-  done
-  FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" --help private-fixture-name >"$OUT" 2>"$ERR"
-  expect_code 64 "$?" "help accepted an extra argument"
-  [ ! -s "$OUT" ] || fail "help refusal emitted stdout"
-  [ "$(cat "$ERR")" = 'fm-rtk: refused request: help accepts no arguments' ] \
-    || fail "help refusal emitted an unexpected diagnostic"
-  assert_private_output "help refusal"
-
-  FM_HOME=private-fixture-name FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" verify >"$OUT" 2>"$ERR"
-  expect_code 65 "$?" "relative FM_HOME was accepted"
-  [ ! -s "$OUT" ] || fail "relative-home refusal emitted stdout"
-  [ "$(cat "$ERR")" = 'fm-rtk: invalid absolute FM_HOME' ] \
-    || fail "relative-home refusal emitted an unexpected diagnostic"
-  assert_private_output "relative-home refusal"
-  pass "fm-rtk: exact verification contract is non-executing"
+artifact_sha() {
+  /usr/bin/shasum -a 256 "$(artifact_path "$1")" | awk '{print $1}'
 }
 
-# Every home and artifact component is opened relative to an already-opened parent.
-test_types_and_symlinks_fail_closed() {
-  local valid outside home target
-  valid=$(make_home valid-components)
-  outside=$(make_home outside-components)
-
-  home=$TMP_ROOT/home-through-link
-  mkdir -p "$TMP_ROOT/real-parent"
-  mv "$outside" "$TMP_ROOT/real-parent/home"
-  outside=$TMP_ROOT/real-parent/home
-  ln -s "$TMP_ROOT/real-parent" "$TMP_ROOT/linked-parent"
-  run_verify "$TMP_ROOT/linked-parent/home" "$(artifact_sha "$outside")"
-  assert_verification_failure "intermediate home symlink"
-
-  home=$TMP_ROOT/final-home-link
-  ln -s "$outside" "$home"
-  run_verify "$home" "$(artifact_sha "$outside")"
-  assert_verification_failure "final home symlink"
-
-  home=$TMP_ROOT/data-link
-  mkdir -p "$home"
-  ln -s "$outside/data" "$home/data"
-  run_verify "$home" "$(artifact_sha "$outside")"
-  assert_verification_failure "artifact parent symlink"
-
-  home=$(make_home final-link)
-  target=$(artifact_path "$home")
-  mv "$target" "$target.real"
-  ln -s rtk.real "$target"
-  run_verify "$home" "$(/usr/bin/shasum -a 256 "$target.real" | /usr/bin/awk '{print $1}')"
-  assert_verification_failure "artifact symlink"
-
-  home=$(make_home non-executable)
-  chmod 600 "$(artifact_path "$home")"
-  run_verify "$home"
-  assert_verification_failure "non-executable artifact"
-
-  home=$(make_home owner-not-executable)
-  chmod 401 "$(artifact_path "$home")"
-  run_verify "$home"
-  assert_verification_failure "caller-owned artifact without owner execute"
-
-  home=$(make_home owner-executable)
-  chmod 500 "$(artifact_path "$home")"
-  run_verify "$home" "$(artifact_sha "$home")"
-  expect_code 0 "$LAST_RC" "caller-owned artifact with owner execute was rejected"
-
-  home=$(make_home directory-artifact)
-  target=$(artifact_path "$home")
-  rm "$target"; mkdir "$target"
-  run_verify "$home" unavailable
-  assert_verification_failure "directory artifact"
-
-  home=$(make_home fifo-artifact)
-  target=$(artifact_path "$home")
-  rm "$target"; mkfifo "$target"
-  run_verify "$home" unavailable
-  assert_verification_failure "FIFO artifact"
-
-  run_verify "$valid" 0000000000000000000000000000000000000000000000000000000000000000
-  assert_verification_failure "hash mismatch"
-  assert_absent "$CONTROL/artifact-executed" "failed identity check executed an artifact"
-  assert_project_unchanged
-  pass "fm-rtk: path, type, mode, and hash checks fail closed"
+reset_evidence() {
+  rm -f "$RAW_LOG" "$OBSERVER_LOG" "$OUT" "$ERR" "$CONTROL/version.count" "$CONTROL/mode" \
+    "$CONTROL/executed-path" "$CONTROL/compact-args" "$CONTROL/compact-env"
 }
 
-test_effective_permission_branches() {
-  local row
-  for row in \
-    '0100 501 501 20 20,80 1' '0001 501 501 20 20,80 0' \
-    '0010 501 777 80 20,80 1' '0001 501 777 80 20,80 0' \
-    '0010 501 777 90 20,80 0' '0001 501 777 90 20,80 1' \
-    '0001 0 777 90 0 1' '0000 0 777 90 0 0'; do
-    # shellcheck disable=SC2086 # Rows are deterministic synthetic identities.
-    FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" test-effective-executable $row >"$OUT" 2>"$ERR"
-    expect_code 0 "$?" "effective execute permission branch failed for $row"
-    [ ! -s "$OUT" ] && [ ! -s "$ERR" ] || fail "permission branch emitted output"
-  done
-  pass "fm-rtk: effective owner, group, other, and root permissions are exact"
-}
-
-test_hash_snapshot_rejects_mutation() {
-  local before after
-  before=1,2,33261,1,501,20,0,100,0,1000.123456789,1000.123456789,4096,8
-  FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" test-stable-metadata \
-    "$before" "$before" 1 >"$OUT" 2>"$ERR"
-  expect_code 0 "$?" "an unchanged hash snapshot was rejected"
-  [ ! -s "$OUT" ] && [ ! -s "$ERR" ] || fail "metadata seam emitted output"
-
-  after=1,2,33188,1,501,20,0,100,0,1000.123456789,1000.223456789,4096,8
-  FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" test-stable-metadata \
-    "$before" "$after" 0 >"$OUT" 2>"$ERR"
-  expect_code 0 "$?" "mode and ctime mutation during hashing was not rejected"
-  [ ! -s "$OUT" ] && [ ! -s "$ERR" ] || fail "metadata mutation seam emitted output"
-  pass "fm-rtk: hashing rejects concurrent identity and metadata mutation"
-}
-
-run_public_launcher() {
-  rm -f "$OUT" "$ERR"
-  /usr/bin/env "$@" "$ROOT/bin/fm-rtk.sh" verify >"$OUT" 2>"$ERR"
+run_helper_at() {
+  local directory=$1 home=$2 sha
+  shift 2
+  reset_evidence
+  if [ -f "$(artifact_path "$home")" ] && [ ! -L "$(artifact_path "$home")" ]; then
+    sha=$(artifact_sha "$home")
+  else
+    sha=unavailable
+  fi
+  printf '%s\n' "${RTK_TEST_MODE:-ok}" > "$CONTROL/mode"
+  (cd "$directory" && PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    FM_RTK_TEST_SHA256="$sha" "$HELPER" "$@") > "$OUT" 2> "$ERR"
   LAST_RC=$?
 }
 
-assert_launcher_baseline() {
-  local name=$1 marker=$2
-  expect_code "$PUBLIC_RC" "$LAST_RC" "$name changed launcher status"
-  cmp -s "$PUBLIC_OUT" "$OUT" || fail "$name changed launcher stdout"
-  cmp -s "$PUBLIC_ERR" "$ERR" || fail "$name changed launcher stderr"
-  assert_absent "$marker" "$name executed attacker code"
-  assert_absent "$CONTROL/artifact-executed" "$name executed the artifact"
-  assert_project_unchanged
+run_helper() {
+  local home=$1
+  shift
+  run_helper_at "$TASK_COPY" "$home" "$@"
 }
 
-# Each caller-controlled environment boundary is exercised independently so an
-# early interpreter failure cannot mask a later sanitization regression.
-test_public_launcher_ignores_hostile_environment() {
-  local home marker module_dir
-  home=$(make_home hostile-env)
-  module_dir=$CONTROL/perl-modules
-  mkdir -p "$module_dir"
-  FM_HOME="$home" run_public_launcher
-  case "$(/usr/bin/uname -s):$(/usr/bin/uname -m)" in
-    Darwin:arm64)
-      expect_code 65 "$LAST_RC" "known-good launcher did not report the pinned-hash refusal"
-      [ ! -s "$OUT" ] || fail "known-good launcher emitted unexpected stdout"
-      [ "$(cat "$ERR")" = 'fm-rtk: artifact verification failed' ] \
-        || fail "known-good launcher emitted unexpected verification refusal"
-      ;;
-    *)
-      expect_code 69 "$LAST_RC" "known-good launcher did not report unsupported platform"
-      [ ! -s "$OUT" ] || fail "known-good launcher emitted unexpected stdout"
-      [ "$(cat "$ERR")" = 'fm-rtk: unsupported platform (requires Darwin arm64)' ] \
-        || fail "known-good launcher emitted unexpected platform refusal"
-      ;;
-  esac
-  PUBLIC_RC=$LAST_RC
-  PUBLIC_OUT=$CONTROL/public.stdout
-  PUBLIC_ERR=$CONTROL/public.stderr
-  cp "$OUT" "$PUBLIC_OUT"
-  cp "$ERR" "$PUBLIC_ERR"
-
-  marker=$CONTROL/path-ran
-  mkdir -p "$CONTROL/hostile-path"
-  for tool in env perl bash uname; do
-    printf '#!/bin/sh\ntouch %q\nexit 99\n' "$marker" > "$CONTROL/hostile-path/$tool"
-    chmod +x "$CONTROL/hostile-path/$tool"
-  done
-  FM_HOME="$home" run_public_launcher PATH="$CONTROL/hostile-path"
-  assert_launcher_baseline PATH "$marker"
-
-  for variable in BASH_ENV ENV; do
-    case "$variable" in BASH_ENV) marker=$CONTROL/bash-env-ran ;; ENV) marker=$CONTROL/env-ran ;; esac
-    printf 'touch %q\n' "$marker" > "$CONTROL/$variable"
-    FM_HOME="$home" run_public_launcher "$variable=$CONTROL/$variable"
-    assert_launcher_baseline "$variable" "$marker"
-  done
-
-  marker=$CONTROL/perl5opt-ran
-  cat > "$module_dir/Hostile.pm" <<EOF
-package Hostile;
-BEGIN { system('/usr/bin/touch', '$marker') }
-1;
-EOF
-  FM_HOME="$home" run_public_launcher "PERL5OPT=-I$module_dir -MHostile"
-  assert_launcher_baseline PERL5OPT "$marker"
-
-  for variable in PERL5LIB PERLLIB; do
-    case "$variable" in PERL5LIB) marker=$CONTROL/perl5lib-ran ;; PERLLIB) marker=$CONTROL/perllib-ran ;; esac
-    cat > "$module_dir/Cwd.pm" <<EOF
-package Cwd;
-BEGIN { system('/usr/bin/touch', '$marker') }
-sub import { }
-1;
-EOF
-    FM_HOME="$home" run_public_launcher "$variable=$module_dir"
-    assert_launcher_baseline "$variable" "$marker"
-  done
-
-  marker=$CONTROL/shellopts-ran
-  FM_HOME="$home" run_public_launcher SHELLOPTS=xtrace "PS4=\$(/usr/bin/touch '$marker')"
-  assert_launcher_baseline SHELLOPTS "$marker"
-
-  marker=$CONTROL/bashopts-ran
-  FM_HOME="$home" run_public_launcher BASHOPTS=extdebug "BASH_COMPAT=\$(/usr/bin/touch '$marker')"
-  assert_launcher_baseline BASHOPTS "$marker"
-
-  marker=$CONTROL/function-ran
-  eval "cd() { /usr/bin/touch '$marker'; builtin cd \"\$@\"; }"
-  export -f cd
-  FM_HOME="$home" run_public_launcher
-  export -n -f cd
-  unset -f cd
-  assert_launcher_baseline exported-function "$marker"
-
-  marker=$CONTROL/sentinel-ran
-  FM_HOME="$home" run_public_launcher "FM_RTK_STARTED=$marker"
-  assert_launcher_baseline former-sentinel "$marker"
-
-  marker=$CONTROL/system-seam-ran
-  cat > "$SYSTEM_ROOT/usr/bin/uname" <<EOF
-#!/bin/sh
-/usr/bin/touch '$marker'
-printf 'Darwin\n'
-EOF
-  chmod +x "$SYSTEM_ROOT/usr/bin/uname"
-  FM_HOME="$home" run_public_launcher "FM_RTK_TEST_SYSTEM_ROOT=$SYSTEM_ROOT"
-  assert_launcher_baseline system-test-seam "$marker"
-
-  marker=$CONTROL/hash-seam-ran
-  FM_HOME="$home" run_public_launcher "FM_RTK_TEST_SHA256=$(artifact_sha "$home")" \
-    "FM_RTK_TEST_MARKER=$marker"
-  assert_launcher_baseline hash-test-seam "$marker"
-
-  marker=$CONTROL/tmpdir-ran
-  FM_HOME="$home" run_public_launcher "TMPDIR=$PROJECT" "FM_RTK_TEST_MARKER=$marker"
-  assert_launcher_baseline TMPDIR "$marker"
-  pass "fm-rtk: public launcher independently sanitizes caller environment"
+assert_raw() {
+  local expected=$1
+  assert_present "$RAW_LOG" "raw fallback did not run"
+  assert_grep "$expected" "$RAW_LOG" "raw fallback argv was not exact"
+  [ "$(wc -l < "$RAW_LOG" | tr -d '[:space:]')" = 1 ] || fail "raw fallback ran more than once"
 }
 
-make_trap_tools() {
-  local fakebin=$1 tool
-  mkdir -p "$fakebin"
-  for tool in rtk fm-rtk.sh git-status git-log git-diff search list brew npm installer \
-    curl wget activate pre-commit post-checkout rtk-hook; do
-    cat > "$fakebin/$tool" <<EOF
-#!/bin/sh
-printf '%s\\n' '$tool' >> '$CONTROL/lifecycle-calls'
-exit 97
-EOF
-    chmod +x "$fakebin/$tool"
-  done
-  cat > "$fakebin/git" <<EOF
-#!/bin/sh
-printf '%s\\n' "\$*" >> '$CONTROL/lifecycle-git-calls'
-exec /usr/bin/git "\$@"
-EOF
-  chmod +x "$fakebin/git"
+assert_no_ambient() {
+  assert_absent "$OBSERVER_LOG" "caller PATH wrapper was executed"
 }
 
-snapshot_tree() {
-  if [ -n "$PYTHON3" ]; then
-    "$PYTHON3" "$SNAPSHOT_HELPER" --snapshot "$1"
-    return
-  fi
-  /usr/bin/perl -MDigest::SHA -MFile::Find -MFcntl=:mode -MTime::HiRes=lstat -e '
-    use strict;
-    use warnings;
-    my $root = shift;
-    my @records;
-    find({
-      no_chdir => 1,
-      wanted => sub {
-        my $path = $File::Find::name;
-        my @stat = lstat($path);
-        die "lstat failed\n" unless @stat;
-        my $mode = $stat[2];
-        my $relative = $path eq $root ? "." : substr($path, length($root) + 1);
-        my ($type, $detail) = ("unknown", "");
-        if (S_ISREG($mode)) {
-          open my $file, "<", $path or die "open failed\n";
-          binmode $file;
-          $type = "file";
-          $detail = Digest::SHA->new(256)->addfile($file)->hexdigest;
-          close $file or die "close failed\n";
-        } elsif (S_ISDIR($mode)) {
-          $type = "directory";
-        } elsif (S_ISLNK($mode)) {
-          $type = "symlink";
-          my $target = readlink($path);
-          die "readlink failed\n" unless defined $target;
-          $detail = unpack("H*", $target);
-        } elsif (S_ISFIFO($mode)) {
-          $type = "fifo";
-        } elsif (S_ISSOCK($mode)) {
-          $type = "socket";
-        } elsif (S_ISBLK($mode)) {
-          $type = "block";
-          $detail = $stat[6];
-        } elsif (S_ISCHR($mode)) {
-          $type = "character";
-          $detail = $stat[6];
-        }
-        push @records, join("|", unpack("H*", $relative), $type,
-          sprintf("%04o", $mode & 07777), $stat[4], $stat[5], $stat[0], $stat[1],
-          sprintf("%.9f", $stat[9]), sprintf("%.9f", $stat[10]), "-", $detail);
-      }
-    }, $root);
-    print join("\n", sort @records), "\n";
-  ' "$1"
-}
-
-assert_lifecycle_inert() {
-  local name=$1 project_before=$2 config_before=$3 project_after config_after
-  project_after=$(snapshot_tree "$PROJECT") || fail "$name could not snapshot project tree"
-  config_after=$(snapshot_tree "$CONTROL/lifecycle-home/config") \
-    || fail "$name could not snapshot private config tree"
-  [ "$project_before" = "$project_after" ] || fail "$name changed project tree"
-  [ "$config_before" = "$config_after" ] || fail "$name changed private config tree"
-  assert_absent "$CONTROL/lifecycle-calls" "$name called an RTK, installer, network, hook, or activation command"
-  if [ -f "$CONTROL/lifecycle-git-calls" ] && /usr/bin/grep -E '(^| )(status|diff|log)( |$)' "$CONTROL/lifecycle-git-calls" >/dev/null; then
-    fail "$name ran a forbidden project-orientation git command"
-  fi
-  assert_absent "$CONTROL/verifier-called" "$name called the tracked RTK verifier"
-  assert_absent "$CONTROL/artifact-executed" "$name executed the private artifact"
-}
-
-# Bootstrap and session start are driven as public commands with executable
-# traps; source-level absence is not used as evidence for lifecycle inertness.
-test_lifecycle_never_activates_rtk() {
-  local home fakebin project_before config_before rc lifecycle_root
-  home=$CONTROL/lifecycle-home
-  fakebin=$CONTROL/lifecycle-fakebin
-  lifecycle_root=$CONTROL/lifecycle-root
-  mkdir -p "$lifecycle_root" "$home/config" "$home/state/.lock" "$home/data" "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin"
-  cp -R "$ROOT/bin" "$ROOT/lib" "$lifecycle_root/"
-  cat > "$lifecycle_root/lib/Firstmate/rtk-run" <<EOF
-#!/bin/sh
-/usr/bin/touch '$CONTROL/verifier-called'
-exit 97
-EOF
-  chmod +x "$lifecycle_root/lib/Firstmate/rtk-run"
-  printf 'disabled\n' > "$home/config/rtk"
-  printf 'private-config\n' > "$home/config/sentinel"
-  cat > "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk" <<EOF
-#!/bin/sh
-/usr/bin/touch '$CONTROL/artifact-executed'
-EOF
-  chmod +x "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk"
-  make_trap_tools "$fakebin"
-  project_before=$(snapshot_tree "$PROJECT") || fail "could not snapshot project tree"
-  config_before=$(snapshot_tree "$home/config") || fail "could not snapshot private config tree"
-
-  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/lifecycle-git-calls" \
-    "$CONTROL/verifier-called" "$CONTROL/artifact-executed"
-  (cd "$PROJECT" && FM_HOME="$home" FM_BOOTSTRAP_DETECT_ONLY=1 FM_BOOTSTRAP_NETWORK=skip \
-    PATH="$fakebin:/usr/bin:/bin" "$lifecycle_root/bin/fm-bootstrap.sh") >"$OUT" 2>"$ERR"
-  rc=$?
-  expect_code 0 "$rc" "detect-only bootstrap failed"
-  assert_lifecycle_inert bootstrap "$project_before" "$config_before"
-
-  rm -f "$CONTROL/lifecycle-calls" "$CONTROL/lifecycle-git-calls" \
-    "$CONTROL/verifier-called" "$CONTROL/artifact-executed"
-  (cd "$PROJECT" && FM_HOME="$home" FM_SESSION_START_TIMEOUT=20 \
-    PATH="$fakebin:/usr/bin:/bin" "$lifecycle_root/bin/fm-session-start.sh") >"$OUT" 2>"$ERR"
-  rc=$?
-  expect_code 0 "$rc" "read-only session start failed"
-  assert_lifecycle_inert session-start "$project_before" "$config_before"
-  pass "fm-rtk: bootstrap and session start remain lifecycle-inert"
-}
-
-# Platform rejection occurs before any artifact access.
-test_platform_rejection() {
-  local home
-  home=$(make_home platform)
-  mv "$SYSTEM_ROOT/usr/bin/uname" "$SYSTEM_ROOT/usr/bin/uname.saved"
-  run_verify "$home"
-  expect_code 69 "$LAST_RC" "missing trusted utility was accepted"
-  [ ! -s "$OUT" ] || fail "trusted-utility refusal emitted stdout"
-  [ "$(cat "$ERR")" = 'fm-rtk: trusted system utility unavailable' ] \
-    || fail "trusted-utility refusal output changed"
-  assert_private_output "trusted-utility refusal"
-  mv "$SYSTEM_ROOT/usr/bin/uname.saved" "$SYSTEM_ROOT/usr/bin/uname"
-  cat > "$SYSTEM_ROOT/usr/bin/uname" <<'SH'
+test_public_launcher_sanitizes_startup_environment() {
+  local marker rc=0
+  marker=$CONTROL/startup-injected
+  cat > "$TMP_ROOT/startup-attacker" <<EOF
 #!/bin/bash
-case "$1" in -s) printf 'Linux\n' ;; -m) printf 'x86_64\n' ;; esac
-SH
-  chmod +x "$SYSTEM_ROOT/usr/bin/uname"
-  run_verify "$home"
-  expect_code 69 "$LAST_RC" "unsupported platform was accepted"
-  [ ! -s "$OUT" ] || fail "platform refusal emitted stdout"
-  [ "$(cat "$ERR")" = 'fm-rtk: unsupported platform (requires Darwin arm64)' ] \
-    || fail "platform refusal output changed"
-  assert_private_output "platform refusal"
-  assert_absent "$CONTROL/artifact-executed" "platform rejection executed artifact"
-  assert_project_unchanged
-  pass "fm-rtk: unsupported platform fails before inspection"
+touch '$marker'
+EOF
+  chmod +x "$TMP_ROOT/startup-attacker"
+  BASH_ENV="$TMP_ROOT/startup-attacker" ENV="$TMP_ROOT/startup-attacker" \
+    FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" FM_RTK_TEST_SHA256=spoofed \
+    "$ROOT/bin/fm-rtk.sh" search --json > "$OUT" 2> "$ERR" || rc=$?
+  expect_code 64 "$rc" "public admission refusal returned the wrong status"
+  assert_absent "$marker" "caller shell startup code reached the RTK runner"
+  assert_absent "$RAW_LOG" "public admission refusal ran raw"
+  pass "fm-rtk: public launcher removes hostile startup and test overrides"
 }
 
-test_exact_verification_contract
-test_types_and_symlinks_fail_closed
-test_effective_permission_branches
-test_hash_snapshot_rejects_mutation
-test_public_launcher_ignores_hostile_environment
-test_lifecycle_never_activates_rtk
-test_platform_rejection
+test_admission_and_trusted_raw() {
+  local home rc
+  home=$(make_home admission)
+  reset_evidence
+  PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$HELPER" search --json . > "$OUT" 2> "$ERR"; rc=$?
+  expect_code 64 "$rc" "option-like search should be refused"
+  assert_absent "$RAW_LOG" "admission refusal ran raw"
+  assert_absent "$CONTROL/version.count" "admission refusal ran RTK"
+
+  rm -f "$home/config/rtk"
+  RAW_FAIL=37 run_helper "$home" git-status
+  expect_code 37 "$LAST_RC" "raw status was not preserved"
+  assert_raw 'git|-c core.fsmonitor=false'
+  assert_grep 'raw stdout' "$OUT" "raw stdout was lost"
+  assert_grep 'raw stderr' "$ERR" "raw stderr was lost"
+  assert_no_ambient
+  pass "fm-rtk: admission executes nothing and fallback uses trusted exact argv once"
+}
+
+test_spoofing_and_private_execution() {
+  local home path root hostile
+  home=$(make_home compact)
+  # shellcheck disable=SC2016 # The command substitution is hostile literal test data.
+  hostile='needle;$(touch LEAK)|private/path'
+  run_helper "$home" search "$hostile" "$TASK_COPY"
+  expect_code 0 "$LAST_RC" "compact search failed"
+  assert_no_ambient
+  assert_absent "$RAW_LOG" "successful compact command also ran raw"
+  assert_grep 'rg' "$CONTROL/compact-args" "compact search verb changed"
+  assert_grep "$hostile" "$CONTROL/compact-args" "hostile data was not preserved"
+  assert_no_grep "$hostile" "$ERR" "argument data leaked to diagnostics"
+  path=$(< "$CONTROL/executed-path")
+  case "$path" in */fm-rtk.*/invocation/rtk) ;; *) fail "RTK did not execute from the private copy: $path" ;; esac
+  [ "$path" != "$(artifact_path "$home")" ] || fail "source artifact executed directly"
+  root=${path%/invocation/rtk}
+  assert_absent "$root" "private invocation root was not cleaned"
+  assert_grep "HOME=$root/home" "$CONTROL/compact-env" "HOME was not private"
+  assert_grep "PATH=$SYSTEM_ROOT/opt/homebrew/opt/ripgrep/bin:$SYSTEM_ROOT/usr/bin:$SYSTEM_ROOT/bin:$SYSTEM_ROOT/usr/sbin:$SYSTEM_ROOT/sbin" \
+    "$CONTROL/compact-env" "caller PATH reached RTK"
+  assert_grep 'TELEMETRY=1' "$CONTROL/compact-env" "telemetry was not disabled"
+  assert_grep 'TEE=0' "$CONTROL/compact-env" "tee was not disabled"
+  assert_grep 'TOML=1' "$CONTROL/compact-env" "project filters were not disabled"
+  assert_grep 'OPTIONAL_LOCKS=0' "$CONTROL/compact-env" "Git optional locks were not disabled"
+  assert_grep 'GLOBAL_CONFIG=/dev/null' "$CONTROL/compact-env" "global Git config was not isolated"
+  assert_grep 'SYSTEM_CONFIG=1' "$CONTROL/compact-env" "system Git config was not isolated"
+  pass "fm-rtk: spoofed PATH is ignored and only a private verified copy executes"
+}
+
+test_fixed_semantic_verbs() {
+  local home expected actual git_config
+  home=$(make_home verbs)
+  git_config='-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat -c pager.log=false -c pager.diff=false -c pager.status=false -c diff.external= -c diff.trustExitCode=false -c interactive.diffFilter= -c status.submoduleSummary=false -c protocol.allow=never'
+  while IFS='|' read -r invocation expected; do
+    # shellcheck disable=SC2086 # Fixture rows intentionally encode the public argv.
+    run_helper "$home" $invocation
+    expect_code 0 "$LAST_RC" "$invocation failed"
+    actual=$(tr '\n' ' ' < "$CONTROL/compact-args")
+    actual=${actual% }
+    [ "$actual" = "$expected" ] || fail "$invocation mapped to unexpected compact argv: $actual"
+    assert_absent "$RAW_LOG" "$invocation also ran raw"
+  done <<ROWS
+git-log|git $git_config log --no-ext-diff --no-textconv -n 50 --decorate
+git-diff|git $git_config diff --no-ext-diff --no-textconv
+git-diff --cached|git $git_config diff --no-ext-diff --no-textconv --cached
+git-status|git $git_config status
+list $TASK_COPY|ls $TASK_COPY
+search needle $TASK_COPY|rg needle $TASK_COPY
+ROWS
+
+  reset_evidence
+  PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    "$HELPER" exec git status > "$OUT" 2> "$ERR"; LAST_RC=$?
+  expect_code 64 "$LAST_RC" "generic command escape should be refused"
+  assert_absent "$RAW_LOG" "generic command refusal ran raw"
+  assert_absent "$CONTROL/version.count" "generic command refusal ran RTK"
+  pass "fm-rtk: every fixed semantic verb maps exactly and generic execution is refused"
+}
+
+test_path_confinement() {
+  local home rc symlink
+  home=$(make_home confinement)
+  symlink=$TASK_COPY/link
+  ln -s "$TMP_ROOT" "$symlink"
+
+  for invocation in "list $TMP_ROOT" "list $symlink" "search needle $TMP_ROOT" \
+    "search needle $symlink" "list ../control"; do
+    reset_evidence
+    # shellcheck disable=SC2086 # Fixture rows intentionally encode denied public argv.
+    (cd "$TASK_COPY" && PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" \
+      FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" "$HELPER" $invocation) > "$OUT" 2> "$ERR"
+    rc=$?
+    expect_code 64 "$rc" "$invocation should be refused"
+    assert_absent "$RAW_LOG" "$invocation ran a raw utility"
+    assert_absent "$CONTROL/version.count" "$invocation ran RTK"
+  done
+
+  mkdir -p "$TASK_COPY/.ssh"
+  run_helper "$home" list "$TASK_COPY/.ssh"
+  expect_code 64 "$LAST_RC" "credential directory should be refused"
+  assert_absent "$RAW_LOG" "credential refusal ran a raw utility"
+  assert_absent "$CONTROL/version.count" "credential refusal ran RTK"
+  pass "fm-rtk: paths are confined without symlink or credential traversal"
+}
+
+test_git_configuration_cannot_execute_or_write() {
+  local home repo marker before after real_git
+  home=$(make_home git-safety)
+  rm "$home/config/rtk"
+  repo=$TASK_COPY/repo
+  marker=$CONTROL/git-config-executed
+  real_git=$(command -v git)
+  mkdir -p "$repo"
+  "$real_git" -C "$repo" init -q
+  "$real_git" -C "$repo" config user.name fixture
+  "$real_git" -C "$repo" config user.email fixture@example.invalid
+  printf 'one\n' > "$repo/tracked"
+  printf 'tracked filter=hostile\n' > "$repo/.gitattributes"
+  "$real_git" -C "$repo" add tracked .gitattributes
+  "$real_git" -C "$repo" commit -qm initial
+  printf 'two\n' >> "$repo/tracked"
+  cat > "$CONTROL/git-attacker" <<SH
+#!/bin/bash
+touch '$marker'
+cat
+SH
+  chmod +x "$CONTROL/git-attacker"
+  "$real_git" -C "$repo" config core.fsmonitor "$CONTROL/git-attacker"
+  "$real_git" -C "$repo" config diff.external "$CONTROL/git-attacker"
+  "$real_git" -C "$repo" config diff.hostile.textconv "$CONTROL/git-attacker"
+  printf '#!/bin/bash\nexec %q "$@"\n' "$real_git" > "$SYSTEM_ROOT/usr/bin/git"
+  chmod +x "$SYSTEM_ROOT/usr/bin/git"
+
+  before=$(find "$repo" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  run_helper_at "$repo" "$home" git-diff
+  expect_code 0 "$LAST_RC" "safe raw git diff failed"
+  assert_grep 'diff --git ' "$OUT" "safe raw git diff lost ordinary output"
+  assert_absent "$marker" "Git diff executed repository-configured code"
+  run_helper_at "$repo" "$home" git-status
+  expect_code 0 "$LAST_RC" "safe raw git status failed"
+  assert_grep 'Changes not staged for commit' "$OUT" "safe raw git status lost ordinary output"
+  assert_absent "$marker" "Git status executed repository-configured code"
+  after=$(find "$repo" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  [ "$before" = "$after" ] || fail "observational Git commands changed project or index bytes"
+  make_raw_tool "$SYSTEM_ROOT/usr/bin/git" git
+  pass "fm-rtk: Git orientation disables configured execution and all writes"
+}
+
+test_artifact_and_version_failures() {
+  local home artifact mode started
+  home=$(make_home failures)
+  artifact=$(artifact_path "$home")
+
+  mv "$artifact" "$artifact.real"; ln -s rtk.real "$artifact"
+  run_helper "$home" git-status
+  assert_raw 'git|-c core.fsmonitor=false'
+  assert_absent "$CONTROL/version.count" "symlink artifact executed"
+  rm "$artifact"; mv "$artifact.real" "$artifact"
+
+  rm "$artifact"; mkfifo "$artifact"
+  run_helper "$home" git-status
+  assert_raw 'git|-c core.fsmonitor=false'
+  assert_absent "$CONTROL/version.count" "FIFO artifact executed"
+  rm "$artifact"; home=$(make_home failures)
+
+  for mode in wrong nonzero noisy second-wrong; do
+    RTK_TEST_MODE=$mode run_helper "$home" git-status
+    expect_code 0 "$LAST_RC" "$mode preflight should fall back"
+    assert_raw 'git|-c core.fsmonitor=false'
+    assert_absent "$CONTROL/executed-path" "$mode preflight started compact execution"
+  done
+
+  started=$(date +%s)
+  RTK_TEST_MODE=hang run_helper "$home" git-status
+  [ $(( $(date +%s) - started )) -lt 9 ] || fail "version preflight was not bounded"
+  assert_raw 'git|-c core.fsmonitor=false'
+  assert_absent "$CONTROL/executed-path" "hanging version started compact execution"
+  pass "fm-rtk: invalid artifacts and bounded version failures fall back once"
+}
+
+test_copy_race_and_copy_failure() {
+  local home artifact sha real_shasum
+  home=$(make_home race)
+  artifact=$(artifact_path "$home")
+  sha=$(artifact_sha "$home")
+  real_shasum=$SYSTEM_ROOT/usr/bin/shasum.real
+  mv "$SYSTEM_ROOT/usr/bin/shasum" "$real_shasum"
+  cat > "$SYSTEM_ROOT/usr/bin/shasum" <<SH
+#!/bin/bash
+'$real_shasum' "\$@"
+if [ "\${REPLACE_AFTER_HASH:-0}" = 1 ] && [ ! -f '$CONTROL/replaced' ]; then
+  : > '$CONTROL/replaced'
+  printf '#!/bin/bash\nprintf malicious > %q\n' '$CONTROL/malicious-ran' > '$artifact'
+  chmod +x '$artifact'
+fi
+SH
+  chmod +x "$SYSTEM_ROOT/usr/bin/shasum"
+  reset_evidence
+  rm -f "$CONTROL/replaced" "$CONTROL/malicious-ran"
+  PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    FM_RTK_TEST_SHA256="$sha" REPLACE_AFTER_HASH=1 "$HELPER" git-status > "$OUT" 2> "$ERR"
+  LAST_RC=$?
+  expect_code 0 "$LAST_RC" "replacement race should fall back"
+  assert_raw 'git|-c core.fsmonitor=false'
+  assert_absent "$CONTROL/malicious-ran" "replacement artifact executed"
+  assert_absent "$CONTROL/executed-path" "replacement reached compact execution"
+  mv "$real_shasum" "$SYSTEM_ROOT/usr/bin/shasum"
+
+  home=$(make_home copy-fail)
+  mv "$SYSTEM_ROOT/bin/cp" "$SYSTEM_ROOT/bin/cp.real"
+  printf '#!/bin/bash\nexit 1\n' > "$SYSTEM_ROOT/bin/cp"
+  chmod +x "$SYSTEM_ROOT/bin/cp"
+  run_helper "$home" git-status
+  assert_raw 'git|-c core.fsmonitor=false'
+  assert_absent "$CONTROL/version.count" "copy failure executed RTK"
+  mv "$SYSTEM_ROOT/bin/cp.real" "$SYSTEM_ROOT/bin/cp"
+
+  home=$(make_home utility-fail)
+  mv "$SYSTEM_ROOT/usr/bin/shasum" "$SYSTEM_ROOT/usr/bin/shasum.missing"
+  run_helper "$home" git-status
+  expect_code 0 "$LAST_RC" "missing compact-only utility should fall back"
+  assert_raw 'git|-c core.fsmonitor=false'
+  assert_absent "$CONTROL/version.count" "missing compact-only utility executed RTK"
+  mv "$SYSTEM_ROOT/usr/bin/shasum.missing" "$SYSTEM_ROOT/usr/bin/shasum"
+  pass "fm-rtk: replacement races and setup failures fall back without executing candidates"
+}
+
+test_post_start_no_rerun_and_signal_cleanup() {
+  local home pid path root rc=0 i=0 sha
+  home=$(make_home outcomes)
+  RTK_TEST_MODE=compact-fail run_helper "$home" git-status
+  expect_code 23 "$LAST_RC" "compact failure status was not preserved"
+  assert_grep 'compact stdout' "$OUT" "compact stdout was lost"
+  assert_grep 'compact stderr' "$ERR" "compact stderr was lost"
+  assert_absent "$RAW_LOG" "compact failure reran raw"
+
+  reset_evidence
+  sha=$(artifact_sha "$home")
+  printf 'compact-hang\n' > "$CONTROL/mode"
+  PATH="$AMBIENT:/usr/bin:/bin" FM_HOME="$home" FM_RTK_TEST_SYSTEM_ROOT="$SYSTEM_ROOT" \
+    FM_RTK_TEST_SHA256="$sha" "$HELPER" git-status > "$OUT" 2> "$ERR" &
+  pid=$!
+  while [ ! -f "$CONTROL/executed-path" ] && [ "$i" -lt 100 ]; do /bin/sleep 0.05; i=$((i + 1)); done
+  assert_present "$CONTROL/executed-path" "signal fixture did not start compact execution"
+  path=$(< "$CONTROL/executed-path"); root=${path%/invocation/rtk}
+  kill -TERM "$pid"
+  wait "$pid" || rc=$?
+  expect_code 143 "$rc" "TERM status was not preserved"
+  assert_absent "$root" "TERM left the private root behind"
+  assert_absent "$RAW_LOG" "TERM reran raw"
+  pass "fm-rtk: compact outcomes preserve streams/status and signals clean without rerun"
+}
+
+test_public_launcher_sanitizes_startup_environment
+test_admission_and_trusted_raw
+test_spoofing_and_private_execution
+test_fixed_semantic_verbs
+test_path_confinement
+test_git_configuration_cannot_execute_or_write
+test_artifact_and_version_failures
+test_copy_race_and_copy_failure
+test_post_start_no_rerun_and_signal_cleanup
