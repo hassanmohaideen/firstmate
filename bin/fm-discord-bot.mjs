@@ -30,6 +30,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -64,6 +65,8 @@ const CONFIG_KEYS = [
 ];
 const SNOWFLAKE_RE = /^[0-9]{15,22}$/;
 const SAFE_CODE_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const INCIDENT_ID_RE = /^[0-9a-f]{64}$/;
+let diagnosticTransitions = Promise.resolve();
 
 class DisabledError extends Error {}
 class ConfigError extends Error {}
@@ -76,6 +79,13 @@ class DiscordHttpError extends Error {
 
 function safeLog(message) {
   process.stderr.write(`[discord-bot] ${message}\n`);
+}
+
+function diagnosticEpochSeconds() {
+  if (TEST_MODE && /^[0-9]+$/.test(process.env.FM_DISCORD_TEST_EPOCH_SECONDS || "")) {
+    return Number(process.env.FM_DISCORD_TEST_EPOCH_SECONDS);
+  }
+  return Math.floor(Date.now() / 1000);
 }
 
 function modeBits(info) {
@@ -283,62 +293,97 @@ async function removeMarker(path) {
   }
 }
 
-async function diagnosticCode(path) {
+async function readDiagnostic(path) {
   try {
     await assertPrivateFile(path);
-    const code = JSON.parse(await readFile(path, "utf8")).code || "";
-    return SAFE_CODE_RE.test(code) ? code : "";
+    const record = JSON.parse(await readFile(path, "utf8"));
+    if (!SAFE_CODE_RE.test(record?.code || "")) return null;
+    return {
+      code: record.code,
+      incidentId: INCIDENT_ID_RE.test(record.incident_id || "") ? record.incident_id : "",
+    };
   } catch (error) {
-    if (error?.code === "ENOENT" || error instanceof SyntaxError) return "";
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
     throw error;
   }
 }
 
-async function publishDiagnostic(code) {
-  if (await diagnosticCode(ERROR_NOTIFIED_FILE) === code) return;
-  await notify("error", code);
+function enqueueDiagnostic(transition) {
+  const result = diagnosticTransitions.then(transition);
+  diagnosticTransitions = result.catch(() => {});
+  return result;
+}
+
+async function publishDiagnostic(record) {
+  const notified = await readDiagnostic(ERROR_NOTIFIED_FILE);
+  if (notified?.incidentId === record.incidentId) return;
+  await notify("error", record.code);
   await atomicReplacePrivate(
     ERROR_NOTIFIED_FILE,
-    `${JSON.stringify({ code, notified_at: Math.floor(Date.now() / 1000) })}\n`,
+    `${JSON.stringify({
+      code: record.code,
+      incident_id: record.incidentId,
+      notified_at: diagnosticEpochSeconds(),
+    })}\n`,
   );
 }
 
-async function reportDiagnostic(code) {
-  if (!SAFE_CODE_RE.test(code)) code = "discord-service-error";
-  let previous;
-  try {
-    previous = await diagnosticCode(ERROR_FILE);
-  } catch {
-    safeLog("cannot inspect the existing diagnostic safely");
-    return;
-  }
-  if (previous !== code) {
-    await atomicReplacePrivate(ERROR_FILE, `${JSON.stringify({ code, recorded_at: Math.floor(Date.now() / 1000) })}\n`);
-  }
-  try {
-    await publishDiagnostic(code);
-  } catch {
-    safeLog("cannot publish the Discord diagnostic to Firstmate");
-  }
+function reportDiagnostic(code) {
+  return enqueueDiagnostic(async () => {
+    if (!SAFE_CODE_RE.test(code)) code = "discord-service-error";
+    let previous;
+    try {
+      previous = await readDiagnostic(ERROR_FILE);
+    } catch {
+      safeLog("cannot inspect the existing diagnostic safely");
+      return;
+    }
+    let record = previous;
+    if (previous?.code !== code || !previous.incidentId) {
+      record = { code, incidentId: randomBytes(32).toString("hex") };
+      await atomicReplacePrivate(ERROR_FILE, `${JSON.stringify({
+        code: record.code,
+        incident_id: record.incidentId,
+        recorded_at: diagnosticEpochSeconds(),
+      })}\n`);
+    }
+    try {
+      await publishDiagnostic(record);
+    } catch {
+      safeLog("cannot publish the Discord diagnostic to Firstmate");
+    }
+  });
 }
 
-async function reconcileDiagnostic() {
-  let code;
-  try {
-    code = await diagnosticCode(ERROR_FILE);
-    if (code) await publishDiagnostic(code);
-  } catch {
-    safeLog("a pending Discord diagnostic could not be reconciled safely");
-  }
+function reconcileDiagnostic() {
+  return enqueueDiagnostic(async () => {
+    try {
+      let record = await readDiagnostic(ERROR_FILE);
+      if (!record) return;
+      if (!record.incidentId) {
+        record = { code: record.code, incidentId: randomBytes(32).toString("hex") };
+        await atomicReplacePrivate(ERROR_FILE, `${JSON.stringify({
+          code: record.code,
+          incident_id: record.incidentId,
+          recorded_at: diagnosticEpochSeconds(),
+        })}\n`);
+      }
+      await publishDiagnostic(record);
+    } catch {
+      safeLog("a pending Discord diagnostic could not be reconciled safely");
+    }
+  });
 }
 
-async function clearDiagnostic() {
-  try {
-    await removeMarker(ERROR_FILE);
-    await removeMarker(ERROR_NOTIFIED_FILE);
-  } catch {
-    safeLog("cannot clear the recovered Discord diagnostic");
-  }
+function clearDiagnostic() {
+  return enqueueDiagnostic(async () => {
+    try {
+      await removeMarker(ERROR_FILE);
+      await removeMarker(ERROR_NOTIFIED_FILE);
+    } catch {
+      safeLog("cannot clear the recovered Discord diagnostic");
+    }
+  });
 }
 
 function boundedString(value, max = 4000) {
@@ -843,6 +888,7 @@ class GatewayRunner {
     clearInterval(pruneTimer);
     clearInterval(reconcileTimer);
     await this.inbound;
+    await diagnosticTransitions;
     safeLog("service stopped");
   }
 }

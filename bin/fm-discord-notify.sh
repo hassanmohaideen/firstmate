@@ -96,7 +96,23 @@ case "$kind" in
       exit 1
       ;;
     esac
-    dedupe=$(opaque_key "$kind:$diagnostic_record") || {
+    node_bin=${FM_DISCORD_NODE_BIN:-node}
+    incident_id=$(printf '%s' "$diagnostic_record" | "$node_bin" -e '
+      let input = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", chunk => { input += chunk; });
+      process.stdin.on("end", () => {
+        try {
+          const record = JSON.parse(input);
+          if (record.code !== process.argv[1] || !/^[0-9a-f]{64}$/.test(record.incident_id || "")) process.exit(1);
+          process.stdout.write(record.incident_id);
+        } catch { process.exit(1); }
+      });
+    ' "$key") || {
+      echo "fm-discord-notify: private diagnostic record is invalid" >&2
+      exit 1
+    }
+    dedupe=$(opaque_key "$kind:$incident_id") || {
       echo "fm-discord-notify: SHA-256 is required for durable deduplication" >&2
       exit 1
     }

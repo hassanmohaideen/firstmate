@@ -184,8 +184,11 @@ server.on("upgrade",(req,socket)=>{
   connections+=1; fs.writeFileSync(countFile,String(connections));
   const url=`ws://127.0.0.1:${server.address().port}`;
   text(socket,{op:10,d:{heartbeat_interval:5000}});
-  setTimeout(()=>text(socket,{op:0,t:"READY",s:connections,d:{user:{id:self},session_id:`session-${connections}`,resume_gateway_url:url}}),20);
+  if (mode !== "diagnostic-recurrence" || connections <= 2) {
+    setTimeout(()=>text(socket,{op:0,t:"READY",s:connections,d:{user:{id:self},session_id:`session-${connections}`,resume_gateway_url:url}}),20);
+  }
   if (mode === "reconnect" && connections === 1) setTimeout(()=>close(socket,1001),100);
+  if (mode === "diagnostic-recurrence" && connections <= 2) setTimeout(()=>close(socket,4004),50);
 });
 server.listen(0,"127.0.0.1",()=>fs.writeFileSync(portFile,String(server.address().port)));
 for (const signal of ["SIGTERM","SIGINT"]) process.on(signal,()=>server.close(()=>process.exit(0)));
@@ -418,6 +421,46 @@ kill -TERM "$auth_worker"
 wait "$auth_worker" || true
 WORKER_PIDS=()
 pass "Discord diagnostics retry transient publication failures without duplicate wakes"
+
+home=$(new_home gateway-diagnostic-order)
+write_config "$home"
+make_gateway_server "$home/gateway" diagnostic-recurrence
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_RECONCILE_MS=20 FM_DISCORD_TEST_EPOCH_SECONDS=1234567890 \
+  "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1 &
+diagnostic_worker=$!
+WORKER_PIDS+=("$diagnostic_worker")
+wait_for_value "$home/gateway/connections" 3 \
+  || fail "Discord diagnostic recurrence did not reach the second recovery boundary"
+i=0
+diagnostic_wakes=0
+while [ "$i" -lt 200 ] && [ "$diagnostic_wakes" -lt 2 ]; do
+  sleep 0.05
+  i=$((i + 1))
+  diagnostic_wakes=$(awk '/check: discord-error authentication-rejected/ { count += 1 } END { print count + 0 }' \
+    "$home/state/.wake-queue" 2>/dev/null)
+done
+[ "$diagnostic_wakes" -eq 2 ] \
+  || fail "same-code failures after recovery did not publish two incidents: $(cat "$home/bot.log")"
+[ "$(awk -F '\t' '/discord-error/ { print $4 }' "$home/state/.wake-queue" | sort -u | wc -l | tr -d ' ')" -eq 2 ] \
+  || fail "same-second diagnostic incidents reused a durable deduplication key"
+[ "$(jq -r .recorded_at "$home/state/discord-bot.error")" -eq 1234567890 ] \
+  || fail "diagnostic recurrence fixture did not hold both incidents in one second"
+incident_id=$(jq -r .incident_id "$home/state/discord-bot.error")
+case "$incident_id" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *)
+    [ "${#incident_id}" -eq 64 ] || fail "diagnostic incident identity did not have cryptographic entropy length"
+    case "$incident_id" in *[!0-9a-f]*) fail "diagnostic incident identity was not opaque hexadecimal" ;; esac
+    ;;
+esac
+[ "$(jq -r .incident_id "$home/state/discord-bot.error.notified")" = "$incident_id" ] \
+  || fail "diagnostic publication receipt was not bound to the current incident"
+kill -TERM "$diagnostic_worker"
+wait "$diagnostic_worker" || true
+WORKER_PIDS=()
+pass "Discord diagnostic transitions preserve rapid same-second recurrences"
 
 # macOS LaunchAgent rendering contains no credential or deployment id.
 home=$(new_home launchagent)
