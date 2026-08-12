@@ -240,9 +240,9 @@ This section is the sole owner of that procedure.
 1. Run `bin/fm-public-followup.sh consume`.
    It reconciles every typed terminal result from disk and prints `ready <obligation-id> <request-id> <platform>` for each commitment that became deliverable.
    A refusal prints `rejected <event-id>: <reason>` and quarantines that event; read the reason rather than re-emitting blindly.
-2. For each ready commitment, run `bin/fm-public-followup.sh deliver <obligation-id>`.
-   With no `--text-file` it reuses the accepted terminal outcome exactly, which is the preferred path for a landed result.
-   Only pass `--text-file` when the outcome genuinely needs composing, and hold it to the same public-safety bar as every other reply here.
+2. For each ready commitment, read its accepted terminal outcome through the documented `tasks-axi public-followup` interface, then compose a concise final reply that preserves the outcome without adding or changing claims.
+   Apply the address and tone axes under **Voice**, including its serious-context and public-name rules, write the reply to a temporary file, and run `bin/fm-public-followup.sh deliver <obligation-id> --text-file <path>`.
+   Never use bare `deliver` for this firstmate-owned path: its verbatim terminal-outcome fallback is tool-facing input, not a preference-aware public reply.
    Delivery clears the bound task's legacy Relay link at the validated receipt boundary; if it reports a cleanup failure, use its reconciliation message and do not post a legacy final.
 3. Read the outcome and stop guessing at anything it refuses:
    - "still waiting on its bound work" means the work has not reported a typed terminal result yet - do not post.
