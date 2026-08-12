@@ -56,7 +56,7 @@ It never tears down a task, merges a PR, dispatches new work, steers a worker, a
    If today's file already exists, delete it first, then create a new file from scratch.
    This is the only write allowed by the skill.
    The detailed report includes:
-   - **Title** - `# Bearings - <day> <YYYY-MM-DD>` by default, or `# Status Report - <day> <YYYY-MM-DD>` when the shared preference rule requires professional non-nautical language (use "Morning status" only when the user specifically asks for a morning brief), followed by two or three sentences framing where things stand.
+   - **Title** - `# Bearings - <day> <YYYY-MM-DD>` by default, or `# Status Report - <day> <YYYY-MM-DD>` when the roleplay/tone axis of the shared preference rule requires professional non-nautical language (use "Morning status" only when the user specifically asks for a morning brief), followed by two or three sentences framing where things stand.
    - **Action bucket** - every open decision summarized with its options from the structured decision record, plus each PR ready to merge and each needed credential or login, every PR with the full `https://...` URL, never a bare `#number`.
    - **Completed bucket** - the bounded current recent-completions baseline from structured state across the main fleet and every registered secondmate home, rendered in full on every run.
    - **In-progress bucket** - each live direct report making progress, with its current state, and the plans or main pickup pointers worth reopening (`data/<id>/report.md` files, `.lavish/*.html` boards).
@@ -67,7 +67,7 @@ It never tears down a task, merges a PR, dispatches new work, steers a worker, a
 ## Chat-response contract
 
 This skill is the one owner of the `/bearings` chat-response format; the snapshot and classifier own the data that feeds it, and no other file restates this contract.
-Every `/bearings` chat response renders EXACTLY four sections in the order below and nothing else structural (there is no fifth section). Use the default labels and empty states unless the shared address and roleplay preference rule in `AGENTS.md` requires professional non-nautical language; in that case use the professional labels and empty states. This label selection changes no bucket content, ordering, or completeness.
+Every `/bearings` chat response renders EXACTLY four sections in the order below and nothing else structural (there is no fifth section). Select labels and empty states solely from the roleplay/tone axis of the shared preference rule in `AGENTS.md`: use the professional variants when that axis requires professional non-nautical language, and the default variants otherwise. The address axis does not select headings. This label selection changes no bucket content, ordering, or completeness.
 
 1. **Captain's Call** (professional: **Action Required**) - ONLY items that need the user's own action now: a decision to make, a PR to approve or merge, a credential or login to provide, or a blocker only the user can clear.
    Empty-state: "Nothing needs your action right now." (professional: "No action is required right now.")
@@ -87,7 +87,7 @@ Rules that keep the contract unambiguous:
 - The strict boundary keeps action-free items OUT of the action bucket: a working or validating task, a queued item blocked on another task or a date, landed work, a completed scout's report pointer, a declared `paused:` external wait, and a bare recorded PR with no merge-ready signal each belong to one of the other three sections, never the action bucket.
 - A secondmate's own row appears in the in-progress bucket only for `active_child_work`; `externally_held` belongs in the queued bucket, and `unknown` belongs there as an unavailable-state gate unless its reason requires the user's action.
 - Do not suppress separately projected decisions, landed records, or gates from a `partial-structured` home merely because that secondmate's own row is `unknown`.
-- Apply the shared address and roleplay preference rule in `AGENTS.md`; include its default direct address inside one item or empty-state sentence only when that rule permits it.
+- Apply the address axis of the shared preference rule in `AGENTS.md` independently of heading selection: include the selected form of direct address inside one item or empty-state sentence, or omit direct address when that axis requests no title or direct address.
 - Every PR appears as the full `https://...` URL; a shorthand `#number` is fine only as a back-reference after the full URL has already appeared in the same digest.
 - The chat follows `AGENTS.md` section 9 and carries one scannable line per item.
 - Detailed decisions, plans, full gate reasons, and evidence belong in the file only when file mode is explicit, so plain chat stays concise and file-mode chat stays materially shorter than that file.
