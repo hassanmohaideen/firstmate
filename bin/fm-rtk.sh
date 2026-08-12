@@ -4,10 +4,6 @@ if [ "${_FM_RTK_CLEAN_ENV:-}" != 'firstmate-rtk-verifier-v1' ]; then
     _FM_RTK_CLEAN_ENV=firstmate-rtk-verifier-v1 \
     PATH=/usr/bin:/bin LC_ALL=C \
     FM_HOME="${FM_HOME:-}" \
-    FM_RTK_TEST_SYSTEM_ROOT="${FM_RTK_TEST_SYSTEM_ROOT:-}" \
-    FM_RTK_TEST_OS="${FM_RTK_TEST_OS:-}" \
-    FM_RTK_TEST_ARCH="${FM_RTK_TEST_ARCH:-}" \
-    FM_RTK_TEST_SHA256="${FM_RTK_TEST_SHA256:-}" \
     /bin/bash -p "$0" "$@"
   exit 70
 fi
@@ -32,7 +28,6 @@ export PATH LC_ALL
 set -u
 
 SOURCE_PATH=${BASH_SOURCE[0]}
-SOURCE_NAME=${SOURCE_PATH##*/}
 case "$SOURCE_PATH" in
   */*) SOURCE_DIR=${SOURCE_PATH%/*} ;;
   *) SOURCE_DIR=. ;;
@@ -42,26 +37,8 @@ FM_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pwd -P) || exit 70
 RTK_PIN=v0.45.0
 RTK_PLATFORM=aarch64-apple-darwin
 RTK_BINARY_SHA256=17d00d61a533a442c61f1be49d8a9321225557f64021d5b70fd8eb75ed8fb0be
-TEST_SYSTEM_ROOT=
-TEST_OS=
-TEST_ARCH=
-if [ "$SOURCE_NAME" = fm-rtk-test-driver.sh ] && [ -n "${FM_RTK_TEST_SYSTEM_ROOT:-}" ]; then
-  case "$FM_RTK_TEST_SYSTEM_ROOT" in
-    /*)
-      TEST_SYSTEM_ROOT=$FM_RTK_TEST_SYSTEM_ROOT
-      TEST_OS=${FM_RTK_TEST_OS:-Darwin}
-      TEST_ARCH=${FM_RTK_TEST_ARCH:-arm64}
-      ;;
-  esac
-fi
-if [ -n "$TEST_SYSTEM_ROOT" ]; then
-  SYS_USR_BIN=$TEST_SYSTEM_ROOT/usr/bin
-  [ -z "${FM_RTK_TEST_SHA256:-}" ] || RTK_BINARY_SHA256=$FM_RTK_TEST_SHA256
-else
-  SYS_USR_BIN=/usr/bin
-fi
-PERL_TOOL=$SYS_USR_BIN/perl
-ENV_TOOL=$SYS_USR_BIN/env
+PERL_TOOL=/usr/bin/perl
+ENV_TOOL=/usr/bin/env
 
 trusted_executable() {
   [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ]
@@ -103,10 +80,8 @@ EFFECTIVE_HOME=$(CDPATH='' cd -- "$REQUESTED_HOME" 2>/dev/null && pwd -P) || {
   use warnings;
   $SIG{ALRM} = sub { exit 68 };
   alarm 5;
-  my ($home, $expected_sha, $test_os, $test_arch, @parts) = @ARGV;
+  my ($home, $expected_sha, @parts) = @ARGV;
   my ($os, $node, $release, $version, $arch) = POSIX::uname();
-  $os = $test_os if length $test_os;
-  $arch = $test_arch if length $test_arch;
   exit 64 unless $os eq "Darwin" && $arch eq "arm64";
 
   my $directory_flags = O_RDONLY | O_NONBLOCK | O_NOFOLLOW;
@@ -137,7 +112,7 @@ EFFECTIVE_HOME=$(CDPATH='' cd -- "$REQUESTED_HOME" 2>/dev/null && pwd -P) || {
   my $sha = Digest::SHA->new(256);
   $sha->addfile($fh);
   exit 69 unless $sha->hexdigest eq $expected_sha;
-' "$EFFECTIVE_HOME" "$RTK_BINARY_SHA256" "$TEST_OS" "$TEST_ARCH" \
+' "$EFFECTIVE_HOME" "$RTK_BINARY_SHA256" \
   data tools rtk "$RTK_PIN" "$RTK_PLATFORM" 2>/dev/null
 INSPECT_RC=$?
 case "$INSPECT_RC" in
