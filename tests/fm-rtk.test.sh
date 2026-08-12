@@ -338,7 +338,7 @@ begin_write_monitor() {
   MONITOR_READY=$CONTROL/monitor-$name.ready
   MONITOR_EVENTS=$CONTROL/monitor-$name.events
   MONITOR_STOP=$CONTROL/monitor-$name.stop
-  rm -f "$MONITOR_READY" "$MONITOR_EVENTS" "$MONITOR_STOP"
+  rm -f "$MONITOR_READY" "$MONITOR_EVENTS" "$MONITOR_STOP" "$MONITOR_STOP.observed"
   "$PYTHON3" "$EVENT_MONITOR" --ready "$MONITOR_READY" --events "$MONITOR_EVENTS" \
     --stop "$MONITOR_STOP" "$@" >"$CONTROL/monitor-$name.out" \
     2>"$CONTROL/monitor-$name.err" &
@@ -385,14 +385,39 @@ self_test_write_monitor() {
   : > "$root/transient"
   rm "$root/transient"
   end_write_monitor transient-entry changed
-  pass "fm-rtk: transient-write monitor detects restored mutations"
+
+  begin_write_monitor stop-time-mutation "$root"
+  : > "$MONITOR_STOP"
+  local attempts=0
+  while [ ! -e "$MONITOR_STOP.observed" ] && [ "$attempts" -lt 200 ]; do
+    kill -0 "$MONITOR_PID" 2>/dev/null || break
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [ -e "$MONITOR_STOP.observed" ] || fail "stop-time monitor handshake was not observed"
+  printf 'same bytes\n' > "$root/file"
+  end_write_monitor stop-time-mutation changed
+  pass "fm-rtk: transient-write monitor detects restored and stop-time mutations"
 }
 
 assert_trace_has_no_orientation_exec() {
   local home=$1 fakebin=$2 lifecycle_root=$3 probe=$CONTROL/dtruss-probe trace=$CONTROL/dtruss-trace rc
-  [ "$(/usr/bin/uname -s)" = Darwin ] && [ -x /usr/bin/dtruss ] || return 0
-  /usr/bin/dtruss -f -t execve /usr/bin/printf '%s' fm-rtk-argv-probe >/dev/null 2>"$probe" || return 0
-  /usr/bin/grep -F fm-rtk-argv-probe "$probe" >/dev/null || return 0
+  if [ "$(/usr/bin/uname -s)" != Darwin ]; then
+    pass "fm-rtk: absolute execution tracing # SKIP dtruss requires Darwin"
+    return
+  fi
+  if [ ! -x /usr/bin/dtruss ]; then
+    pass "fm-rtk: absolute execution tracing # SKIP dtruss facility unavailable"
+    return
+  fi
+  if ! /usr/bin/dtruss -f -t execve /usr/bin/printf '%s' fm-rtk-argv-probe >/dev/null 2>"$probe"; then
+    pass "fm-rtk: absolute execution tracing # SKIP dtruss permission unavailable"
+    return
+  fi
+  if ! /usr/bin/grep -F fm-rtk-argv-probe "$probe" >/dev/null; then
+    pass "fm-rtk: absolute execution tracing # SKIP dtruss argv visibility unavailable"
+    return
+  fi
   [ "$MONITOR_AVAILABLE" -eq 0 ] || begin_write_monitor traced-session "$PROJECT" "$home/config"
   (cd "$PROJECT" && /usr/bin/dtruss -f -t execve /usr/bin/env \
     FM_HOME="$home" FM_SESSION_START_TIMEOUT=20 PATH="$fakebin:/usr/bin:/bin" \

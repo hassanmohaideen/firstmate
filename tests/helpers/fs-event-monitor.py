@@ -52,8 +52,10 @@ def monitor_inotify(roots, ready, events, stop):
             return 77
         open(ready, "xb").close()
         with open(events, "ab", buffering=0) as output:
+            stopping = False
             while True:
                 readable, _, _ = select.select([fd], [], [], 0.05)
+                observed_event = bool(readable)
                 if readable:
                     while True:
                         try:
@@ -68,7 +70,11 @@ def monitor_inotify(roots, ready, events, stop):
                             name = data[offset + 16:offset + 16 + length].rstrip(b"\0")
                             output.write((f"{wd}:{event_mask:x}:{cookie}:".encode() + name + b"\n"))
                             offset += 16 + length
-                if os.path.exists(stop):
+                if not stopping and os.path.exists(stop):
+                    stopping = True
+                    open(stop + ".observed", "xb").close()
+                    continue
+                if stopping and not observed_event:
                     return 0
     finally:
         os.close(fd)
@@ -101,10 +107,16 @@ def monitor_kqueue(roots, ready, events, stop):
         kq.control(changes, 0, 0)
         open(ready, "xb").close()
         with open(events, "ab", buffering=0) as output:
+            stopping = False
             while True:
-                for event in kq.control(None, max(1, len(descriptors)), 0.05):
+                pending = kq.control(None, max(1, len(descriptors)), 0.05)
+                for event in pending:
                     output.write(f"{event.ident}:{event.fflags:x}\n".encode())
-                if os.path.exists(stop):
+                if not stopping and os.path.exists(stop):
+                    stopping = True
+                    open(stop + ".observed", "xb").close()
+                    continue
+                if stopping and not pending:
                     return 0
     finally:
         kq.close()
