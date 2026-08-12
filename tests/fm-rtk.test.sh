@@ -343,12 +343,60 @@ assert_trace_has_no_orientation_exec() {
   fi
 }
 
+snapshot_tree() {
+  /usr/bin/perl -MDigest::SHA -MFile::Find -MFcntl=:mode -e '
+    use strict;
+    use warnings;
+    my $root = shift;
+    my @records;
+    find({
+      no_chdir => 1,
+      wanted => sub {
+        my $path = $File::Find::name;
+        my @stat = lstat($path);
+        die "lstat failed\n" unless @stat;
+        my $mode = $stat[2];
+        my $relative = $path eq $root ? "." : substr($path, length($root) + 1);
+        my ($type, $detail) = ("unknown", "");
+        if (S_ISREG($mode)) {
+          open my $file, "<", $path or die "open failed\n";
+          binmode $file;
+          $type = "file";
+          $detail = Digest::SHA->new(256)->addfile($file)->hexdigest;
+          close $file or die "close failed\n";
+        } elsif (S_ISDIR($mode)) {
+          $type = "directory";
+        } elsif (S_ISLNK($mode)) {
+          $type = "symlink";
+          my $target = readlink($path);
+          die "readlink failed\n" unless defined $target;
+          $detail = unpack("H*", $target);
+        } elsif (S_ISFIFO($mode)) {
+          $type = "fifo";
+        } elsif (S_ISSOCK($mode)) {
+          $type = "socket";
+        } elsif (S_ISBLK($mode)) {
+          $type = "block";
+          $detail = $stat[6];
+        } elsif (S_ISCHR($mode)) {
+          $type = "character";
+          $detail = $stat[6];
+        }
+        push @records, join("|", unpack("H*", $relative), $type,
+          sprintf("%04o", $mode & 07777), $stat[4], $stat[5], $detail);
+      }
+    }, $root);
+    print join("\n", sort @records), "\n";
+  ' "$1"
+}
+
 assert_lifecycle_inert() {
   local name=$1 project_before=$2 config_before=$3 project_after config_after
-  project_after=$(find "$PROJECT" -mindepth 1 -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
-  config_after=$(find "$CONTROL/lifecycle-home/config" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
-  [ "$project_before" = "$project_after" ] || fail "$name changed project bytes"
-  [ "$config_before" = "$config_after" ] || fail "$name changed private config bytes"
+  project_after=$(snapshot_tree "$PROJECT") || fail "$name could not snapshot project tree"
+  config_after=$(snapshot_tree "$CONTROL/lifecycle-home/config") \
+    || fail "$name could not snapshot private config tree"
+  [ "$project_before" = "$project_after" ] || fail "$name changed project tree"
+  [ "$config_before" = "$config_after" ] || fail "$name changed private config tree"
   assert_absent "$CONTROL/lifecycle-calls" "$name called an RTK, installer, network, hook, or activation command"
   if [ -f "$CONTROL/lifecycle-git-calls" ] && /usr/bin/grep -E '(^| )(status|diff|log)( |$)' "$CONTROL/lifecycle-git-calls" >/dev/null; then
     fail "$name ran a forbidden project-orientation git command"
@@ -380,8 +428,8 @@ EOF
 EOF
   chmod +x "$home/data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk"
   make_trap_tools "$fakebin"
-  project_before=$(find "$PROJECT" -mindepth 1 -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
-  config_before=$(find "$home/config" -type f -exec /usr/bin/shasum -a 256 {} \; | LC_ALL=C sort)
+  project_before=$(snapshot_tree "$PROJECT") || fail "could not snapshot project tree"
+  config_before=$(snapshot_tree "$home/config") || fail "could not snapshot private config tree"
 
   rm -f "$CONTROL/lifecycle-calls" "$CONTROL/lifecycle-git-calls" \
     "$CONTROL/verifier-called" "$CONTROL/artifact-executed"
