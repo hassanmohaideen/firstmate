@@ -59,7 +59,7 @@ The operator-run real-account smoke remains `bin/fm-discord-bot.sh start`, `chec
 
 The review covered every primary harness currently supported by the README and configuration owner.
 The Discord runtime never calls a harness executable or injects raw Discord text into a harness composer.
-It commits private input, calls `fm_wake_append` through `fm-discord-notify.sh`, and lets the existing structural `check` path wake the active primary.
+It commits private input, calls the queue's idempotent append path through `fm-discord-notify.sh`, and lets the existing structural `check` path wake the active primary.
 
 | Primary harness | Applicability | Maintained reason |
 | --- | --- | --- |

@@ -70,10 +70,10 @@ It suppresses failed-looking closes when the same identity-matched watcher is he
 [`watcher-continuity.md`](watcher-continuity.md) owns Claude's residual active-turn coverage and watcher-status command-gating boundary.
 The existing turn-end guard remains the final backstop for all five harness-engine protocols, with pi-signed sharing Pi's protocol and the `--claude` mode cooperating with the auto-arm claim.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
-A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, if work, process-event sources, or Relay polling has an unhealthy model-aware supervision verdict, or if queued wakes are waiting to be drained.
+A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, if work, process-event sources, or external messaging through Relay or direct Discord has an unhealthy model-aware supervision verdict, or if queued wakes are waiting to be drained.
 The drain script calls that guard after presenting the queue; records remain durable, and may keep the queued-wakes warning visible, until the exact generation-bound acknowledgement printed by the drain succeeds after handling.
 It leads with a prominent bordered tangle banner, while `bin/fm-guard.sh` owns the watcher-down banner and reminder policy so repeated guarded commands stay noisy without reprinting the full banner in the same episode.
-On every verified primary harness, tracked hook integration gives the primary session a push-based backstop: when work, a process-event source, or Relay polling needs supervision and no identity-matched watcher lock with a fresh beacon is live, direct Stop hooks block and passive turn-end hooks force one bounded follow-up.
+On every verified primary harness, tracked hook integration gives the primary session a push-based backstop: when work, a process-event source, Relay polling, or direct Discord messaging needs supervision and no identity-matched watcher lock with a fresh beacon is live, direct Stop hooks block and passive turn-end hooks force one bounded follow-up.
 The guard covers the main primary and genuinely marked secondmate homes, exempts child crewmate/scout worktrees, is loop-safe per harness, and is documented in [turnend-guard.md](turnend-guard.md).
 
 A presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) extends this for walk-away supervision: the `/afk` skill starts it through the tracked foreground helper `bin/fm-afk-start.sh`, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
@@ -253,7 +253,7 @@ It validates the private owner/guild/channel configuration, maintains one Discor
 Production API and Gateway endpoints are fixed to Discord; local endpoint overrides exist only behind the hermetic test mode.
 The token is read at the authenticated connection boundary and is never copied into the LaunchAgent, queue, inbox, context, task metadata, or logs.
 
-An admitted message is committed under `state/discord-inbox/` and `state/discord-context/` before `bin/fm-discord-notify.sh` calls `fm_wake_append` with a structural `discord-message` check event.
+An admitted message is committed under `state/discord-inbox/` and `state/discord-context/` before `bin/fm-discord-notify.sh` calls the queue's idempotent append path with a structural `discord-message` check event.
 Raw message or thread text never enters the durable queue or canonical operational-input protocol.
 The existing watcher recovery marker and queue therefore own crash recovery and delivery exactly as they do for every other actionable check, and the away-mode daemon already escalates check events without a Discord-specific branch.
 A mode-`0600` `state/discord-bot.enabled` marker keeps ordinary supervision live while the Gateway service runs; a pending private inbox independently keeps supervision needed after a deliberate service stop.

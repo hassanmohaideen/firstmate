@@ -372,7 +372,8 @@ Unknown keys, duplicate keys, missing or empty values, whitespace or control cha
 An explicit process environment value for any of those four names overrides that key from the file for foreground operation.
 All four values must still resolve together, so a partial environment cannot accidentally activate the transport.
 The macOS `start` path requires the private file and validates it without ambient overrides before loading the LaunchAgent, which never copies any of the four values into its property list.
-A worker using a custom configuration path records only that absolute path in the mode-`0600`, single-linked `state/discord-bot.config-path` runtime record. Reply and follow-up helpers use this record when no explicit path is supplied and refuse symlinks, extra lines, non-absolute paths, unsafe modes, or a configuration target that is not itself private; no credential or Discord id is copied into the record.
+A worker using a custom configuration path records only that absolute path in the mode-`0600`, single-linked `state/discord-bot.config-path` runtime record.
+Reply and follow-up helpers use this record when no explicit path is supplied and refuse symlinks, extra lines, non-absolute paths, unsafe modes, or a configuration target that is not itself private; no credential or Discord id is copied into the record.
 
 `bin/fm-discord-bot.sh configure` is the supported interactive writer.
 It reads the token with terminal echo disabled, writes a mode-`0600` temporary, validates all four values through the runtime owner, and replaces the configured file atomically only after validation succeeds.
@@ -385,7 +386,8 @@ Public-safe reply prose files passed by path must remain inside that home's priv
 Both directories are mode `0700`; each artifact is regular, single-linked, and mode `0600`.
 A successful notification adds `state/discord-context/<message-id>.notified`, so a Gateway replay or service restart does not intentionally append another notification after the first durable queue publication.
 A successful initial or terminal post adds `<message-id>.initial.sent` or `<message-id>.final.sent` before inbox or task-binding cleanup, so a retry after local cleanup failure confirms the exact phase instead of posting again.
-Structural Discord wakes use an opaque deterministic SHA-256 key and a private queue acceptance receipt. The append and receipt are recovered under the queue lock, so a crash between them cannot duplicate message or diagnostic publication; inbox reconciliation still repairs publication attempts that failed before queue acceptance.
+Structural Discord wakes use an opaque deterministic SHA-256 key and a private queue acceptance receipt.
+The append and receipt are recovered under the queue lock, so a crash between them cannot duplicate message or diagnostic publication; inbox reconciliation still repairs publication attempts that failed before queue acceptance.
 Answered context and notification records are pruned after seven days, while a still-pending inbox or a task metadata file carrying that `discord_request=` prevents its context from being pruned.
 
 `state/discord-bot.enabled` is a private service-liveness presence marker, `state/discord-bot.ready` records a currently connected Gateway session, and `state/discord-bot.error` carries one safe diagnostic code without credentials, ids, payloads, or remote response bodies.

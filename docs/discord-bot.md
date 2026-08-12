@@ -32,7 +32,7 @@ The transport stores referenced-message text separately as untrusted surrounding
 Raw Discord text stays in a private inbox and never enters an operational-input marker or durable notification row.
 Outbound replies suppress all mention expansion, do not ping the replied-to user, stay below Discord's message limit, and revalidate the original guild/channel/message binding immediately before posting.
 
-The bot token and Discord ids live only in the local gitignored `config/discord-bot.env` file or an explicitly supplied process environment.
+The bot token and configured owner, guild, and channel authorization ids live only in the local gitignored `config/discord-bot.env` file or an explicitly supplied process environment.
 The interactive configurator writes a regular, single-linked mode-`0600` file and never accepts the token in command arguments.
 The macOS LaunchAgent contains only local code and home paths.
 It contains no token, owner id, guild id, or channel id.
@@ -54,10 +54,11 @@ Firstmate does not create an application, generate or rotate a token, invite a b
 5. Generate or reset the bot token only when you are ready to store it immediately through the private configurator.
 6. Open **OAuth2** and use the URL generator for a guild install.
 7. Select the `bot` scope.
-8. Grant only **View Channels**, **Send Messages**, and **Read Message History**.
-9. Open the generated URL, choose the intended server, and approve the install yourself.
-10. In Discord user settings, enable **Advanced -> Developer Mode**.
-11. Use **Copy User ID** on the owner account, **Copy Server ID** on the allowed server, and **Copy Channel ID** on the exact allowed channel or thread.
+8. Grant only **View Channels**, **Send Messages**, and **Read Message History** for an ordinary channel.
+9. If the exact bound conversation will be a thread, also grant **Send Messages in Threads** and ensure the bot can view that thread; do not grant it for an ordinary channel.
+10. Open the generated URL, choose the intended server, and approve the install yourself.
+11. In Discord user settings, enable **Advanced -> Developer Mode**.
+12. Use **Copy User ID** on the owner account, **Copy Server ID** on the allowed server, and **Copy Channel ID** on the exact allowed channel or thread.
 
 Do not grant Administrator.
 Do not grant message-management, role-management, member-management, webhook, mention-everyone, attachment, or voice permissions.
@@ -165,7 +166,8 @@ A connected service that ignores a message is usually enforcing the owner, guild
 Confirm those ids locally with Developer Mode and rerun `configure` rather than weakening the checks.
 
 A reply rejected for channel permission needs the bot's **View Channels**, **Send Messages**, or **Read Message History** permission in that exact channel.
-Do not solve it by granting Administrator.
+A bound thread additionally needs **Send Messages in Threads** and bot access to that thread.
+Do not solve either case by granting Administrator.
 
 The implementation and safety ownership boundary is in [`architecture.md`](architecture.md#optional-self-hosted-discord).
 The local configuration schema is owned by [`configuration.md`](configuration.md#self-hosted-discord-configdiscord-botenv).

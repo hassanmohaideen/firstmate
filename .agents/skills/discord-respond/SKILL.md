@@ -13,7 +13,7 @@ metadata:
 
 The self-hosted Discord transport is an optional direct connection between one Firstmate home and Discord.
 Its local configuration names one owner user, one allowed guild, and one allowed channel.
-The executable intake owner admits only a direct message from that owner that directly mentions this bot in that exact server conversation.
+The executable intake owner admits only an owner-authored server message that directly mentions this bot in that exact configured conversation.
 The bot ignores every other user, bot-authored message, webhook message, other guild, other channel, unsupported message type, empty mention, and message without the direct bot mention before any model sees it.
 
 A valid message arrives as a `check:` notification carrying `discord-message <message-id>`.
