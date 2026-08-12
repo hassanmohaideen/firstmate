@@ -53,7 +53,7 @@ This separation avoids executing a child twice while keeping optional-tool unava
 There is no automatic download, install, discovery, or update path.
 A new pin requires a tracked Firstmate change that reviews the exact stable upstream tag and commit, release workflow, dependency and license changes, signing and provenance posture, telemetry and persistence changes, filter and rewrite changes, and relevant open correctness or privacy issues.
 Every newly admitted platform must run the adversarial artifact suite on that platform before its checksum joins the helper.
-The suite covers every allowed verb, hostile filenames and arguments, machine-mode refusals, stdout and stderr, child failures and signals, deterministic behavior, ANSI-only diagnostics, large late diagnostics, privacy isolation, and raw fallback.
+The review must include every allowed verb, hostile filenames and arguments, machine-mode refusals, stdout and stderr, child failures and signals, deterministic behavior, ANSI-only diagnostics, large late diagnostics, privacy isolation, and raw fallback.
 Development branches, mutable latest selectors, unpinned Git installs, upstream installers, and the unrelated crates.io `rtk` package are never eligible pins.
 
 Immediate rollback is removing the home-local selection so no task can enter compact execution.
@@ -69,6 +69,7 @@ Any correctness miss, privacy write outside the private temporary root, unexpect
 Synthetic byte reduction alone is not enough to graduate the feature because output bytes are not provider-billed tokens and compact output can cause compensating raw reruns.
 
 Routine tests use fake raw and RTK executables and make no network call.
-`tests/fm-rtk.test.sh` owns the helper's executable behavior coverage.
+`tests/fm-rtk.test.sh` owns fixed mappings, admission, confinement, pin checks, privacy isolation, fallback, and child-outcome coverage.
+`tests/fm-rtk-fs-events.test.sh` and `tests/fm-rtk-exec-trace.test.sh` own the lifecycle-inertness guards.
 `tests/fm-brief.test.sh` owns generated opt-in, default-off, charter refusal, ordinary safety-text retention, and runtime-neutral brief coverage.
 No supported harness or backend needs separate behavior because no command interception is installed and every worker receives the same explicit helper command.

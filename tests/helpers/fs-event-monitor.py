@@ -8,6 +8,7 @@ import select
 import stat
 import struct
 import sys
+import time
 
 
 def entries(roots):
@@ -53,6 +54,7 @@ def monitor_inotify(roots, ready, events, stop):
         open(ready, "xb").close()
         with open(events, "ab", buffering=0) as output:
             stopping = False
+            quiet_until = None
             while True:
                 readable, _, _ = select.select([fd], [], [], 0.05)
                 observed_event = bool(readable)
@@ -72,9 +74,12 @@ def monitor_inotify(roots, ready, events, stop):
                             offset += 16 + length
                 if not stopping and os.path.exists(stop):
                     stopping = True
+                    quiet_until = time.monotonic() + 0.1
                     open(stop + ".observed", "xb").close()
                     continue
-                if stopping and not observed_event:
+                if stopping and observed_event:
+                    quiet_until = time.monotonic() + 0.1
+                if stopping and not observed_event and time.monotonic() >= quiet_until:
                     return 0
     finally:
         os.close(fd)
@@ -108,15 +113,19 @@ def monitor_kqueue(roots, ready, events, stop):
         open(ready, "xb").close()
         with open(events, "ab", buffering=0) as output:
             stopping = False
+            quiet_until = None
             while True:
                 pending = kq.control(None, max(1, len(descriptors)), 0.05)
                 for event in pending:
                     output.write(f"{event.ident}:{event.fflags:x}\n".encode())
                 if not stopping and os.path.exists(stop):
                     stopping = True
+                    quiet_until = time.monotonic() + 0.1
                     open(stop + ".observed", "xb").close()
                     continue
-                if stopping and not pending:
+                if stopping and pending:
+                    quiet_until = time.monotonic() + 0.1
+                if stopping and not pending and time.monotonic() >= quiet_until:
                     return 0
     finally:
         kq.close()
