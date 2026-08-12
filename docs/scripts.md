@@ -26,8 +26,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-backlog-handoff.sh`  | Validate and delegate queued backlog-item moves into a secondmate home               |
 | `fm-backlog-receive.sh`  | Idempotently ingest one confined remote handoff outbox through tasks-axi             |
 | `fm-decision-hold.sh`    | Create, verify, complete, and resolve durable captain-held decisions                 |
-| `fm-brief.sh`            | Scaffold ship, scout, or secondmate briefs with explicit delivery and optional Herdr-lab contracts |
-| `fm-rtk.sh`              | Inspect the reviewed RTK scout artifact without executing RTK or project commands |
+| `fm-brief.sh`            | Scaffold ship, scout, or secondmate briefs with explicit delivery and optional lab/orientation contracts |
+| `fm-rtk.sh`              | Run fixed read-only RTK orientation verbs behind pin, privacy, and raw-fallback checks |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
 | `fm-install-herdr.sh`    | Install CI's exact-version Herdr pin with official asset URL, SHA-256, and protocol checks |
 | `fm-install-treehouse.sh`| Install CI's exact-version Treehouse pin for real-Herdr E2E that needs spawn worktrees |

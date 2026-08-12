@@ -174,6 +174,7 @@ test_help_includes_entire_header() {
   local help
   help=$("$ROOT/bin/fm-brief.sh" --help)
   assert_contains "$help" "Refuses to overwrite an existing brief." "fm-brief.sh --help omitted its header terminator"
+  assert_contains "$help" "--rtk-compact" "fm-brief.sh --help omitted optional RTK task orientation"
   pass "fm-brief.sh: --help renders the complete header"
 }
 
@@ -633,6 +634,76 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates() {
   pass "fm-brief.sh: Herdr lab contract covers scouts and rejects secondmate misuse"
 }
 
+test_rtk_compact_is_explicit_for_ordinary_tasks_only() {
+  local home ship scout default_ship default_scout status=0
+  home="$TMP_ROOT/rtk-compact-home"
+  mkdir -p "$home/data" "$home/fakebin"
+  cat > "$home/fakebin/rtk" <<EOF
+#!/usr/bin/env bash
+touch '$home/rtk-executed'
+EOF
+  chmod +x "$home/fakebin/rtk"
+
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-brief.sh" rtk-ship firstmate --mode no-mistakes --rtk-compact >/dev/null 2>&1 \
+    || fail "ship --rtk-compact brief did not scaffold"
+  ship="$home/data/rtk-ship/brief.md"
+  assert_grep "# Supplemental compact orientation - EXPLICIT TASK OPT-IN" "$ship" \
+    "ship opt-in brief omitted the RTK orientation section"
+  assert_grep "FM_HOME='$home' '$ROOT/bin/fm-rtk.sh' git-log" "$ship" \
+    "ship opt-in brief did not bind the exact home and Firstmate helper"
+  assert_grep "Every compact result is supplemental orientation, never authoritative evidence." "$ship" \
+    "ship opt-in brief omitted the non-authoritative boundary"
+  assert_grep "Before any safety, mutation, validation, final-review, cleanliness, landing, or approval decision" "$ship" \
+    "ship opt-in brief omitted the mandatory raw-evidence rerun"
+  # shellcheck disable=SC2016 # Literal backticks are part of the generated brief contract.
+  assert_grep 'Never invoke `rtk` directly' "$ship" \
+    "ship opt-in brief omitted the direct RTK denial"
+  assert_grep "Verify isolation before anything else" "$ship" \
+    "ship opt-in brief lost ordinary worktree isolation"
+  assert_absent "$home/rtk-executed" "scaffolding executed ambient RTK"
+  assert_absent "$home/config/rtk" "scaffolding activated the home-local RTK selection"
+
+  PATH="$home/fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    "$ROOT/bin/fm-brief.sh" rtk-scout firstmate --scout --rtk-compact >/dev/null 2>&1 \
+    || fail "scout --rtk-compact brief did not scaffold"
+  scout="$home/data/rtk-scout/brief.md"
+  assert_grep "# Supplemental compact orientation - EXPLICIT TASK OPT-IN" "$scout" \
+    "scout opt-in brief omitted the RTK orientation section"
+  assert_grep "This is a SCOUT task" "$scout" \
+    "scout opt-in brief lost the ordinary scout contract"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" rtk-secondmate --secondmate --no-projects --rtk-compact \
+    >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "secondmate --rtk-compact must be rejected"
+  assert_absent "$home/data/rtk-secondmate/brief.md" \
+    "rejected secondmate --rtk-compact still wrote a charter"
+
+  status=0
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" rtk-valued firstmate --mode no-mistakes --rtk-compact=1 \
+    >/dev/null 2>&1 || status=$?
+  expect_code 1 "$status" "valued --rtk-compact form must be rejected"
+  assert_absent "$home/data/rtk-valued/brief.md" \
+    "rejected valued --rtk-compact still wrote a brief"
+
+  FM_HOME="$home" FM_BACKEND=orca FM_PI_HARNESS=pi \
+    "$ROOT/bin/fm-brief.sh" rtk-default-ship firstmate --mode direct-PR >/dev/null 2>&1 \
+    || fail "ordinary ship brief failed under unrelated runtime selections"
+  default_ship="$home/data/rtk-default-ship/brief.md"
+  assert_no_grep "Supplemental compact orientation" "$default_ship" \
+    "ordinary ship brief enabled RTK without the explicit flag"
+  assert_no_grep "fm-rtk.sh" "$default_ship" \
+    "ordinary ship brief mentioned the helper without the explicit flag"
+
+  FM_HOME="$home" FM_BACKEND=herdr FM_PI_HARNESS=pi-signed \
+    "$ROOT/bin/fm-brief.sh" rtk-default-scout firstmate --scout >/dev/null 2>&1 \
+    || fail "ordinary scout brief failed under unrelated runtime selections"
+  default_scout="$home/data/rtk-default-scout/brief.md"
+  assert_no_grep "Supplemental compact orientation" "$default_scout" \
+    "ordinary scout brief enabled RTK without the explicit flag"
+  pass "fm-brief.sh: RTK orientation is explicit, ordinary-task only, and runtime-neutral"
+}
+
 test_pause_verb_override_renders_all_brief_scaffolds() {
   local home kind id brief
   home="$TMP_ROOT/pause-verb-home"
@@ -727,6 +798,7 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
 test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
+test_rtk_compact_is_explicit_for_ordinary_tasks_only
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold

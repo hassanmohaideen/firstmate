@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# fm-rtk.sh - optional, fixed-scope RTK output compaction for task orientation.
+#
+# This helper is disabled unless the effective home has a regular non-symlink
+# config/rtk containing exactly `v0.45.0` plus one newline.
+# It never downloads, installs, updates, discovers, or persistently stages RTK.
+# The only supported v1 artifact is:
+#   data/tools/rtk/v0.45.0/aarch64-apple-darwin/rtk
+# on Darwin arm64, with SHA-256:
+#   17d00d61a533a442c61f1be49d8a9321225557f64021d5b70fd8eb75ed8fb0be
+#
+# Usage:
+#   fm-rtk.sh git-log
+#   fm-rtk.sh git-diff [--cached]
+#   fm-rtk.sh git-status
+#   fm-rtk.sh search <pattern> [path...]
+#   fm-rtk.sh list <directory>
+#
+# The verbs map to fixed, read-only, human-oriented argv:
+#   git-log          -> git log -n 50 --decorate
+#   git-diff         -> git diff
+#   git-diff --cached -> git diff --cached
+#   git-status       -> git status
+#   search ...       -> rg <pattern> [path...]
+#   list <directory> -> ls <directory>
+# No arbitrary command, command string, shell syntax, option passthrough, machine
+# mode, RTK proxy, project filter, or mutation escape hatch exists.
+# Standalone shell-operator arguments and option-like search/list arguments are
+# admission errors and execute neither RTK nor the raw command.
+#
+# Compact output is supplemental orientation only.
+# Callers must rerun the corresponding raw command before using its output for a
+# safety, mutation, validation, final-review, cleanliness, landing, or approval
+# decision.
+#
+# Before compact execution, the helper verifies the selected pin, Darwin arm64,
+# artifact type, executable bit, SHA-256, and exact `rtk 0.45.0` version output.
+# An unavailable or invalid optional RTK setup prints one argument-free warning
+# and replaces this helper with the exact raw allowlisted argv once.
+# An admission error executes nothing.
+# After the verified RTK command starts, the helper returns its observed streams
+# and status and never automatically reruns the raw command.
+#
+# Every RTK preflight and compact execution receives a fresh mode-0700 temporary
+# HOME/XDG/data/cache root, a private RTK_DB_PATH, RTK_TELEMETRY_DISABLED=1,
+# RTK_TEE=0, RTK_NO_TOML=1, NO_COLOR=1, PAGER=cat, and GIT_PAGER=cat through a
+# clean environment with a fixed trusted PATH.
+# Caller values cannot override those settings.
+# The temporary root is removed after normal completion and caught termination.
+# The helper logs only its fixed semantic verb and non-sensitive fallback reason,
+# never arguments, patterns, paths, command history, output, or analytics.
+set -u
+
+SOURCE_PATH=${BASH_SOURCE[0]}
+SOURCE_NAME=${SOURCE_PATH##*/}
+case "$SOURCE_PATH" in
+  */*) SOURCE_DIR=${SOURCE_PATH%/*} ;;
+  *) SOURCE_DIR=. ;;
+esac
+SCRIPT_DIR=$(CDPATH='' cd -- "$SOURCE_DIR" 2>/dev/null && pwd -P) || exit 70
+FM_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/../.." 2>/dev/null && pwd -P) || exit 70
+RTK_PIN=v0.45.0
+RTK_VERSION_OUTPUT='rtk 0.45.0'
+RTK_BINARY_SHA256=17d00d61a533a442c61f1be49d8a9321225557f64021d5b70fd8eb75ed8fb0be
+RTK_PLATFORM=aarch64-apple-darwin
+RTK_TMP=
+RTK_CHILD_PID=
+VERB=
+RAW_ARGV=()
+RTK_ARGV=()
+TEST_SYSTEM_ROOT=
+if [ "$SOURCE_NAME" = fm-rtk-test-driver.sh ] && [ ! -L "$SOURCE_PATH" ] && [ -n "${FM_RTK_TEST_SYSTEM_ROOT:-}" ]; then
+  case "$FM_RTK_TEST_SYSTEM_ROOT" in
+    /*) TEST_SYSTEM_ROOT=$FM_RTK_TEST_SYSTEM_ROOT ;;
+  esac
+fi
+if [ -n "$TEST_SYSTEM_ROOT" ]; then
+  SYS_USR_BIN=$TEST_SYSTEM_ROOT/usr/bin
+  SYS_BIN=$TEST_SYSTEM_ROOT/bin
+  SYS_USR_SBIN=$TEST_SYSTEM_ROOT/usr/sbin
+  SYS_SBIN=$TEST_SYSTEM_ROOT/sbin
+  [ -z "${FM_RTK_TEST_SHA256:-}" ] || RTK_BINARY_SHA256=$FM_RTK_TEST_SHA256
+else
+  SYS_USR_BIN=/usr/bin
+  SYS_BIN=/bin
+  SYS_USR_SBIN=/usr/sbin
+  SYS_SBIN=/sbin
+fi
+AWK_TOOL=$SYS_USR_BIN/awk
+UNAME_TOOL=$SYS_USR_BIN/uname
+ENV_TOOL=$SYS_USR_BIN/env
+SHASUM_TOOL=$SYS_USR_BIN/shasum
+WC_TOOL=$SYS_USR_BIN/wc
+TR_TOOL=$SYS_USR_BIN/tr
+MKTEMP_TOOL=$SYS_USR_BIN/mktemp
+GIT_TOOL=$SYS_USR_BIN/git
+RM_TOOL=$SYS_BIN/rm
+CHMOD_TOOL=$SYS_BIN/chmod
+MKDIR_TOOL=$SYS_BIN/mkdir
+CP_TOOL=$SYS_BIN/cp
+LS_TOOL=$SYS_BIN/ls
+SLEEP_TOOL=$SYS_BIN/sleep
+RG_TOOL=
+
+trusted_executable() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ]
+}
+
+require_tool() {
+  trusted_executable "$1" || {
+    printf 'fm-rtk: trusted system utility unavailable\n' >&2
+    exit 69
+  }
+}
+
+usage() {
+  require_tool "$AWK_TOOL"
+  "$AWK_TOOL" '
+    NR == 1 { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
+}
+
+admission_error() {
+  printf 'fm-rtk: refused %s request: %s\n' "${VERB:-unknown}" "$1" >&2
+  exit 64
+}
+
+is_shell_operator() {
+  case "$1" in
+    '|'|'||'|'&'|'&&'|';'|'<'|'>'|'>>'|'<<'|'('|')') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_data_arg() {
+  case "$1" in
+    -*) admission_error 'option-like arguments are not supported' ;;
+  esac
+  is_shell_operator "$1" && admission_error 'standalone shell operators are not supported'
+}
+
+cleanup_tmp() {
+  if [ -n "$RTK_TMP" ] && [ -d "$RTK_TMP" ]; then
+    "$RM_TOOL" -rf -- "$RTK_TMP"
+  fi
+  RTK_TMP=
+}
+
+forward_signal() {
+  local signal=$1 code=$2
+  trap - HUP INT TERM
+  if [ -n "$RTK_CHILD_PID" ]; then
+    kill -s "$signal" "$RTK_CHILD_PID" 2>/dev/null || true
+    wait "$RTK_CHILD_PID" 2>/dev/null || true
+    RTK_CHILD_PID=
+  fi
+  cleanup_tmp
+  kill -s "$signal" "$$" 2>/dev/null || exit "$code"
+}
+
+raw_fallback() {
+  local reason=$1
+  cleanup_tmp
+  trap - EXIT HUP INT TERM
+  printf 'fm-rtk: optional compaction unavailable (%s); running raw %s\n' "$reason" "$VERB" >&2
+  exec "${RAW_ARGV[@]}"
+}
+
+sha256_file() {
+  local file=$1 output
+  output=$("$SHASUM_TOOL" -a 256 "$file" 2>/dev/null) || return 1
+  printf '%s\n' "${output%%[[:space:]]*}"
+}
+
+resolve_home() {
+  local requested=${FM_HOME:-$FM_ROOT}
+  [ -d "$requested" ] || return 1
+  (CDPATH='' cd -- "$requested" 2>/dev/null && pwd -P)
+}
+
+resolve_rg() {
+  local candidate
+  if [ -n "$TEST_SYSTEM_ROOT" ]; then
+    candidate=$TEST_SYSTEM_ROOT/opt/homebrew/opt/ripgrep/bin/rg
+    trusted_executable "$candidate" && { RG_TOOL=$candidate; return 0; }
+    return 1
+  fi
+  for candidate in /opt/homebrew/opt/ripgrep/bin/rg /usr/local/opt/ripgrep/bin/rg; do
+    if trusted_executable "$candidate"; then
+      RG_TOOL=$candidate
+      return 0
+    fi
+  done
+  return 1
+}
+
+copy_verified_artifact() {
+  local source=$1 destination=$2 actual_sha
+  "$CP_TOOL" -pP -- "$source" "$destination" 2>/dev/null || return 1
+  [ -f "$destination" ] && [ ! -L "$destination" ] && [ -x "$destination" ] || return 1
+  actual_sha=$(sha256_file "$destination") || return 1
+  [ "$actual_sha" = "$RTK_BINARY_SHA256" ]
+}
+
+run_version_check() {
+  local artifact=$1 stdout=$2 stderr=$3 watchdog rc
+  "$ENV_TOOL" -i "${ISOLATED_ENV[@]}" "$artifact" --version > "$stdout" 2> "$stderr" &
+  RTK_CHILD_PID=$!
+  (
+    "$SLEEP_TOOL" 5
+    kill -TERM "$RTK_CHILD_PID" 2>/dev/null || exit 0
+    "$SLEEP_TOOL" 1
+    kill -KILL "$RTK_CHILD_PID" 2>/dev/null || true
+  ) &
+  watchdog=$!
+  wait "$RTK_CHILD_PID"
+  rc=$?
+  RTK_CHILD_PID=
+  kill -TERM "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$rc"
+}
+
+version_is_exact() {
+  local stdout=$1 stderr=$2 bytes line=
+  bytes=$(LC_ALL=C "$WC_TOOL" -c < "$stdout" 2>/dev/null | "$TR_TOOL" -d '[:space:]') || return 1
+  IFS= read -r line < "$stdout" || true
+  [ "$bytes" = 11 ] && [ "$line" = "$RTK_VERSION_OUTPUT" ] && [ ! -s "$stderr" ]
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+[ "$#" -gt 0 ] || admission_error 'a semantic verb is required'
+VERB=$1
+shift
+case "$VERB" in
+  git-log)
+    [ "$#" -eq 0 ] || admission_error 'git-log accepts no arguments'
+    RTK_ARGV=(git log -n 50 --decorate)
+    ;;
+  git-diff)
+    case "$#:${1:-}" in
+      0:) RTK_ARGV=(git diff) ;;
+      1:--cached) RTK_ARGV=(git diff --cached) ;;
+      *) admission_error 'git-diff accepts only an optional --cached' ;;
+    esac
+    ;;
+  git-status)
+    [ "$#" -eq 0 ] || admission_error 'git-status accepts no arguments'
+    RTK_ARGV=(git status)
+    ;;
+  search)
+    [ "$#" -ge 1 ] || admission_error 'search requires a pattern'
+    for arg in "$@"; do validate_data_arg "$arg"; done
+    RTK_ARGV=(rg "$@")
+    ;;
+  list)
+    [ "$#" -eq 1 ] || admission_error 'list requires exactly one directory'
+    validate_data_arg "$1"
+    [ -d "$1" ] || admission_error 'list target must be a directory'
+    RTK_ARGV=(ls "$1")
+    ;;
+  *) admission_error 'unknown semantic verb' ;;
+esac
+
+for tool in "$ENV_TOOL" "$UNAME_TOOL" "$SHASUM_TOOL" "$WC_TOOL" "$TR_TOOL" "$MKTEMP_TOOL" \
+  "$RM_TOOL" "$CHMOD_TOOL" "$MKDIR_TOOL" "$CP_TOOL" "$SLEEP_TOOL"; do
+  require_tool "$tool"
+done
+case "$VERB" in
+  git-*) require_tool "$GIT_TOOL"; RAW_ARGV=("$GIT_TOOL" "${RTK_ARGV[@]:1}") ;;
+  list) require_tool "$LS_TOOL"; RAW_ARGV=("$LS_TOOL" "${RTK_ARGV[@]:1}") ;;
+  search)
+    resolve_rg || { printf 'fm-rtk: trusted search utility unavailable\n' >&2; exit 69; }
+    RAW_ARGV=("$RG_TOOL" "${RTK_ARGV[@]:1}")
+    ;;
+esac
+
+EFFECTIVE_HOME=$(resolve_home) || raw_fallback 'home unavailable'
+CONFIG_FILE=$EFFECTIVE_HOME/config/rtk
+if [ -L "$CONFIG_FILE" ]; then raw_fallback 'invalid config'; fi
+if [ ! -e "$CONFIG_FILE" ]; then raw_fallback 'disabled'; fi
+if [ ! -f "$CONFIG_FILE" ]; then raw_fallback 'invalid config'; fi
+CONFIG_BYTES=$(LC_ALL=C "$WC_TOOL" -c < "$CONFIG_FILE" 2>/dev/null | "$TR_TOOL" -d '[:space:]') \
+  || raw_fallback 'unreadable config'
+SELECTED_PIN=
+IFS= read -r SELECTED_PIN < "$CONFIG_FILE" || true
+if [ "$CONFIG_BYTES" != 8 ] || [ "$SELECTED_PIN" != "$RTK_PIN" ]; then raw_fallback 'invalid pin'; fi
+
+OS_NAME=$("$UNAME_TOOL" -s 2>/dev/null) || raw_fallback 'platform check failed'
+ARCH_NAME=$("$UNAME_TOOL" -m 2>/dev/null) || raw_fallback 'platform check failed'
+if [ "$OS_NAME" != Darwin ] || [ "$ARCH_NAME" != arm64 ]; then raw_fallback 'unsupported platform'; fi
+
+ARTIFACT=$EFFECTIVE_HOME/data/tools/rtk/$RTK_PIN/$RTK_PLATFORM/rtk
+if [ -L "$ARTIFACT" ]; then raw_fallback 'invalid artifact type'; fi
+if [ ! -f "$ARTIFACT" ]; then raw_fallback 'missing artifact'; fi
+if [ ! -x "$ARTIFACT" ]; then raw_fallback 'artifact is not executable'; fi
+ACTUAL_SHA=$(sha256_file "$ARTIFACT") || raw_fallback 'artifact hash unavailable'
+if [ "$ACTUAL_SHA" != "$RTK_BINARY_SHA256" ]; then raw_fallback 'artifact hash mismatch'; fi
+
+old_umask=$(umask)
+umask 077
+RTK_TMP=$("$MKTEMP_TOOL" -d "${TMPDIR:-/tmp}/fm-rtk.XXXXXX") || {
+  umask "$old_umask"
+  raw_fallback 'temporary isolation unavailable'
+}
+trap cleanup_tmp EXIT
+trap 'forward_signal HUP 129' HUP
+trap 'forward_signal INT 130' INT
+trap 'forward_signal TERM 143' TERM
+umask "$old_umask"
+"$CHMOD_TOOL" 700 "$RTK_TMP" 2>/dev/null || raw_fallback 'temporary isolation unavailable'
+"$MKDIR_TOOL" -p "$RTK_TMP/home" "$RTK_TMP/config" "$RTK_TMP/data" "$RTK_TMP/cache" \
+  "$RTK_TMP/tmp" "$RTK_TMP/preflight" "$RTK_TMP/invocation" || raw_fallback 'temporary isolation unavailable'
+
+TRUSTED_PATH=$SYS_USR_BIN:$SYS_BIN:$SYS_USR_SBIN:$SYS_SBIN
+[ -z "$RG_TOOL" ] || TRUSTED_PATH=${RG_TOOL%/*}:$TRUSTED_PATH
+ISOLATED_ENV=(
+  "HOME=$RTK_TMP/home"
+  "XDG_CONFIG_HOME=$RTK_TMP/config"
+  "XDG_DATA_HOME=$RTK_TMP/data"
+  "XDG_CACHE_HOME=$RTK_TMP/cache"
+  "TMPDIR=$RTK_TMP/tmp"
+  "RTK_DB_PATH=$RTK_TMP/data/history.db"
+  'RTK_TELEMETRY_DISABLED=1'
+  'RTK_TEE=0'
+  'RTK_NO_TOML=1'
+  'NO_COLOR=1'
+  'PAGER=cat'
+  'GIT_PAGER=cat'
+  "PATH=$TRUSTED_PATH"
+)
+
+PREFLIGHT_ARTIFACT=$RTK_TMP/preflight/rtk
+copy_verified_artifact "$ARTIFACT" "$PREFLIGHT_ARTIFACT" || raw_fallback 'artifact copy verification failed'
+VERSION_STDOUT=$RTK_TMP/version.stdout
+VERSION_STDERR=$RTK_TMP/version.stderr
+run_version_check "$PREFLIGHT_ARTIFACT" "$VERSION_STDOUT" "$VERSION_STDERR"
+VERSION_RC=$?
+if [ "$VERSION_RC" -ne 0 ]; then raw_fallback 'artifact startup failed'; fi
+version_is_exact "$VERSION_STDOUT" "$VERSION_STDERR" || raw_fallback 'artifact version mismatch'
+
+PRIVATE_ARTIFACT=$RTK_TMP/invocation/rtk
+copy_verified_artifact "$PREFLIGHT_ARTIFACT" "$PRIVATE_ARTIFACT" || raw_fallback 'private copy verification failed'
+run_version_check "$PRIVATE_ARTIFACT" "$VERSION_STDOUT" "$VERSION_STDERR"
+VERSION_RC=$?
+if [ "$VERSION_RC" -ne 0 ]; then raw_fallback 'private artifact startup failed'; fi
+version_is_exact "$VERSION_STDOUT" "$VERSION_STDERR" || raw_fallback 'private artifact version mismatch'
+
+printf 'fm-rtk: using RTK %s for supplemental %s orientation\n' "$RTK_PIN" "$VERB" >&2
+"$ENV_TOOL" -i "${ISOLATED_ENV[@]}" "$PRIVATE_ARTIFACT" "${RTK_ARGV[@]}" &
+RTK_CHILD_PID=$!
+wait "$RTK_CHILD_PID"
+RTK_RC=$?
+RTK_CHILD_PID=
+trap - HUP INT TERM
+exit "$RTK_RC"
