@@ -183,6 +183,45 @@ test_platform_path_and_hash_boundaries() {
   pass "fm-rtk: platform, checksum, and exact artifact path are enforced"
 }
 
+test_intermediate_symlinks_and_effective_execute_permission() {
+  local home artifact component current escaped index sha
+  index=0
+  for component in data tools rtk v0.45.0 aarch64-apple-darwin; do
+    home=$(make_home "intermediate-symlink-$index")
+    artifact=$(artifact_path "$home")
+    sha=$(artifact_sha "$home")
+    current=$home
+    case "$component" in
+      data) current=$current/data ;;
+      tools) current=$current/data/tools ;;
+      rtk) current=$current/data/tools/rtk ;;
+      v0.45.0) current=$current/data/tools/rtk/v0.45.0 ;;
+      aarch64-apple-darwin) current=$current/data/tools/rtk/v0.45.0/aarch64-apple-darwin ;;
+    esac
+    escaped=$TMP_ROOT/escaped-component-$index
+    mv "$current" "$escaped"
+    ln -s "$escaped" "$current"
+    run_verify "$home" "$sha"
+    expect_code 69 "$LAST_RC" "symlink $component path component was accepted"
+    assert_never_executed "$home"
+    index=$((index + 1))
+  done
+
+  home=$(make_home effective-execute-permission)
+  artifact=$(artifact_path "$home")
+  sha=$(artifact_sha "$home")
+  chmod 410 "$artifact"
+  run_verify "$home" "$sha"
+  expect_code 69 "$LAST_RC" "execute bit unavailable to the effective owner was accepted"
+  assert_never_executed "$home"
+
+  chmod 500 "$artifact"
+  run_verify "$home" "$sha"
+  expect_code 0 "$LAST_RC" "effective owner execute permission was rejected"
+  assert_never_executed "$home"
+  pass "fm-rtk: every artifact path identity and effective execute permission are verified"
+}
+
 test_type_mode_and_config_nonactivation() {
   local home artifact target started
   home=$(make_home shapes)
@@ -226,4 +265,5 @@ test_public_interface_and_static_verification
 test_hostile_shell_environment_is_removed
 test_hostile_perl_environment_is_removed
 test_platform_path_and_hash_boundaries
+test_intermediate_symlinks_and_effective_execute_permission
 test_type_mode_and_config_nonactivation

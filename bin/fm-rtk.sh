@@ -98,27 +98,47 @@ EFFECTIVE_HOME=$(CDPATH='' cd -- "$REQUESTED_HOME" 2>/dev/null && pwd -P) || {
   printf 'fm-rtk: home unavailable\n' >&2
   exit 69
 }
-ARTIFACT=$EFFECTIVE_HOME/data/tools/rtk/$RTK_PIN/$RTK_PLATFORM/rtk
-
 "$ENV_TOOL" -i PATH=/usr/bin:/bin "$PERL_TOOL" -MDigest::SHA -MFcntl=:DEFAULT -MPOSIX -e '
   use strict;
   use warnings;
   $SIG{ALRM} = sub { exit 68 };
   alarm 5;
-  my ($path, $expected_sha, $test_os, $test_arch) = @ARGV;
+  my ($home, $expected_sha, $test_os, $test_arch, @parts) = @ARGV;
   my ($os, $node, $release, $version, $arch) = POSIX::uname();
   $os = $test_os if length $test_os;
   $arch = $test_arch if length $test_arch;
   exit 64 unless $os eq "Darwin" && $arch eq "arm64";
-  sysopen(my $fh, $path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or exit 65;
+
+  my $directory_flags = O_RDONLY | O_NONBLOCK | O_NOFOLLOW;
+  $directory_flags |= O_DIRECTORY if defined &O_DIRECTORY;
+  sysopen(my $directory, $home, $directory_flags) or exit 65;
+  my @directory_stat = stat($directory);
+  exit 66 unless @directory_stat && (($directory_stat[2] & 0170000) == 0040000);
+  chdir($directory) or exit 65;
+  for my $part (@parts) {
+    sysopen(my $child, $part, $directory_flags) or exit 65;
+    my @child_stat = stat($child);
+    exit 66 unless @child_stat && (($child_stat[2] & 0170000) == 0040000);
+    chdir($child) or exit 65;
+    $directory = $child;
+  }
+
+  sysopen(my $fh, "rtk", O_RDONLY | O_NONBLOCK | O_NOFOLLOW) or exit 65;
   my @st = stat($fh);
   exit 66 unless @st && (($st[2] & 0170000) == 0100000);
-  exit 67 unless ($st[2] & 0111);
+  my $euid = $>;
+  my %effective_groups = map { $_ => 1 } split(/\s+/, $));
+  my $executable = $euid == 0 ? ($st[2] & 0111)
+    : $euid == $st[4] ? ($st[2] & 0100)
+    : $effective_groups{$st[5]} ? ($st[2] & 0010)
+    : ($st[2] & 0001);
+  exit 67 unless $executable;
   binmode($fh);
   my $sha = Digest::SHA->new(256);
   $sha->addfile($fh);
   exit 69 unless $sha->hexdigest eq $expected_sha;
-' "$ARTIFACT" "$RTK_BINARY_SHA256" "$TEST_OS" "$TEST_ARCH" 2>/dev/null
+' "$EFFECTIVE_HOME" "$RTK_BINARY_SHA256" "$TEST_OS" "$TEST_ARCH" \
+  data tools rtk "$RTK_PIN" "$RTK_PLATFORM" 2>/dev/null
 INSPECT_RC=$?
 case "$INSPECT_RC" in
   0) ;;
