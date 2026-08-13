@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fm-herdr-ci-cleanup.sh - bounded cleanup of CI-owned Herdr lab sessions.
 #
-# Snapshot the session list before the real-Herdr suite, then at job end only
+# Snapshot the session list before one real-Herdr shard, then at job end only
 # stop/delete sessions that:
 #   1. match the guarded fm-lab-* name pattern,
 #   2. were not present in the pre-suite snapshot (job-proven ownership),

@@ -1,6 +1,6 @@
-# Firstmate portable test shards
+# Firstmate test shards
 
-`bin/fm-test-run.sh` owns portable lane composition and execution.
+`bin/fm-test-run.sh` owns behavior-test lane composition and execution.
 `bin/fm-test-isolation-proof.sh` owns the proven-isolated candidate set.
 
 ## Verification inputs
@@ -166,7 +166,7 @@ It verifies the real-Herdr CI shards the same way against the real-herdr-gated f
 
 ## Timing artifacts and budgets
 
-Portable shards, each portable serial shard, and the Herdr lane upload runner-generated timing JSON.
+Portable shards, each portable serial shard, and each real-Herdr shard upload runner-generated timing JSON.
 `bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
 The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from archived timing artifacts.
 An unmeasured script has no budget: local execution reports it as missing, enforced execution fails after the functional result, and the coverage guard rejects it from every required lane.

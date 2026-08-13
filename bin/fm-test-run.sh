@@ -34,11 +34,11 @@
 #   --exclude-family <name>
 #                   drop scripts whose primary family matches <name> after selection
 #                   (repeatable; portable CI lanes exclude real-herdr-gated so the
-#                   dedicated required Herdr lane owns that coverage)
+#                   dedicated required Herdr shards own that coverage)
 #   --fail-on-gate-skip <token>
 #                   after each script, fail the run if any output line contains
 #                   "skip: <token>" (e.g. --fail-on-gate-skip 'herdr not found').
-#                   The required Herdr CI lane uses this so a missing pin cannot
+#                   Every required Herdr CI shard uses this so a missing pin cannot
 #                   silently pass as a gate skip.
 #   --jobs N        run proven-isolated scripts with up to N concurrent workers.
 #                   --portable and --all default to 4 and automatically keep
@@ -66,8 +66,8 @@
 # or missing. Other gate skips (first meaningful line matching ^skip:) remain
 # successful and are counted as skipped_gate.
 #
-# Family labels, the changed-file map, and production portable-shard composition
-# live in this script only (one owner). The proven-isolated candidate set remains
+# Family labels, the changed-file map, and production CI shard composition live
+# in this script only (one owner). The proven-isolated candidate set remains
 # owned by bin/fm-test-isolation-proof.sh; portable parallel shards are a
 # duration-balanced partition of that exact set (see docs/fm-test-portable-shards.md).
 #
@@ -81,7 +81,7 @@
 # --changed is conservative: it over-selects related families rather than
 # under-selecting, and never expands to the complete suite.
 # --portable is the routine complete local path: it excludes real-herdr-gated
-# because the dedicated required CI lane owns that integration coverage.
+# because the dedicated required CI shards own that integration coverage.
 # --all remains the explicit operator path that includes that family.
 set -eu
 
