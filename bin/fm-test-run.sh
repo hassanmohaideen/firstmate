@@ -110,6 +110,7 @@ PORTABLE_SERIAL_SHARDS=4
 # the measured per-script mean so a newly added test neither starves nor
 # overloads the shard it lands in.
 PORTABLE_SERIAL_DEFAULT_WEIGHT_MS=20000
+DURATION_BUDGET_DEFAULT_BASELINE_MS=20000
 
 usage() {
   awk '
@@ -527,7 +528,9 @@ script_duration_baseline_ms() {
 # without turning ordinary machine variance into a brittle wall-clock test.
 duration_budget_ms_for() {
   local script=$1 baseline
-  baseline=$(script_duration_baseline_ms "$script") || return 1
+  if ! baseline=$(script_duration_baseline_ms "$script"); then
+    baseline=$DURATION_BUDGET_DEFAULT_BASELINE_MS
+  fi
   printf '%s\t%s\n' "$baseline" "$((baseline * 2 + 10000))"
 }
 
@@ -1596,8 +1599,21 @@ worker_group_is_running() {
 
 # shellcheck disable=SC2329 # Invoked indirectly by cleanup/signal traps.
 stop_active_workers() {
-  local pid n running
+  local pid registered known n running
+  local jobs_file="$RUN_TMP/active-jobs"
   trap - INT TERM HUP
+  jobs -p >"$jobs_file" 2>/dev/null || true
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    known=0
+    for registered in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+      if [ "$registered" = "$pid" ]; then
+        known=1
+        break
+      fi
+    done
+    [ "$known" -eq 1 ] || WORKER_PIDS+=("$pid")
+  done <"$jobs_file"
   for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
     kill -TERM -- "-$pid" 2>/dev/null || true
@@ -1902,6 +1918,9 @@ else
         exit 143
       }
       trap stop_child INT TERM HUP
+      while [ ! -f "$work/start" ]; do
+        sleep 0.01
+      done
       export TMPDIR="$work/tmp"
       export TMP="$work/tmp"
       unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
@@ -1928,6 +1947,7 @@ else
     WORKER_IDX[worker_n]=$worker_n
     WORKER_SCRIPTS[worker_n]=$script
     active_workers=$((active_workers + 1))
+    : >"$work/start"
   done
   while [ "$active_workers" -gt 0 ]; do
     wait_one_completed_job_worker

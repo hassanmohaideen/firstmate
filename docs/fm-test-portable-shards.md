@@ -108,6 +108,7 @@ It separately verifies that the portable serial CI shards are non-empty, disjoin
 Portable shards, each portable serial shard, and the Herdr lane upload runner-generated timing JSON.
 `bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
 The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from the archived isolation proof timings.
+Scripts awaiting an individual measurement use the measured 20-second portable-suite mean, so every required CI script remains covered while fresh timing artifacts provide the next per-script refresh.
 Budget overruns warn during local runs and are enforced by required CI lanes without replacing or hiding functional failures.
 `.github/workflows/ci.yml` owns the exact artifact names, enforcement wiring, and aggregation wiring.
 

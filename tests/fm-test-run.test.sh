@@ -839,9 +839,13 @@ test_duration_budget_warns_and_ci_enforces() {
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
   cat > "$repo/tests/fm-backend-herdr.test.sh" <<'SH'
 #!/usr/bin/env bash
-echo "ok - budget fixture"
+echo "ok - measured budget fixture"
 SH
-  chmod +x "$repo/tests/fm-backend-herdr.test.sh"
+  cat > "$repo/tests/fm-backend-herdr-smoke.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo "ok - default budget fixture"
+SH
+  chmod +x "$repo"/tests/*.test.sh
   real_python=$(command -v python3)
   cat > "$fakebin/python3" <<SH
 #!/usr/bin/env bash
@@ -873,8 +877,18 @@ SH
     || fail "duration enforcement hid or rewrote the functional result"
   grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=enforce' "$tmp/enforce.out" \
     || fail "duration enforcement summary was missing"
+
+  rm -f "$tmp/clock"
+  set +e
+  PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
+    tests/fm-backend-herdr-smoke.test.sh > "$tmp/default.out" 2> "$tmp/default.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "required CI script without a measured hint escaped enforcement"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=enforce' "$tmp/default.out" \
+    || fail "default duration budget did not cover an unmeasured required CI script"
   rm -rf "$tmp"
-  pass "duration budgets warn locally, enforce explicitly, and preserve functional reporting"
+  pass "duration budgets warn locally and enforce every required CI script"
 }
 
 test_aggregate_json() {
