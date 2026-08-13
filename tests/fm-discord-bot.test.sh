@@ -293,12 +293,17 @@ server.on("upgrade",(req,socket)=>{
           }
           fs.writeFileSync(countFile.replace(/connections$/, "sequence-burst-sent"),"sent\n");
         }
+        if (mode === "resume-message-replay") {
+          text(socket,{op:0,t:"MESSAGE_CREATE",s:2,d:{id:message,guild_id:guild,channel_id:channel,type:0,
+            author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> replay intake`}});
+          fs.writeFileSync(countFile.replace(/connections$/, "message-sent"),"sent\n");
+        }
       } else if (packet.op === 6 && packet.d?.token === token && packet.d?.session_id) {
         handshakeComplete=true;
         fs.appendFileSync(eventFile,JSON.stringify({connection,op:"resume",session:packet.d.session_id,sequence:packet.d.seq})+"\n");
-        text(socket,{op:0,t:"RESUMED",s:connection,d:{}});
-        if (mode === "resume-message") setTimeout(()=>text(socket,{
-          op:0,t:"MESSAGE_CREATE",s:connection+1,d:{id:message,guild_id:guild,channel_id:channel,type:0,
+        text(socket,{op:0,t:"RESUMED",s:mode === "resume-message-replay" ? 1 : connection,d:{}});
+        if (["resume-message","resume-message-replay"].includes(mode)) setTimeout(()=>text(socket,{
+          op:0,t:"MESSAGE_CREATE",s:mode === "resume-message-replay" ? 2 : connection+1,d:{id:message,guild_id:guild,channel_id:channel,type:0,
             author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> resumed intake`}
         }),10);
       }
@@ -883,6 +888,52 @@ reconnect_record=$(cat "$home/state/.discord-bot-service/reconnect.json")
 assert_not_contains "$reconnect_record" "$TOKEN" "durable resume state exposed the bot token"
 assert_not_contains "$reconnect_record" "$OWNER" "durable resume state exposed a deployment id"
 pass "valid Gateway Resume state survives abrupt process replacement"
+
+home=$(new_home gateway-message-checkpoint-replay)
+write_config "$home"
+mkdir "$home/state/.wake-queue"
+make_gateway_server "$home/gateway" resume-message-replay
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=1000 \
+  "$CONTROL" run > "$home/first.log" 2>&1 &
+resume_worker=$!
+WORKER_PIDS+=("$resume_worker")
+wait_for_file "$home/gateway/message-sent" || fail "checkpoint replay fixture did not send its message"
+wait_for_file "$home/state/discord-bot.error" || fail "failed inbox notification did not publish its diagnostic"
+[ "$(jq -r '.resume_session.sequence' "$home/state/.discord-bot-service/reconnect.json")" = 1 ] \
+  || fail "failed message publication advanced the durable Resume checkpoint"
+resume_child=$(pgrep -P "$resume_worker" | head -n 1)
+[ -n "$resume_child" ] || fail "checkpoint replay fixture had no runtime process"
+kill -KILL "$resume_child"
+wait "$resume_worker" 2>/dev/null || true
+WORKER_PIDS=()
+rmdir "$home/state/.wake-queue"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/second.log" 2>&1 &
+resume_worker=$!
+WORKER_PIDS+=("$resume_worker")
+wait_for_value "$home/gateway/connections" 2 || fail "checkpoint replacement process did not reconnect"
+second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
+second_sequence=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .sequence)
+[ "$second_op" = resume ] || fail "checkpoint replacement process did not preserve Resume"
+[ "$second_sequence" = 1 ] || fail "replacement process resumed past the uncommitted message"
+wait_for_file "$home/state/.wake-queue" || fail "replayed message did not commit its durable notification"
+i=0
+while [ "$i" -lt 100 ]; do
+  replayed_sequence=$(jq -r '.resume_session.sequence // -1' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf '%s' -1)
+  [ "$replayed_sequence" -eq 2 ] 2>/dev/null && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ "$replayed_sequence" -eq 2 ] 2>/dev/null || fail "replayed message did not advance its committed checkpoint"
+[ "$(grep -c "check: discord-message $MESSAGE" "$home/state/.wake-queue")" -eq 1 ] \
+  || fail "replayed message did not retain one durable notification"
+kill -TERM "$resume_worker"
+wait "$resume_worker" || true
+WORKER_PIDS=()
+pass "Resume checkpoints advance only after durable message publication"
 
 home=$(new_home gateway-invalid-session-restart)
 write_config "$home"

@@ -864,6 +864,7 @@ class GatewayRunner {
     this.sessionId = "";
     this.resumeUrl = "";
     this.sequence = null;
+    this.resumeSequence = null;
     this.selfUserId = "";
     this.failurePressure = 0;
     this.lastConnectionAt = null;
@@ -892,6 +893,7 @@ class GatewayRunner {
     this.sessionId = "";
     this.resumeUrl = "";
     this.sequence = null;
+    this.resumeSequence = null;
     this.selfUserId = "";
   }
 
@@ -900,7 +902,7 @@ class GatewayRunner {
     return {
       session_id: this.sessionId,
       resume_url: this.resumeUrl,
-      sequence: this.sequence,
+      sequence: this.resumeSequence,
       self_user_id: this.selfUserId,
     };
   }
@@ -1051,6 +1053,7 @@ class GatewayRunner {
       this.sessionId = resume.session_id;
       this.resumeUrl = resume.resume_url;
       this.sequence = resume.sequence;
+      this.resumeSequence = resume.sequence;
       this.selfUserId = resume.self_user_id;
     }
     if (!record || legacy || !authenticationBound || (authenticationBound && resume && !resumable)) {
@@ -1139,7 +1142,7 @@ class GatewayRunner {
   }
 
   resume() {
-    this.send({ op: 6, d: { token: this.config.token, session_id: this.sessionId, seq: this.sequence } });
+    this.send({ op: 6, d: { token: this.config.token, session_id: this.sessionId, seq: this.resumeSequence } });
   }
 
   async connect(url) {
@@ -1159,6 +1162,7 @@ class GatewayRunner {
       let readyAt = 0;
       let serverDelayMs = 0;
       let settled = false;
+      let checkpointBlocked = false;
       const clearTimers = () => {
         if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
         if (heartbeatInterval) clearInterval(heartbeatInterval);
@@ -1206,10 +1210,7 @@ class GatewayRunner {
           socket.close(4002, "invalid payload");
           return;
         }
-        if (Number.isInteger(packet.s)) {
-          this.sequence = packet.s;
-          this.queueSequencePersistence();
-        }
+        if (Number.isInteger(packet.s)) this.sequence = packet.s;
         switch (packet.op) {
           case 10: {
             if (handshakeTimeout) clearTimeout(handshakeTimeout);
@@ -1273,15 +1274,39 @@ class GatewayRunner {
               this.selfUserId = userId;
               this.sessionId = sessionId;
               this.resumeUrl = resumeUrl;
+              this.resumeSequence = Number.isInteger(packet.s) ? packet.s : this.resumeSequence;
               void this.persistDurableStateOrStop().then((persisted) => {
                 if (persisted) markReady();
               });
             } else if (packet.t === "RESUMED") {
               markReady();
+              if (Number.isInteger(packet.s)) {
+                this.inbound = this.inbound.then(() => {
+                  if (checkpointBlocked) return;
+                  this.resumeSequence = packet.s;
+                  this.queueSequencePersistence();
+                });
+              }
             } else if (packet.t === "MESSAGE_CREATE" && this.selfUserId) {
-              this.inbound = this.inbound
-                .then(() => ingestMessage(packet.d, this.config, this.selfUserId))
-                .catch(() => reportDiagnostic("inbox-publication-failed"));
+              const dispatchSequence = packet.s;
+              this.inbound = this.inbound.then(async () => {
+                if (checkpointBlocked) return;
+                await ingestMessage(packet.d, this.config, this.selfUserId);
+                if (Number.isInteger(dispatchSequence)) {
+                  this.resumeSequence = dispatchSequence;
+                  this.queueSequencePersistence();
+                }
+              }).catch(async () => {
+                checkpointBlocked = true;
+                await reportDiagnostic("inbox-publication-failed");
+                if (socket.readyState < WebSocket.CLOSING) socket.close(4000, "inbox publication failed");
+              });
+            } else if (Number.isInteger(packet.s)) {
+              this.inbound = this.inbound.then(() => {
+                if (checkpointBlocked) return;
+                this.resumeSequence = packet.s;
+                this.queueSequencePersistence();
+              });
             }
             break;
           default:
