@@ -395,7 +395,7 @@ The append and receipt are recovered under the queue lock, so a crash between th
 Answered context and notification records are pruned after seven days, while a still-pending inbox or a task metadata file carrying that `discord_request=` prevents its context from being pruned.
 
 `state/discord-bot.enabled` is a private service-liveness presence marker, `state/discord-bot.ready` records a currently connected Gateway session, and `state/discord-bot.error` carries one safe diagnostic code without credentials, ids, payloads, or remote response bodies.
-`state/discord-bot.terminal` is a mode-`0600` suppression record containing a safe code, an opaque SHA-256 fingerprint of the active configuration, and a timestamp.
+`state/.discord-bot-service/terminal.json` is the canonical mode-`0600` suppression record containing a safe code, an opaque SHA-256 fingerprint of the active configuration, and a timestamp.
 The canonical `state/.discord-bot-service/reconnect.json` is a mode-`0600` record holding only an opaque bot-authentication fingerprint, per-home reconnect pressure, last-attempt time, and Discord session-start counters needed to preserve pacing across process replacement and filtering changes; it contains no credential or deployment id.
 A matching terminal record stops Gateway attempts across process restarts, a changed configuration retires it automatically, and the explicit `retry` command retires it after an operator corrects an external application setting.
 The service removes enabled/ready markers on a clean stop but preserves terminal suppression until one of those intervention paths clears it.

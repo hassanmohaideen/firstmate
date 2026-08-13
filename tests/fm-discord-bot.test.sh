@@ -973,9 +973,12 @@ out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/alternate-state" FM_ROOT_OVERRIDE
   "$NODE_BIN" "$BOT" run 2>&1)
 assert_contains "$out" "reconnects stopped" "alternate state override did not honor terminal suppression"
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "alternate state override bypassed terminal suppression"
-out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" check 2>&1); rc=$?
-[ "$rc" -ne 0 ] || fail "terminally stopped service reported healthy"
-assert_contains "$out" "reconnects are stopped" "health check did not report terminal suppression actionably"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/alternate-state" FM_ROOT_OVERRIDE="$ROOT" \
+  "$CONTROL" check 2>&1); rc=$?
+[ "$rc" -ne 0 ] || fail "terminally stopped service reported healthy through an alternate state override"
+assert_contains "$out" "reconnects are stopped" "alternate-state health check did not report terminal suppression"
+assert_contains "$out" "diagnostic: authentication-rejected" \
+  "alternate-state health check lost the canonical terminal diagnostic"
 assert_not_contains "$(cat "$home/bot.log")$out" "$TOKEN" "terminal authentication diagnostics exposed the bot token"
 assert_not_contains "$(cat "$home/bot.log")$out" "$OWNER" "terminal authentication diagnostics exposed a deployment id"
 out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry)

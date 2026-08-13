@@ -1430,7 +1430,11 @@ async function main() {
     }
     case "terminal-check": {
       const config = await loadConfig();
-      if (await activeTerminalSuppression(config)) process.exitCode = 4;
+      const code = await activeTerminalSuppression(config);
+      if (code) {
+        process.stdout.write(`${code}\n`);
+        process.exitCode = 4;
+      }
       return;
     }
     case "terminal-reset": {

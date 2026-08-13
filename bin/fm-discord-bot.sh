@@ -451,7 +451,7 @@ reset_terminal() {
 }
 
 check_service() {
-  local validate_out validate_rc=0 pid='' code='' stopped=1 terminal=0
+  local validate_out validate_rc=0 pid='' code='' canonical_code='' terminal_rc=0 stopped=1 terminal=0
   validate_out=$(validate_config 2>&1) || validate_rc=$?
   if [ "$validate_rc" -eq 3 ]; then
     echo "self-hosted Discord bot is disabled (no private configuration)"
@@ -472,8 +472,12 @@ check_service() {
       try { const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).code; if (/^[a-z0-9-]+$/.test(value)) process.stdout.write(value); } catch {}
     ' "$STATE/discord-bot.error" 2>/dev/null || true)
   fi
-  if [ -f "$TERMINAL_FILE" ] && [ ! -L "$TERMINAL_FILE" ]; then
+  canonical_code=$(FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+    FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
+    "$NODE_BIN" "$NODE_SCRIPT" terminal-check 2>/dev/null) || terminal_rc=$?
+  if [ "$terminal_rc" -eq 4 ]; then
     terminal=1
+    [ -n "$code" ] || code=$canonical_code
   fi
   if [ "$stopped" -eq 1 ]; then
     if [ "$terminal" -eq 1 ] && [ -n "$code" ]; then
