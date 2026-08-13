@@ -440,7 +440,7 @@ tests/fm-backend-cmux.test.sh 2349
 tests/fm-backend-orca.test.sh 12041
 tests/fm-backend-tmux-smoke.test.sh 314
 tests/fm-backend-zellij-smoke.test.sh 21
-tests/fm-backend-zellij.test.sh 4225
+tests/fm-backend-zellij.test.sh 20324
 tests/fm-backend.test.sh 16370
 tests/fm-backlog-handoff.test.sh 2786
 tests/fm-bearings-snapshot.test.sh 66300
@@ -472,12 +472,12 @@ tests/fm-pi-watch-extension.test.sh 16386
 tests/fm-pr-check-security.test.sh 199573
 tests/fm-playop-dispatch-live-e2e.test.sh 19
 tests/fm-procevent.test.sh 42789
-tests/fm-public-followup.test.sh 23365
+tests/fm-public-followup.test.sh 88295
 tests/fm-quota-array-dispatch-live-e2e.test.sh 19
 tests/fm-secondmate-harness.test.sh 128852
 tests/fm-secondmate-lifecycle-e2e.test.sh 4929
 tests/fm-secondmate-liveness.test.sh 12553
-tests/fm-secondmate-safety.test.sh 24432
+tests/fm-secondmate-safety.test.sh 104120
 tests/fm-secondmate-sync.test.sh 12289
 tests/fm-send-secondmate-marker-herdr-e2e.test.sh 27
 tests/fm-send-secondmate-marker.test.sh 2136
