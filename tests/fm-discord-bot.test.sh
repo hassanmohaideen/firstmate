@@ -179,6 +179,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
 const portFile=process.argv[2], countFile=process.argv[3], token=process.argv[4], self=process.argv[5], mode=process.argv[6];
+const owner=process.argv[7], guild=process.argv[8], channel=process.argv[9], message=process.argv[10];
 const eventFile=countFile.replace(/connections$/, "events.jsonl");
 const lookupFile=countFile.replace(/connections$/, "lookups");
 const lookupEventFile=countFile.replace(/connections$/, "lookup-events.jsonl");
@@ -278,10 +279,22 @@ server.on("upgrade",(req,socket)=>{
         fs.writeFileSync(countFile.replace(/connections$/, "identify.json"), JSON.stringify({token_ok:true,intents:packet.d.intents,properties:packet.d.properties}));
         if (mode === "terminal-auth-close") { setTimeout(()=>close(socket,4004),10); continue; }
         text(socket,{op:0,t:"READY",s:connection,d:{user:{id:self},session_id:`session-${connection}`,resume_gateway_url:resumeUrl}});
+        if (mode === "sequence-persistence-failure") {
+          fs.writeFileSync(countFile.replace(/connections$/, "sequence-ready"),"ready\n");
+          const release=setInterval(()=>{
+            if (!fs.existsSync(countFile.replace(/connections$/, "release-sequence"))) return;
+            clearInterval(release);
+            text(socket,{op:0,t:"PRESENCE_UPDATE",s:connection+1,d:{}});
+          },5);
+        }
       } else if (packet.op === 6 && packet.d?.token === token && packet.d?.session_id) {
         handshakeComplete=true;
         fs.appendFileSync(eventFile,JSON.stringify({connection,op:"resume",session:packet.d.session_id,sequence:packet.d.seq})+"\n");
         text(socket,{op:0,t:"RESUMED",s:connection,d:{}});
+        if (mode === "resume-message") setTimeout(()=>text(socket,{
+          op:0,t:"MESSAGE_CREATE",s:connection+1,d:{id:message,guild_id:guild,channel_id:channel,type:0,
+            author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> resumed intake`}
+        }),10);
       }
       if (handshakeComplete && mode === "reconnect" && connection === 1) setTimeout(()=>close(socket,1001),50);
       if (handshakeComplete && mode === "storm") setTimeout(()=>close(socket,1001),10);
@@ -298,7 +311,8 @@ for (const signal of ["SIGTERM","SIGINT"]) process.on(signal,()=>{
   server.close(()=>process.exit(0));
 });
 JS
-  "$NODE_BIN" "$script" "$dir/port" "$dir/connections" "$TOKEN" "$SELF" "$mode" > "$dir/server.log" 2>&1 &
+  "$NODE_BIN" "$script" "$dir/port" "$dir/connections" "$TOKEN" "$SELF" "$mode" \
+    "$OWNER" "$GUILD" "$CHANNEL" "$MESSAGE" > "$dir/server.log" 2>&1 &
   GATEWAY_SERVER_PID=$!
   SERVER_PIDS+=("$GATEWAY_SERVER_PID")
   wait_for_file "$dir/port" || fail "fake Discord Gateway did not start"
@@ -819,7 +833,7 @@ pass "server reconnect and invalid-session directions choose resume or fresh ide
 
 home=$(new_home gateway-resume-restart)
 write_config "$home"
-make_gateway_server "$home/gateway" steady
+make_gateway_server "$home/gateway" resume-message
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
   "$CONTROL" run > "$home/first.log" 2>&1 &
@@ -852,6 +866,10 @@ second_sequence=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .sequence)
 [ "$second_op" = resume ] || fail "replacement process consumed a fresh Identify instead of Resume"
 [ "$second_session" = "$persisted_session" ] || fail "replacement process resumed the wrong session"
 [ "$second_sequence" = 1 ] || fail "replacement process lost the durable Gateway sequence"
+wait_for_file "$home/state/discord-inbox/$MESSAGE.json" \
+  || fail "replacement process ignored eligible intake after RESUMED"
+[ "$(jq -r '.resume_session.self_user_id' "$home/state/.discord-bot-service/reconnect.json")" = "$SELF" ] \
+  || fail "durable Resume state did not retain the authenticated bot identity"
 kill -TERM "$resume_worker"
 wait "$resume_worker" || true
 WORKER_PIDS=()
@@ -1038,6 +1056,30 @@ wait "$rate_worker" || true
 WORKER_PIDS=()
 pass "retry deadline persistence failures remain stopped until termination"
 
+home=$(new_home gateway-sequence-persistence-stop)
+write_config "$home"
+make_gateway_server "$home/gateway" sequence-persistence-failure
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+sequence_worker=$!
+WORKER_PIDS+=("$sequence_worker")
+wait_for_file "$home/gateway/sequence-ready" || fail "sequence-persistence fixture did not reach READY"
+rm -f "$home/state/.discord-bot-service/reconnect.json"
+mkdir "$home/state/.discord-bot-service/reconnect.json"
+printf 'release\n' > "$home/gateway/release-sequence"
+wait_for_file "$home/state/discord-bot.error" || fail "sequence persistence failure did not fail closed"
+[ "$(jq -r .code "$home/state/discord-bot.error")" = reconnect-state-unavailable ] \
+  || fail "sequence persistence failure lacked its safe diagnostic"
+stop_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+kill -TERM "$sequence_worker"
+wait "$sequence_worker" || true
+stop_finished=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+WORKER_PIDS=()
+[ $((stop_finished - stop_started)) -lt 1500 ] \
+  || fail "sequence persistence fail-closed wait delayed termination"
+pass "sequence persistence failure keeps one promptly cancellable fail-closed wait"
+
 home=$(new_home gateway-rate-limit-clock)
 write_config "$home"
 make_gateway_server "$home/gateway" reconnect
@@ -1052,6 +1094,7 @@ jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$clock_deadline
    server_wait_ms:120,session_start_limit:null}
 ' > "$home/state/.discord-bot-service/reconnect.json"
 chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+clock_launched=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
   "$CONTROL" run > "$home/bot.log" 2>&1 &
@@ -1060,7 +1103,7 @@ WORKER_PIDS+=("$rate_worker")
 wait_for_value "$home/gateway/lookups" 1 || fail "clock-bounded retry deadline did not resume"
 clock_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
 [ $((clock_lookup - clock_started)) -ge 100 ] || fail "clock-bounded retry deadline resumed too early"
-[ $((clock_lookup - clock_started)) -lt 1500 ] || fail "future wall clock extended the retry deadline"
+[ $((clock_lookup - clock_launched)) -lt 1500 ] || fail "future wall clock extended the retry deadline"
 [ "$(jq -r '.server_not_before' "$home/state/.discord-bot-service/reconnect.json")" = null ] \
   || fail "satisfied server retry deadline remained durable before Gateway lookup"
 kill -TERM "$rate_worker"

@@ -45,6 +45,7 @@ ok - session-start reservations survive process restarts while Resume stays avai
 ok - Gateway lookup rate limits preserve server-provided retry direction
 ok - server retry deadlines survive abrupt process and service-manager restarts
 ok - retry deadline persistence failures remain stopped until termination
+ok - sequence persistence failure keeps one promptly cancellable fail-closed wait
 ok - server retry deadlines retire safely across clock movement
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
