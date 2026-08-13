@@ -42,6 +42,7 @@ OWNERSHIP_DIR="$OWNERSHIP_STATE/.discord-bot-service"
 OWNERSHIP_LOCK="$OWNERSHIP_DIR/owner.lock"
 START_LOCK="$OWNERSHIP_DIR/start.lock"
 OWNER_READY="$OWNERSHIP_DIR/owner.ready"
+TERMINAL_FILE="$OWNERSHIP_DIR/terminal.json"
 
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/fm-discord-config-lib.sh"
@@ -471,7 +472,7 @@ check_service() {
       try { const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).code; if (/^[a-z0-9-]+$/.test(value)) process.stdout.write(value); } catch {}
     ' "$STATE/discord-bot.error" 2>/dev/null || true)
   fi
-  if [ -f "$STATE/discord-bot.terminal" ] && [ ! -L "$STATE/discord-bot.terminal" ]; then
+  if [ -f "$TERMINAL_FILE" ] && [ ! -L "$TERMINAL_FILE" ]; then
     terminal=1
   fi
   if [ "$stopped" -eq 1 ]; then

@@ -46,8 +46,8 @@ const ENABLED_FILE = join(STATE, "discord-bot.enabled");
 const READY_FILE = join(STATE, "discord-bot.ready");
 const ERROR_FILE = join(STATE, "discord-bot.error");
 const ERROR_NOTIFIED_FILE = join(STATE, "discord-bot.error.notified");
-const TERMINAL_FILE = join(STATE, "discord-bot.terminal");
 const OWNERSHIP_DIR = join(HOME, "state", ".discord-bot-service");
+const TERMINAL_FILE = join(OWNERSHIP_DIR, "terminal.json");
 const RECONNECT_FILE = join(OWNERSHIP_DIR, "reconnect.json");
 const WAKE_DEDUP_DIR = join(STATE, ".wake-dedup");
 const NOTIFIER = join(ROOT, "bin", "fm-discord-notify.sh");
@@ -842,6 +842,7 @@ async function activeTerminalSuppression(config) {
 }
 
 async function writeTerminalSuppression(config, code) {
+  await ensureOwnershipDirectory();
   await atomicReplacePrivate(TERMINAL_FILE, `${JSON.stringify({
     schema: "firstmate.discord-terminal.v1",
     code,

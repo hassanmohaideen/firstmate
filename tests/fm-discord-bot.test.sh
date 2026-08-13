@@ -925,7 +925,7 @@ write_config "$home"
 make_gateway_server "$home/gateway" lookup-fail-once
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
-  FM_DISCORD_TEST_STABLE_MS=100 "$CONTROL" run > "$home/bot.log" 2>&1 &
+  FM_DISCORD_TEST_STABLE_MS=500 "$CONTROL" run > "$home/bot.log" 2>&1 &
 stable_worker=$!
 WORKER_PIDS+=("$stable_worker")
 wait_for_file "$home/state/discord-bot.error" || fail "transient Gateway failure did not publish its diagnostic"
@@ -958,7 +958,7 @@ rmdir "$home/state/.wake-queue"
 wait "$auth_worker" || fail "terminal authentication failure did not stop cleanly"
 WORKER_PIDS=()
 wait_for_file "$home/state/discord-bot.error.notified" || fail "terminal diagnostic publication was not retried"
-assert_present "$home/state/discord-bot.terminal" "terminal authentication failure did not persist reconnect suppression"
+assert_present "$home/state/.discord-bot-service/terminal.json" "terminal authentication failure did not persist reconnect suppression"
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "authentication rejection retried the Gateway lookup"
 [ "$(grep -c 'check: discord-error authentication-rejected' "$home/state/.wake-queue")" -eq 1 ] \
   || fail "terminal authentication failure emitted duplicate durable notifications"
@@ -966,6 +966,13 @@ out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" "$NODE_BIN" "$BOT" run 2>&1)
 assert_contains "$out" "reconnects stopped" "service-manager restart did not honor terminal suppression"
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "service-manager restart bypassed terminal suppression"
+mkdir "$home/alternate-state"
+chmod 700 "$home/alternate-state"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/alternate-state" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_DISCORD_TEST_MODE=1 FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  "$NODE_BIN" "$BOT" run 2>&1)
+assert_contains "$out" "reconnects stopped" "alternate state override did not honor terminal suppression"
+[ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "alternate state override bypassed terminal suppression"
 out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" check 2>&1); rc=$?
 [ "$rc" -ne 0 ] || fail "terminally stopped service reported healthy"
 assert_contains "$out" "reconnects are stopped" "health check did not report terminal suppression actionably"
@@ -973,7 +980,7 @@ assert_not_contains "$(cat "$home/bot.log")$out" "$TOKEN" "terminal authenticati
 assert_not_contains "$(cat "$home/bot.log")$out" "$OWNER" "terminal authentication diagnostics exposed a deployment id"
 out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry)
 assert_contains "$out" "suppression cleared" "explicit operator retry did not report its narrow action"
-assert_absent "$home/state/discord-bot.terminal" "explicit operator retry left terminal suppression active"
+assert_absent "$home/state/.discord-bot-service/terminal.json" "explicit operator retry left terminal suppression active"
 assert_absent "$home/state/discord-bot.error" "explicit operator retry left the old diagnostic active"
 pass "terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic"
 
@@ -996,7 +1003,7 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_RECONCILE_MS=20 \
   "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "diagnostic persistence failure retried authentication"
-assert_present "$home/state/discord-bot.terminal" "diagnostic persistence failure lost terminal suppression"
+assert_present "$home/state/.discord-bot-service/terminal.json" "diagnostic persistence failure lost terminal suppression"
 assert_contains "$(cat "$home/bot.log")" "cannot persist or publish the Discord diagnostic safely" \
   "diagnostic persistence failure did not emit its fixed safe diagnostic"
 assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "diagnostic persistence failure exposed the bot token"
