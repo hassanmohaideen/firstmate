@@ -171,6 +171,8 @@ fm_backend_detect() {
 # bundle-id or ancestry on success. Cheap-first: the bundle-id check is a pure
 # env read; the ancestry walk (subprocess-per-hop) runs only when it misses.
 fm_backend_detect_cmux_fallback() {
+  # The test runner sets this internal guard so parent cmux ancestry cannot
+  # route an isolated test back into the operator's live workspace.
   [ "${FM_BACKEND_DISABLE_CMUX_FALLBACK:-0}" != 1 ] || return 1
   [ "$(uname 2>/dev/null)" = Darwin ] || return 1
   if [ "${__CFBundleIdentifier:-}" = "$FM_BACKEND_CMUX_BUNDLE_ID" ]; then

@@ -79,7 +79,8 @@ The single longest measured script, `tests/fm-pr-check-security.test.sh` at 1942
 
 ## Performance evidence
 
-The original complete local `bin/fm-test-run.sh --all` measurement took 1,527 seconds for 146 scripts. Focused before/after measurements retained from the optimization work are:
+The original complete local `bin/fm-test-run.sh --all` measurement took 1,527 seconds for 146 scripts.
+Focused before/after measurements retained from the optimization work are:
 
 | Script | Before | After |
 |---|---:|---:|
@@ -87,16 +88,19 @@ The original complete local `bin/fm-test-run.sh --all` measurement took 1,527 se
 | `tests/fm-backend-herdr-presentation-e2e.test.sh` | ~269.6 s | ~238.9 s |
 | `tests/fm-pr-check-security.test.sh` | ~268.8 s | ~194.2 s |
 
-The required-lane focus-flash baseline was measured separately on 2026-08-13 on macOS aarch64 with the installed Herdr 0.8.0 protocol 19 pin. The generated non-default lab contract used the mandatory helper and completed all functional and default-session tripwire checks:
+The required-lane focus-flash baseline was measured separately on 2026-08-13 on macOS aarch64 with the installed Herdr 0.8.0 protocol 19 pin.
+The generated non-default lab contract used the mandatory helper and completed all functional and default-session tripwire checks:
 
 ```sh
 HERDR_LAB_HELPER=/Users/hassanmohaideen/.hassanmohaideen-agent-workspace/bin/fm-herdr-lab.sh \
   tests/fm-backend-herdr-focus-flash-e2e.test.sh
 ```
 
-The successful live path took 3,760 ms. `real_herdr_duration_hints` retains that measured baseline, from which the runner's `2 × baseline + 10,000 ms` policy derives the enforced 17,520 ms CI budget.
+The successful live path took 3,760 ms.
+`real_herdr_duration_hints` retains that measured baseline for the runner-owned CI budget.
 
-A subsequent portable regression attempt ran for about 1,500 seconds. Its failures were pre-existing failures unrelated to the scheduling and slow-test optimizations, so the attempt remains classified as incomplete evidence rather than a green regression result or justification to omit coverage.
+A subsequent portable regression attempt ran for about 1,500 seconds.
+Its failures were pre-existing failures unrelated to the scheduling and slow-test optimizations, so the attempt remains classified as incomplete evidence rather than a green regression result or justification to omit coverage.
 
 Refresh the hints by downloading the per-shard timing artifacts from a green CI run, replacing the `portable_serial_weight_hints` table in `bin/fm-test-run.sh` with the measured `path`/`duration_ms` pairs, and updating the table above:
 
@@ -124,7 +128,6 @@ Budget overruns warn during local runs and are enforced by required CI lanes wit
 ## Local entry points
 
 [CONTRIBUTING.md](../CONTRIBUTING.md) owns the local test policy and common entry points.
-The routine complete local path is portable: proven-isolated scripts use bounded parallel workers, while stateful scripts remain strictly serial and the required real-Herdr family remains in its dedicated CI lane.
 `bin/fm-test-run.sh --help` owns exact selection flags, lane names, duration enforcement, and bounded scheduling mechanics.
 
 ## Timeouts
