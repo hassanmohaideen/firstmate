@@ -1453,8 +1453,20 @@ fm_super_main() {
     wedge_alarm_stop_active_notifier
     escalate_flush "$STATE" 2>/dev/null || true
     if [ -n "${WATCHER_PID:-}" ]; then
-      kill "$WATCHER_PID" 2>/dev/null || true
-      wait "$WATCHER_PID" 2>/dev/null || true
+      local watcher_pid=$WATCHER_PID watcher_killer_pid
+      kill -TERM "$watcher_pid" 2>/dev/null || true
+      # Bash can defer TERM while the watcher is blocked in one of its own
+      # children (observed on Linux CI). Never let daemon shutdown wait forever:
+      # the still-unreaped watcher keeps its pid reserved, so this bounded KILL
+      # cannot race a reused process id.
+      (
+        sleep 2
+        kill -KILL "$watcher_pid" 2>/dev/null || true
+      ) &
+      watcher_killer_pid=$!
+      wait "$watcher_pid" 2>/dev/null || true
+      kill -TERM "$watcher_killer_pid" 2>/dev/null || true
+      wait "$watcher_killer_pid" 2>/dev/null || true
     fi
     if [ -n "${CUR_TMP:-}" ]; then
       rm -f "$CUR_TMP" 2>/dev/null || true
