@@ -7,7 +7,7 @@
 // It delegates notification publication to bin/fm-discord-notify.sh so the
 // existing durable wake queue remains the only Firstmate notification plane.
 //
-// Operator lifecycle and Gateway ownership are owned by bin/fm-discord-bot.sh.
+// Operator lifecycle and Gateway ownership admission are owned by bin/fm-discord-bot.sh.
 // Direct use is limited to non-Gateway operations:
 //   fm-discord-bot.mjs validate
 //   fm-discord-bot.mjs send <message-id> --text-file <path> [--nonce-scope initial|final]
@@ -161,6 +161,23 @@ async function ensureOwnershipDirectory() {
   await assertPlainDirectory(OWNERSHIP_DIR, 0o700);
 }
 
+async function replaceLeasePid(path, pid) {
+  const temp = join(dirname(path), `.pid.handoff.${process.pid}.${randomBytes(8).toString("hex")}`);
+  const handle = await open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+  try {
+    try {
+      await handle.writeFile(`${pid}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temp, path);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+
 async function requireGatewayOwnership() {
   const ownerPid = process.env.FM_DISCORD_OWNER_PID || "";
   if (!/^[1-9][0-9]*$/.test(ownerPid) || Number(ownerPid) !== process.ppid) {
@@ -177,10 +194,44 @@ async function requireGatewayOwnership() {
     throw new ConfigError("Gateway ownership lease is invalid");
   }
   await assertPlainDirectory(ownerTarget, 0o700);
-  const recordedPid = (await readFile(join(ownerTarget, "pid"), "utf8")).trim();
+  const pidFile = join(ownerTarget, "pid");
+  const pidInfo = await lstat(pidFile);
+  if (!pidInfo.isFile() || pidInfo.isSymbolicLink() || pidInfo.nlink !== 1) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
+  const recordedPid = (await readFile(pidFile, "utf8")).trim();
   if (recordedPid !== ownerPid) {
     throw new ConfigError("Gateway ownership lease is invalid");
   }
+  const readyFile = join(OWNERSHIP_DIR, "owner.ready");
+  await assertPrivateFile(readyFile);
+  const ready = (await readFile(readyFile, "utf8")).trim().split("\n");
+  if (ready.length !== 2 || ready[0] !== ownerPid || !/^[a-f0-9]{64}$/.test(ready[1])) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
+  if (resolve(dirname(lock), await readlink(lock)) !== ownerTarget) {
+    throw new ConfigError("Gateway ownership lease changed during handoff");
+  }
+  await atomicReplacePrivate(readyFile, `${process.pid}\n${ready[1]}\n`);
+  await replaceLeasePid(pidFile, String(process.pid));
+  if (resolve(dirname(lock), await readlink(lock)) !== ownerTarget
+      || (await readFile(pidFile, "utf8")).trim() !== String(process.pid)) {
+    throw new ConfigError("Gateway ownership lease changed during handoff");
+  }
+  return { lock, ownerTarget, pidFile, readyFile };
+}
+
+async function releaseGatewayOwnership(lease) {
+  const currentPid = String(process.pid);
+  const lockInfo = await lstat(lease.lock).catch(() => null);
+  if (!lockInfo?.isSymbolicLink()
+      || resolve(dirname(lease.lock), await readlink(lease.lock)) !== lease.ownerTarget
+      || (await readFile(lease.pidFile, "utf8").catch(() => "")).trim() !== currentPid) return;
+  const ready = await readFile(lease.readyFile, "utf8").catch(() => "");
+  if (ready.split("\n", 1)[0] === currentPid) await removeMarker(lease.readyFile);
+  await unlink(lease.lock);
+  await unlink(lease.pidFile).catch(() => {});
+  await rm(lease.ownerTarget, { recursive: false }).catch(() => {});
 }
 
 async function atomicReplacePrivate(path, content) {
@@ -1653,10 +1704,12 @@ async function main() {
         safeLog(`reconnects stopped: ${suppressedCode}; operator intervention is required`);
         return;
       }
-      await requireGatewayOwnership();
-      const runner = new GatewayRunner(config);
+      let lease = null;
+      let runner = null;
+      let stopping = false;
       const stop = () => {
-        runner.stop();
+        stopping = true;
+        runner?.stop();
         removeMarker(READY_FILE).catch(() => {});
         removeMarker(ENABLED_FILE).catch(() => {});
         const forcedExit = setTimeout(() => process.exit(0), 5000);
@@ -1666,10 +1719,14 @@ async function main() {
       process.once("SIGTERM", stop);
       process.once("SIGHUP", stop);
       try {
+        lease = await requireGatewayOwnership();
+        if (stopping) return;
+        runner = new GatewayRunner(config);
         await runner.run();
       } finally {
         await removeMarker(READY_FILE).catch(() => {});
         await removeMarker(ENABLED_FILE).catch(() => {});
+        if (lease) await releaseGatewayOwnership(lease);
       }
       return;
     }

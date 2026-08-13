@@ -669,6 +669,53 @@ assert_absent "$home/state/discord-bot.ready" "clean shutdown left the ready mar
 assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "Gateway logs exposed the bot token"
 pass "the Gateway reconnects, remains single-instance, and shuts down cleanly"
 
+home=$(new_home gateway-orphan-owner)
+write_config "$home"
+make_gateway_server "$home/gateway" stable
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=20 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+wrapper=$!
+WORKER_PIDS+=("$wrapper")
+wait_for_file "$home/gateway/connections" || fail "orphan ownership fixture did not connect"
+runtime_pid=''
+i=0
+while [ "$i" -lt 200 ]; do
+  runtime_pid=$(cat "$home/state/.discord-bot-service/owner.lock/pid" 2>/dev/null || true)
+  case "$runtime_pid" in
+    ''|*[!0-9]*) ;;
+    *) [ "$runtime_pid" != "$wrapper" ] && kill -0 "$runtime_pid" 2>/dev/null && break ;;
+  esac
+  runtime_pid=''
+  sleep 0.05
+  i=$((i + 1))
+done
+[ -n "$runtime_pid" ] || fail "Gateway runtime did not assume canonical ownership"
+kill -KILL "$wrapper"
+wait "$wrapper" 2>/dev/null || true
+WORKER_PIDS=("$runtime_pid")
+connections_before=$(cat "$home/gateway/connections")
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=20 \
+  "$CONTROL" run 2>&1); rc=$?
+[ "$rc" -ne 0 ] || fail "wrapper death allowed a concurrent Discord runtime"
+assert_contains "$out" "another self-hosted Discord bot" \
+  "contender did not report the orphaned runtime's canonical ownership"
+kill -0 "$runtime_pid" 2>/dev/null || fail "wrapper death terminated the tracked Gateway runtime"
+[ "$(cat "$home/gateway/connections")" = "$connections_before" ] \
+  || fail "wrapper death allowed a contender to open another Gateway connection"
+kill -TERM "$runtime_pid"
+i=0
+while [ "$i" -lt 200 ] && { [ -e "$home/state/.discord-bot-service/owner.lock" ] || [ -L "$home/state/.discord-bot-service/owner.lock" ]; }; do
+  sleep 0.05
+  i=$((i + 1))
+done
+[ ! -e "$home/state/.discord-bot-service/owner.lock" ] \
+  && [ ! -L "$home/state/.discord-bot-service/owner.lock" ] \
+  || fail "orphaned Gateway runtime did not release ownership on prompt stop"
+WORKER_PIDS=()
+pass "Gateway ownership survives wrapper death and refuses contenders"
+
 # Discord can issue a regional resume endpoint in READY while the transport
 # connection itself remains hermetic.
 home=$(new_home gateway-regional-resume)

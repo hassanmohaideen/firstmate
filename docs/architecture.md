@@ -270,7 +270,7 @@ Cross-home terminal return is not inferred or copied by this narrow v1 path.
 `bin/fm-discord-bot.sh` owns local lifecycle and the per-home macOS LaunchAgent.
 The service property list carries only home and code paths, uses `RunAtLoad`, restart-on-failure `KeepAlive`, and launchd throttling, and enters the same worker path as foreground operation.
 A terminal protocol outcome exits successfully after persisting suppression, so launchd does not restart it, while any external service manager that invokes the worker again reaches the same suppression check before Gateway I/O.
-That worker holds a recoverable home-local lock before starting the Node child, which makes service/manual overlap and restart races single-instance.
+That worker acquires a recoverable home-local lock and hands it to the verified Node child before Gateway I/O. The child remains the canonical owner for its full runtime lifetime, so service/manual overlap, wrapper loss, and restart races remain single-instance.
 
 This transport is independent of both primary harness and task runtime backend.
 It neither injects into a harness-specific composer nor calls a backend adapter; it writes the existing queue and lets the active primary's established supervision protocol deliver the structural event.
