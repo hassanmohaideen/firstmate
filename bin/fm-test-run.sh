@@ -467,6 +467,7 @@ EOF
 
 real_herdr_duration_hints() {
   cat <<'EOF'
+tests/fm-afk-inject-herdr-e2e.test.sh 65000
 tests/fm-backend-herdr-presentation-e2e.test.sh 238900
 EOF
 }
@@ -1769,6 +1770,14 @@ record_script_result() {
   TOTAL=$((TOTAL + 1))
 }
 
+clear_ambient_fleet_environment() {
+  unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
+    FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND \
+    TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH HERDR_PANE_ID \
+    CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID \
+    __CFBundleIdentifier 2>/dev/null || true
+}
+
 run_one_serial() {
   local script=$1
   local base family expected out begin_iso begin_ms end_ms end_iso duration rc
@@ -1787,8 +1796,7 @@ run_one_serial() {
   # ambient fleet routing exactly as parallel workers do, so a local complete
   # run cannot point a test at the operator's live home.
   (
-    unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
-      FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND 2>/dev/null || true
+    clear_ambient_fleet_environment
     bash "$script"
   ) 2>&1 | tee "$out"
   rc=${PIPESTATUS[0]}
@@ -1907,6 +1915,7 @@ else
     set -m
     (
       set +e
+      set +m
       child_pid=
       # shellcheck disable=SC2329 # Invoked indirectly by worker signal traps.
       stop_child() {
@@ -1923,8 +1932,7 @@ else
       done
       export TMPDIR="$work/tmp"
       export TMP="$work/tmp"
-      unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
-        FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND 2>/dev/null || true
+      clear_ambient_fleet_environment
       cd "$ROOT" || exit 1
       begin_ms=$(now_ms)
       bash "$script" >"$work/output" 2>&1 &

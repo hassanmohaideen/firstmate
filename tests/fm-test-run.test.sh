@@ -812,7 +812,9 @@ test_environment_isolation_in_serial_and_parallel_children() {
   for name in fm-brief fm-daemon; do
     cat > "$repo/tests/$name.test.sh" <<'SH'
 #!/usr/bin/env bash
-for key in FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND; do
+for key in FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND \
+  TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH HERDR_PANE_ID \
+  CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID __CFBundleIdentifier; do
   eval "value=\${$key-}"
   [ -z "$value" ] || exit 9
 done
@@ -822,6 +824,10 @@ SH
   done
   FM_HOME=poison FM_STATE_OVERRIDE=poison FM_DATA_OVERRIDE=poison FM_ROOT_OVERRIDE=poison \
     FM_PROJECTS_OVERRIDE=poison FM_CONFIG_OVERRIDE=poison FM_BACKEND=poison \
+    TMUX=poison TMUX_PANE=poison HERDR_ENV=1 HERDR_SESSION=poison \
+    HERDR_SOCKET_PATH=poison HERDR_PANE_ID=poison CMUX_WORKSPACE_ID=poison \
+    CMUX_SURFACE_ID=poison CMUX_SOCKET_PATH=poison CMUX_TAB_ID=poison \
+    CMUX_PANEL_ID=poison __CFBundleIdentifier=com.cmuxterm.app \
     ENV_EVIDENCE="$evidence" "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
     || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "isolated environment fixture failed"; }
   [ -e "$evidence/fm-brief.test.sh.isolated" ] \
@@ -845,6 +851,10 @@ SH
 #!/usr/bin/env bash
 echo "ok - default budget fixture"
 SH
+  cat > "$repo/tests/fm-afk-inject-herdr-e2e.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo "ok - long measured Herdr fixture"
+SH
   chmod +x "$repo"/tests/*.test.sh
   real_python=$(command -v python3)
   cat > "$fakebin/python3" <<SH
@@ -853,7 +863,7 @@ if [ "\${1:-}" = -c ] && printf '%s' "\${2:-}" | grep -Fq 'time.time()'; then
   n=0
   [ ! -f '$tmp/clock' ] || n=\$(cat '$tmp/clock')
   n=\$((n + 1)); printf '%s\n' "\$n" > '$tmp/clock'
-  case "\$n" in 1|2) echo 0 ;; *) echo 200000 ;; esac
+  case "\$n" in 1|2) echo 0 ;; *) echo "\${FAKE_DURATION_MS:-200000}" ;; esac
   exit 0
 fi
 exec '$real_python' "\$@"
@@ -887,6 +897,13 @@ SH
   [ "$rc" -ne 0 ] || fail "required CI script without a measured hint escaped enforcement"
   grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=enforce' "$tmp/default.out" \
     || fail "default duration budget did not cover an unmeasured required CI script"
+
+  rm -f "$tmp/clock"
+  FAKE_DURATION_MS=65000 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
+    tests/fm-afk-inject-herdr-e2e.test.sh > "$tmp/herdr.out" 2> "$tmp/herdr.err" \
+    || fail "measured long Herdr duration was rejected by the default fallback budget"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 mode=enforce' "$tmp/herdr.out" \
+    || fail "long Herdr duration did not use its measured budget"
   rm -rf "$tmp"
   pass "duration budgets warn locally and enforce every required CI script"
 }
