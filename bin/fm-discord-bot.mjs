@@ -7,9 +7,9 @@
 // It delegates notification publication to bin/fm-discord-notify.sh so the
 // existing durable wake queue remains the only Firstmate notification plane.
 //
-// Operator lifecycle is owned by bin/fm-discord-bot.sh. Direct use:
+// Operator lifecycle and Gateway ownership admission are owned by bin/fm-discord-bot.sh.
+// Direct use is limited to non-Gateway operations:
 //   fm-discord-bot.mjs validate
-//   fm-discord-bot.mjs run
 //   fm-discord-bot.mjs send <message-id> --text-file <path> [--nonce-scope initial|final]
 //
 // FM_DISCORD_TEST_* variables and `ingest` are hermetic-test seams only. They
@@ -24,6 +24,8 @@ import {
   open,
   readFile,
   readdir,
+  readlink,
+  realpath,
   rename,
   rm,
   stat,
@@ -32,6 +34,7 @@ import {
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
+import { platform, uptime } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -46,6 +49,10 @@ const ENABLED_FILE = join(STATE, "discord-bot.enabled");
 const READY_FILE = join(STATE, "discord-bot.ready");
 const ERROR_FILE = join(STATE, "discord-bot.error");
 const ERROR_NOTIFIED_FILE = join(STATE, "discord-bot.error.notified");
+const OWNERSHIP_DIR = join(HOME, "state", ".discord-bot-service");
+const TERMINAL_FILE = join(OWNERSHIP_DIR, "terminal.json");
+const RECONNECT_FILE = join(OWNERSHIP_DIR, "reconnect.json");
+const RECONNECT_SUPPRESSION_FILE = join(OWNERSHIP_DIR, "reconnect-suppression.json");
 const WAKE_DEDUP_DIR = join(STATE, ".wake-dedup");
 const NOTIFIER = join(ROOT, "bin", "fm-discord-notify.sh");
 const TEST_MODE = process.env.FM_DISCORD_TEST_MODE === "1";
@@ -70,14 +77,17 @@ const CONFIG_KEYS = [
 const SNOWFLAKE_RE = /^[0-9]{15,22}$/;
 const SAFE_CODE_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const INCIDENT_ID_RE = /^[0-9a-f]{64}$/;
+const BOOT_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 let diagnosticTransitions = Promise.resolve();
+let diagnosticGeneration = 0;
 
 class DisabledError extends Error {}
 class ConfigError extends Error {}
 class DiscordHttpError extends Error {
-  constructor(status) {
+  constructor(status, retryAfterMs = 0) {
     super(`Discord HTTP ${status}`);
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -90,6 +100,36 @@ function diagnosticEpochSeconds() {
     return Number(process.env.FM_DISCORD_TEST_EPOCH_SECONDS);
   }
   return Math.floor(Date.now() / 1000);
+}
+
+function monotonicMilliseconds() {
+  return Math.floor(uptime() * 1000);
+}
+
+async function systemBootIdentity() {
+  const testIdentity = TEST_MODE ? process.env.FM_DISCORD_TEST_BOOT_ID || "" : "";
+  if (BOOT_ID_RE.test(testIdentity)) return testIdentity;
+  if (platform() === "linux") {
+    try {
+      const identity = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+      if (BOOT_ID_RE.test(identity)) return identity;
+    } catch {}
+  }
+  if (platform() === "darwin") {
+    try {
+      const identity = await new Promise((resolvePromise, rejectPromise) => {
+        const child = spawn("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        let output = "";
+        child.stdout.on("data", (chunk) => { output += chunk.toString("utf8"); });
+        child.once("error", rejectPromise);
+        child.once("close", (code) => code === 0 ? resolvePromise(output.trim()) : rejectPromise(new Error("sysctl failed")));
+      });
+      if (BOOT_ID_RE.test(identity)) return identity;
+    } catch {}
+  }
+  return `process-${process.pid}-${randomBytes(8).toString("hex")}`;
 }
 
 function modeBits(info) {
@@ -138,9 +178,98 @@ async function ensurePrivateDirectory(path) {
   await assertPlainDirectory(path, 0o700);
 }
 
-async function atomicReplacePrivate(path, content) {
+async function ensureOwnershipDirectory() {
+  const ownershipState = join(HOME, "state");
+  try {
+    await mkdir(ownershipState, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  await assertPlainDirectory(ownershipState);
+  try {
+    await mkdir(OWNERSHIP_DIR, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  await assertPlainDirectory(OWNERSHIP_DIR, 0o700);
+}
+
+async function replaceLeasePid(path, pid) {
+  const temp = join(dirname(path), `.pid.handoff.${process.pid}.${randomBytes(8).toString("hex")}`);
+  const handle = await open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+  try {
+    try {
+      await handle.writeFile(`${pid}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temp, path);
+  } catch (error) {
+    await rm(temp, { force: true });
+    throw error;
+  }
+}
+
+async function requireGatewayOwnership() {
+  const ownerPid = process.env.FM_DISCORD_OWNER_PID || "";
+  if (!/^[1-9][0-9]*$/.test(ownerPid) || Number(ownerPid) !== process.ppid) {
+    throw new ConfigError("Gateway run requires the single-instance service wrapper");
+  }
+  const lock = join(OWNERSHIP_DIR, "owner.lock");
+  const info = await lstat(lock).catch(() => null);
+  if (!info?.isSymbolicLink()) {
+    throw new ConfigError("Gateway run requires the single-instance service wrapper");
+  }
+  const ownerTarget = resolve(dirname(lock), await readlink(lock));
+  const canonicalOwnershipDir = await realpath(OWNERSHIP_DIR);
+  if (dirname(ownerTarget) !== canonicalOwnershipDir || !/^owner\.lock\.owner\.[A-Za-z0-9]+$/.test(ownerTarget.split("/").pop())) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
+  await assertPlainDirectory(ownerTarget, 0o700);
+  const pidFile = join(ownerTarget, "pid");
+  const pidInfo = await lstat(pidFile);
+  if (!pidInfo.isFile() || pidInfo.isSymbolicLink() || pidInfo.nlink !== 1) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
+  const recordedPid = (await readFile(pidFile, "utf8")).trim();
+  if (recordedPid !== ownerPid) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
+  const readyFile = join(OWNERSHIP_DIR, "owner.ready");
+  await assertPrivateFile(readyFile);
+  const ready = (await readFile(readyFile, "utf8")).trim().split("\n");
+  if (ready.length !== 2 || ready[0] !== ownerPid || !/^[a-f0-9]{64}$/.test(ready[1])) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
+  if (resolve(dirname(lock), await readlink(lock)) !== ownerTarget) {
+    throw new ConfigError("Gateway ownership lease changed during handoff");
+  }
+  await atomicReplaceOwnershipPrivate(readyFile, `${process.pid}\n${ready[1]}\n`);
+  await replaceLeasePid(pidFile, String(process.pid));
+  if (resolve(dirname(lock), await readlink(lock)) !== ownerTarget
+      || (await readFile(pidFile, "utf8")).trim() !== String(process.pid)) {
+    throw new ConfigError("Gateway ownership lease changed during handoff");
+  }
+  return { lock, ownerTarget, pidFile, readyFile };
+}
+
+async function releaseGatewayOwnership(lease) {
+  const currentPid = String(process.pid);
+  const lockInfo = await lstat(lease.lock).catch(() => null);
+  if (!lockInfo?.isSymbolicLink()
+      || resolve(dirname(lease.lock), await readlink(lease.lock)) !== lease.ownerTarget
+      || (await readFile(lease.pidFile, "utf8").catch(() => "")).trim() !== currentPid) return;
+  const ready = await readFile(lease.readyFile, "utf8").catch(() => "");
+  if (ready.split("\n", 1)[0] === currentPid) await removeMarker(lease.readyFile);
+  await unlink(lease.lock);
+  await unlink(lease.pidFile).catch(() => {});
+  await rm(lease.ownerTarget, { recursive: false }).catch(() => {});
+}
+
+async function replacePrivateFile(path, content, prepareParent) {
   const parent = dirname(path);
-  await ensureStateRoot();
+  await prepareParent();
   await assertPlainDirectory(parent);
   const temp = join(parent, `.${path.split("/").pop()}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`);
   const handle = await open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
@@ -162,6 +291,45 @@ async function atomicReplacePrivate(path, content) {
   } catch (error) {
     await rm(temp, { force: true });
     throw error;
+  }
+}
+
+async function atomicReplacePrivate(path, content) {
+  await replacePrivateFile(path, content, ensureStateRoot);
+}
+
+async function atomicReplaceOwnershipPrivate(path, content) {
+  if (dirname(path) !== OWNERSHIP_DIR) throw new ConfigError("invalid ownership artifact path");
+  await replacePrivateFile(path, content, ensureOwnershipDirectory);
+}
+
+async function quarantineInvalidReconnectState() {
+  await ensureOwnershipDirectory();
+  try {
+    await assertPrivateFile(RECONNECT_FILE);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  for (;;) {
+    const quarantineFile = join(
+      OWNERSHIP_DIR,
+      `reconnect.invalid.${randomBytes(16).toString("hex")}.json`,
+    );
+    try {
+      await lstat(quarantineFile);
+      continue;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    try {
+      await rename(RECONNECT_FILE, quarantineFile);
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+    await assertPrivateFile(quarantineFile);
+    return true;
   }
 }
 
@@ -340,6 +508,7 @@ async function publishDiagnostic(record) {
 }
 
 function reportDiagnostic(code) {
+  diagnosticGeneration += 1;
   return enqueueDiagnostic(async () => {
     if (!SAFE_CODE_RE.test(code)) code = "discord-service-error";
     try {
@@ -380,8 +549,9 @@ function reconcileDiagnostic() {
   });
 }
 
-function clearDiagnostic() {
+function clearDiagnostic(expectedGeneration = null) {
   return enqueueDiagnostic(async () => {
+    if (expectedGeneration !== null && expectedGeneration !== diagnosticGeneration) return;
     try {
       await removeMarker(ERROR_FILE);
       await removeMarker(ERROR_NOTIFIED_FILE);
@@ -674,7 +844,7 @@ async function fetchWithTimeout(url, options, timeoutMs = 10_000) {
 async function gatewayUrl(config) {
   if (TEST_GATEWAY_URL) {
     validateProductionEndpoint(TEST_GATEWAY_URL, "gateway");
-    return TEST_GATEWAY_URL;
+    return { url: TEST_GATEWAY_URL, sessionStartLimit: null };
   }
   validateProductionEndpoint(API_BASE, "api");
   let response;
@@ -685,23 +855,286 @@ async function gatewayUrl(config) {
   } catch {
     throw new Error("gateway lookup unavailable");
   }
-  if (!response.ok) throw new DiscordHttpError(response.status);
+  if (!response.ok) {
+    let retryAfterMs = 0;
+    if (response.status === 429) {
+      const headerDelay = Number(response.headers.get("retry-after"));
+      if (Number.isFinite(headerDelay) && headerDelay > 0) retryAfterMs = Math.ceil(headerDelay * 1000);
+      try {
+        const errorBody = await response.json();
+        const bodyDelay = Number(errorBody?.retry_after);
+        if (Number.isFinite(bodyDelay) && bodyDelay > 0) {
+          retryAfterMs = Math.max(retryAfterMs, Math.ceil(bodyDelay * 1000));
+        }
+      } catch {}
+    }
+    throw new DiscordHttpError(response.status, retryAfterMs);
+  }
   const body = await response.json();
   validateProductionEndpoint(body.url, "gateway");
-  return body.url;
+  const limit = body.session_start_limit;
+  if (!limit || !Number.isInteger(limit.total) || limit.total < 1
+      || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
+      || !Number.isFinite(limit.reset_after) || limit.reset_after < 0) {
+    throw new ConfigError("gateway session-start limit is invalid");
+  }
+  const resetAfter = Math.ceil(limit.reset_after);
+  const testWallOffset = TEST_MODE
+    && /^-?[0-9]+$/.test(process.env.FM_DISCORD_TEST_SESSION_RESET_WALL_OFFSET_MS || "")
+    ? Number(process.env.FM_DISCORD_TEST_SESSION_RESET_WALL_OFFSET_MS)
+    : 0;
+  return {
+    url: body.url,
+    sessionStartLimit: {
+      total: limit.total,
+      remaining: limit.remaining,
+      resetAfter,
+      resetAt: Date.now() + resetAfter + testWallOffset,
+    },
+  };
 }
 
-function backoffMilliseconds(attempt) {
-  if (TEST_MODE && /^[0-9]+$/.test(process.env.FM_DISCORD_TEST_BACKOFF_MS || "")) {
-    return Math.max(1, Math.min(1000, Number(process.env.FM_DISCORD_TEST_BACKOFF_MS)));
+function testDuration(name, fallback, minimum = 1, maximum = fallback) {
+  const value = process.env[name] || "";
+  if (!TEST_MODE || !/^[0-9]+$/.test(value)) return fallback;
+  return Math.max(minimum, Math.min(maximum, Number(value)));
+}
+
+const TEST_BACKOFF_MS = testDuration("FM_DISCORD_TEST_BACKOFF_MS", 5000, 1, 1000);
+const RECONNECT_POLICY = {
+  minimumIntervalMs: TEST_MODE && process.env.FM_DISCORD_TEST_BACKOFF_MS
+    ? TEST_BACKOFF_MS
+    : testDuration("FM_DISCORD_TEST_MIN_CONNECTION_MS", 5000, 1, 5000),
+  baseDelayMs: TEST_BACKOFF_MS,
+  maximumDelayMs: TEST_MODE && process.env.FM_DISCORD_TEST_BACKOFF_MS
+    ? Math.max(TEST_BACKOFF_MS, testDuration("FM_DISCORD_TEST_MAX_BACKOFF_MS", 1000, 1, 5000))
+    : 300_000,
+  cooldownAfter: 8,
+  cooldownMs: testDuration("FM_DISCORD_TEST_COOLDOWN_MS", 15 * 60_000, 1, 15 * 60_000),
+};
+const STABLE_CONNECTION_MS = testDuration("FM_DISCORD_TEST_STABLE_MS", 5 * 60_000, 50, 5 * 60_000);
+const HEARTBEAT_STABLE_MS = testDuration("FM_DISCORD_TEST_HEARTBEAT_STABLE_MS", 2 * 60_000, 50, 2 * 60_000);
+
+function randomFraction() {
+  const fixture = process.env.FM_DISCORD_TEST_RANDOM || "";
+  if (TEST_MODE && /^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(fixture)) return Number(fixture);
+  return Math.random();
+}
+
+function reconnectDelayMilliseconds({ pressure, random, now, lastConnectionAt, serverDelayMs = 0, policy = RECONNECT_POLICY }) {
+  const exponent = Math.min(16, Math.max(0, pressure - 1));
+  const unjittered = Math.min(policy.maximumDelayMs, policy.baseDelayMs * (2 ** exponent));
+  const jittered = Math.floor(unjittered * (0.5 + Math.max(0, Math.min(1, random)) * 0.5));
+  const intervalRemaining = lastConnectionAt === null
+    ? 0
+    : Math.max(0, Math.min(policy.minimumIntervalMs, policy.minimumIntervalMs - (now - lastConnectionAt)));
+  const cooldown = pressure >= policy.cooldownAfter
+    ? Math.floor(policy.cooldownMs * (0.8 + Math.max(0, Math.min(1, random)) * 0.2))
+    : 0;
+  return Math.max(1, jittered, intervalRemaining, Math.max(0, serverDelayMs), cooldown);
+}
+
+function simulateReconnectPolicy(input) {
+  const policy = {
+    minimumIntervalMs: Number(input.minimum_interval_ms ?? 5000),
+    baseDelayMs: Number(input.base_delay_ms ?? 5000),
+    maximumDelayMs: Number(input.maximum_delay_ms ?? 300_000),
+    cooldownAfter: Number(input.cooldown_after ?? 8),
+    cooldownMs: Number(input.cooldown_ms ?? 15 * 60_000),
+  };
+  const duration = Number(input.duration_ms ?? 60 * 60_000);
+  const uptime = Number(input.unstable_uptime_ms ?? 50);
+  const stableAt = Number(input.stable_at_connection ?? 0);
+  const maximumConnections = Number(input.maximum_connections ?? 10_000);
+  const random = Number(input.random ?? 0.5);
+  let now = 0;
+  let pressure = 0;
+  let connections = 0;
+  const delays = [];
+  while (now < duration && connections < maximumConnections) {
+    const lastConnectionAt = now;
+    connections += 1;
+    now += uptime;
+    if (connections === stableAt) pressure = 0;
+    pressure += 1;
+    const delay = reconnectDelayMilliseconds({ pressure, random, now, lastConnectionAt, policy });
+    if (delays.length < 16) delays.push(delay);
+    now += delay;
   }
-  const exponent = Math.min(6, Math.max(0, attempt));
-  const base = Math.min(60_000, 1000 * (2 ** exponent));
-  return Math.min(60_000, Math.floor(base * (0.75 + Math.random() * 0.5)));
+  return { connections, elapsed_ms: now, final_pressure: pressure, delays };
 }
 
 function sleep(milliseconds) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function authenticationFingerprint(config) {
+  return createHash("sha256").update(config.token).digest("hex");
+}
+
+function rebootWaitRemaining(waitMilliseconds) {
+  return waitMilliseconds;
+}
+
+function simulateRebootWaitPolicy(input) {
+  let remaining = Number(input.remaining_ms);
+  const remainingAfterObservations = [];
+  const observations = input.reboot_observations_ms || [];
+  for (let index = 0; index < observations.length; index += 1) {
+    remaining = rebootWaitRemaining(remaining);
+    remainingAfterObservations.push(remaining);
+  }
+  return { remaining_ms: remaining, remaining_after_observations: remainingAfterObservations };
+}
+
+function validFallbackSuppression(record) {
+  return record?.schema === "firstmate.discord-reconnect-suppression.v1"
+    && INCIDENT_ID_RE.test(record.authentication_fingerprint || "")
+    && typeof record.operator_intervention_required === "boolean"
+    && (record.operator_code === undefined || record.operator_code === null
+      || SAFE_CODE_RE.test(record.operator_code))
+    && (record.server_not_before === null
+      ? record.server_wait_ms === null && record.operator_intervention_required
+      : Number.isSafeInteger(record.server_not_before) && record.server_not_before >= 0
+        && Number.isSafeInteger(record.server_wait_ms) && record.server_wait_ms >= 0
+        && (record.server_wall_observed_at === undefined
+          || record.server_wall_observed_at === null
+          || Number.isSafeInteger(record.server_wall_observed_at)
+            && record.server_wall_observed_at >= 0)
+        && (record.server_boot_id === undefined || record.server_boot_id === null
+          || BOOT_ID_RE.test(record.server_boot_id))
+        && (record.server_monotonic_not_before === undefined
+          || record.server_monotonic_not_before === null
+          || Number.isSafeInteger(record.server_monotonic_not_before)
+            && record.server_monotonic_not_before >= 0)
+        && (record.server_reboot_fallback_used === undefined
+          || typeof record.server_reboot_fallback_used === "boolean")
+        && !record.operator_intervention_required);
+}
+
+async function activeTerminalSuppression(config) {
+  let record;
+  try {
+    await assertPrivateFile(TERMINAL_FILE);
+    record = JSON.parse(await readFile(TERMINAL_FILE, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") return "terminal-suppression-invalid";
+  }
+  if (record) {
+    if (record.schema !== "firstmate.discord-terminal.v2" || !SAFE_CODE_RE.test(record.code || "")
+        || !INCIDENT_ID_RE.test(record.authentication_fingerprint || "")) {
+      return "terminal-suppression-invalid";
+    }
+    if (record.authentication_fingerprint === authenticationFingerprint(config)) return record.code;
+    await removeMarker(TERMINAL_FILE);
+    await clearDiagnostic();
+  }
+  let fallback;
+  try {
+    await assertPrivateFile(RECONNECT_SUPPRESSION_FILE);
+    fallback = JSON.parse(await readFile(RECONNECT_SUPPRESSION_FILE, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return "";
+    return "terminal-suppression-invalid";
+  }
+  if (!validFallbackSuppression(fallback)) return "terminal-suppression-invalid";
+  if (fallback.authentication_fingerprint !== authenticationFingerprint(config)) {
+    await removeMarker(RECONNECT_SUPPRESSION_FILE);
+    return "";
+  }
+  return fallback.operator_intervention_required
+    ? fallback.operator_code || "reconnect-state-unavailable"
+    : "";
+}
+
+async function writeTerminalSuppression(config, code) {
+  await ensureOwnershipDirectory();
+  if (TEST_MODE && process.env.FM_DISCORD_TEST_TERMINAL_WRITE_FAILURE === "1") {
+    throw new Error("injected terminal state failure");
+  }
+  await atomicReplaceOwnershipPrivate(TERMINAL_FILE, `${JSON.stringify({
+    schema: "firstmate.discord-terminal.v2",
+    code,
+    authentication_fingerprint: authenticationFingerprint(config),
+    recorded_at: diagnosticEpochSeconds(),
+  })}\n`);
+}
+
+function terminalDiagnosticForClose(code) {
+  return new Map([
+    [4004, "authentication-rejected"],
+    [4010, "gateway-sharding-invalid"],
+    [4011, "gateway-sharding-required"],
+    [4012, "gateway-version-invalid"],
+    [4013, "gateway-intents-invalid"],
+    [4014, "message-content-intent-disabled"],
+  ]).get(code) || "";
+}
+
+function validReconnectRecord(record) {
+  if (!record) return true;
+  const legacy = record.schema === "firstmate.discord-reconnect.v1";
+  const limit = record.session_start_limit;
+  const resume = record.resume_session;
+  if ((!legacy && record.schema !== "firstmate.discord-reconnect.v2")
+      || (legacy && !INCIDENT_ID_RE.test(record.config_fingerprint || ""))
+      || (!legacy && !INCIDENT_ID_RE.test(record.authentication_fingerprint || ""))
+      || !Number.isInteger(record.failure_pressure) || record.failure_pressure < 0
+      || (record.last_connection_at !== null
+        && (!Number.isSafeInteger(record.last_connection_at) || record.last_connection_at < 0))
+      || (record.server_not_before !== undefined && record.server_not_before !== null
+        && (!Number.isSafeInteger(record.server_not_before) || record.server_not_before < 0))
+      || (record.server_wait_ms !== undefined && record.server_wait_ms !== null
+        && (!Number.isSafeInteger(record.server_wait_ms) || record.server_wait_ms < 0))
+      || (record.server_wall_observed_at !== undefined && record.server_wall_observed_at !== null
+        && (!Number.isSafeInteger(record.server_wall_observed_at) || record.server_wall_observed_at < 0))
+      || ((record.server_not_before ?? null) === null !== ((record.server_wait_ms ?? null) === null))
+      || (record.server_boot_id !== undefined && record.server_boot_id !== null
+        && !BOOT_ID_RE.test(record.server_boot_id))
+      || (record.server_monotonic_not_before !== undefined && record.server_monotonic_not_before !== null
+        && (!Number.isSafeInteger(record.server_monotonic_not_before)
+          || record.server_monotonic_not_before < 0))
+      || (record.server_reboot_fallback_used !== undefined
+        && typeof record.server_reboot_fallback_used !== "boolean")
+      || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
+        || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
+        || !Number.isInteger(limit.resetAt) || limit.resetAt < 0
+        || (limit.resetWaitMs !== undefined
+          && (!Number.isSafeInteger(limit.resetWaitMs) || limit.resetWaitMs < 0))
+        || (limit.resetBootId !== undefined && limit.resetBootId !== null
+          && !BOOT_ID_RE.test(limit.resetBootId))
+        || (limit.resetMonotonicAt !== undefined && limit.resetMonotonicAt !== null
+          && (!Number.isSafeInteger(limit.resetMonotonicAt) || limit.resetMonotonicAt < 0))
+        || (limit.resetRebootFallbackUsed !== undefined
+          && typeof limit.resetRebootFallbackUsed !== "boolean")))
+      || (resume !== undefined && resume !== null
+        && (!resume || typeof resume.session_id !== "string" || !resume.session_id
+          || typeof resume.resume_url !== "string" || !resume.resume_url
+          || (resume.sequence !== null && !Number.isSafeInteger(resume.sequence))
+          || (resume.self_user_id !== undefined && !SNOWFLAKE_RE.test(resume.self_user_id))))) {
+    return false;
+  }
+  if (resume) {
+    try {
+      validateProductionEndpoint(resume.resume_url, "gateway");
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function readReconnectRecord() {
+  let record;
+  try {
+    await assertPrivateFile(RECONNECT_FILE);
+    record = JSON.parse(await readFile(RECONNECT_FILE, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new ConfigError("reconnect state is invalid");
+  }
+  if (!validReconnectRecord(record)) throw new ConfigError("reconnect state is invalid");
+  return record;
 }
 
 class GatewayRunner {
@@ -712,42 +1145,454 @@ class GatewayRunner {
     this.sessionId = "";
     this.resumeUrl = "";
     this.sequence = null;
+    this.resumeSequence = null;
     this.selfUserId = "";
-    this.attempt = 0;
+    this.sessionGeneration = 0;
+    this.failurePressure = 0;
+    this.lastConnectionAt = null;
+    this.serverNotBefore = null;
+    this.serverWaitMs = null;
+    this.serverWallObservedAt = null;
+    this.serverBootId = null;
+    this.serverMonotonicNotBefore = null;
+    this.serverRebootFallbackUsed = false;
+    this.bootId = null;
+    this.sessionStartLimit = null;
+    this.durableTransitions = Promise.resolve();
+    this.fallbackTransitions = Promise.resolve();
+    this.sequencePersistPending = false;
+    this.sequencePersistTask = null;
     this.connected = false;
     this.inbound = Promise.resolve();
-    this.backoffTimer = null;
-    this.backoffResolve = null;
+    this.waiters = new Set();
+    this.failClosed = false;
+    this.failClosedWait = null;
+    this.fallbackSuppressionActive = false;
+    this.durableWriteCount = 0;
+  }
+
+  canUseGateway() {
+    return !this.stopping && !this.failClosed;
   }
 
   stop() {
     this.stopping = true;
-    if (this.backoffTimer) clearTimeout(this.backoffTimer);
-    this.backoffTimer = null;
-    if (this.backoffResolve) this.backoffResolve();
-    this.backoffResolve = null;
+    for (const waiter of [...this.waiters]) waiter.resolve();
     if (this.socket && this.socket.readyState < WebSocket.CLOSING) {
       this.socket.close(1000, "shutdown");
     }
   }
 
+  clearSession() {
+    this.sessionGeneration += 1;
+    this.sessionId = "";
+    this.resumeUrl = "";
+    this.sequence = null;
+    this.resumeSequence = null;
+    this.selfUserId = "";
+  }
+
+  resumeSessionRecord() {
+    if (!this.sessionId) return null;
+    return {
+      session_id: this.sessionId,
+      resume_url: this.resumeUrl,
+      sequence: this.resumeSequence,
+      self_user_id: this.selfUserId,
+    };
+  }
+
   async waitForReconnect(milliseconds) {
-    if (this.stopping) return;
-    await new Promise((resolvePromise) => {
-      this.backoffResolve = resolvePromise;
-      this.backoffTimer = setTimeout(resolvePromise, milliseconds);
+    const startedAt = performance.now();
+    while (!this.stopping) {
+      const remaining = milliseconds - (performance.now() - startedAt);
+      if (remaining <= 0) break;
+      await new Promise((resolvePromise) => {
+        const waiter = {
+          timer: null,
+          resolve: () => {
+            if (waiter.timer) clearTimeout(waiter.timer);
+            this.waiters.delete(waiter);
+            resolvePromise();
+          },
+        };
+        waiter.timer = setTimeout(waiter.resolve, Math.min(remaining, 2_147_000_000));
+        this.waiters.add(waiter);
+        if (this.stopping) waiter.resolve();
+      });
+    }
+  }
+
+  durableRecord() {
+    return {
+      schema: "firstmate.discord-reconnect.v2",
+      authentication_fingerprint: authenticationFingerprint(this.config),
+      failure_pressure: this.failurePressure,
+      last_connection_at: this.lastConnectionAt,
+      server_not_before: this.serverNotBefore,
+      server_wait_ms: this.serverWaitMs,
+      server_wall_observed_at: this.serverWallObservedAt,
+      server_boot_id: this.serverBootId,
+      server_monotonic_not_before: this.serverMonotonicNotBefore,
+      server_reboot_fallback_used: this.serverRebootFallbackUsed,
+      session_start_limit: this.sessionStartLimit,
+      resume_session: this.resumeSessionRecord(),
+    };
+  }
+
+  persistDurableState() {
+    const content = `${JSON.stringify(this.durableRecord())}\n`;
+    const writeNumber = ++this.durableWriteCount;
+    const transition = this.durableTransitions.then(async () => {
+      if (TEST_MODE && process.env.FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS) {
+        await sleep(testDuration("FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS", 1, 1, 1000));
+      }
+      if (TEST_MODE && Number(process.env.FM_DISCORD_TEST_DURABLE_WRITE_FAIL_AT) === writeNumber) {
+        throw new Error("injected reconnect state failure");
+      }
+      await atomicReplaceOwnershipPrivate(RECONNECT_FILE, content);
+      if (TEST_MODE && process.env.FM_DISCORD_TEST_DURABLE_WRITE_LOG === "1") {
+        const log = await open(join(STATE, "discord-bot.durable-writes"), "a", 0o600);
+        try {
+          await log.writeFile("write\n");
+        } finally {
+          await log.close();
+        }
+      }
     });
-    this.backoffTimer = null;
-    this.backoffResolve = null;
+    this.durableTransitions = transition.catch(() => {});
+    return transition;
+  }
+
+  persistFallbackSuppression(operatorCode = "reconnect-state-unavailable") {
+    const terminal = operatorCode !== "reconnect-state-unavailable";
+    const transition = this.fallbackTransitions.then(async () => {
+      let existing;
+      try {
+        await assertPrivateFile(RECONNECT_SUPPRESSION_FILE);
+        existing = JSON.parse(await readFile(RECONNECT_SUPPRESSION_FILE, "utf8"));
+      } catch {}
+      const fingerprint = authenticationFingerprint(this.config);
+      if (!terminal && validFallbackSuppression(existing)
+          && existing.authentication_fingerprint === fingerprint
+          && existing.operator_intervention_required) {
+        this.fallbackSuppressionActive = true;
+        return;
+      }
+      const deadlineActive = !terminal && this.serverNotBefore !== null && this.serverWaitMs !== null;
+      await atomicReplaceOwnershipPrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
+        schema: "firstmate.discord-reconnect-suppression.v1",
+        authentication_fingerprint: fingerprint,
+        server_not_before: deadlineActive ? this.serverNotBefore : null,
+        server_wait_ms: deadlineActive ? this.serverWaitMs : null,
+        server_wall_observed_at: deadlineActive ? this.serverWallObservedAt : null,
+        server_boot_id: deadlineActive ? this.serverBootId : null,
+        server_monotonic_not_before: deadlineActive ? this.serverMonotonicNotBefore : null,
+        server_reboot_fallback_used: deadlineActive ? this.serverRebootFallbackUsed : false,
+        operator_intervention_required: !deadlineActive,
+        operator_code: deadlineActive ? null : operatorCode,
+        recorded_at: diagnosticEpochSeconds(),
+      })}\n`);
+      this.fallbackSuppressionActive = true;
+    });
+    this.fallbackTransitions = transition.catch(() => {});
+    return transition;
+  }
+
+  activateFailClosed(code = "reconnect-state-unavailable") {
+    this.failClosed = true;
+    if (this.socket && this.socket.readyState < WebSocket.CLOSING) {
+      this.socket.close(4000, "reconnect state unavailable");
+    }
+    if (!this.failClosedWait) {
+      this.failClosedWait = (async () => {
+        await reportDiagnostic(code);
+        safeLog("reconnect state could not be persisted; Gateway retries remain stopped");
+        while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);
+        return false;
+      })();
+    }
+    return this.failClosedWait;
+  }
+
+  async persistDurableStateOrStop() {
+    if (this.failClosed) return await this.failClosedWait;
+    try {
+      await this.persistDurableState();
+      if (this.failClosed) return await this.failClosedWait;
+      return true;
+    } catch {
+      try {
+        await this.persistFallbackSuppression();
+      } catch {}
+      return await this.activateFailClosed();
+    }
+  }
+
+  queueSequencePersistence() {
+    this.sequencePersistPending = true;
+    if (this.sequencePersistTask) return;
+    this.sequencePersistTask = (async () => {
+      while (this.sequencePersistPending && !this.stopping && !this.failClosed) {
+        this.sequencePersistPending = false;
+        if (!await this.persistDurableStateOrStop()) break;
+      }
+    })().finally(() => {
+      this.sequencePersistTask = null;
+      if (this.sequencePersistPending && !this.stopping && !this.failClosed) {
+        this.queueSequencePersistence();
+      }
+    });
+  }
+
+  async loadDurableState() {
+    await ensureOwnershipDirectory();
+    this.bootId = await systemBootIdentity();
+    let stateNeedsRebase = false;
+    const record = await readReconnectRecord();
+    const legacy = record?.schema === "firstmate.discord-reconnect.v1";
+    const authenticationBound = record?.schema === "firstmate.discord-reconnect.v2"
+      && record.authentication_fingerprint === authenticationFingerprint(this.config);
+    const limit = record?.session_start_limit;
+    const resume = record?.resume_session;
+    this.failurePressure = record?.failure_pressure || 0;
+    this.lastConnectionAt = record?.last_connection_at ?? null;
+    this.serverNotBefore = record?.server_not_before ?? null;
+    this.serverWaitMs = this.serverNotBefore === null ? null : record.server_wait_ms;
+    this.serverWallObservedAt = this.serverNotBefore === null
+      ? null
+      : record?.server_wall_observed_at
+        ?? Math.max(0, this.serverNotBefore - this.serverWaitMs);
+    this.serverBootId = record?.server_boot_id ?? null;
+    this.serverMonotonicNotBefore = record?.server_monotonic_not_before ?? null;
+    this.serverRebootFallbackUsed = record?.server_reboot_fallback_used ?? false;
+    if (this.serverNotBefore !== null
+        && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
+      const now = Date.now();
+      this.serverWaitMs = rebootWaitRemaining(this.serverWaitMs);
+      this.serverRebootFallbackUsed = true;
+      this.serverWallObservedAt = Math.max(this.serverWallObservedAt, now);
+      this.serverBootId = this.bootId;
+      this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+      stateNeedsRebase = true;
+    }
+    let suppression;
+    try {
+      await assertPrivateFile(RECONNECT_SUPPRESSION_FILE);
+      suppression = JSON.parse(await readFile(RECONNECT_SUPPRESSION_FILE, "utf8"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") this.activateFailClosed();
+    }
+    if (suppression) {
+      if (!validFallbackSuppression(suppression)) {
+        this.activateFailClosed();
+      } else if (suppression.authentication_fingerprint !== authenticationFingerprint(this.config)) {
+        await removeMarker(RECONNECT_SUPPRESSION_FILE);
+      } else if (suppression.operator_intervention_required) {
+        this.fallbackSuppressionActive = true;
+        this.activateFailClosed(suppression.operator_code || "reconnect-state-unavailable");
+      } else {
+        const fallbackSameBoot = suppression.server_boot_id === this.bootId
+          && Number.isSafeInteger(suppression.server_monotonic_not_before);
+        const fallbackPreviouslyUsed = suppression.server_reboot_fallback_used ?? false;
+        const now = Date.now();
+        const fallbackRemaining = fallbackSameBoot
+          ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
+          : rebootWaitRemaining(suppression.server_wait_ms);
+        const currentRemaining = this.serverDelayRemaining();
+        if (fallbackRemaining === 0 && currentRemaining === 0) {
+          try {
+            await removeMarker(RECONNECT_SUPPRESSION_FILE);
+          } catch {
+            this.activateFailClosed();
+          }
+        } else {
+          if (fallbackRemaining > currentRemaining) {
+            this.serverWaitMs = fallbackRemaining;
+            this.serverNotBefore = suppression.server_not_before;
+            this.serverWallObservedAt = suppression.server_wall_observed_at
+              ?? Math.max(0, suppression.server_not_before - suppression.server_wait_ms);
+          } else {
+            this.serverWaitMs = currentRemaining;
+          }
+          this.serverRebootFallbackUsed = this.serverRebootFallbackUsed
+            || fallbackPreviouslyUsed || !fallbackSameBoot;
+          this.serverWallObservedAt = Math.max(this.serverWallObservedAt, now);
+          this.serverBootId = this.bootId;
+          this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+          this.fallbackSuppressionActive = true;
+          stateNeedsRebase = true;
+          try {
+            await this.persistFallbackSuppression();
+          } catch {
+            this.activateFailClosed();
+          }
+        }
+      }
+    }
+    this.sessionStartLimit = authenticationBound ? limit : null;
+    if (this.sessionStartLimit) {
+      const sameBoot = this.sessionStartLimit.resetBootId === this.bootId
+        && Number.isSafeInteger(this.sessionStartLimit.resetMonotonicAt);
+      if (!sameBoot) {
+        const fallbackUsed = this.sessionStartLimit.resetRebootFallbackUsed ?? false;
+        const conservativeWait = fallbackUsed ? 0 : this.sessionStartLimit.resetWaitMs
+          ?? Math.max(0, this.sessionStartLimit.resetAt - Date.now());
+        this.sessionStartLimit.resetWaitMs = conservativeWait;
+        this.sessionStartLimit.resetBootId = this.bootId;
+        this.sessionStartLimit.resetMonotonicAt = monotonicMilliseconds() + conservativeWait;
+        this.sessionStartLimit.resetAt = Date.now() + conservativeWait;
+        this.sessionStartLimit.resetRebootFallbackUsed = true;
+        stateNeedsRebase = true;
+      }
+    }
+    const resumable = authenticationBound && resume && SNOWFLAKE_RE.test(resume.self_user_id || "");
+    if (resumable) {
+      this.sessionId = resume.session_id;
+      this.resumeUrl = resume.resume_url;
+      this.sequence = resume.sequence;
+      this.resumeSequence = resume.sequence;
+      this.selfUserId = resume.self_user_id;
+      this.sessionGeneration = 1;
+    }
+    if (!record || legacy || !authenticationBound || stateNeedsRebase
+        || (authenticationBound && resume && !resumable)) {
+      await this.persistDurableState();
+    }
+  }
+
+  async updateSessionStartLimit(limit) {
+    if (!limit) return true;
+    const resetWaitMs = limit.resetAfter;
+    const normalized = {
+      total: limit.total,
+      remaining: limit.remaining,
+      resetAt: limit.resetAt,
+      resetWaitMs,
+      resetBootId: this.bootId,
+      resetMonotonicAt: monotonicMilliseconds() + resetWaitMs,
+      resetRebootFallbackUsed: false,
+    };
+    const previous = this.sessionStartLimit;
+    if (previous && previous.total === normalized.total
+        && previous.resetBootId === this.bootId
+        && previous.resetMonotonicAt > monotonicMilliseconds()
+        && Math.abs(previous.resetMonotonicAt - normalized.resetMonotonicAt) <= 5000) {
+      normalized.remaining = Math.min(previous.remaining, normalized.remaining);
+      if (previous.resetMonotonicAt > normalized.resetMonotonicAt) {
+        normalized.resetMonotonicAt = previous.resetMonotonicAt;
+        normalized.resetWaitMs = Math.max(0, previous.resetMonotonicAt - monotonicMilliseconds());
+        normalized.resetAt = Date.now() + normalized.resetWaitMs;
+      }
+    }
+    this.sessionStartLimit = normalized;
+    return await this.persistDurableStateOrStop();
+  }
+
+  async reserveIdentify() {
+    const limit = this.sessionStartLimit;
+    if (!limit) return true;
+    if (limit.remaining === 0) {
+      const remaining = limit.resetBootId === this.bootId
+        ? Math.max(0, limit.resetMonotonicAt - monotonicMilliseconds())
+        : limit.resetWaitMs;
+      if (remaining > 0) await this.waitForReconnect(remaining);
+      return false;
+    }
+    if (TEST_MODE && process.env.FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS) {
+      await sleep(testDuration("FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS", 1, 1, 1000));
+      if (!this.canUseGateway()) return false;
+    }
+    limit.remaining -= 1;
+    return await this.persistDurableStateOrStop();
+  }
+
+  serverDelayRemaining() {
+    if (this.serverNotBefore === null || this.serverWaitMs === null) return 0;
+    if (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null) {
+      return this.serverWaitMs;
+    }
+    return Math.max(0, this.serverMonotonicNotBefore - monotonicMilliseconds());
+  }
+
+  async waitForServerDelay() {
+    const checkpointInterval = TEST_MODE ? 50 : 5000;
+    while (this.canUseGateway()) {
+      const remaining = this.serverDelayRemaining();
+      if (remaining <= 0) return true;
+      await this.waitForReconnect(Math.min(remaining, checkpointInterval));
+      const checkpointRemaining = this.serverDelayRemaining();
+      this.serverWaitMs = checkpointRemaining;
+      this.serverBootId = this.bootId;
+      this.serverMonotonicNotBefore = monotonicMilliseconds() + checkpointRemaining;
+      this.serverWallObservedAt = Math.max(this.serverWallObservedAt, Date.now());
+      if (!await this.persistDurableStateOrStop()) return false;
+      if (this.fallbackSuppressionActive) {
+        try {
+          await this.persistFallbackSuppression();
+        } catch {
+          await this.activateFailClosed();
+          return false;
+        }
+      }
+    }
+    return false;
+  }
+
+  retainServerDelay(milliseconds) {
+    if (!Number.isFinite(milliseconds) || milliseconds <= 0) return;
+    const now = Date.now();
+    const delay = Math.min(Number.MAX_SAFE_INTEGER - now, Math.ceil(milliseconds));
+    const retainedRemaining = this.serverDelayRemaining();
+    this.serverWaitMs = Math.max(retainedRemaining, delay);
+    this.serverBootId = this.bootId;
+    this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+    this.serverRebootFallbackUsed = false;
+    this.serverWallObservedAt = now;
+    this.serverNotBefore = now + this.serverWaitMs;
+  }
+
+  async retireServerDelay() {
+    this.serverNotBefore = null;
+    this.serverWaitMs = null;
+    this.serverWallObservedAt = null;
+    this.serverBootId = null;
+    this.serverMonotonicNotBefore = null;
+    this.serverRebootFallbackUsed = false;
+    if (!await this.persistDurableStateOrStop()) return false;
+    if (this.fallbackSuppressionActive) {
+      try {
+        await removeMarker(RECONNECT_SUPPRESSION_FILE);
+        this.fallbackSuppressionActive = false;
+      } catch {
+        try {
+          await this.persistFallbackSuppression();
+        } catch {}
+        await this.activateFailClosed();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  reconnectDelay(serverDelayMs = this.serverDelayRemaining()) {
+    return reconnectDelayMilliseconds({
+      pressure: this.failurePressure,
+      random: randomFraction(),
+      now: Date.now(),
+      lastConnectionAt: this.lastConnectionAt,
+      serverDelayMs,
+    });
   }
 
   send(payload) {
-    if (this.socket?.readyState === WebSocket.OPEN) {
+    if (this.canUseGateway() && this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify(payload));
     }
   }
 
   identify() {
+    if (!this.canUseGateway()) return;
     this.send({
       op: 2,
       d: {
@@ -759,10 +1604,12 @@ class GatewayRunner {
   }
 
   resume() {
-    this.send({ op: 6, d: { token: this.config.token, session_id: this.sessionId, seq: this.sequence } });
+    if (!this.canUseGateway()) return;
+    this.send({ op: 6, d: { token: this.config.token, session_id: this.sessionId, seq: this.resumeSequence } });
   }
 
   async connect(url) {
+    if (!this.canUseGateway()) return null;
     const gateway = new URL(url);
     gateway.searchParams.set("v", "10");
     gateway.searchParams.set("encoding", "json");
@@ -770,23 +1617,53 @@ class GatewayRunner {
       let heartbeatTimeout = null;
       let heartbeatInterval = null;
       let handshakeTimeout = null;
+      let stableTimeout = null;
       let heartbeatAcknowledged = true;
+      let heartbeatAcks = 0;
       let opened = false;
       let ready = false;
+      let stable = false;
+      let readyAt = 0;
+      let serverDelayMs = 0;
       let settled = false;
-      const clearHeartbeat = () => {
+      let checkpointBlocked = false;
+      const clearTimers = () => {
         if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (handshakeTimeout) clearTimeout(handshakeTimeout);
+        if (stableTimeout) clearTimeout(stableTimeout);
       };
       const finish = (result) => {
         if (settled) return;
         settled = true;
-        clearHeartbeat();
+        clearTimers();
         resolvePromise(result);
+      };
+      const markStable = () => {
+        if (stable || !ready || settled || this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
+        stable = true;
+        this.failurePressure = 0;
+        const stableDiagnosticGeneration = diagnosticGeneration;
+        void this.persistDurableState()
+          .then(() => clearDiagnostic(stableDiagnosticGeneration))
+          .catch(() => reportDiagnostic("reconnect-state-unavailable"));
+      };
+      const markReady = () => {
+        if (settled || this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
+        ready = true;
+        readyAt = Date.now();
+        this.connected = true;
+        if (handshakeTimeout) clearTimeout(handshakeTimeout);
+        handshakeTimeout = null;
+        stableTimeout = setTimeout(markStable, STABLE_CONNECTION_MS);
+        writeMarker(READY_FILE, "connected").catch(() => safeLog("cannot publish the ready marker"));
       };
       let socket;
       try {
+        if (!this.canUseGateway()) {
+          finish(null);
+          return;
+        }
         socket = new WebSocket(gateway);
       } catch (error) {
         rejectPromise(error);
@@ -824,12 +1701,18 @@ class GatewayRunner {
             heartbeatTimeout = setTimeout(() => {
               beat();
               heartbeatInterval = setInterval(beat, interval);
-            }, Math.floor(Math.random() * interval));
+            }, Math.floor(randomFraction() * interval));
+            if (!this.canUseGateway()) {
+              socket.close(4000, "Gateway retries stopped");
+              return;
+            }
             if (this.sessionId) this.resume(); else this.identify();
             break;
           }
           case 11:
             heartbeatAcknowledged = true;
+            heartbeatAcks += 1;
+            if (ready && heartbeatAcks >= 3 && Date.now() - readyAt >= HEARTBEAT_STABLE_MS) markStable();
             break;
           case 1:
             this.send({ op: 1, d: this.sequence });
@@ -838,12 +1721,14 @@ class GatewayRunner {
             socket.close(4000, "server reconnect");
             break;
           case 9:
-            if (packet.d !== true) {
-              this.sessionId = "";
-              this.resumeUrl = "";
-              this.sequence = null;
-            }
-            socket.close(4000, "invalid session");
+            serverDelayMs = TEST_MODE && process.env.FM_DISCORD_TEST_INVALID_SESSION_MS
+              ? testDuration("FM_DISCORD_TEST_INVALID_SESSION_MS", 1000, 1, 1000)
+              : 1000 + Math.floor(randomFraction() * 4001);
+            if (packet.d !== true) this.clearSession();
+            this.retainServerDelay(serverDelayMs);
+            void this.persistDurableStateOrStop().then((persisted) => {
+              if (persisted) socket.close(4000, "invalid session");
+            });
             break;
           case 0:
             if (packet.t === "READY") {
@@ -860,26 +1745,51 @@ class GatewayRunner {
                 socket.close(4002, "invalid resume endpoint");
                 return;
               }
+              if (this.sessionId !== sessionId) this.sessionGeneration += 1;
               this.selfUserId = userId;
               this.sessionId = sessionId;
               this.resumeUrl = resumeUrl;
-              ready = true;
-              this.connected = true;
-              if (handshakeTimeout) clearTimeout(handshakeTimeout);
-              handshakeTimeout = null;
-              writeMarker(READY_FILE, "connected").catch(() => safeLog("cannot publish the ready marker"));
-              clearDiagnostic();
+              this.resumeSequence = Number.isInteger(packet.s) ? packet.s : this.resumeSequence;
+              void this.persistDurableStateOrStop().then((persisted) => {
+                if (persisted) markReady();
+              });
             } else if (packet.t === "RESUMED") {
-              ready = true;
-              this.connected = true;
-              if (handshakeTimeout) clearTimeout(handshakeTimeout);
-              handshakeTimeout = null;
-              writeMarker(READY_FILE, "connected").catch(() => safeLog("cannot publish the ready marker"));
-              clearDiagnostic();
+              markReady();
+              if (Number.isInteger(packet.s)) {
+                const originGeneration = this.sessionGeneration;
+                this.inbound = this.inbound.then(() => {
+                  if (checkpointBlocked || this.sessionGeneration !== originGeneration) return;
+                  this.resumeSequence = packet.s;
+                  this.queueSequencePersistence();
+                });
+              }
             } else if (packet.t === "MESSAGE_CREATE" && this.selfUserId) {
-              this.inbound = this.inbound
-                .then(() => ingestMessage(packet.d, this.config, this.selfUserId))
-                .catch(() => reportDiagnostic("inbox-publication-failed"));
+              const dispatchSequence = packet.s;
+              const originGeneration = this.sessionGeneration;
+              const originSelfUserId = this.selfUserId;
+              this.inbound = this.inbound.then(async () => {
+                if (checkpointBlocked || this.sessionGeneration !== originGeneration) return;
+                if (TEST_MODE && process.env.FM_DISCORD_TEST_INGEST_DELAY_MS) {
+                  await sleep(testDuration("FM_DISCORD_TEST_INGEST_DELAY_MS", 1, 1, 1000));
+                  if (this.sessionGeneration !== originGeneration) return;
+                }
+                await ingestMessage(packet.d, this.config, originSelfUserId);
+                if (Number.isInteger(dispatchSequence) && this.sessionGeneration === originGeneration) {
+                  this.resumeSequence = dispatchSequence;
+                  this.queueSequencePersistence();
+                }
+              }).catch(async () => {
+                checkpointBlocked = true;
+                await reportDiagnostic("inbox-publication-failed");
+                if (socket.readyState < WebSocket.CLOSING) socket.close(4000, "inbox publication failed");
+              });
+            } else if (Number.isInteger(packet.s)) {
+              const originGeneration = this.sessionGeneration;
+              this.inbound = this.inbound.then(() => {
+                if (checkpointBlocked || this.sessionGeneration !== originGeneration) return;
+                this.resumeSequence = packet.s;
+                this.queueSequencePersistence();
+              });
             }
             break;
           default:
@@ -892,21 +1802,61 @@ class GatewayRunner {
       });
       socket.addEventListener("close", (event) => {
         this.connected = false;
+        if (this.socket === socket) this.socket = null;
         removeMarker(READY_FILE).catch(() => {});
-        if ([4007, 4009].includes(event.code)) {
-          this.sessionId = "";
-          this.resumeUrl = "";
-          this.sequence = null;
-        }
-        if ([4004].includes(event.code)) reportDiagnostic("authentication-rejected");
-        if ([4013].includes(event.code)) reportDiagnostic("gateway-intents-invalid");
-        if ([4014].includes(event.code)) reportDiagnostic("message-content-intent-disabled");
-        finish({ opened, ready, code: event.code });
+        const complete = async () => {
+          if ([4007, 4009].includes(event.code)) {
+            this.clearSession();
+            if (!await this.persistDurableStateOrStop()) {
+              finish({ opened, ready, stable, code: event.code, terminalCode: "", serverDelayMs });
+              return;
+            }
+          }
+          finish({
+            opened,
+            ready,
+            stable,
+            code: event.code,
+            terminalCode: terminalDiagnosticForClose(event.code),
+            serverDelayMs,
+          });
+        };
+        void complete();
       });
     });
   }
 
+  async suppressTerminal(code) {
+    try {
+      await writeTerminalSuppression(this.config, code);
+    } catch {
+      try {
+        await this.persistFallbackSuppression(code);
+      } catch {}
+      await reportDiagnostic(code);
+      safeLog("terminal reconnect suppression could not be persisted; Gateway retries remain stopped");
+      while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);
+      return;
+    }
+    await reportDiagnostic(code);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await readDiagnostic(ERROR_FILE).catch(() => null);
+      const notified = await readDiagnostic(ERROR_NOTIFIED_FILE).catch(() => null);
+      if (current?.incidentId && current.incidentId === notified?.incidentId) break;
+      await this.waitForReconnect(Math.min(1000, RECONCILE_INTERVAL_MS));
+      if (this.stopping) break;
+      await reconcileDiagnostic();
+    }
+  }
+
   async run() {
+    try {
+      await this.loadDurableState();
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      await this.suppressTerminal("reconnect-state-invalid");
+      return;
+    }
     await writeMarker(ENABLED_FILE, "enabled");
     await pruneContexts();
     await reconcileInbox(this.config);
@@ -925,32 +1875,78 @@ class GatewayRunner {
     }, RECONCILE_INTERVAL_MS);
     reconcileTimer.unref?.();
     safeLog("service started");
-    while (!this.stopping) {
-      let url;
+    if (this.failClosed) await this.failClosedWait;
+    if (this.failurePressure > 0 || this.serverNotBefore !== null) {
+      if (this.serverNotBefore !== null) {
+        if (await this.waitForServerDelay()) await this.retireServerDelay();
+      }
+      if (this.canUseGateway() && this.failurePressure > 0) {
+        await this.waitForReconnect(this.reconnectDelay(0));
+      }
+    }
+    while (this.canUseGateway()) {
+      if (this.serverNotBefore !== null) {
+        if (!await this.waitForServerDelay() || !await this.retireServerDelay()) break;
+      }
+      if (!this.canUseGateway()) break;
+      let gateway;
       try {
-        url = this.resumeUrl || await gatewayUrl(this.config);
+        gateway = this.resumeUrl
+          ? { url: this.resumeUrl, sessionStartLimit: null }
+          : await gatewayUrl(this.config);
+        if (!this.canUseGateway()) break;
+        if (!await this.updateSessionStartLimit(gateway.sessionStartLimit)) break;
       } catch (error) {
         if (error instanceof DiscordHttpError && [401, 403].includes(error.status)) {
-          await reportDiagnostic("authentication-rejected");
-        } else {
-          await reportDiagnostic("discord-api-unavailable");
+          await this.suppressTerminal("authentication-rejected");
+          break;
         }
-        await this.waitForReconnect(backoffMilliseconds(this.attempt++));
+        if (error instanceof ConfigError) {
+          await this.suppressTerminal("gateway-configuration-invalid");
+          break;
+        }
+        await reportDiagnostic("discord-api-unavailable");
+        this.failurePressure += 1;
+        if (error instanceof DiscordHttpError) this.retainServerDelay(error.retryAfterMs);
+        if (!await this.persistDurableStateOrStop()) break;
+        if (this.serverNotBefore !== null
+            && (!await this.waitForServerDelay() || !await this.retireServerDelay())) break;
+        await this.waitForReconnect(this.reconnectDelay(0));
+        if (!this.canUseGateway()) break;
         continue;
       }
-      try {
-        const result = await this.connect(url);
-        if (result.ready) this.attempt = 0;
-        else this.attempt += 1;
-      } catch {
-        await reportDiagnostic("gateway-connect-failed");
-        this.attempt += 1;
+      if (!this.canUseGateway()) break;
+      if (!this.sessionId && !await this.reserveIdentify()) {
+        if (this.canUseGateway()) continue;
+        break;
       }
-      if (!this.stopping) await this.waitForReconnect(backoffMilliseconds(this.attempt));
+      if (!this.canUseGateway()) break;
+      try {
+        this.failurePressure += 1;
+        this.lastConnectionAt = Date.now();
+        if (!await this.persistDurableStateOrStop() || !this.canUseGateway()) break;
+        const result = await this.connect(gateway.url);
+        if (!result || !this.canUseGateway()) break;
+        if (result.terminalCode) {
+          await this.suppressTerminal(result.terminalCode);
+          break;
+        }
+      } catch {
+        if (!this.canUseGateway()) break;
+        await reportDiagnostic("gateway-connect-failed");
+      }
+      if (!this.canUseGateway()) break;
+      if (this.serverNotBefore !== null
+          && (!await this.waitForServerDelay() || !await this.retireServerDelay())) break;
+      await this.waitForReconnect(this.reconnectDelay(0));
+      if (!this.canUseGateway()) break;
     }
     clearInterval(pruneTimer);
     clearInterval(reconcileTimer);
     await this.inbound;
+    if (this.sequencePersistTask) await this.sequencePersistTask;
+    await this.durableTransitions;
+    await this.fallbackTransitions;
     await diagnosticTransitions;
     safeLog("service stopped");
   }
@@ -1095,11 +2091,43 @@ async function main() {
       process.stdout.write("self-hosted Discord configuration is valid\n");
       return;
     }
+    case "terminal-check": {
+      const config = await loadConfig();
+      const code = await activeTerminalSuppression(config);
+      if (code) {
+        process.stdout.write(`${code}\n`);
+        process.exitCode = 4;
+      }
+      return;
+    }
+    case "terminal-reset": {
+      await loadConfig();
+      try {
+        await readReconnectRecord();
+      } catch (error) {
+        if (!(error instanceof ConfigError)) throw error;
+        await quarantineInvalidReconnectState();
+        safeLog("invalid reconnect state quarantined for operator inspection");
+      }
+      await removeMarker(TERMINAL_FILE);
+      await removeMarker(RECONNECT_SUPPRESSION_FILE);
+      await clearDiagnostic();
+      return;
+    }
     case "run": {
       const config = await loadConfig();
-      const runner = new GatewayRunner(config);
+      const suppressedCode = await activeTerminalSuppression(config);
+      if (suppressedCode) {
+        await reportDiagnostic(suppressedCode);
+        safeLog(`reconnects stopped: ${suppressedCode}; operator intervention is required`);
+        return;
+      }
+      let lease = null;
+      let runner = null;
+      let stopping = false;
       const stop = () => {
-        runner.stop();
+        stopping = true;
+        runner?.stop();
         removeMarker(READY_FILE).catch(() => {});
         removeMarker(ENABLED_FILE).catch(() => {});
         const forcedExit = setTimeout(() => process.exit(0), 5000);
@@ -1109,10 +2137,14 @@ async function main() {
       process.once("SIGTERM", stop);
       process.once("SIGHUP", stop);
       try {
+        lease = await requireGatewayOwnership();
+        if (stopping) return;
+        runner = new GatewayRunner(config);
         await runner.run();
       } finally {
         await removeMarker(READY_FILE).catch(() => {});
         await removeMarker(ENABLED_FILE).catch(() => {});
+        if (lease) await releaseGatewayOwnership(lease);
       }
       return;
     }
@@ -1142,6 +2174,22 @@ async function main() {
     case "prune": {
       if (!TEST_MODE || args.length) throw new ConfigError("prune is available only in hermetic test mode");
       await pruneContexts();
+      return;
+    }
+    case "reconnect-policy": {
+      if (!TEST_MODE) throw new ConfigError("reconnect-policy is available only in hermetic test mode");
+      const fixtureFile = args.shift() || "";
+      if (!fixtureFile || args.length) throw new ConfigError("test reconnect-policy requires one fixture file");
+      const fixture = JSON.parse(await readFile(fixtureFile, "utf8"));
+      process.stdout.write(`${JSON.stringify(simulateReconnectPolicy(fixture))}\n`);
+      return;
+    }
+    case "reboot-wait-policy": {
+      if (!TEST_MODE) throw new ConfigError("reboot-wait-policy is available only in hermetic test mode");
+      const fixtureFile = args.shift() || "";
+      if (!fixtureFile || args.length) throw new ConfigError("test reboot-wait-policy requires one fixture file");
+      const fixture = JSON.parse(await readFile(fixtureFile, "utf8"));
+      process.stdout.write(`${JSON.stringify(simulateRebootWaitPolicy(fixture))}\n`);
       return;
     }
     case "ingest": {

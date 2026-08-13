@@ -100,9 +100,14 @@ bin/fm-discord-bot.sh start
 ```
 
 The command validates Node.js and configuration first, writes a home-derived LaunchAgent under `~/Library/LaunchAgents/`, loads it in the current Aqua login domain, and starts it.
-The service uses `RunAtLoad`, `KeepAlive`, and a 15-second launchd throttle, so it survives ordinary Discord disconnects and starts again after machine restart and user login.
-The process itself uses Discord session resume when possible and bounded exponential reconnect backoff capped at about one minute.
+The service uses `RunAtLoad`, restart-on-failure `KeepAlive`, and a 15-second launchd throttle, so it survives process crashes and starts again after machine restart and user login.
+The process reconnects ordinary Discord disconnects itself and resumes the existing session whenever Discord permits it.
+Reconnect pressure and the last connection attempt survive process and service-manager restarts, as well as READY and RESUMED events, until the connection remains healthy for five minutes or has at least three acknowledged heartbeats spanning two minutes.
+Unstable connections use randomized exponential delays with a five-second minimum connection interval, a five-minute local delay cap, and a separately jittered cooldown capped at 15 minutes after eight consecutive unstable outcomes; a longer Discord `retry_after` remains the minimum wait.
+Discord-directed reconnect and invalid-session responses retain or clear session material as required and still pass through the same pacing policy.
+Fresh Identify attempts reserve Discord's authenticated `session_start_limit` durably and wait through an exhausted reset window, while a valid Resume remains available without consuming a new session start.
 It also holds a recoverable per-home process lock so a manual start and LaunchAgent cannot create two Gateway sessions.
+The shell admits and hands the lease to the Node runtime before Gateway I/O; the runtime remains its canonical owner for its full lifetime, including after wrapper loss, and direct Node invocation cannot bypass ownership.
 
 Check configuration and current service health with:
 
@@ -110,9 +115,11 @@ Check configuration and current service health with:
 bin/fm-discord-bot.sh check
 ```
 
-The check reports one of the disabled, invalid, stopped, connecting, reconnecting, or connected outcomes without printing credentials or deployment ids.
-Authentication rejection, missing Message Content intent, invalid Gateway intents, unavailable Discord API, Gateway connection failure, and private inbox publication failure use bounded safe diagnostic codes.
-A new service diagnostic reaches the active Firstmate through the existing durable notification queue exactly once until the code changes or recovery clears it.
+The check reports one of the disabled, invalid, stopped, terminally stopped, connecting, reconnecting, or connected outcomes without printing credentials or deployment ids.
+Authentication rejection, missing Message Content intent, invalid Gateway intents, invalid Gateway version, sharding configuration, or authenticated Gateway metadata, unavailable Discord API, Gateway connection failure, untrusted reconnect state, reconnect-state persistence failure, and private inbox publication failure use bounded safe diagnostic codes.
+Authentication rejection and other non-retryable Gateway configuration close codes stop all Gateway reconnects and persist that suppression across service-manager restarts.
+Only a changed bot authentication identity or explicit operator intervention through `bin/fm-discord-bot.sh retry` or `bin/fm-discord-bot.sh configure` clears terminal suppression; owner, guild, and channel filtering changes do not clear it.
+A new service diagnostic reaches the active Firstmate through the existing durable notification queue exactly once until the code changes or stable recovery clears it.
 
 Stop the service and prevent the LaunchAgent from returning at the next login with:
 
@@ -122,6 +129,16 @@ bin/fm-discord-bot.sh stop
 
 Stop removes the per-home LaunchAgent and live service markers but leaves the private configuration, pending inbox, and durable conversation bindings unchanged.
 An unanswered inbox continues to count as supervision need until Firstmate answers it.
+
+After correcting a terminal application setting that does not change the private configuration, explicitly clear reconnect suppression with:
+
+```sh
+bin/fm-discord-bot.sh retry
+```
+
+This command does not start the service.
+It allows only the next operator or service-manager start, and another terminal rejection suppresses reconnects again.
+Rerunning the interactive configurator also clears terminal suppression after it safely replaces and revalidates the private configuration.
 
 For foreground operation under an operator-owned service manager, use:
 
@@ -158,10 +175,16 @@ The log should never contain a token, id, or message body.
 A `context pruning was skipped` line concerns private local cleanup and does not diagnose Gateway authentication or connection health; use the `check` outcome for that.
 
 An `authentication-rejected` diagnostic means the stored token is invalid or revoked.
-Rotate the token in the trusted Developer Portal session, rerun `configure`, and restart the service.
+Rotate the token in the trusted Developer Portal session, rerun `configure`, and start the service again.
+The unchanged rejected configuration remains suppressed even if a service manager tries to relaunch it.
 
 A `message-content-intent-disabled` diagnostic means **Message Content Intent** is off for the application.
-Enable that one privileged intent and restart the service.
+Enable that one privileged intent, run `bin/fm-discord-bot.sh retry` to record the operator intervention, and start the service again.
+Invalid intent, Gateway version, or sharding diagnostics are also terminal configuration failures and require correcting the application or runtime configuration before retrying.
+A `gateway-configuration-invalid` diagnostic means Discord returned Gateway metadata the runtime could not safely use; confirm the current Firstmate version and Discord service status before running `retry` and starting once more.
+
+A `reconnect-state-invalid`, `terminal-suppression-invalid`, or `reconnect-state-unavailable` diagnostic means the private reconnect records could not be trusted or updated safely.
+Stop the service, correct any local storage, file-type, or mode problem in the [documented private state boundary](configuration.md#self-hosted-discord-configdiscord-botenv), run `retry`, and then start the service again.
 
 A connected service that ignores a message is usually enforcing the owner, guild, channel, author-type, or direct-mention boundary.
 Confirm those ids locally with Developer Mode and rerun `configure` rather than weakening the checks.

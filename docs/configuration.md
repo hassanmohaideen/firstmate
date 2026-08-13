@@ -381,7 +381,7 @@ Reply and follow-up helpers use this record when no explicit path is supplied an
 
 `bin/fm-discord-bot.sh configure` is the supported interactive writer.
 It reads the token with terminal echo disabled, writes a mode-`0600` temporary, validates all four values through the runtime owner, and replaces the configured file atomically only after validation succeeds.
-`start`, `stop`, `check`, and `run` own service lifecycle and safe diagnostics; their exact mechanics and flags live in the script header and `--help` output.
+`start`, `stop`, `check`, `retry`, and `run` own service lifecycle, terminal-suppression acknowledgement, and safe diagnostics; their exact mechanics and flags live in the script header and `--help` output.
 The runtime requires Node.js with built-in `fetch` and `WebSocket` support, currently Node.js 22 or newer, and the operator command refuses before service mutation when that feature is unavailable.
 This optional requirement does not change the universal bootstrap toolchain for homes that never enable the transport.
 
@@ -395,7 +395,12 @@ The append and receipt are recovered under the queue lock, so a crash between th
 Answered context and notification records are pruned after seven days, while a still-pending inbox or a task metadata file carrying that `discord_request=` prevents its context from being pruned.
 
 `state/discord-bot.enabled` is a private service-liveness presence marker, `state/discord-bot.ready` records a currently connected Gateway session, and `state/discord-bot.error` carries one safe diagnostic code without credentials, ids, payloads, or remote response bodies.
-The service removes enabled/ready markers on a clean stop.
+`state/.discord-bot-service/terminal.json` is the canonical mode-`0600` suppression record containing a safe code, an opaque SHA-256 fingerprint of the bot authentication identity, and a timestamp.
+The canonical `state/.discord-bot-service/reconnect.json` is a mode-`0600` record holding only an opaque bot-authentication fingerprint, per-home reconnect pressure, last-attempt time, Discord's wall-clock diagnostic deadline, last wall-clock observation, and bounded remaining wait paired with a boot identity and monotonic deadline, similarly monotonic Discord session-start counters and reboot-fallback state, and the private resumable session id, validated Gateway URL, sequence, and authenticated bot user id needed to preserve pacing, Resume, and intake across process replacement, clock changes, and filtering changes; it contains no bot token or configured owner, guild, or channel id.
+When `retry` can safely read but cannot validate that record, it atomically preserves the mode-`0600` bytes as `state/.discord-bot-service/reconnect.invalid.<random>.json` for operator inspection before clearing suppression; the runtime ignores quarantined records.
+The mode-`0600` `state/.discord-bot-service/reconnect-suppression.json` independently preserves the same secret-safe boot-bound server wait and durable wall-clock observation or an authentication-bound operator-intervention requirement when the primary reconnect or terminal record cannot be replaced, and `retry` or `configure` clears that fallback.
+A matching terminal record stops Gateway attempts across process restarts and filtering changes, a changed bot authentication identity retires it automatically, and the explicit `retry` command retires it after an operator corrects an external application setting.
+The service removes enabled/ready markers on a clean stop but preserves terminal suppression until one of those intervention paths clears it.
 `bin/fm-supervision-lib.sh` treats either a genuine enabled marker or any pending private inbox record as supervision need, so stopping the service cannot strand an already accepted message.
 The durable event is an ordinary `check` row whose payload is only `discord-message <message-id>` or `discord-error <safe-code>`; raw Discord text never enters the queue.
 

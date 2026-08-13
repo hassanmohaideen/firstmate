@@ -249,7 +249,9 @@ The self-hosted Discord transport is a separate opt-in path for a captain who wa
 [`discord-bot.md`](discord-bot.md) owns current operator setup and security behavior, while [`configuration.md`](configuration.md#self-hosted-discord-configdiscord-botenv) owns the local schema and state surfaces.
 
 `bin/fm-discord-bot.mjs` is the narrow protocol runtime.
-It validates the private owner/guild/channel configuration, maintains one Discord Gateway session with resume and bounded reconnect backoff, rejects ineligible message events before model context, publishes private inbox and conversation-binding artifacts, and posts bound replies through Discord REST with mention expansion disabled.
+It validates the private owner/guild/channel configuration, maintains one Discord Gateway session with resume and lifecycle-wide reconnect pressure, rejects ineligible message events before model context, publishes private inbox and conversation-binding artifacts, and posts bound replies through Discord REST with mention expansion disabled.
+The canonical per-home ownership boundary durably retains reconnect pressure, the last attempt, and session-start reservations across worker replacement; fresh Identify obeys Discord's authenticated session-start window while valid Resume does not consume it.
+READY does not reset reconnect pressure; sustained connection or acknowledged-heartbeat evidence does, while terminal close codes persist a configuration-bound suppression record before the process exits normally.
 Production API and Gateway endpoints remain fixed to Discord: the authenticated lookup uses `discord.com`, while Gateway connections accept only the canonical `gateway.discord.gg` host or a Discord-owned regional `gateway-*.discord.gg` resume host returned by the authenticated READY handshake.
 Lookalike host suffixes remain invalid, and local endpoint overrides exist only behind the hermetic test mode.
 The token is read at the authenticated connection boundary and is never copied into the LaunchAgent, queue, inbox, context, task metadata, or logs.
@@ -266,8 +268,10 @@ Longer-running work in the service-owning home may record one `discord_request=`
 Cross-home terminal return is not inferred or copied by this narrow v1 path.
 
 `bin/fm-discord-bot.sh` owns local lifecycle and the per-home macOS LaunchAgent.
-The service property list carries only home and code paths, uses `RunAtLoad`, `KeepAlive`, and launchd throttling, and enters the same worker path as foreground operation.
-That worker holds a recoverable home-local lock before starting the Node child, which makes service/manual overlap and restart races single-instance.
+The service property list carries only home and code paths, uses `RunAtLoad`, restart-on-failure `KeepAlive`, and launchd throttling, and enters the same worker path as foreground operation.
+A terminal protocol outcome exits successfully after persisting suppression, so launchd does not restart it, while any external service manager that invokes the worker again reaches the same suppression check before Gateway I/O.
+That worker acquires a recoverable home-local lock and hands it to the verified Node child before Gateway I/O.
+The child remains the canonical owner for its full runtime lifetime, so service/manual overlap, wrapper loss, and restart races remain single-instance.
 
 This transport is independent of both primary harness and task runtime backend.
 It neither injects into a harness-specific composer nor calls a backend adapter; it writes the existing queue and lets the active primary's established supervision protocol deliver the structural event.

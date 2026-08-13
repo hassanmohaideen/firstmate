@@ -12,7 +12,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-sessionstart-run.sh` | Route a native session-open hook to the full digest, a context re-emit, or the nudge |
 | `fm-operational-input.sh` | Construct and parse the canonical cross-language operational-input protocol |
 | `fm-discord-bot.sh`      | Configure and operate the optional per-home self-hosted Discord service |
-| `fm-discord-bot.mjs`     | Own direct Discord Gateway/REST, authorization, private artifacts, reconnects, and safe diagnostics |
+| `fm-discord-bot.mjs`     | Implement Discord Gateway/REST, authorization, private artifacts, reconnects, and safe diagnostics behind the single-instance shell lifecycle |
 | `fm-discord-config-lib.sh` | Validate private Discord configuration files and persist a safe custom path |
 | `fm-discord-notify.sh`   | Publish a committed Discord inbox or diagnostic through the existing durable wake queue |
 | `fm-discord-reply.sh`    | Send one public-safe answer to the exact accepted Discord conversation binding |

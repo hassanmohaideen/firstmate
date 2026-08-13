@@ -9,7 +9,7 @@ This record supports the active guarantees for Firstmate's optional direct self-
 
 ## Hermetic protocol and safety pass
 
-The executable transport suite ran on 2026-08-12 with Node.js v25.9.0, jq 1.7.1, and macOS Bash 3.2 compatibility syntax.
+The executable transport suite ran on 2026-08-13 with Node.js v25.9.0, jq 1.7.1, and macOS Bash 3.2 compatibility syntax.
 It used generated fake tokens and ids inside private temporary homes.
 It made no live Discord, myfirstmate.io, Relay, GitHub, browser, account, bot, server, or channel change.
 
@@ -31,11 +31,44 @@ ok - Discord intake enforces owner, guild, channel, direct mention, and bot-loop
 ok - outbound replies authenticate directly, suppress mentions, and preserve the bound conversation
 ok - terminal Discord replies survive bounded REST retries and clear their exact task binding
 ok - the Gateway reconnects, remains single-instance, and shuts down cleanly
+ok - Gateway ownership survives wrapper death and refuses contenders
 ok - foreground service accepts Discord's regional resume endpoint independently of private-state pruning
 ok - Gateway resume remains limited to Discord-owned endpoints
-ok - Discord diagnostics retry transient publication failures without duplicate wakes
-ok - diagnostic persistence failures remain contained during reconnect
-ok - Discord diagnostic transitions preserve rapid same-second recurrences
+ok - reconnect policy retains READY failure pressure, resets only after stability, and applies bounded jitter
+ok - rapid Gateway disconnects remain bounded and stop promptly during cooldown
+ok - reconnect pressure survives filtering changes and process restarts
+ok - future-dated reconnect attempts clamp to the minimum interval
+ok - server reconnect and invalid-session directions choose resume or fresh identify correctly
+ok - valid Gateway Resume state survives abrupt process replacement
+ok - Resume checkpoints advance only after durable message publication
+ok - stale READY persistence cannot publish health or reset pressure
+ok - fail-closed activation prevents reconnect after socket close
+ok - newer failure diagnostics survive pending stable transitions
+ok - queued intake remains bound to its originating session generation
+ok - non-resumable invalid-session waits survive abrupt process replacement
+ok - fresh Identify honors Discord session-start exhaustion
+ok - exhausted session starts re-query after monotonic reset waits
+ok - session-start reservations survive process restarts while Resume stays available
+ok - Identify reservation persistence failures remain stopped until termination
+ok - Gateway sequence persistence coalesces bursts to bounded writes
+ok - Gateway lookup rate limits preserve server-provided retry direction
+ok - server retry deadlines survive abrupt process and service-manager restarts
+ok - failed retry persistence survives crashes and retires after expiry
+ok - expired stopped-process retry fallback resumes without terminal suppression
+ok - sequence persistence failure keeps one promptly cancellable fail-closed wait
+ok - invalid-session persistence failure settles promptly after stop
+ok - server retry deadlines survive backward and forward clock movement
+ok - server retry waits do not replenish across same-boot restarts
+ok - server retry waits survive rapid reboots without replenishment
+ok - session-start reset waits re-query across repeated reboots
+ok - READY retains failure pressure until sustained stable Gateway operation
+ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
+ok - invalid reconnect state stops restarts and reports one safe diagnostic
+ok - concurrent reconnect recovery preserves one private quarantine
+ok - terminal Gateway close performs no reconnect
+ok - canonical terminal suppression survives selected state removal
+ok - diagnostic persistence failures preserve terminal reconnect suppression
+ok - terminal fallback dominates invalid-session delays across restarts
 ok - the macOS service path reaches connected without copying credentials or deployment ids
 ok - reply helpers resolve only strict shared custom configuration records
 ok - self-hosted Discord and Relay coexist while sharing only durable supervision
@@ -55,13 +88,25 @@ The accepted path asserts a mode-`0700` private inbox directory, mode-`0600` inb
 The outbound pass drives the same REST code as `fm-discord-reply.sh` and asserts the exact channel endpoint, guild/channel/message reference, direct bot authentication, disabled outbound mention parsing, `replied_user=false`, enforced stable nonce, private phase-sent receipt, post-success inbox removal, and retained durable context.
 The terminal pass first proves ordinary task cleanup refuses while the Discord outcome is owed, then returns HTTP 500 once and success, proving one bounded retry with the same final-scope nonce before only the exact task binding clears.
 
-The authentication-failure pass returns HTTP 401 repeatedly while reconnect cadence is reduced only through the test seam.
-It asserts one durable `authentication-rejected` notification across retries and verifies the fake token is absent from service output.
+The fake-time policy pass drives fixed random samples and unstable durations through the executable test seam.
+It bounds an hour of rapid successful handshakes to at most 12 connections, proves READY alone does not reset pressure, proves a stable interval does reset pressure, and checks the jitter endpoints remain within the configured cap.
+The real local Gateway storm pass repeatedly sends READY or RESUMED and disconnects, then asserts the connection count remains bounded and TERM interrupts the active cooldown promptly.
+The restart pass builds pressure against that Gateway, replaces the worker, and observes the next connection retain the accumulated delay through the private canonical ownership record.
+The directed reconnect pass proves Opcode 7 and resumable Opcode 9 retain the session, while non-resumable Opcode 9 clears it before the next Identify.
+The message replay pass forces durable notification publication to fail, replaces the worker, observes Resume from the prior checkpoint, and proves the replay commits once before that checkpoint advances.
+The asynchronous lifecycle passes prove a closed socket cannot publish delayed READY health, queued intake from an invalidated session cannot mutate its replacement, and a failed invalid-session state clear settles promptly when stopped.
+The session-limit passes prove exhausted authenticated metadata blocks fresh Identify until reset, a pre-crash reservation cannot be reused after worker replacement, and reservation persistence failure prevents both a Gateway attempt and service-manager restart, while the directed reconnect pass continues to prove Resume remains available.
+The sequence-burst pass delivers 100 dispatches faster than deliberately slowed durable writes, observes the latest sequence become durable, and bounds actual private-state replacements rather than allowing one queued write per event.
+The local HTTP 429 pass sets Discord's direction above every configured local cap and proves the authenticated Gateway lookup does not retry before that minimum.
+The stable-recovery pass creates a transient HTTP failure, reaches READY with its diagnostic still present, and observes that diagnostic clear only after the configured sustained-health interval.
+The authentication-failure pass returns HTTP 401 once, publishes one `authentication-rejected` notification, persists terminal suppression, and proves service-manager replacement, alternate state selection, and owner/guild/channel filtering overrides make no further HTTP or Gateway request for the unchanged bot authentication identity.
+The terminal close pass sends Gateway close code 4004 before READY and observes one connection with no retry.
+The fixed output, health output, private service record, and property-list assertions reject the generated token and authorization ids.
 The worker pass starts the real shell single-instance wrapper, proves a second start is refused, sends TERM, and verifies enabled and ready markers retire.
 The regional READY pass also leaves the pruning-warning precondition active and still reaches connected, proving that cleanup warning is not the handshake cause.
 
 The LaunchAgent pass uses a private `HOME` and fake `launchctl` while driving the real `start`, worker, Node runtime, health check, and `stop` entrypoints against the fake Gateway.
-It asserts the persistent path reaches connected, plus `RunAtLoad`, `KeepAlive`, restart throttling, per-home naming, and complete absence of token, owner id, guild id, and channel id from the property list.
+It asserts the persistent path reaches connected, plus `RunAtLoad`, restart-on-failure `KeepAlive`, restart throttling, per-home naming, and complete absence of token, owner id, guild id, and channel id from the property list.
 This is executable contract evidence, not a claim that a real Aqua login launchd service or live Discord bot was changed during development.
 The operator-run real-account smoke remains `bin/fm-discord-bot.sh start`, `check`, one owner mention in the bound channel, and `stop` after the captain performs the documented Developer Portal setup.
 

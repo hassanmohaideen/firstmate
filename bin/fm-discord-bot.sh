@@ -6,6 +6,7 @@
 #   bin/fm-discord-bot.sh start       # install/load a per-home macOS LaunchAgent
 #   bin/fm-discord-bot.sh stop        # unload it and remove its LaunchAgent
 #   bin/fm-discord-bot.sh check       # validate config and report safe service health
+#   bin/fm-discord-bot.sh retry       # clear terminal suppression after operator correction
 #   bin/fm-discord-bot.sh run         # foreground service (portable/manual)
 #   bin/fm-discord-bot.sh worker      # LaunchAgent entry; single-instance wrapper
 #
@@ -52,6 +53,7 @@ Usage:
   bin/fm-discord-bot.sh start
   bin/fm-discord-bot.sh stop
   bin/fm-discord-bot.sh check
+  bin/fm-discord-bot.sh retry
   bin/fm-discord-bot.sh run
 EOF
 }
@@ -210,7 +212,10 @@ render_launchagent() {
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 	<key>ThrottleInterval</key>
 	<integer>15</integer>
 	<key>StandardOutPath</key>
@@ -256,11 +261,19 @@ configure() {
   FM_DISCORD_CONFIG_FILE="$tmp" validate_config_file_only >/dev/null || die "configuration was refused; no existing configuration changed"
   mv -f -- "$tmp" "$CONFIG_FILE" || die "cannot publish $CONFIG_FILE"
   trap - EXIT HUP INT TERM
+  validate_config_file_only >/dev/null || die "the saved configuration could not be revalidated"
+  (
+    unset FM_DISCORD_BOT_TOKEN FM_DISCORD_OWNER_USER_ID FM_DISCORD_GUILD_ID FM_DISCORD_CHANNEL_ID
+    FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+      FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
+      "$NODE_BIN" "$NODE_SCRIPT" terminal-reset
+  ) || die "configuration was saved but terminal reconnect suppression could not be cleared safely"
   echo "self-hosted Discord configuration saved privately; run bin/fm-discord-bot.sh start"
 }
 
 run_worker() {
-  local lock child='' rc=0 terminating=0 start_guard_held=0
+  local lock child='' rc=0 terminating=0 start_guard_held=0 owner_pid
+  owner_pid=${BASHPID:-$$}
   validate_config >/dev/null
   mkdir -p "$STATE" || die "cannot create $STATE"
   prepare_ownership_boundary
@@ -307,6 +320,7 @@ run_worker() {
   [ "$terminating" -eq 0 ] || exit 0
   FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
     FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
+    FM_DISCORD_OWNER_PID="$owner_pid" \
     "$NODE_BIN" "$NODE_SCRIPT" run &
   child=$!
   wait "$child" || rc=$?
@@ -318,10 +332,17 @@ run_worker() {
 }
 
 start_service() {
-  local uid domain tmp out i=0 lock start_lock_held=0 owner_proven=0
+  local uid domain tmp out i=0 lock start_lock_held=0 owner_proven=0 terminal_rc=0
   [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] \
     || die "persistent start requires the private file written by bin/fm-discord-bot.sh configure"
   validate_config_file_only >/dev/null
+  terminal_rc=0
+  FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+    FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
+    "$NODE_BIN" "$NODE_SCRIPT" terminal-check >/dev/null 2>&1 || terminal_rc=$?
+  [ "$terminal_rc" -ne 4 ] \
+    || die "reconnects remain stopped after a terminal Discord failure; correct the Discord setting and run retry before starting"
+  [ "$terminal_rc" -eq 0 ] || die "terminal reconnect suppression could not be checked safely"
   [ "$(uname)" = Darwin ] || die "persistent start is currently supported on macOS; use run under your own service manager elsewhere"
   command -v launchctl >/dev/null 2>&1 || die "launchctl is unavailable"
   uid=$(id -u 2>/dev/null || true)
@@ -421,8 +442,17 @@ stop_service() {
   echo "self-hosted Discord bot stopped; its private configuration is unchanged"
 }
 
+reset_terminal() {
+  validate_config >/dev/null
+  FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+    FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
+    "$NODE_BIN" "$NODE_SCRIPT" terminal-reset \
+    || die "terminal reconnect suppression could not be cleared safely"
+  echo "terminal Discord reconnect suppression cleared; start the corrected service when ready"
+}
+
 check_service() {
-  local validate_out validate_rc=0 pid='' code='' stopped=1
+  local validate_out validate_rc=0 pid='' code='' canonical_code='' terminal_rc=0 stopped=1 terminal=0
   validate_out=$(validate_config 2>&1) || validate_rc=$?
   if [ "$validate_rc" -eq 3 ]; then
     echo "self-hosted Discord bot is disabled (no private configuration)"
@@ -437,21 +467,34 @@ check_service() {
     pid=$(cat "$OWNERSHIP_LOCK/pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*) ;; *) kill -0 "$pid" 2>/dev/null && stopped=0 ;; esac
   fi
-  if [ "$stopped" -eq 1 ]; then
-    echo "self-hosted Discord bot is configured but stopped"
-    return 1
-  fi
-  if [ -f "$STATE/discord-bot.ready" ] && [ ! -L "$STATE/discord-bot.ready" ]; then
-    echo "self-hosted Discord bot is connected"
-    return 0
-  fi
   if [ -f "$STATE/discord-bot.error" ] && [ ! -L "$STATE/discord-bot.error" ]; then
     code=$("$NODE_BIN" -e '
       const fs=require("fs");
       try { const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).code; if (/^[a-z0-9-]+$/.test(value)) process.stdout.write(value); } catch {}
     ' "$STATE/discord-bot.error" 2>/dev/null || true)
   fi
-  if [ -n "$code" ]; then
+  canonical_code=$(FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+    FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
+    "$NODE_BIN" "$NODE_SCRIPT" terminal-check 2>/dev/null) || terminal_rc=$?
+  if [ "$terminal_rc" -eq 4 ]; then
+    terminal=1
+    code=$canonical_code
+  fi
+  if [ "$stopped" -eq 1 ]; then
+    if [ "$terminal" -eq 1 ] && [ -n "$code" ]; then
+      echo "self-hosted Discord bot reconnects are stopped; diagnostic: $code; correct the Discord setting and run retry"
+    else
+      echo "self-hosted Discord bot is configured but stopped"
+    fi
+    return 1
+  fi
+  if [ -f "$STATE/discord-bot.ready" ] && [ ! -L "$STATE/discord-bot.ready" ]; then
+    echo "self-hosted Discord bot is connected"
+    return 0
+  fi
+  if [ "$terminal" -eq 1 ] && [ -n "$code" ]; then
+    echo "self-hosted Discord bot reconnects are stopped; diagnostic: $code; correct the Discord setting and run retry"
+  elif [ -n "$code" ]; then
     echo "self-hosted Discord bot is reconnecting; diagnostic: $code"
   else
     echo "self-hosted Discord bot is running and waiting for Discord"
@@ -465,6 +508,7 @@ case "$command" in
   start) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; start_service ;;
   stop) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; stop_service ;;
   check) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; check_service ;;
+  retry) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; reset_terminal ;;
   run) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; run_worker ;;
   worker) [ "$#" -eq 1 ] || { usage >&2; exit 2; }; run_worker ;;
   -h|--help|help) usage ;;
