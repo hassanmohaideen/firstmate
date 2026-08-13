@@ -45,7 +45,7 @@ The fake REST endpoint records only an authentication-match boolean and parsed r
 The fake Gateway performs a real local WebSocket upgrade, sends Discord v10 Hello, waits for an authenticated Identify carrying the minimum intent bitset `33281`, sends Ready, closes the first connection, and observes a valid Resume on the second connection.
 A separate READY fixture returns a Discord-owned regional resume hostname and reaches `connected` through both the foreground shell entrypoint and the real Node child launched behind the fake macOS service boundary.
 The same lifecycle rejects a lookalike hostname outside Discord's domain.
-The production runtime's alternate API and Gateway inputs are refused unless its hermetic test-mode flag is set.
+The production runtime's alternate API and Gateway inputs have no effect unless its hermetic test-mode flag is set.
 Production destinations remain fixed to Discord's authenticated API and canonical or regional Discord-owned Gateway hosts.
 
 The authorization matrix drives the same executable `ingestMessage` owner used by Gateway `MESSAGE_CREATE` events.
