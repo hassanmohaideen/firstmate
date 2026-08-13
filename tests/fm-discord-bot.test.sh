@@ -1470,10 +1470,11 @@ clock_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
 clock_monotonic=$("$NODE_BIN" -e 'process.stdout.write(String(Math.floor(require("node:os").uptime()*1000)))')
 clock_deadline=$((clock_started - 5000))
 jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$clock_deadline" \
+  --argjson observed "$((clock_started + 5000))" \
   --argjson monotonic "$((clock_monotonic + 120))" '
   {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
    failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
-   server_wait_ms:120,server_boot_id:"clock-boot",
+   server_wait_ms:120,server_wall_observed_at:$observed,server_boot_id:"previous-boot",
    server_monotonic_not_before:$monotonic,session_start_limit:null}
 ' > "$home/state/.discord-bot-service/reconnect.json"
 chmod 600 "$home/state/.discord-bot-service/reconnect.json"
@@ -1521,7 +1522,35 @@ wait_for_value "$home/gateway/lookups" 1 || fail "expired retry deadline blocked
 kill -TERM "$rate_worker"
 wait "$rate_worker" || true
 WORKER_PIDS=()
-pass "server retry deadlines use monotonic time across wall-clock movement"
+home=$(new_home gateway-rate-limit-forward-reboot)
+write_config "$home"
+make_gateway_server "$home/gateway" reconnect
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+forward_now=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((forward_now - 5000))" \
+  --argjson observed "$((forward_now - 120000))" '
+  {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
+   failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
+   server_wait_ms:120,server_wall_observed_at:$observed,server_boot_id:"previous-boot",
+   server_monotonic_not_before:120,session_start_limit:null}
+' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=clock-boot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/bot.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "forward clock anomaly did not recover"
+forward_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+[ $((forward_lookup - forward_now)) -ge 100 ] \
+  || fail "forward clock anomaly expired the server retry minimum"
+[ $((forward_lookup - forward_now)) -lt 1500 ] \
+  || fail "forward clock anomaly prevented bounded recovery"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+pass "server retry deadlines survive backward and forward clock movement"
 
 home=$(new_home gateway-rate-limit-restart-clock)
 write_config "$home"
@@ -1568,50 +1597,53 @@ mkdir "$home/state/.discord-bot-service"
 chmod 700 "$home/state/.discord-bot-service"
 auth_fingerprint=$(discord_digest "$TOKEN")
 reboot_now=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
-jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((reboot_now + 1500))" '
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((reboot_now + 8000))" \
+  --argjson observed "$reboot_now" '
   {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
    failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
-   server_wait_ms:1500,server_boot_id:"original-boot",server_monotonic_not_before:1500,
-   server_reboot_fallback_used:false,session_start_limit:null}
+   server_wait_ms:8000,server_wall_observed_at:$observed,server_boot_id:"original-boot",
+   server_monotonic_not_before:8000,server_reboot_fallback_used:false,session_start_limit:null}
 ' > "$home/state/.discord-bot-service/reconnect.json"
 chmod 600 "$home/state/.discord-bot-service/reconnect.json"
-FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
-  FM_DISCORD_TEST_BOOT_ID=first-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
-  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/first.log" 2>&1 &
-rate_worker=$!
-WORKER_PIDS+=("$rate_worker")
-sleep 0.12
-assert_absent "$home/gateway/lookups" "first reboot skipped its conservative server wait"
-i=0
-while [ "$i" -lt 100 ]; do
-  fallback_used=$(jq -r '.server_reboot_fallback_used // false' \
-    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf false)
-  [ "$fallback_used" = true ] && break
-  sleep 0.01
-  i=$((i + 1))
+reboot=1
+while [ "$reboot" -le 4 ]; do
+  boot_id="rapid-reboot-$reboot"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+    FM_DISCORD_TEST_BOOT_ID="$boot_id" FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+    FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/reboot-$reboot.log" 2>&1 &
+  rate_worker=$!
+  WORKER_PIDS+=("$rate_worker")
+  i=0
+  while [ "$i" -lt 200 ]; do
+    persisted_boot=$(jq -r '.server_boot_id // ""' \
+      "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || true)
+    [ "$persisted_boot" = "$boot_id" ] && break
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ "$persisted_boot" = "$boot_id" ] || fail "rapid reboot did not persist elapsed-wait evidence"
+  assert_absent "$home/gateway/lookups" "rapid reboot bypassed the outstanding server wait"
+  kill -TERM "$rate_worker"
+  wait "$rate_worker" || true
+  WORKER_PIDS=()
+  reboot=$((reboot + 1))
 done
-[ "$fallback_used" = true ] || fail "first reboot did not consume the bounded server fallback"
-kill -TERM "$rate_worker"
-wait "$rate_worker" || true
-WORKER_PIDS=()
-second_reboot_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
-  FM_DISCORD_TEST_BOOT_ID=second-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
-  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/second.log" 2>&1 &
+  FM_DISCORD_TEST_BOOT_ID=final-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/final.log" 2>&1 &
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
-sleep 0.25
-assert_absent "$home/gateway/lookups" "second reboot bypassed the outstanding server wait"
 wait_for_value "$home/gateway/lookups" 1 || fail "completed reboot fallback did not reconnect"
-second_reboot_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
-[ $((second_reboot_lookup - second_reboot_started)) -ge 1000 ] \
-  || fail "repeated reboot collapsed the server retry minimum"
-[ $((second_reboot_lookup - reboot_now)) -lt 3000 ] \
-  || fail "repeated reboot replenished the bounded server fallback"
+reboot_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+reboot_elapsed=$((reboot_lookup - reboot_now))
+[ "$reboot_elapsed" -ge 7800 ] \
+  || fail "rapid reboots collapsed the server retry minimum ($reboot_elapsed ms)"
+[ "$reboot_elapsed" -lt 9000 ] \
+  || fail "rapid reboots replenished the bounded server fallback ($reboot_elapsed ms)"
 kill -TERM "$rate_worker"
 wait "$rate_worker" || true
 WORKER_PIDS=()
-pass "server retry waits survive repeated reboots without early lookup"
+pass "server retry waits survive rapid reboots without replenishment"
 
 home=$(new_home gateway-session-reboots)
 write_config "$home"

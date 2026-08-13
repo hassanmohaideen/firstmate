@@ -933,6 +933,15 @@ function authenticationFingerprint(config) {
   return createHash("sha256").update(config.token).digest("hex");
 }
 
+function rebootWaitRemaining(waitMilliseconds, wallDeadline, wallObservedAt, now = Date.now()) {
+  const observedAt = Number.isSafeInteger(wallObservedAt)
+    ? wallObservedAt
+    : Math.max(0, wallDeadline - waitMilliseconds);
+  const elapsed = now - observedAt;
+  if (elapsed < 0 || elapsed > 60_000) return waitMilliseconds;
+  return Math.max(0, waitMilliseconds - elapsed);
+}
+
 function validFallbackSuppression(record) {
   return record?.schema === "firstmate.discord-reconnect-suppression.v1"
     && INCIDENT_ID_RE.test(record.authentication_fingerprint || "")
@@ -943,6 +952,10 @@ function validFallbackSuppression(record) {
       ? record.server_wait_ms === null && record.operator_intervention_required
       : Number.isSafeInteger(record.server_not_before) && record.server_not_before >= 0
         && Number.isSafeInteger(record.server_wait_ms) && record.server_wait_ms >= 0
+        && (record.server_wall_observed_at === undefined
+          || record.server_wall_observed_at === null
+          || Number.isSafeInteger(record.server_wall_observed_at)
+            && record.server_wall_observed_at >= 0)
         && (record.server_boot_id === undefined || record.server_boot_id === null
           || BOOT_ID_RE.test(record.server_boot_id))
         && (record.server_monotonic_not_before === undefined
@@ -1028,6 +1041,7 @@ class GatewayRunner {
     this.lastConnectionAt = null;
     this.serverNotBefore = null;
     this.serverWaitMs = null;
+    this.serverWallObservedAt = null;
     this.serverBootId = null;
     this.serverMonotonicNotBefore = null;
     this.serverRebootFallbackUsed = false;
@@ -1106,6 +1120,7 @@ class GatewayRunner {
       last_connection_at: this.lastConnectionAt,
       server_not_before: this.serverNotBefore,
       server_wait_ms: this.serverWaitMs,
+      server_wall_observed_at: this.serverWallObservedAt,
       server_boot_id: this.serverBootId,
       server_monotonic_not_before: this.serverMonotonicNotBefore,
       server_reboot_fallback_used: this.serverRebootFallbackUsed,
@@ -1159,6 +1174,7 @@ class GatewayRunner {
         authentication_fingerprint: fingerprint,
         server_not_before: deadlineActive ? this.serverNotBefore : null,
         server_wait_ms: deadlineActive ? this.serverWaitMs : null,
+        server_wall_observed_at: deadlineActive ? this.serverWallObservedAt : null,
         server_boot_id: deadlineActive ? this.serverBootId : null,
         server_monotonic_not_before: deadlineActive ? this.serverMonotonicNotBefore : null,
         server_reboot_fallback_used: deadlineActive ? this.serverRebootFallbackUsed : false,
@@ -1244,6 +1260,10 @@ class GatewayRunner {
           && (!Number.isSafeInteger(record.server_not_before) || record.server_not_before < 0))
         || (record.server_wait_ms !== undefined && record.server_wait_ms !== null
           && (!Number.isSafeInteger(record.server_wait_ms) || record.server_wait_ms < 0))
+        || (record.server_wall_observed_at !== undefined
+          && record.server_wall_observed_at !== null
+          && (!Number.isSafeInteger(record.server_wall_observed_at)
+            || record.server_wall_observed_at < 0))
         || ((record.server_not_before ?? null) === null
           !== ((record.server_wait_ms ?? null) === null))
         || (record.server_boot_id !== undefined && record.server_boot_id !== null
@@ -1283,13 +1303,22 @@ class GatewayRunner {
     this.lastConnectionAt = record?.last_connection_at ?? null;
     this.serverNotBefore = record?.server_not_before ?? null;
     this.serverWaitMs = this.serverNotBefore === null ? null : record.server_wait_ms;
+    this.serverWallObservedAt = this.serverNotBefore === null
+      ? null
+      : record?.server_wall_observed_at
+        ?? Math.max(0, this.serverNotBefore - this.serverWaitMs);
     this.serverBootId = record?.server_boot_id ?? null;
     this.serverMonotonicNotBefore = record?.server_monotonic_not_before ?? null;
     this.serverRebootFallbackUsed = record?.server_reboot_fallback_used ?? false;
     if (this.serverNotBefore !== null
         && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
+      const now = Date.now();
+      this.serverWaitMs = rebootWaitRemaining(
+        this.serverWaitMs, this.serverNotBefore, this.serverWallObservedAt, now,
+      );
       this.serverRebootFallbackUsed = true;
-      this.serverNotBefore = Date.now() + this.serverWaitMs;
+      this.serverWallObservedAt = now;
+      this.serverNotBefore = now + this.serverWaitMs;
       this.serverBootId = this.bootId;
       this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
       stateNeedsRebase = true;
@@ -1313,10 +1342,16 @@ class GatewayRunner {
         const fallbackSameBoot = suppression.server_boot_id === this.bootId
           && Number.isSafeInteger(suppression.server_monotonic_not_before);
         const fallbackPreviouslyUsed = suppression.server_reboot_fallback_used ?? false;
+        const now = Date.now();
         const fallbackRemaining = fallbackSameBoot
           ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
-          : suppression.server_wait_ms;
-        const fallbackNotBefore = Date.now() + fallbackRemaining;
+          : rebootWaitRemaining(
+            suppression.server_wait_ms,
+            suppression.server_not_before,
+            suppression.server_wall_observed_at,
+            now,
+          );
+        const fallbackNotBefore = now + fallbackRemaining;
         const currentRemaining = this.serverDelayRemaining();
         if (fallbackRemaining > currentRemaining) {
           this.serverWaitMs = fallbackRemaining;
@@ -1326,6 +1361,8 @@ class GatewayRunner {
         }
         this.serverRebootFallbackUsed = this.serverRebootFallbackUsed
           || fallbackPreviouslyUsed || !fallbackSameBoot;
+        this.serverWallObservedAt = now;
+        this.serverNotBefore = now + this.serverWaitMs;
         this.serverBootId = this.bootId;
         this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
         this.fallbackSuppressionActive = true;
@@ -1432,7 +1469,11 @@ class GatewayRunner {
       this.serverWaitMs = checkpointRemaining;
       this.serverBootId = this.bootId;
       this.serverMonotonicNotBefore = monotonicMilliseconds() + checkpointRemaining;
-      this.serverNotBefore = Date.now() + checkpointRemaining;
+      this.serverWallObservedAt = Date.now();
+      this.serverNotBefore = Math.max(
+        this.serverNotBefore,
+        this.serverWallObservedAt + checkpointRemaining,
+      );
       if (!await this.persistDurableStateOrStop()) return false;
       if (this.fallbackSuppressionActive) {
         try {
@@ -1455,12 +1496,14 @@ class GatewayRunner {
     this.serverBootId = this.bootId;
     this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
     this.serverRebootFallbackUsed = false;
+    this.serverWallObservedAt = now;
     this.serverNotBefore = now + this.serverWaitMs;
   }
 
   async retireServerDelay() {
     this.serverNotBefore = null;
     this.serverWaitMs = null;
+    this.serverWallObservedAt = null;
     this.serverBootId = null;
     this.serverMonotonicNotBefore = null;
     this.serverRebootFallbackUsed = false;

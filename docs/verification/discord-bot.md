@@ -56,9 +56,9 @@ ok - server retry deadlines survive abrupt process and service-manager restarts
 ok - failed retry persistence survives crashes and retires after expiry
 ok - sequence persistence failure keeps one promptly cancellable fail-closed wait
 ok - invalid-session persistence failure settles promptly after stop
-ok - server retry deadlines use monotonic time across wall-clock movement
+ok - server retry deadlines survive backward and forward clock movement
 ok - server retry waits do not replenish across same-boot restarts
-ok - server retry waits survive repeated reboots without early lookup
+ok - server retry waits survive rapid reboots without replenishment
 ok - session-start reset waits re-query across repeated reboots
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
