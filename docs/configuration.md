@@ -270,7 +270,7 @@ An optional repository-owned tracked `defaults/crew-dispatch.json` supplies stan
 Firstmate considers rules from both files as one best-fit set: an explicit per-task captain instruction remains highest, the most specific matching rule wins regardless of file, and an equally fitting local rule wins over a tracked rule.
 When no rule matches, the local `default` wins over the tracked `default`, then dispatch falls back to `config/crew-harness`.
 This lets a repository-specific tracked rule beat a generic local implementation or design default while future local configuration can override it with an equally or more specific rule.
-The shell scripts select and validate both files but do not match their natural-language rules; firstmate chooses the best matching rule with judgment, resolves its profile object or array under the operating contract in `AGENTS.md` section 4 and `quota-array-dispatch`, and passes only concrete `--harness`, `--model`, and `--effort` flags to `fm-spawn.sh`.
+The shell scripts discover and validate both files but do not match their natural-language rules; firstmate chooses the best matching rule with judgment, resolves its profile object or array under the operating contract in `AGENTS.md` section 4 and `quota-array-dispatch`, and passes only concrete `--harness`, `--model`, and `--effort` flags to `fm-spawn.sh`.
 When either file is effective, `fm-spawn.sh` enforces that contract by refusing crewmate and scout spawns that lack an explicit harness (`--harness`, a positional adapter, or a raw launch command).
 Batch spawns satisfy the same requirement with a shared `--harness`.
 Secondmate spawns are exempt and still resolve through `config/secondmate-harness` and its optional model and effort tokens.
@@ -298,7 +298,7 @@ Per rule, `when` and `use` are required.
 Both `use` and the optional top-level `default` accept either one profile object or a non-empty array of profile objects.
 The single-object form stays fully backward-compatible, and every profile needs `harness`.
 Profile `model` and `effort` fields and rule `why` are optional.
-An omitted model or effort means the selected harness uses its own default for that axis.
+An omitted model uses the selected harness's default model; an omitted effort uses the generic effort fallback owned by `harness-adapters`.
 Every profile array is an implicit quota-aware choice resolved through `quota-array-dispatch`.
 If no dispatch rule fits, firstmate resolves `default` through the same object-or-array path before falling back to `config/crew-harness`.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.

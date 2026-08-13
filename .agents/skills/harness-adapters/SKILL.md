@@ -13,7 +13,7 @@ Use this reference before any harness-specific firstmate operation: spawn, recov
 Crewmates default to the same harness firstmate is running on unless `config/crew-harness` records an adapter name.
 The layered dispatch profiles in home-local `config/crew-dispatch.json` and repository-owned `defaults/crew-dispatch.json` can override that static default for one crewmate or scout dispatch by selecting concrete harness, model, and effort axes at intake; `docs/configuration.md` owns their rule and default precedence.
 When a matched rule or default is a profile array, load `quota-array-dispatch` for the completion-aware candidate choice after this skill establishes harness and model/provider facts.
-The captain may override that file at session start or later; a per-task instruction such as "run this one on codex" overrides it for that dispatch only.
+The captain may override those profiles through the documented local layer at session start or later; a per-task instruction such as "run this one on codex" overrides them for that dispatch only.
 `default` means mirror firstmate's own harness.
 
 Secondmates have their own harness knob, so a secondmate can run on a different adapter than crewmates.
@@ -170,6 +170,9 @@ OpenCode can accept and queue an Enter while leaving text visible, Grok can cons
 The shared symptom is a healthy-looking pane with no work in progress, so each adapter must verify the observable postcondition that is specific to its TUI.
 
 ## claude (VERIFIED; busy-state hooks live-verified 2026-07-28 on Claude Code 2.1.220)
+
+When concrete evidence proves the selected Claude credential unusable, ask the captain to complete the safe interactive `claude auth login` flow and verify it with `claude auth status` before resuming; do not route the task around its selected Claude profile.
+Authentication uncertainty alone remains governed by the eligibility rules in `AGENTS.md` section 4 and does not trigger login.
 
 | Fact | Value |
 |---|---|
