@@ -31,6 +31,7 @@ ok - Discord intake enforces owner, guild, channel, direct mention, and bot-loop
 ok - outbound replies authenticate directly, suppress mentions, and preserve the bound conversation
 ok - terminal Discord replies survive bounded REST retries and clear their exact task binding
 ok - the Gateway reconnects, remains single-instance, and shuts down cleanly
+ok - Gateway ownership survives wrapper death and refuses contenders
 ok - foreground service accepts Discord's regional resume endpoint independently of private-state pruning
 ok - Gateway resume remains limited to Discord-owned endpoints
 ok - reconnect policy retains READY failure pressure, resets only after stability, and applies bounded jitter
