@@ -1035,6 +1035,33 @@ wait "$stale_worker" || true
 WORKER_PIDS=()
 pass "stale READY persistence cannot publish health or reset pressure"
 
+home=$(new_home gateway-close-persistence-fail-closed)
+write_config "$home"
+make_gateway_server "$home/gateway" stale-ready-close
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS=60 FM_DISCORD_TEST_DURABLE_WRITE_FAIL_AT=5 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+fail_closed_worker=$!
+WORKER_PIDS+=("$fail_closed_worker")
+wait_for_file "$home/state/discord-bot.error" \
+  || fail "close-versus-persistence fixture did not enter fail-closed state"
+[ "$(jq -r .code "$home/state/discord-bot.error")" = reconnect-state-unavailable ] \
+  || fail "close-versus-persistence failure lacked its safe diagnostic"
+sleep 0.25
+[ "$(cat "$home/gateway/connections")" -eq 1 ] \
+  || fail "a closed socket reconnected after durable state entered fail-closed mode"
+stop_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+kill -TERM "$fail_closed_worker"
+wait "$fail_closed_worker" || true
+stop_finished=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+WORKER_PIDS=()
+[ $((stop_finished - stop_started)) -lt 1500 ] \
+  || fail "close-versus-persistence fail-closed state delayed termination"
+assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "fail-closed race logs exposed the bot token"
+assert_not_contains "$(cat "$home/bot.log")" "$OWNER" "fail-closed race logs exposed a deployment id"
+pass "fail-closed activation prevents reconnect after socket close"
+
 home=$(new_home gateway-stable-diagnostic-race)
 write_config "$home"
 mkdir "$home/state/.wake-queue"

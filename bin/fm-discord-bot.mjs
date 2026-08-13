@@ -958,6 +958,11 @@ class GatewayRunner {
     this.waiters = new Set();
     this.failClosed = false;
     this.failClosedWait = null;
+    this.durableWriteCount = 0;
+  }
+
+  canUseGateway() {
+    return !this.stopping && !this.failClosed;
   }
 
   stop() {
@@ -1023,9 +1028,13 @@ class GatewayRunner {
 
   persistDurableState() {
     const content = `${JSON.stringify(this.durableRecord())}\n`;
+    const writeNumber = ++this.durableWriteCount;
     const transition = this.durableTransitions.then(async () => {
       if (TEST_MODE && process.env.FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS) {
         await sleep(testDuration("FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS", 1, 1, 1000));
+      }
+      if (TEST_MODE && Number(process.env.FM_DISCORD_TEST_DURABLE_WRITE_FAIL_AT) === writeNumber) {
+        throw new Error("injected reconnect state failure");
       }
       await atomicReplacePrivate(RECONNECT_FILE, content);
       if (TEST_MODE && process.env.FM_DISCORD_TEST_DURABLE_WRITE_LOG === "1") {
@@ -1042,8 +1051,10 @@ class GatewayRunner {
   }
 
   async persistDurableStateOrStop() {
+    if (this.failClosed) return await this.failClosedWait;
     try {
       await this.persistDurableState();
+      if (this.failClosed) return await this.failClosedWait;
       return true;
     } catch {
       this.failClosed = true;
@@ -1143,7 +1154,7 @@ class GatewayRunner {
   }
 
   async updateSessionStartLimit(limit) {
-    if (!limit) return;
+    if (!limit) return true;
     const previous = this.sessionStartLimit;
     if (previous && previous.total === limit.total && Date.now() < previous.resetAt
         && Math.abs(previous.resetAt - limit.resetAt) <= 5000) {
@@ -1151,7 +1162,7 @@ class GatewayRunner {
       limit.resetAt = Math.max(previous.resetAt, limit.resetAt);
     }
     this.sessionStartLimit = limit;
-    await this.persistDurableState();
+    return await this.persistDurableStateOrStop();
   }
 
   async reserveIdentify() {
@@ -1159,7 +1170,7 @@ class GatewayRunner {
     if (!limit) return true;
     if (limit.remaining === 0 && Date.now() < limit.resetAt) {
       await this.waitForReconnect(limit.resetAt - Date.now());
-      if (this.stopping) return false;
+      if (!this.canUseGateway()) return false;
     }
     if (Date.now() >= limit.resetAt) {
       limit.remaining = limit.total;
@@ -1168,7 +1179,7 @@ class GatewayRunner {
     if (limit.remaining === 0) return false;
     if (TEST_MODE && process.env.FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS) {
       await sleep(testDuration("FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS", 1, 1, 1000));
-      if (this.stopping) return false;
+      if (!this.canUseGateway()) return false;
     }
     limit.remaining -= 1;
     return await this.persistDurableStateOrStop();
@@ -1206,12 +1217,13 @@ class GatewayRunner {
   }
 
   send(payload) {
-    if (this.socket?.readyState === WebSocket.OPEN) {
+    if (this.canUseGateway() && this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify(payload));
     }
   }
 
   identify() {
+    if (!this.canUseGateway()) return;
     this.send({
       op: 2,
       d: {
@@ -1223,10 +1235,12 @@ class GatewayRunner {
   }
 
   resume() {
+    if (!this.canUseGateway()) return;
     this.send({ op: 6, d: { token: this.config.token, session_id: this.sessionId, seq: this.resumeSequence } });
   }
 
   async connect(url) {
+    if (!this.canUseGateway()) return null;
     const gateway = new URL(url);
     gateway.searchParams.set("v", "10");
     gateway.searchParams.set("encoding", "json");
@@ -1277,6 +1291,10 @@ class GatewayRunner {
       };
       let socket;
       try {
+        if (!this.canUseGateway()) {
+          finish(null);
+          return;
+        }
         socket = new WebSocket(gateway);
       } catch (error) {
         rejectPromise(error);
@@ -1315,6 +1333,10 @@ class GatewayRunner {
               beat();
               heartbeatInterval = setInterval(beat, interval);
             }, Math.floor(randomFraction() * interval));
+            if (!this.canUseGateway()) {
+              socket.close(4000, "Gateway retries stopped");
+              return;
+            }
             if (this.sessionId) this.resume(); else this.identify();
             break;
           }
@@ -1480,20 +1502,22 @@ class GatewayRunner {
       if (this.failurePressure > 0 || delay > 0) {
         await this.waitForReconnect(this.reconnectDelay(delay));
       }
-      if (!this.stopping && this.serverNotBefore !== null) await this.retireServerDelay();
+      if (this.canUseGateway() && this.serverNotBefore !== null) await this.retireServerDelay();
     }
-    while (!this.stopping) {
+    while (this.canUseGateway()) {
       if (this.serverNotBefore !== null) {
         const delay = this.serverDelayRemaining();
         if (delay > 0) await this.waitForReconnect(delay);
-        if (this.stopping || !await this.retireServerDelay()) break;
+        if (!this.canUseGateway() || !await this.retireServerDelay()) break;
       }
+      if (!this.canUseGateway()) break;
       let gateway;
       try {
         gateway = this.resumeUrl
           ? { url: this.resumeUrl, sessionStartLimit: null }
           : await gatewayUrl(this.config);
-        await this.updateSessionStartLimit(gateway.sessionStartLimit);
+        if (!this.canUseGateway()) break;
+        if (!await this.updateSessionStartLimit(gateway.sessionStartLimit)) break;
       } catch (error) {
         if (error instanceof DiscordHttpError && [401, 403].includes(error.status)) {
           await this.suppressTerminal("authentication-rejected");
@@ -1509,28 +1533,32 @@ class GatewayRunner {
         if (!await this.persistDurableStateOrStop()) break;
         const retainedServerDelay = this.serverDelayRemaining();
         await this.waitForReconnect(this.reconnectDelay(retainedServerDelay));
-        if (this.stopping) break;
+        if (!this.canUseGateway()) break;
         if (this.serverNotBefore !== null && !await this.retireServerDelay()) break;
         continue;
       }
+      if (!this.canUseGateway()) break;
       if (!this.sessionId && !await this.reserveIdentify()) break;
+      if (!this.canUseGateway()) break;
       let serverDelayMs = 0;
       try {
         this.failurePressure += 1;
         this.lastConnectionAt = Date.now();
-        await this.persistDurableState();
+        if (!await this.persistDurableStateOrStop() || !this.canUseGateway()) break;
         const result = await this.connect(gateway.url);
-        if (this.stopping || this.failClosed) break;
+        if (!result || !this.canUseGateway()) break;
         if (result.terminalCode) {
           await this.suppressTerminal(result.terminalCode);
           break;
         }
         serverDelayMs = result.serverDelayMs;
       } catch {
+        if (!this.canUseGateway()) break;
         await reportDiagnostic("gateway-connect-failed");
       }
-      if (this.failClosed) break;
-      if (!this.stopping) await this.waitForReconnect(this.reconnectDelay(serverDelayMs));
+      if (!this.canUseGateway()) break;
+      await this.waitForReconnect(this.reconnectDelay(serverDelayMs));
+      if (!this.canUseGateway()) break;
     }
     clearInterval(pruneTimer);
     clearInterval(reconcileTimer);

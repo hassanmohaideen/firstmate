@@ -42,6 +42,7 @@ ok - server reconnect and invalid-session directions choose resume or fresh iden
 ok - valid Gateway Resume state survives abrupt process replacement
 ok - Resume checkpoints advance only after durable message publication
 ok - stale READY persistence cannot publish health or reset pressure
+ok - fail-closed activation prevents reconnect after socket close
 ok - newer failure diagnostics survive pending stable transitions
 ok - queued intake remains bound to its originating session generation
 ok - non-resumable invalid-session waits survive abrupt process replacement
