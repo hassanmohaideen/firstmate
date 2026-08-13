@@ -477,7 +477,7 @@ check_service() {
     "$NODE_BIN" "$NODE_SCRIPT" terminal-check 2>/dev/null) || terminal_rc=$?
   if [ "$terminal_rc" -eq 4 ]; then
     terminal=1
-    [ -n "$code" ] || code=$canonical_code
+    code=$canonical_code
   fi
   if [ "$stopped" -eq 1 ]; then
     if [ "$terminal" -eq 1 ] && [ -n "$code" ]; then

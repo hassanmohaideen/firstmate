@@ -35,11 +35,13 @@ ok - foreground service accepts Discord's regional resume endpoint independently
 ok - Gateway resume remains limited to Discord-owned endpoints
 ok - reconnect policy retains READY failure pressure, resets only after stability, and applies bounded jitter
 ok - rapid Gateway disconnects remain bounded and stop promptly during cooldown
-ok - reconnect pressure survives process and service-manager restarts
+ok - reconnect pressure survives filtering changes and process restarts
+ok - future-dated reconnect attempts clamp to the minimum interval
 ok - server reconnect and invalid-session directions choose resume or fresh identify correctly
 ok - fresh Identify honors Discord session-start exhaustion
 ok - session-start reservations survive process restarts while Resume stays available
 ok - Gateway lookup rate limits preserve server-provided retry direction
+ok - server retry deadlines survive abrupt process and service-manager restarts
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
 ok - terminal Gateway close performs no reconnect
