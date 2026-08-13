@@ -81,7 +81,7 @@ Hints only affect balance: the coverage guard keeps the partition complete and d
 | `portable-serial-10of10` | 14 | 221053 ms (~221.1 s) |
 | imbalance | | 482 ms |
 
-The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210081 ms in that run, is the floor for any serial shard count.
+The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210119 ms in that run, is the floor for any serial shard count.
 Ten shards sit just above that floor, so more serial runners would stop paying off without first splitting or speeding that script.
 
 ## Real-Herdr CI shards
