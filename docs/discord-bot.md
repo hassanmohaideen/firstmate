@@ -106,7 +106,8 @@ Reconnect pressure and the last connection attempt survive process and service-m
 Unstable connections use randomized exponential delays with a five-second minimum connection interval, a five-minute local delay cap, and a separately jittered cooldown capped at 15 minutes after eight consecutive unstable outcomes; a longer Discord `retry_after` remains the minimum wait.
 Discord-directed reconnect and invalid-session responses retain or clear session material as required and still pass through the same pacing policy.
 Fresh Identify attempts reserve Discord's authenticated `session_start_limit` durably and wait through an exhausted reset window, while a valid Resume remains available without consuming a new session start.
-It also holds a recoverable per-home process lock so a manual start and LaunchAgent cannot create two Gateway sessions. The shell admits and hands the lease to the Node runtime before Gateway I/O; the runtime remains its canonical owner for its full lifetime, including after wrapper loss, and direct Node invocation cannot bypass ownership.
+It also holds a recoverable per-home process lock so a manual start and LaunchAgent cannot create two Gateway sessions.
+The shell admits and hands the lease to the Node runtime before Gateway I/O; the runtime remains its canonical owner for its full lifetime, including after wrapper loss, and direct Node invocation cannot bypass ownership.
 
 Check configuration and current service health with:
 
@@ -115,7 +116,7 @@ bin/fm-discord-bot.sh check
 ```
 
 The check reports one of the disabled, invalid, stopped, terminally stopped, connecting, reconnecting, or connected outcomes without printing credentials or deployment ids.
-Authentication rejection, missing Message Content intent, invalid Gateway intents, invalid Gateway version or sharding configuration, unavailable Discord API, Gateway connection failure, and private inbox publication failure use bounded safe diagnostic codes.
+Authentication rejection, missing Message Content intent, invalid Gateway intents, invalid Gateway version, sharding configuration, or authenticated Gateway metadata, unavailable Discord API, Gateway connection failure, untrusted reconnect state, reconnect-state persistence failure, and private inbox publication failure use bounded safe diagnostic codes.
 Authentication rejection and other non-retryable Gateway configuration close codes stop all Gateway reconnects and persist that suppression across service-manager restarts.
 Only a changed bot authentication identity or explicit operator intervention through `bin/fm-discord-bot.sh retry` or `bin/fm-discord-bot.sh configure` clears terminal suppression; owner, guild, and channel filtering changes do not clear it.
 A new service diagnostic reaches the active Firstmate through the existing durable notification queue exactly once until the code changes or stable recovery clears it.
@@ -180,6 +181,10 @@ The unchanged rejected configuration remains suppressed even if a service manage
 A `message-content-intent-disabled` diagnostic means **Message Content Intent** is off for the application.
 Enable that one privileged intent, run `bin/fm-discord-bot.sh retry` to record the operator intervention, and start the service again.
 Invalid intent, Gateway version, or sharding diagnostics are also terminal configuration failures and require correcting the application or runtime configuration before retrying.
+A `gateway-configuration-invalid` diagnostic means Discord returned Gateway metadata the runtime could not safely use; confirm the current Firstmate version and Discord service status before running `retry` and starting once more.
+
+A `reconnect-state-invalid`, `terminal-suppression-invalid`, or `reconnect-state-unavailable` diagnostic means the private reconnect records could not be trusted or updated safely.
+Stop the service, correct any local storage, file-type, or mode problem in the [documented private state boundary](configuration.md#self-hosted-discord-configdiscord-botenv), run `retry`, and then start the service again.
 
 A connected service that ignores a message is usually enforcing the owner, guild, channel, author-type, or direct-mention boundary.
 Confirm those ids locally with Developer Mode and rerun `configure` rather than weakening the checks.
