@@ -278,6 +278,15 @@ server.on("upgrade",(req,socket)=>{
         fs.appendFileSync(eventFile,JSON.stringify({connection,op:"identify",session:""})+"\n");
         fs.writeFileSync(countFile.replace(/connections$/, "identify.json"), JSON.stringify({token_ok:true,intents:packet.d.intents,properties:packet.d.properties}));
         if (mode === "terminal-auth-close") { setTimeout(()=>close(socket,4004),10); continue; }
+        if (mode === "terminal-auth-close-on-signal") {
+          fs.writeFileSync(countFile.replace(/connections$/, "terminal-ready"), "ready\n");
+          const release=setInterval(()=>{
+            if (!fs.existsSync(countFile.replace(/connections$/, "release-terminal"))) return;
+            clearInterval(release);
+            close(socket,4004);
+          },5);
+          continue;
+        }
         text(socket,{op:0,t:"READY",s:connection,d:{user:{id:self},session_id:`session-${connection}`,resume_gateway_url:resumeUrl}});
         if (mode === "invalid-then-terminal-close") {
           text(socket,{op:9,d:false});
@@ -1897,6 +1906,32 @@ assert_absent "$home/state/.discord-bot-service/terminal.json" \
 [ "$(cat "$home/gateway/lookups")" -eq 0 ] || fail "repeated invalid reconnect recovery reached Gateway lookup"
 pass "invalid reconnect state stops restarts and reports one safe diagnostic"
 
+home=$(new_home gateway-concurrent-reconnect-quarantine)
+write_config "$home"
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+printf '%s\n' '{"invalid":"concurrent-artifact"}' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+printf '%s\n' '{"schema":"firstmate.discord-terminal.v2","code":"reconnect-state-invalid","authentication_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recorded_at":1}' \
+  > "$home/state/.discord-bot-service/terminal.json"
+chmod 600 "$home/state/.discord-bot-service/terminal.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry > "$home/retry-one.log" 2>&1 &
+retry_one=$!
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry > "$home/retry-two.log" 2>&1 &
+retry_two=$!
+wait "$retry_one" || fail "first concurrent reconnect recovery failed"
+wait "$retry_two" || fail "second concurrent reconnect recovery failed"
+[ "$(find "$home/state/.discord-bot-service" -type f -name 'reconnect.invalid.*.json' | wc -l | tr -d ' ')" -eq 1 ] \
+  || fail "concurrent recovery did not preserve exactly one invalid source artifact"
+quarantine=$(find "$home/state/.discord-bot-service" -type f -name 'reconnect.invalid.*.json' -print)
+[ "$(jq -r .invalid "$quarantine")" = concurrent-artifact ] \
+  || fail "concurrent recovery lost the invalid source artifact"
+[ "$(path_mode "$quarantine")" = 600 ] \
+  || fail "concurrent recovery weakened quarantine privacy"
+assert_absent "$home/state/.discord-bot-service/reconnect.json" \
+  "concurrent recovery left invalid reconnect state active"
+pass "concurrent reconnect recovery preserves one private quarantine"
+
 # A terminal Gateway close also stops after one connection, even when READY never occurred.
 home=$(new_home gateway-terminal-close)
 write_config "$home"
@@ -1907,6 +1942,38 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 [ "$(jq -r .code "$home/state/discord-bot.error")" = authentication-rejected ] \
   || fail "terminal Gateway close published the wrong safe diagnostic"
 pass "terminal Gateway close performs no reconnect"
+
+home=$(new_home gateway-terminal-missing-selected-state)
+write_config "$home"
+custom_state="$home/selected-state"
+mkdir "$custom_state"
+chmod 700 "$custom_state"
+make_gateway_server "$home/gateway" terminal-auth-close-on-signal
+FM_HOME="$home" FM_STATE_OVERRIDE="$custom_state" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_DISCORD_TEST_MODE=1 FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_RECONCILE_MS=20 "$CONTROL" run > "$home/first.log" 2>&1 &
+terminal_worker=$!
+WORKER_PIDS+=("$terminal_worker")
+wait_for_file "$home/gateway/terminal-ready" \
+  || fail "terminal state-removal fixture did not connect"
+rm -rf "$custom_state"
+touch "$home/gateway/release-terminal"
+wait "$terminal_worker" || fail "missing selected state made terminal shutdown retryable"
+WORKER_PIDS=()
+[ "$(cat "$home/gateway/lookups")" -eq 1 ] \
+  || fail "missing selected state caused a terminal reconnect"
+[ "$(jq -r .code "$home/state/.discord-bot-service/terminal.json")" = authentication-rejected ] \
+  || fail "canonical terminal suppression depended on the missing selected state"
+mkdir "$home/alternate-state"
+chmod 700 "$home/alternate-state"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/alternate-state" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_DISCORD_TEST_MODE=1 FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  "$CONTROL" run > "$home/second.log" 2>&1
+[ "$(cat "$home/gateway/lookups")" -eq 1 ] \
+  || fail "alternate state override bypassed canonical terminal suppression"
+assert_not_contains "$(cat "$home/first.log")$(cat "$home/second.log")" "$TOKEN" \
+  "missing selected state terminal suppression exposed the bot token"
+pass "canonical terminal suppression survives selected state removal"
 
 home=$(new_home gateway-diagnostic-persistence)
 write_config "$home"

@@ -245,7 +245,7 @@ async function requireGatewayOwnership() {
   if (resolve(dirname(lock), await readlink(lock)) !== ownerTarget) {
     throw new ConfigError("Gateway ownership lease changed during handoff");
   }
-  await atomicReplacePrivate(readyFile, `${process.pid}\n${ready[1]}\n`);
+  await atomicReplaceOwnershipPrivate(readyFile, `${process.pid}\n${ready[1]}\n`);
   await replaceLeasePid(pidFile, String(process.pid));
   if (resolve(dirname(lock), await readlink(lock)) !== ownerTarget
       || (await readFile(pidFile, "utf8")).trim() !== String(process.pid)) {
@@ -267,9 +267,9 @@ async function releaseGatewayOwnership(lease) {
   await rm(lease.ownerTarget, { recursive: false }).catch(() => {});
 }
 
-async function atomicReplacePrivate(path, content) {
+async function replacePrivateFile(path, content, prepareParent) {
   const parent = dirname(path);
-  await ensureStateRoot();
+  await prepareParent();
   await assertPlainDirectory(parent);
   const temp = join(parent, `.${path.split("/").pop()}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`);
   const handle = await open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
@@ -294,27 +294,42 @@ async function atomicReplacePrivate(path, content) {
   }
 }
 
+async function atomicReplacePrivate(path, content) {
+  await replacePrivateFile(path, content, ensureStateRoot);
+}
+
+async function atomicReplaceOwnershipPrivate(path, content) {
+  if (dirname(path) !== OWNERSHIP_DIR) throw new ConfigError("invalid ownership artifact path");
+  await replacePrivateFile(path, content, ensureOwnershipDirectory);
+}
+
 async function quarantineInvalidReconnectState() {
-  await assertPrivateFile(RECONNECT_FILE);
+  await ensureOwnershipDirectory();
+  try {
+    await assertPrivateFile(RECONNECT_FILE);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
   for (;;) {
     const quarantineFile = join(
       OWNERSHIP_DIR,
       `reconnect.invalid.${randomBytes(16).toString("hex")}.json`,
     );
     try {
-      await link(RECONNECT_FILE, quarantineFile);
+      await lstat(quarantineFile);
+      continue;
     } catch (error) {
-      if (error?.code === "EEXIST") continue;
-      throw error;
+      if (error?.code !== "ENOENT") throw error;
     }
     try {
-      await unlink(RECONNECT_FILE);
-      await assertPrivateFile(quarantineFile);
-      return;
+      await rename(RECONNECT_FILE, quarantineFile);
     } catch (error) {
-      await unlink(quarantineFile).catch(() => {});
+      if (error?.code === "ENOENT") return false;
       throw error;
     }
+    await assertPrivateFile(quarantineFile);
+    return true;
   }
 }
 
@@ -1037,7 +1052,7 @@ async function writeTerminalSuppression(config, code) {
   if (TEST_MODE && process.env.FM_DISCORD_TEST_TERMINAL_WRITE_FAILURE === "1") {
     throw new Error("injected terminal state failure");
   }
-  await atomicReplacePrivate(TERMINAL_FILE, `${JSON.stringify({
+  await atomicReplaceOwnershipPrivate(TERMINAL_FILE, `${JSON.stringify({
     schema: "firstmate.discord-terminal.v2",
     code,
     authentication_fingerprint: authenticationFingerprint(config),
@@ -1235,7 +1250,7 @@ class GatewayRunner {
       if (TEST_MODE && Number(process.env.FM_DISCORD_TEST_DURABLE_WRITE_FAIL_AT) === writeNumber) {
         throw new Error("injected reconnect state failure");
       }
-      await atomicReplacePrivate(RECONNECT_FILE, content);
+      await atomicReplaceOwnershipPrivate(RECONNECT_FILE, content);
       if (TEST_MODE && process.env.FM_DISCORD_TEST_DURABLE_WRITE_LOG === "1") {
         const log = await open(join(STATE, "discord-bot.durable-writes"), "a", 0o600);
         try {
@@ -1265,7 +1280,7 @@ class GatewayRunner {
         return;
       }
       const deadlineActive = !terminal && this.serverNotBefore !== null && this.serverWaitMs !== null;
-      await atomicReplacePrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
+      await atomicReplaceOwnershipPrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
         schema: "firstmate.discord-reconnect-suppression.v1",
         authentication_fingerprint: fingerprint,
         server_not_before: deadlineActive ? this.serverNotBefore : null,
