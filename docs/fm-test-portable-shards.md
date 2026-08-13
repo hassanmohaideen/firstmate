@@ -88,7 +88,9 @@ Focused before/after measurements retained from the optimization work are:
 | `tests/fm-backend-herdr-presentation-e2e.test.sh` | ~269.6 s | ~238.9 s |
 | `tests/fm-pr-check-security.test.sh` | ~268.8 s | ~194.2 s |
 
-The required real-Herdr baselines came from successful run `31650453019`'s `fm-test-timing-herdr` artifact on 2026-08-12. Every script completed its genuine live path in a non-default named lab with functional success and the default-session fleet tripwire intact. The generated lab helper used by that run is byte-identical to `/Users/hassanmohaideen/.hassanmohaideen-agent-workspace/bin/fm-herdr-lab.sh` (SHA-256 `3aadae228853e3f8a91199b116b816f18d91df844f1e7bf22b3b6105044ef6d6`). Focus-flash was measured separately on 2026-08-13 on macOS aarch64 with Herdr 0.8.0 protocol 19 through that named helper path.
+Successful run [`31650453019`](https://github.com/hassanmohaideen/firstmate/actions/runs/31650453019) supplied the 2026-08-12 `fm-test-timing-herdr` baselines below except for focus-flash and presentation E2E. Its presentation E2E result was 228,569 ms, not the 238,900 ms focused result in the optimization summary. The raw artifact for that focused result was not retained, so it is not used as a budget baseline.
+
+Presentation E2E was remeasured twice on 2026-08-13 through `/Users/hassanmohaideen/.hassanmohaideen-agent-workspace/bin/fm-herdr-lab.sh` (SHA-256 `3aadae228853e3f8a91199b116b816f18d91df844f1e7bf22b3b6105044ef6d6`) with Herdr 0.8.0 and Treehouse 2.1.1. Both genuine non-default lab runs completed every functional assertion and the default-session tripwire in [261,092 ms](verification/fm-test-timing-herdr-presentation-e2e-2026-08-13.json) and [260,721 ms](verification/fm-test-timing-herdr-presentation-e2e-2026-08-13-rerun.json); the latest result is the budget baseline. Focus-flash was measured separately on macOS aarch64 with Herdr 0.8.0 protocol 19 through the same named helper path.
 
 | Script | Measured live-path baseline |
 |---|---:|
@@ -98,7 +100,7 @@ The required real-Herdr baselines came from successful run `31650453019`'s `fm-t
 | `tests/fm-backend-herdr-eventwait-smoke.test.sh` | 1,703 ms |
 | `tests/fm-backend-herdr-focus-flash-e2e.test.sh` | 3,760 ms |
 | `tests/fm-backend-herdr-launcher-workspace-e2e.test.sh` | 33,330 ms |
-| `tests/fm-backend-herdr-presentation-e2e.test.sh` | 238,900 ms |
+| `tests/fm-backend-herdr-presentation-e2e.test.sh` | 260,721 ms |
 | `tests/fm-backend-herdr-prune-safety-e2e.test.sh` | 6,385 ms |
 | `tests/fm-backend-herdr-respawn-idem-e2e.test.sh` | 2,222 ms |
 | `tests/fm-backend-herdr-smoke.test.sh` | 4,699 ms |

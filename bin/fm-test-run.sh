@@ -517,7 +517,7 @@ tests/fm-backend-herdr-workspace-per-home-e2e.test.sh 15487
 tests/fm-control-herdr-smoke.test.sh 5821
 tests/fm-herdr-session-cleanup-e2e.test.sh 2047
 tests/fm-backend-herdr-focus-flash-e2e.test.sh 3760
-tests/fm-backend-herdr-presentation-e2e.test.sh 238900
+tests/fm-backend-herdr-presentation-e2e.test.sh 260721
 EOF
 }
 
