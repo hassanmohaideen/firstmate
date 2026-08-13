@@ -929,11 +929,11 @@ SH
     || fail "long Herdr duration did not use its measured budget"
 
   rm -f "$tmp/clock"
-  FAKE_DURATION_MS=60000 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
+  FAKE_DURATION_MS=17520 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
     tests/fm-backend-herdr-focus-flash-e2e.test.sh > "$tmp/focus.out" 2> "$tmp/focus.err" \
-    || fail "live focus-flash duration used its portable gate-skip budget"
+    || fail "measured focus-flash budget rejected its inclusive boundary"
   grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 mode=enforce' "$tmp/focus.out" \
-    || fail "focus-flash duration did not use its real-Herdr baseline"
+    || fail "focus-flash duration did not use its measured real-Herdr budget"
   rm -rf "$tmp"
   pass "duration budgets warn locally and enforce every required CI script"
 }

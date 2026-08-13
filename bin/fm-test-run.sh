@@ -467,7 +467,7 @@ EOF
 real_herdr_duration_hints() {
   cat <<'EOF'
 tests/fm-afk-inject-herdr-e2e.test.sh 65000
-tests/fm-backend-herdr-focus-flash-e2e.test.sh 60000
+tests/fm-backend-herdr-focus-flash-e2e.test.sh 3760
 tests/fm-backend-herdr-presentation-e2e.test.sh 238900
 EOF
 }
