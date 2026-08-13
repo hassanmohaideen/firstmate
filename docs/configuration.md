@@ -405,7 +405,7 @@ Ordinary task cleanup refuses while the binding remains; only a successful exact
 This binding neither changes task lifecycle nor shares the Relay `x_request=` vocabulary.
 
 Production networking follows the fixed Discord endpoint policy and safety rationale owned by [`architecture.md`](architecture.md#optional-self-hosted-discord).
-The only alternate endpoint inputs are `FM_DISCORD_TEST_*` seams that the runtime refuses unless `FM_DISCORD_TEST_MODE=1`; they exist solely for hermetic executable tests and are not supported operator configuration.
+The only alternate endpoint inputs are `FM_DISCORD_TEST_*` seams that the runtime ignores unless `FM_DISCORD_TEST_MODE=1`; they exist solely for hermetic executable tests and are not supported operator configuration.
 
 ## Relay (.env)
 
