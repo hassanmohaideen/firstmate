@@ -933,13 +933,34 @@ function authenticationFingerprint(config) {
   return createHash("sha256").update(config.token).digest("hex");
 }
 
-function rebootWaitRemaining(waitMilliseconds, wallDeadline, wallObservedAt, now = Date.now()) {
+function rebootWaitRemaining(
+  waitMilliseconds, wallDeadline, wallObservedAt, evidenceEstablished, now = Date.now(),
+) {
   const observedAt = Number.isSafeInteger(wallObservedAt)
     ? wallObservedAt
     : Math.max(0, wallDeadline - waitMilliseconds);
-  const elapsed = now - observedAt;
-  if (elapsed < 0 || elapsed > 60_000) return waitMilliseconds;
-  return Math.max(0, waitMilliseconds - elapsed);
+  const elapsed = Math.max(0, now - observedAt);
+  if (!evidenceEstablished) return waitMilliseconds;
+  const maximumTrustedProgress = Math.max(1, Math.floor(waitMilliseconds / 2));
+  const corroboratedProgress = Math.floor(elapsed / 2);
+  return Math.max(0, waitMilliseconds - Math.min(corroboratedProgress, maximumTrustedProgress));
+}
+
+function simulateRebootWaitPolicy(input) {
+  let remaining = Number(input.remaining_ms);
+  const deadline = Number(input.deadline_ms);
+  let observedAt = Number(input.observed_at_ms);
+  let evidenceEstablished = Boolean(input.evidence_established);
+  const remainingAfterObservations = [];
+  for (const now of input.reboot_observations_ms || []) {
+    remaining = rebootWaitRemaining(
+      remaining, deadline, observedAt, evidenceEstablished, Number(now),
+    );
+    evidenceEstablished = true;
+    observedAt = Math.max(observedAt, Number(now));
+    remainingAfterObservations.push(remaining);
+  }
+  return { remaining_ms: remaining, remaining_after_observations: remainingAfterObservations };
 }
 
 function validFallbackSuppression(record) {
@@ -1314,11 +1335,14 @@ class GatewayRunner {
         && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
       const now = Date.now();
       this.serverWaitMs = rebootWaitRemaining(
-        this.serverWaitMs, this.serverNotBefore, this.serverWallObservedAt, now,
+        this.serverWaitMs,
+        this.serverNotBefore,
+        this.serverWallObservedAt,
+        this.serverRebootFallbackUsed,
+        now,
       );
       this.serverRebootFallbackUsed = true;
-      this.serverWallObservedAt = now;
-      this.serverNotBefore = now + this.serverWaitMs;
+      this.serverWallObservedAt = Math.max(this.serverWallObservedAt, now);
       this.serverBootId = this.bootId;
       this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
       stateNeedsRebase = true;
@@ -1349,20 +1373,21 @@ class GatewayRunner {
             suppression.server_wait_ms,
             suppression.server_not_before,
             suppression.server_wall_observed_at,
+            fallbackPreviouslyUsed,
             now,
           );
-        const fallbackNotBefore = now + fallbackRemaining;
         const currentRemaining = this.serverDelayRemaining();
         if (fallbackRemaining > currentRemaining) {
           this.serverWaitMs = fallbackRemaining;
-          this.serverNotBefore = fallbackNotBefore;
+          this.serverNotBefore = suppression.server_not_before;
+          this.serverWallObservedAt = suppression.server_wall_observed_at
+            ?? Math.max(0, suppression.server_not_before - suppression.server_wait_ms);
         } else {
           this.serverWaitMs = currentRemaining;
         }
         this.serverRebootFallbackUsed = this.serverRebootFallbackUsed
           || fallbackPreviouslyUsed || !fallbackSameBoot;
-        this.serverWallObservedAt = now;
-        this.serverNotBefore = now + this.serverWaitMs;
+        this.serverWallObservedAt = Math.max(this.serverWallObservedAt, now);
         this.serverBootId = this.bootId;
         this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
         this.fallbackSuppressionActive = true;
@@ -1469,11 +1494,7 @@ class GatewayRunner {
       this.serverWaitMs = checkpointRemaining;
       this.serverBootId = this.bootId;
       this.serverMonotonicNotBefore = monotonicMilliseconds() + checkpointRemaining;
-      this.serverWallObservedAt = Date.now();
-      this.serverNotBefore = Math.max(
-        this.serverNotBefore,
-        this.serverWallObservedAt + checkpointRemaining,
-      );
+      this.serverWallObservedAt = Math.max(this.serverWallObservedAt, Date.now());
       if (!await this.persistDurableStateOrStop()) return false;
       if (this.fallbackSuppressionActive) {
         try {
@@ -2117,6 +2138,14 @@ async function main() {
       if (!fixtureFile || args.length) throw new ConfigError("test reconnect-policy requires one fixture file");
       const fixture = JSON.parse(await readFile(fixtureFile, "utf8"));
       process.stdout.write(`${JSON.stringify(simulateReconnectPolicy(fixture))}\n`);
+      return;
+    }
+    case "reboot-wait-policy": {
+      if (!TEST_MODE) throw new ConfigError("reboot-wait-policy is available only in hermetic test mode");
+      const fixtureFile = args.shift() || "";
+      if (!fixtureFile || args.length) throw new ConfigError("test reboot-wait-policy requires one fixture file");
+      const fixture = JSON.parse(await readFile(fixtureFile, "utf8"));
+      process.stdout.write(`${JSON.stringify(simulateRebootWaitPolicy(fixture))}\n`);
       return;
     }
     case "ingest": {

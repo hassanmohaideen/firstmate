@@ -797,6 +797,20 @@ low=$(jq -r '.delays[0]' "$home/jitter-0.out")
 high=$(jq -r '.delays[0]' "$home/jitter-1.out")
 [ "$low" -ge 2500 ] && [ "$high" -le 5000 ] && [ "$low" -lt "$high" ] \
   || fail "retry jitter was absent or outside its bounded delay: low=$low high=$high"
+cat > "$home/forward-clock.json" <<'JSON'
+{"remaining_ms":30000,"deadline_ms":30000,"observed_at_ms":0,"reboot_observations_ms":[30000,20000]}
+JSON
+forward_clock=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  "$NODE_BIN" "$BOT" reboot-wait-policy "$home/forward-clock.json")
+[ "$(printf '%s' "$forward_clock" | jq -r .remaining_ms)" -eq 30000 ] \
+  || fail "an immediate 30-second wall jump consumed the server minimum: $forward_clock"
+cat > "$home/long-reboots.json" <<'JSON'
+{"remaining_ms":8000,"deadline_ms":8000,"observed_at_ms":0,"reboot_observations_ms":[61000,122000,183000,244000,305000]}
+JSON
+long_reboots=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  "$NODE_BIN" "$BOT" reboot-wait-policy "$home/long-reboots.json")
+[ "$(printf '%s' "$long_reboots" | jq -r .remaining_ms)" -eq 500 ] \
+  || fail "widely spaced reboot evidence replenished the durable server wait: $long_reboots"
 pass "reconnect policy retains READY failure pressure, resets only after stability, and applies bounded jitter"
 
 # A real local Gateway cannot turn rapid successful handshakes into a storm.
