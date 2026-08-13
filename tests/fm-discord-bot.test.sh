@@ -224,9 +224,10 @@ const server=http.createServer((req,res)=>{
     fs.appendFileSync(lookupEventFile,JSON.stringify({lookup:lookups,at:Date.now()})+"\n");
     if (mode === "auth-fail") { res.writeHead(401); res.end("{}"); return; }
     if (mode === "lookup-fail-once" && lookups === 1) { res.writeHead(500); res.end("{}"); return; }
-    if (mode === "rate-limit") {
-      res.writeHead(429,{"content-type":"application/json","retry-after":"0.18"});
-      res.end(JSON.stringify({retry_after:0.18})); return;
+    if (mode === "rate-limit" || (mode === "rate-limit-once" && lookups === 1)) {
+      const retryAfter=mode === "rate-limit-once" ? 0.45 : 0.18;
+      res.writeHead(429,{"content-type":"application/json","retry-after":String(retryAfter)});
+      res.end(JSON.stringify({retry_after:retryAfter})); return;
     }
     const url=`ws://127.0.0.1:${server.address().port}`;
     const resetAfter=Math.max(0,sessionResetAt-Date.now());
@@ -874,6 +875,50 @@ kill -TERM "$rate_worker"
 wait "$rate_worker" || true
 WORKER_PIDS=()
 pass "Gateway lookup rate limits preserve server-provided retry direction"
+
+home=$(new_home gateway-rate-limit-restart)
+write_config "$home"
+make_gateway_server "$home/gateway" rate-limit-once
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_MAX_BACKOFF_MS=20 FM_DISCORD_TEST_RANDOM=0.5 \
+  "$CONTROL" run > "$home/first.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "restart rate-limit fixture did not receive its first lookup"
+i=0
+server_not_before=0
+while [ "$i" -lt 100 ]; do
+  server_not_before=$(jq -r '.server_not_before // 0' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf '0')
+  [ "$server_not_before" -gt 0 ] 2>/dev/null && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ "$server_not_before" -gt 0 ] 2>/dev/null \
+  || fail "server retry deadline was not durably recorded"
+rate_child=$(pgrep -P "$rate_worker" | head -n 1)
+[ -n "$rate_child" ] || fail "restart rate-limit fixture had no runtime process"
+kill -KILL "$rate_child"
+wait "$rate_worker" 2>/dev/null || true
+WORKER_PIDS=()
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_MAX_BACKOFF_MS=20 FM_DISCORD_TEST_RANDOM=0.5 \
+  "$CONTROL" run > "$home/second.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 2 || fail "restarted rate-limited Gateway lookup did not resume"
+second_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+[ "$second_lookup" -ge "$server_not_before" ] \
+  || fail "process restart bypassed the durable server retry deadline"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+reconnect_record=$(cat "$home/state/.discord-bot-service/reconnect.json")
+assert_not_contains "$reconnect_record" "$TOKEN" "durable server retry state exposed the bot token"
+assert_not_contains "$reconnect_record" "$OWNER" "durable server retry state exposed a deployment id"
+pass "server retry deadlines survive abrupt process and service-manager restarts"
 
 home=$(new_home gateway-stable-recovery)
 write_config "$home"

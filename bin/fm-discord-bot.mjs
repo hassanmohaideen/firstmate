@@ -872,6 +872,7 @@ class GatewayRunner {
     this.selfUserId = "";
     this.failurePressure = 0;
     this.lastConnectionAt = null;
+    this.serverNotBefore = null;
     this.sessionStartLimit = null;
     this.durableTransitions = Promise.resolve();
     this.connected = false;
@@ -917,6 +918,7 @@ class GatewayRunner {
       authentication_fingerprint: authenticationFingerprint(this.config),
       failure_pressure: this.failurePressure,
       last_connection_at: this.lastConnectionAt,
+      server_not_before: this.serverNotBefore,
       session_start_limit: this.sessionStartLimit,
     };
   }
@@ -945,7 +947,9 @@ class GatewayRunner {
         || (!legacy && !INCIDENT_ID_RE.test(record.authentication_fingerprint || ""))
         || !Number.isInteger(record.failure_pressure) || record.failure_pressure < 0
         || (record.last_connection_at !== null
-          && (!Number.isInteger(record.last_connection_at) || record.last_connection_at < 0))
+          && (!Number.isSafeInteger(record.last_connection_at) || record.last_connection_at < 0))
+        || (record.server_not_before !== undefined && record.server_not_before !== null
+          && (!Number.isSafeInteger(record.server_not_before) || record.server_not_before < 0))
         || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
           || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
           || !Number.isInteger(limit.resetAt) || limit.resetAt < 0)))) {
@@ -953,6 +957,7 @@ class GatewayRunner {
     }
     this.failurePressure = record?.failure_pressure || 0;
     this.lastConnectionAt = record?.last_connection_at ?? null;
+    this.serverNotBefore = record?.server_not_before ?? null;
     this.sessionStartLimit = authenticationBound ? limit : null;
     if (!record || legacy || !authenticationBound) await this.persistDurableState();
   }
@@ -986,7 +991,17 @@ class GatewayRunner {
     return true;
   }
 
-  reconnectDelay(serverDelayMs = 0) {
+  serverDelayRemaining() {
+    return this.serverNotBefore === null ? 0 : Math.max(0, this.serverNotBefore - Date.now());
+  }
+
+  retainServerDelay(milliseconds) {
+    if (!Number.isFinite(milliseconds) || milliseconds <= 0) return;
+    const deadline = Math.min(Number.MAX_SAFE_INTEGER, Date.now() + Math.ceil(milliseconds));
+    this.serverNotBefore = Math.max(this.serverNotBefore || 0, deadline);
+  }
+
+  reconnectDelay(serverDelayMs = this.serverDelayRemaining()) {
     return reconnectDelayMilliseconds({
       pressure: this.failurePressure,
       random: randomFraction(),
@@ -1216,8 +1231,14 @@ class GatewayRunner {
     }, RECONCILE_INTERVAL_MS);
     reconcileTimer.unref?.();
     safeLog("service started");
-    if (this.failurePressure > 0) await this.waitForReconnect(this.reconnectDelay());
+    if (this.failurePressure > 0 || this.serverDelayRemaining() > 0) {
+      await this.waitForReconnect(this.reconnectDelay());
+    }
     while (!this.stopping) {
+      if (this.serverDelayRemaining() > 0) {
+        await this.waitForReconnect(this.serverDelayRemaining());
+        if (this.stopping) break;
+      }
       let gateway;
       try {
         gateway = this.resumeUrl
@@ -1235,8 +1256,9 @@ class GatewayRunner {
         }
         await reportDiagnostic("discord-api-unavailable");
         this.failurePressure += 1;
+        if (error instanceof DiscordHttpError) this.retainServerDelay(error.retryAfterMs);
         await this.persistDurableState();
-        await this.waitForReconnect(this.reconnectDelay(error instanceof DiscordHttpError ? error.retryAfterMs : 0));
+        await this.waitForReconnect(this.reconnectDelay());
         continue;
       }
       if (!this.sessionId && !await this.reserveIdentify()) break;
