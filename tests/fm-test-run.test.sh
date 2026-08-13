@@ -805,10 +805,23 @@ SH
 }
 
 test_environment_isolation_in_serial_and_parallel_children() {
-  local tmp repo evidence runner name
+  local tmp repo evidence runner fakebin name
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-env.XXXXXX")
-  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
-  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
+  repo="$tmp/repo"; evidence="$tmp/evidence"; fakebin="$tmp/fakebin"
+  mkdir -p "$repo/bin" "$repo/tests" "$evidence" "$fakebin"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  cp "$ROOT/bin/fm-backend.sh" "$repo/bin/fm-backend.sh"
+  runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
+  printf '#!/bin/sh\necho Darwin\n' > "$fakebin/uname"
+  printf '#!/bin/sh\nexit 0\n' > "$fakebin/lsappinfo"
+  cat > "$fakebin/ps" <<'SH'
+#!/bin/sh
+case "${2:-}" in
+  comm=) printf '%s\n' '/Applications/cmux.app/Contents/MacOS/cmux' ;;
+  ppid=) printf '%s\n' 1 ;;
+esac
+SH
+  chmod +x "$fakebin/uname" "$fakebin/lsappinfo" "$fakebin/ps"
   for name in fm-brief fm-daemon; do
     cat > "$repo/tests/$name.test.sh" <<'SH'
 #!/usr/bin/env bash
@@ -818,6 +831,11 @@ for key in FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE FM_PROJEC
   eval "value=\${$key-}"
   [ -z "$value" ] || exit 9
 done
+root=$(cd "$(dirname "$0")/.." && pwd)
+. "$root/bin/fm-backend.sh"
+if PATH="$ENV_FAKEBIN:$PATH" fm_backend_detect >/dev/null; then
+  exit 10
+fi
 touch "$ENV_EVIDENCE/$(basename "$0").isolated"
 SH
     chmod +x "$repo/tests/$name.test.sh"
@@ -828,7 +846,8 @@ SH
     HERDR_SOCKET_PATH=poison HERDR_PANE_ID=poison CMUX_WORKSPACE_ID=poison \
     CMUX_SURFACE_ID=poison CMUX_SOCKET_PATH=poison CMUX_TAB_ID=poison \
     CMUX_PANEL_ID=poison __CFBundleIdentifier=com.cmuxterm.app \
-    ENV_EVIDENCE="$evidence" "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
+    ENV_EVIDENCE="$evidence" ENV_FAKEBIN="$fakebin" \
+    "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
     || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "isolated environment fixture failed"; }
   [ -e "$evidence/fm-brief.test.sh.isolated" ] \
     || fail "parallel child did not observe an isolated fleet environment"
@@ -854,6 +873,10 @@ SH
   cat > "$repo/tests/fm-afk-inject-herdr-e2e.test.sh" <<'SH'
 #!/usr/bin/env bash
 echo "ok - long measured Herdr fixture"
+SH
+  cat > "$repo/tests/fm-backend-herdr-focus-flash-e2e.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo "ok - measured focus-flash fixture"
 SH
   chmod +x "$repo"/tests/*.test.sh
   real_python=$(command -v python3)
@@ -904,6 +927,13 @@ SH
     || fail "measured long Herdr duration was rejected by the default fallback budget"
   grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 mode=enforce' "$tmp/herdr.out" \
     || fail "long Herdr duration did not use its measured budget"
+
+  rm -f "$tmp/clock"
+  FAKE_DURATION_MS=60000 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
+    tests/fm-backend-herdr-focus-flash-e2e.test.sh > "$tmp/focus.out" 2> "$tmp/focus.err" \
+    || fail "live focus-flash duration used its portable gate-skip budget"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 mode=enforce' "$tmp/focus.out" \
+    || fail "focus-flash duration did not use its real-Herdr baseline"
   rm -rf "$tmp"
   pass "duration budgets warn locally and enforce every required CI script"
 }

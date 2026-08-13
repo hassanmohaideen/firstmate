@@ -396,7 +396,6 @@ tests/fm-afk-return.test.sh 1105
 tests/fm-ask-user-authority.test.sh 68
 tests/fm-backend-cmux-smoke.test.sh 29
 tests/fm-backend-cmux.test.sh 2349
-tests/fm-backend-herdr-focus-flash-e2e.test.sh 21
 tests/fm-backend-orca.test.sh 12041
 tests/fm-backend-tmux-smoke.test.sh 314
 tests/fm-backend-zellij-smoke.test.sh 21
@@ -468,6 +467,7 @@ EOF
 real_herdr_duration_hints() {
   cat <<'EOF'
 tests/fm-afk-inject-herdr-e2e.test.sh 65000
+tests/fm-backend-herdr-focus-flash-e2e.test.sh 60000
 tests/fm-backend-herdr-presentation-e2e.test.sh 238900
 EOF
 }
@@ -1776,6 +1776,7 @@ clear_ambient_fleet_environment() {
     TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH HERDR_PANE_ID \
     CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID \
     __CFBundleIdentifier 2>/dev/null || true
+  export FM_BACKEND_DISABLE_CMUX_FALLBACK=1
 }
 
 run_one_serial() {
