@@ -481,8 +481,8 @@ tests/fm-secondmate-safety.test.sh 24432
 tests/fm-secondmate-sync.test.sh 12289
 tests/fm-send-secondmate-marker-herdr-e2e.test.sh 27
 tests/fm-send-secondmate-marker.test.sh 2136
-tests/fm-session-start.test.sh 37289
-tests/fm-sessionstart-nudge.test.sh 264
+tests/fm-session-start.test.sh 128810
+tests/fm-sessionstart-nudge.test.sh 27570
 tests/fm-sessionstart-instruction-refresh-live-e2e.test.sh 19
 tests/fm-shared-captain-inheritance.test.sh 3506
 tests/fm-spawn-dispatch-profile.test.sh 41351
@@ -498,7 +498,7 @@ tests/fm-turnend-guard.test.sh 5986
 tests/fm-update.test.sh 1894
 tests/fm-vendor-auth-probe.test.sh 42796
 tests/fm-wake-daemon-lifecycle-e2e.test.sh 4284
-tests/fm-wake-queue.test.sh 22787
+tests/fm-wake-queue.test.sh 57567
 tests/fm-watch-checkpoint.test.sh 3943
 tests/fm-watch-triage.test.sh 113051
 tests/fm-watcher-lock.test.sh 98342
