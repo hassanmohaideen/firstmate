@@ -201,13 +201,13 @@ test_empty_selection_emits_summary() {
   printf 'documentation only\n' >"$repo/README.md"
   out=$(cd "$repo" && bin/fm-test-run.sh --changed --base HEAD --json "$tmp/artifacts/timing.json" 2>"$tmp/err") \
     || fail "empty valid changed selection must pass"
-  [ "$out" = "FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0" ] \
+  [ "$out" = "$(printf 'FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0\nFM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 mode=warn')" ] \
     || fail "empty selection summary is missing or non-deterministic: $out"
   json="$tmp/artifacts/timing.json"
   python3 -c '
 import json, sys
 doc = json.load(open(sys.argv[1]))
-assert doc["summary"] == {"duration_ms": 0, "failed": 0, "skipped_gate": 0, "total": 0}
+assert doc["summary"] == {"duration_budget_exceeded": 0, "duration_ms": 0, "failed": 0, "skipped_gate": 0, "total": 0}
 assert doc["scripts"] == []
 assert doc["families"] == []
 ' "$json" || { rm -rf "$tmp"; fail "empty selection JSON summary is wrong"; }
@@ -638,6 +638,197 @@ SH
   pass "jobs scheduler runs proven scripts; failure propagates; non-proven refused"
 }
 
+test_default_changed_and_portable_selection() {
+  local tmp repo explicit implicit portable all herdr
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-defaults.XXXXXX")
+  repo="$tmp/repo"
+  init_changed_fixture_repo "$repo"
+  printf '\n' >> "$repo/tests/fm-brief.test.sh"
+  explicit=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
+  implicit=$(cd "$repo" && bin/fm-test-run.sh --list --base HEAD)
+  [ "$implicit" = "$explicit" ] || fail "no-mode default diverged from conservative --changed selection"
+  [ "$implicit" = tests/fm-brief.test.sh ] || fail "default changed selection was not focused: $implicit"
+
+  portable=$($RUNNER --list --portable | LC_ALL=C sort)
+  all=$($RUNNER --list --all | LC_ALL=C sort)
+  herdr=$($RUNNER --list --family real-herdr-gated | LC_ALL=C sort)
+  [ -n "$portable" ] && [ -n "$herdr" ] || fail "portable or Herdr selection was empty"
+  [ "$(comm -12 <(printf '%s\n' "$portable") <(printf '%s\n' "$herdr"))" = "" ] \
+    || fail "routine portable selection included real-Herdr integration"
+  [ "$(printf '%s\n%s\n' "$portable" "$herdr" | LC_ALL=C sort -u)" = "$all" ] \
+    || fail "portable plus required Herdr path must equal complete --all selection"
+  rm -rf "$tmp"
+  pass "defaults favor changed selection and portable complete excludes required Herdr ownership"
+}
+
+make_mixed_runner_fixture() { # <repo> <evidence>
+  local repo=$1 evidence=$2 script
+  mkdir -p "$repo/bin" "$repo/tests" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  chmod +x "$repo/bin/fm-test-run.sh"
+  for script in fm-brief.test.sh fm-composer-lib.test.sh; do
+    cat > "$repo/tests/$script" <<'SH'
+#!/usr/bin/env bash
+name=$(basename "$0" .test.sh)
+touch "$MIXED_EVIDENCE/$name.started"
+other=fm-brief
+[ "$name" = fm-brief ] && other=fm-composer-lib
+n=0
+while [ ! -e "$MIXED_EVIDENCE/$other.started" ] && [ "$n" -lt 200 ]; do
+  sleep 0.01
+  n=$((n + 1))
+done
+[ -e "$MIXED_EVIDENCE/$other.started" ] || exit 9
+printf '%s\n' "$name" >> "$MIXED_EVIDENCE/counts"
+touch "$MIXED_EVIDENCE/$name.done"
+echo "ok - $name"
+SH
+  done
+  cat > "$repo/tests/fm-daemon.test.sh" <<'SH'
+#!/usr/bin/env bash
+[ -e "$MIXED_EVIDENCE/fm-brief.done" ] || exit 8
+[ -e "$MIXED_EVIDENCE/fm-composer-lib.done" ] || exit 8
+printf '%s\n' fm-daemon >> "$MIXED_EVIDENCE/counts"
+if [ "${MIXED_SERIAL_FAIL:-0}" = 1 ]; then
+  echo "not ok - serial failure"
+  exit 1
+fi
+if [ "${MIXED_SERIAL_SKIP:-0}" = 1 ]; then
+  echo "skip: optional mixed fixture"
+  exit 0
+fi
+echo "ok - serial"
+SH
+  cat > "$repo/tests/fm-backend-herdr-smoke.test.sh" <<'SH'
+#!/usr/bin/env bash
+touch "$MIXED_EVIDENCE/herdr-ran"
+exit 0
+SH
+  chmod +x "$repo"/tests/*.test.sh
+}
+
+test_mixed_complete_scheduler_exact_once_and_failures() {
+  local tmp repo evidence runner rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-mixed.XXXXXX")
+  repo="$tmp/repo"
+  evidence="$tmp/evidence"
+  make_mixed_runner_fixture "$repo" "$evidence"
+  runner="$repo/bin/fm-test-run.sh"
+
+  MIXED_EVIDENCE="$evidence" "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
+    || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "mixed portable fixture failed"; }
+  [ ! -e "$evidence/herdr-ran" ] || fail "portable mixed scheduler ran real-Herdr family"
+  [ "$(LC_ALL=C sort "$evidence/counts")" = "$(printf 'fm-brief\nfm-composer-lib\nfm-daemon')" ] \
+    || fail "mixed scheduler did not run every portable script exactly once: $(cat "$evidence/counts")"
+  grep -q 'FM_TEST_SUMMARY total=3 failed=0 skipped_gate=0' "$tmp/out" \
+    || fail "mixed success summary was wrong: $(grep FM_TEST_SUMMARY "$tmp/out")"
+
+  rm -rf "$evidence"; mkdir -p "$evidence"
+  set +e
+  MIXED_EVIDENCE="$evidence" MIXED_SERIAL_FAIL=1 "$runner" --portable > "$tmp/fail.out" 2> "$tmp/fail.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "mixed serial functional failure did not propagate"
+  grep -q 'FM_TEST_SUMMARY total=3 failed=1' "$tmp/fail.out" \
+    || fail "mixed failure summary was wrong: $(grep FM_TEST_SUMMARY "$tmp/fail.out")"
+
+  rm -rf "$evidence"; mkdir -p "$evidence"
+  MIXED_EVIDENCE="$evidence" MIXED_SERIAL_SKIP=1 "$runner" --portable > "$tmp/skip.out" 2> "$tmp/skip.err" \
+    || fail "ordinary mixed gate skip should remain successful"
+  grep -q 'FM_TEST_SUMMARY total=3 failed=0 skipped_gate=1' "$tmp/skip.out" \
+    || fail "mixed gate-skip accounting was wrong: $(grep FM_TEST_SUMMARY "$tmp/skip.out")"
+  rm -rf "$tmp"
+  pass "mixed complete scheduling is parallel/serial exact-once with failure and gate-skip propagation"
+}
+
+test_parallel_signal_cleanup() {
+  local tmp repo evidence runner pid rc n script
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-signal.XXXXXX")
+  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
+  for script in fm-brief.test.sh fm-composer-lib.test.sh; do
+    cat > "$repo/tests/$script" <<'SH'
+#!/usr/bin/env bash
+name=$(basename "$0" .test.sh)
+cleanup() { touch "$SIGNAL_EVIDENCE/$name.cleaned"; exit 143; }
+trap cleanup TERM INT HUP
+touch "$SIGNAL_EVIDENCE/$name.ready"
+while :; do sleep 1; done
+SH
+    chmod +x "$repo/tests/$script"
+  done
+  SIGNAL_EVIDENCE="$evidence" "$runner" --jobs 2 \
+    tests/fm-brief.test.sh tests/fm-composer-lib.test.sh > "$tmp/out" 2> "$tmp/err" &
+  pid=$!
+  n=0
+  while { [ ! -e "$evidence/fm-brief.ready" ] || [ ! -e "$evidence/fm-composer-lib.ready" ]; } && [ "$n" -lt 300 ]; do
+    sleep 0.01
+    n=$((n + 1))
+  done
+  [ -e "$evidence/fm-brief.ready" ] && [ -e "$evidence/fm-composer-lib.ready" ] \
+    || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"; fail "parallel cleanup fixtures never started"; }
+  kill -TERM "$pid"
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "interrupted runner exited successfully"
+  n=0
+  while { [ ! -e "$evidence/fm-brief.cleaned" ] || [ ! -e "$evidence/fm-composer-lib.cleaned" ]; } && [ "$n" -lt 300 ]; do
+    sleep 0.01
+    n=$((n + 1))
+  done
+  [ -e "$evidence/fm-brief.cleaned" ] && [ -e "$evidence/fm-composer-lib.cleaned" ] \
+    || fail "interrupted runner left a parallel worker alive"
+  rm -rf "$tmp"
+  pass "parallel signal cleanup terminates and waits for every active worker"
+}
+
+test_duration_budget_warns_and_ci_enforces() {
+  local tmp repo runner fakebin real_python rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-budget.XXXXXX")
+  repo="$tmp/repo"; fakebin="$tmp/fakebin"; mkdir -p "$repo/bin" "$repo/tests" "$fakebin"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
+  cat > "$repo/tests/fm-backend-herdr.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo "ok - budget fixture"
+SH
+  chmod +x "$repo/tests/fm-backend-herdr.test.sh"
+  real_python=$(command -v python3)
+  cat > "$fakebin/python3" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = -c ] && printf '%s' "\${2:-}" | grep -Fq 'time.time()'; then
+  n=0
+  [ ! -f '$tmp/clock' ] || n=\$(cat '$tmp/clock')
+  n=\$((n + 1)); printf '%s\n' "\$n" > '$tmp/clock'
+  case "\$n" in 1|2) echo 0 ;; *) echo 200000 ;; esac
+  exit 0
+fi
+exec '$real_python' "\$@"
+SH
+  chmod +x "$fakebin/python3"
+
+  PATH="$fakebin:$PATH" "$runner" tests/fm-backend-herdr.test.sh > "$tmp/warn.out" 2> "$tmp/warn.err" \
+    || fail "local duration budget warning must not fail a functional pass"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=warn' "$tmp/warn.out" \
+    || fail "local duration budget warning summary was missing"
+  grep -q 'duration budget exceeded:' "$tmp/warn.err" || fail "duration overrun was not actionable"
+
+  rm -f "$tmp/clock"
+  set +e
+  PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
+    tests/fm-backend-herdr.test.sh > "$tmp/enforce.out" 2> "$tmp/enforce.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "CI duration budget enforcement did not fail"
+  grep -q 'FM_TEST_SUMMARY total=1 failed=0' "$tmp/enforce.out" \
+    || fail "duration enforcement hid or rewrote the functional result"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=enforce' "$tmp/enforce.out" \
+    || fail "duration enforcement summary was missing"
+  rm -rf "$tmp"
+  pass "duration budgets warn locally, enforce explicitly, and preserve functional reporting"
+}
+
 test_aggregate_json() {
   local tmp a b
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-aggjson.XXXXXX")
@@ -666,6 +857,9 @@ JSON
 JSON
   out=$("$RUNNER" --aggregate-json "$tmp/out.json" "$tmp/a.json" "$tmp/b.json")
   assert_contains "$out" "FM_TEST_AGGREGATE lanes=2 total=3 failed=1" "aggregate summary line"
+  "$RUNNER" --aggregate-json "$tmp/reversed.json" "$tmp/b.json" "$tmp/a.json" >/dev/null
+  cmp -s "$tmp/out.json" "$tmp/reversed.json" \
+    || { rm -rf "$tmp"; fail "aggregate JSON depends on input order"; }
   python3 -c '
 import json,sys
 doc=json.load(open(sys.argv[1]))
@@ -696,4 +890,8 @@ test_portable_serial_shards_partition_the_serial_lane
 test_portable_serial_shard_lane_refusals
 test_jobs_requires_proven_isolated
 test_jobs_parallel_scheduler_and_failure_propagation
+test_default_changed_and_portable_selection
+test_mixed_complete_scheduler_exact_once_and_failures
+test_parallel_signal_cleanup
+test_duration_budget_warns_and_ci_enforces
 test_aggregate_json

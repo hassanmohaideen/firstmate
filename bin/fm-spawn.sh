@@ -2717,7 +2717,8 @@ spawn_record_traceparent() {
 
 # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
 # process (go build, go test, ...) inherit it. Sent before the launch command so
-# the env is set when the agent starts; the brief sleep lets the export land.
+# the env is set when the agent starts. Herdr's ordered pane APIs need no blind
+# settle; terminal-key transports retain their established settle window.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # Send through the exact channel that already ships GOTMPDIR, so every backend
 # and harness - ship, scout, and secondmate - gets it before launch. Skipped
@@ -2736,9 +2737,9 @@ if [ -n "$SPAWN_TRACEPARENT" ]; then
     LAUNCH="unset TRACEPARENT; $LAUNCH"
   fi
 fi
-sleep 0.3
+[ "$BACKEND" = herdr ] || sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
-sleep 0.3
+[ "$BACKEND" = herdr ] || sleep 0.3
 if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   HERDR_PROJECTION_ABORT_CLEANUP=0
   spawn_herdr_presentation_order_lock_release

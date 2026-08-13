@@ -3,9 +3,11 @@
 # composition for portable CI shards, local --jobs for the proven-isolated set,
 # timing markers, and the complete-regression coverage guard.
 #
-# Selection modes (exactly one of: --all, --family, --changed, --lane,
-# --proven-isolated, or script paths):
-#   fm-test-run.sh --all
+# Selection modes (exactly one of: --portable, --all, --family, --changed,
+# --lane, --proven-isolated, or script paths):
+#   fm-test-run.sh                         (defaults to --changed --base origin/main)
+#   fm-test-run.sh --portable              (complete local portable regression)
+#   fm-test-run.sh --all                   (complete regression including real Herdr)
 #   fm-test-run.sh --family <name>
 #   fm-test-run.sh --changed [--base <git-ref>]
 #   fm-test-run.sh --lane portable-parallel-1|portable-parallel-2|portable-serial
@@ -37,11 +39,14 @@
 #                   "skip: <token>" (e.g. --fail-on-gate-skip 'herdr not found').
 #                   The required Herdr CI lane uses this so a missing pin cannot
 #                   silently pass as a gate skip.
-#   --jobs N        run the selected scripts with up to N concurrent workers.
-#                   Default is 1 (serial). N>1 is allowed only when every
-#                   selected script is in the proven-isolated set
-#                   (bin/fm-test-isolation-proof.sh --list). Cap is 8. Stateful
-#                   families never schedule under --jobs.
+#   --jobs N        run proven-isolated scripts with up to N concurrent workers.
+#                   --portable and --all default to 4 and automatically keep
+#                   every other selected script strictly serial. Other modes
+#                   default to 1 and refuse N>1 for mixed/stateful selections.
+#                   Cap is 8.
+#   --enforce-duration-budgets
+#                   fail after functional results are reported when a script
+#                   exceeds the data-driven baseline budget. The default warns.
 #   -h, --help      print this header
 #
 # Per-script machine-parseable markers (stdout):
@@ -52,6 +57,7 @@
 #   FM_TEST_SUMMARY total=<n> failed=<n> skipped_gate=<n> duration_ms=<n>
 #   FM_TEST_SUMMARY_FAMILY family=<name> count=<n> duration_ms=<n> failed=<n>
 #   FM_TEST_SLOWEST rank=<k> script=<path> duration_ms=<n>
+#   FM_TEST_BUDGET_SUMMARY checked=<n> exceeded=<n> mode=warn|enforce
 #
 # Exit status is non-zero if any selected script exits non-zero or a configured
 # --fail-on-gate-skip token appears. Other gate skips (first meaningful line
@@ -67,7 +73,10 @@
 # share a machine. This script owns <n>: a lane whose <n> disagrees with the
 # configured shard count is refused, so a CI matrix cannot silently drop a shard.
 # --changed is conservative: it over-selects related families rather than
-# under-selecting, and never expands to the complete suite unless --all.
+# under-selecting, and never expands to the complete suite.
+# --portable is the routine complete local path: it excludes real-herdr-gated
+# because the dedicated required CI lane owns that integration coverage.
+# --all remains the explicit operator path that includes that family.
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,8 +95,12 @@ JSON_PATH=
 SCRIPTS=()
 EXCLUDE_FAMILIES=()
 FAIL_ON_GATE_SKIP=
-JOBS=1
+JOBS=
+JOBS_EXPLICIT=0
 JOBS_MAX=8
+DURATION_BUDGET_MODE=warn
+DURATION_BUDGET_CHECKED=0
+DURATION_BUDGET_EXCEEDED=0
 
 # How many separate-runner shards the portable serial remainder splits into.
 # One owner: CI lane names carry this count and are refused when they disagree.
@@ -389,8 +402,8 @@ tests/fm-backend-zellij-smoke.test.sh 21
 tests/fm-backend-zellij.test.sh 4225
 tests/fm-backend.test.sh 16370
 tests/fm-backlog-handoff.test.sh 2786
-tests/fm-bearings-snapshot.test.sh 60103
-tests/fm-bootstrap.test.sh 21912
+tests/fm-bearings-snapshot.test.sh 66300
+tests/fm-bootstrap.test.sh 110200
 tests/fm-busy-adapter-wiring.test.sh 13962
 tests/fm-busy-state.test.sh 607
 tests/fm-calm-pi-extension.test.sh 203
@@ -420,7 +433,7 @@ tests/fm-playop-dispatch-live-e2e.test.sh 19
 tests/fm-procevent.test.sh 42789
 tests/fm-public-followup.test.sh 23365
 tests/fm-quota-array-dispatch-live-e2e.test.sh 19
-tests/fm-secondmate-harness.test.sh 87895
+tests/fm-secondmate-harness.test.sh 128852
 tests/fm-secondmate-lifecycle-e2e.test.sh 4929
 tests/fm-secondmate-liveness.test.sh 12553
 tests/fm-secondmate-safety.test.sh 24432
@@ -438,7 +451,7 @@ tests/fm-subagent-pretool-check.test.sh 901
 tests/fm-supervision-events.test.sh 413
 tests/fm-tangle-guard.test.sh 7230
 tests/fm-teardown-endpoint-safety.test.sh 1073
-tests/fm-teardown.test.sh 23237
+tests/fm-teardown.test.sh 109406
 tests/fm-test-isolation-proof.test.sh 326
 tests/fm-turnend-guard.test.sh 5986
 tests/fm-update.test.sh 1894
@@ -451,7 +464,42 @@ tests/fm-watcher-lock.test.sh 98342
 EOF
 }
 
-portable_serial_weight_for() {
+real_herdr_duration_hints() {
+  cat <<'EOF'
+tests/fm-backend-herdr-presentation-e2e.test.sh 269600
+EOF
+}
+
+proven_isolated_duration_hints() {
+  cat <<'EOF'
+tests/fm-arm-pretool-check.test.sh 46788
+tests/fm-backend-herdr.test.sh 37224
+tests/fm-brief.test.sh 2224
+tests/fm-cd-pretool-check.test.sh 34207
+tests/fm-composer-ghost.test.sh 9065
+tests/fm-composer-lib.test.sh 64
+tests/fm-crew-state.test.sh 25365
+tests/fm-decision-hold-lifecycle.test.sh 30771
+tests/fm-ensure-agents-md.test.sh 581
+tests/fm-grok-harness.test.sh 6251
+tests/fm-herdr-lab.test.sh 15422
+tests/fm-lint.test.sh 5237
+tests/fm-pi-primary-types.test.sh 2945
+tests/fm-pr-merge.test.sh 8564
+tests/fm-review-diff.test.sh 2875
+tests/fm-send-popup-settle.test.sh 5644
+tests/fm-send-settle.test.sh 2911
+tests/fm-send-strict.test.sh 2747
+tests/fm-spawn-batch.test.sh 855
+tests/fm-supervision-instructions.test.sh 703
+tests/fm-test-run.test.sh 15674
+tests/fm-tmux-submit-busy.test.sh 4816
+tests/fm-transition-lib.test.sh 248
+tests/fm-x-mode.test.sh 52939
+EOF
+}
+
+script_duration_baseline_ms() {
   local want=$1 path ms
   while read -r path ms; do
     if [ "$path" = "$want" ]; then
@@ -459,7 +507,37 @@ portable_serial_weight_for() {
       return 0
     fi
   done < <(portable_serial_weight_hints)
-  printf '%s\n' "$PORTABLE_SERIAL_DEFAULT_WEIGHT_MS"
+  while read -r path ms; do
+    if [ "$path" = "$want" ]; then
+      printf '%s\n' "$ms"
+      return 0
+    fi
+  done < <(proven_isolated_duration_hints)
+  while read -r path ms; do
+    if [ "$path" = "$want" ]; then
+      printf '%s\n' "$ms"
+      return 0
+    fi
+  done < <(real_herdr_duration_hints)
+  return 1
+}
+
+# A budget is deliberately generous across macOS/Linux and loaded runners.
+# Two times the measured baseline plus ten seconds catches material regressions
+# without turning ordinary machine variance into a brittle wall-clock test.
+duration_budget_ms_for() {
+  local script=$1 baseline
+  baseline=$(script_duration_baseline_ms "$script") || return 1
+  printf '%s\t%s\n' "$baseline" "$((baseline * 2 + 10000))"
+}
+
+portable_serial_weight_for() {
+  local want=$1 baseline
+  if baseline=$(script_duration_baseline_ms "$want"); then
+    printf '%s\n' "$baseline"
+  else
+    printf '%s\n' "$PORTABLE_SERIAL_DEFAULT_WEIGHT_MS"
+  fi
 }
 
 # Longest-processing-time assignment of the serial remainder to
@@ -716,6 +794,7 @@ lanes = []
 all_scripts = []
 failed = 0
 skipped = 0
+budget_exceeded = 0
 total = 0
 wall_ms = 0
 for path in inputs:
@@ -733,6 +812,7 @@ for path in inputs:
     total += int(summary.get("total") or 0)
     failed += int(summary.get("failed") or 0)
     skipped += int(summary.get("skipped_gate") or 0)
+    budget_exceeded += int(summary.get("duration_budget_exceeded") or 0)
     wall_ms = max(wall_ms, int(summary.get("duration_ms") or 0))
     for s in doc.get("scripts") or []:
         row = dict(s)
@@ -740,7 +820,8 @@ for path in inputs:
         row["lane_run_id"] = doc.get("run_id")
         all_scripts.append(row)
 
-all_scripts.sort(key=lambda s: (-int(s.get("duration_ms") or 0), s.get("path") or ""))
+lanes.sort(key=lambda lane: (lane.get("selection") or "", lane.get("path") or ""))
+all_scripts.sort(key=lambda s: (-int(s.get("duration_ms") or 0), s.get("path") or "", s.get("lane_selection") or ""))
 agg = {
     "kind": "aggregate",
     "lanes": lanes,
@@ -749,6 +830,7 @@ agg = {
         "total": total,
         "failed": failed,
         "skipped_gate": skipped,
+        "duration_budget_exceeded": budget_exceeded,
         "critical_path_duration_ms": wall_ms,
     },
     "scripts": all_scripts,
@@ -805,6 +887,16 @@ select_all() {
   local s
   while IFS= read -r s; do
     [ -n "$s" ] || continue
+    add_script "$s"
+  done < <(all_repo_tests)
+}
+
+select_portable() {
+  local s fam
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    fam=$(family_for_basename "$(basename "$s")")
+    [ "$fam" = real-herdr-gated ] && continue
     add_script "$s"
   done < <(all_repo_tests)
 }
@@ -1159,15 +1251,22 @@ with open(records_file, encoding="utf-8") as fh:
         line = line.rstrip("\n")
         if not line:
             continue
-        path, family, expected, exit_s, dur_s, gate = line.split("\t")
-        scripts.append({
+        path, family, expected, exit_s, dur_s, gate, baseline_s, budget_s, exceeded = line.split("\t")
+        row = {
             "path": path,
             "family": family,
             "expected_gate_skip": expected,
             "duration_ms": int(dur_s),
             "exit": int(exit_s),
             "gate_skip": gate == "true",
-        })
+            "duration_budget_exceeded": exceeded == "true",
+        }
+        if baseline_s:
+            row["duration_baseline_ms"] = int(baseline_s)
+            row["duration_budget_ms"] = int(budget_s)
+        scripts.append(row)
+
+scripts.sort(key=lambda s: s["path"])
 
 families = []
 with open(families_file, encoding="utf-8") as fh:
@@ -1193,6 +1292,7 @@ doc = {
         "failed": int(failed),
         "skipped_gate": int(skipped),
         "duration_ms": int(duration),
+        "duration_budget_exceeded": sum(1 for s in scripts if s["duration_budget_exceeded"]),
     },
     "scripts": scripts,
     "families": families,
@@ -1205,6 +1305,11 @@ PY
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --portable)
+      [ -z "$MODE" ] || die "only one selection mode is allowed"
+      MODE=portable
+      shift
+      ;;
     --all)
       [ -z "$MODE" ] || die "only one selection mode is allowed"
       MODE=all
@@ -1267,10 +1372,16 @@ while [ "$#" -gt 0 ]; do
     --jobs)
       [ "$#" -gt 1 ] || die "--jobs requires a positive integer"
       JOBS=$2
+      JOBS_EXPLICIT=1
       shift 2
       ;;
     --jobs=*)
       JOBS=${1#--jobs=}
+      JOBS_EXPLICIT=1
+      shift
+      ;;
+    --enforce-duration-budgets)
+      DURATION_BUDGET_MODE=enforce
       shift
       ;;
     --list)
@@ -1368,6 +1479,15 @@ if [ "${MODE:-}" = "aggregate" ]; then
   exit 0
 fi
 
+if [ -z "${MODE:-}" ]; then
+  MODE=changed
+fi
+if [ "$JOBS_EXPLICIT" -eq 0 ]; then
+  case "$MODE" in
+    portable|all) JOBS=4 ;;
+    *) JOBS=1 ;;
+  esac
+fi
 case "$JOBS" in
   ''|*[!0-9]*) die "--jobs must be a positive integer" ;;
 esac
@@ -1375,6 +1495,10 @@ esac
 [ "$JOBS" -le "$JOBS_MAX" ] || die "--jobs is capped at $JOBS_MAX (got $JOBS)"
 
 case "${MODE:-}" in
+  portable)
+    select_portable
+    SELECTION_DESC="portable"
+    ;;
   all)
     select_all
     SELECTION_DESC="all"
@@ -1405,7 +1529,7 @@ case "${MODE:-}" in
     SELECTION_DESC="scripts"
     ;;
   *)
-    die "select with --all, --family <name>, --lane <name>, --proven-isolated, --changed, or one or more script paths (see --help)"
+    die "select with --portable, --all, --family <name>, --lane <name>, --proven-isolated, --changed, or one or more script paths (see --help)"
     ;;
 esac
 
@@ -1430,6 +1554,7 @@ fi
 if [ "${#SCRIPTS[@]}" -eq 0 ]; then
   log "nothing to run"
   printf 'FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0\n'
+  printf 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 mode=%s\n' "$DURATION_BUDGET_MODE"
   if [ -n "$JSON_PATH" ]; then
     empty_rec=$(mktemp)
     empty_fam=$(mktemp)
@@ -1449,8 +1574,9 @@ for s in "${SCRIPTS[@]}"; do
   [ -x "$s" ] || [ -r "$s" ] || die "test script not readable: $s"
 done
 
-# --jobs N>1 only for the proven-isolated set. Stateful families stay serial.
-if [ "$JOBS" -gt 1 ]; then
+# Mixed complete modes parallelize only their proven-isolated subset and keep
+# every other selected script serial. Other modes retain the stricter refusal.
+if [ "$JOBS" -gt 1 ] && [ "$MODE" != portable ] && [ "$MODE" != all ]; then
   for s in "${SCRIPTS[@]}"; do
     if ! is_proven_isolated_script "$s"; then
       die "--jobs $JOBS refused: $s is not in the proven-isolated set (see bin/fm-test-isolation-proof.sh --list). Stateful families stay serial."
@@ -1462,7 +1588,41 @@ RUN_TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run.XXXXXX")
 RECORDS="$RUN_TMP/records.tsv"
 FAMILIES_TSV="$RUN_TMP/families.tsv"
 : >"$RECORDS"
-trap 'rm -rf "$RUN_TMP"' EXIT
+WORKER_PIDS=()
+
+# shellcheck disable=SC2329 # Invoked indirectly by cleanup/signal traps.
+stop_active_workers() {
+  local pid
+  trap - INT TERM HUP
+  for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+    [ -n "$pid" ] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+    [ -n "$pid" ] || continue
+    wait "$pid" 2>/dev/null || true
+  done
+  WORKER_PIDS=()
+}
+
+# shellcheck disable=SC2329 # Invoked indirectly by EXIT and signal traps.
+cleanup_run() {
+  stop_active_workers
+  rm -rf "$RUN_TMP"
+}
+
+# shellcheck disable=SC2329 # Invoked indirectly by signal traps.
+interrupt_run() { # <exit-code>
+  local code=$1
+  cleanup_run
+  trap - EXIT
+  exit "$code"
+}
+
+trap cleanup_run EXIT
+trap 'interrupt_run 130' INT
+trap 'interrupt_run 143' TERM
+trap 'interrupt_run 129' HUP
 
 RUN_STARTED_ISO=$(now_iso)
 RUN_STARTED_MS=$(now_ms)
@@ -1505,7 +1665,7 @@ family_bump() {
 
 record_script_result() {
   local script=$1 rc=$2 duration=$3 out=$4 end_iso=$5
-  local base family expected gate_skip fail_delta
+  local base family expected gate_skip fail_delta budget_row baseline budget exceeded
   base=$(basename "$script")
   family=$(family_for_basename "$base")
   expected=$(expected_gate_skip_for_family "$family")
@@ -1531,8 +1691,26 @@ record_script_result() {
     AGG_RC=1
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$script" "$family" "$expected" "$rc" "$duration" "$gate_skip" >>"$RECORDS"
+  baseline=
+  budget=
+  exceeded=false
+  if budget_row=$(duration_budget_ms_for "$script"); then
+    baseline=${budget_row%%$'\t'*}
+    budget=${budget_row#*$'\t'}
+    DURATION_BUDGET_CHECKED=$((DURATION_BUDGET_CHECKED + 1))
+    if [ "$duration" -gt "$budget" ]; then
+      exceeded=true
+      DURATION_BUDGET_EXCEEDED=$((DURATION_BUDGET_EXCEEDED + 1))
+      log "duration budget exceeded: $script duration_ms=$duration budget_ms=$budget baseline_ms=$baseline mode=$DURATION_BUDGET_MODE"
+      if [ "$DURATION_BUDGET_MODE" = enforce ]; then
+        AGG_RC=1
+      fi
+    fi
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$script" "$family" "$expected" "$rc" "$duration" "$gate_skip" \
+    "$baseline" "$budget" "$exceeded" >>"$RECORDS"
   family_bump "$family" "$duration" "$fail_delta"
   TOTAL=$((TOTAL + 1))
 }
@@ -1551,9 +1729,14 @@ run_one_serial() {
     "$begin_iso" "$script" "$family" "$expected"
 
   set +e
-  # Stream live output while retaining a copy for gate-skip detection.
-  # PIPESTATUS[0] is the test script; tee's exit is ignored for aggregate.
-  bash "$script" 2>&1 | tee "$out"
+  # Stream live output while retaining a copy for gate-skip detection. Clear
+  # ambient fleet routing exactly as parallel workers do, so a local complete
+  # run cannot point a test at the operator's live home.
+  (
+    unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
+      FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND 2>/dev/null || true
+    bash "$script"
+  ) 2>&1 | tee "$out"
   rc=${PIPESTATUS[0]}
   set -e
   : "${rc:=1}"
@@ -1572,10 +1755,25 @@ if [ "$JOBS" -eq 1 ]; then
     run_one_serial "$script"
   done
 else
-  # Bounded concurrent execution for proven-isolated scripts only. Each worker
-  # gets a private mode-0700 TMPDIR so mktemp roots cannot collide. Retries are
-  # never used as a green strategy.
-  declare -a WORKER_PIDS=()
+  # Complete modes split the selection exactly once: the proven subset runs in
+  # this bounded phase, then every stateful/unproven script runs serially.
+  # Non-complete modes reached here only after the all-proven validation above.
+  declare -a SERIAL_PHASE_SCRIPTS=()
+  if [ "$MODE" = portable ] || [ "$MODE" = all ]; then
+    parallel_selection=()
+    for script in "${SCRIPTS[@]}"; do
+      if is_proven_isolated_script "$script"; then
+        parallel_selection+=("$script")
+      else
+        SERIAL_PHASE_SCRIPTS+=("$script")
+      fi
+    done
+    SCRIPTS=("${parallel_selection[@]+"${parallel_selection[@]}"}")
+  fi
+
+  # Each concurrent worker gets a private mode-0700 TMPDIR so mktemp roots
+  # cannot collide. Retries are never used as a green strategy.
+  WORKER_PIDS=()
   declare -a WORKER_IDX=()
   declare -a WORKER_SCRIPTS=()
   worker_n=0
@@ -1654,14 +1852,28 @@ else
       "$(now_iso)" "$script" "$family" "$expected"
     (
       set +e
+      child_pid=
+      # shellcheck disable=SC2329 # Invoked indirectly by worker signal traps.
+      stop_child() {
+        trap - INT TERM HUP
+        if [ -n "$child_pid" ]; then
+          kill -TERM "$child_pid" 2>/dev/null || true
+          wait "$child_pid" 2>/dev/null || true
+        fi
+        exit 143
+      }
+      trap stop_child INT TERM HUP
       export TMPDIR="$work/tmp"
       export TMP="$work/tmp"
       unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
         FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND 2>/dev/null || true
       cd "$ROOT" || exit 1
       begin_ms=$(now_ms)
-      bash "$script" >"$work/output" 2>&1
+      bash "$script" >"$work/output" 2>&1 &
+      child_pid=$!
+      wait "$child_pid"
       rc=$?
+      child_pid=
       end_ms=$(now_ms)
       duration=$((end_ms - begin_ms))
       if [ "$duration" -lt 0 ]; then
@@ -1678,6 +1890,11 @@ else
   done
   while [ "$active_workers" -gt 0 ]; do
     wait_one_completed_job_worker
+  done
+  WORKER_PIDS=()
+
+  for script in "${SERIAL_PHASE_SCRIPTS[@]+"${SERIAL_PHASE_SCRIPTS[@]}"}"; do
+    run_one_serial "$script"
   done
 fi
 
@@ -1699,15 +1916,18 @@ if [ -s "$FAMILIES_TSV" ]; then
   done
 fi
 
-# Slowest scripts (top 15) from records.
+# Slowest scripts (top 15) from records. Path is the stable tie-breaker.
 if [ -s "$RECORDS" ]; then
   rank=1
-  sort -t$'\t' -k5,5nr "$RECORDS" | head -n 15 | while IFS=$'\t' read -r path _family _expected _rc duration _gate; do
+  sort -t$'\t' -k5,5nr -k1,1 "$RECORDS" | head -n 15 | while IFS=$'\t' read -r path _family _expected _rc duration _gate _baseline _budget _exceeded; do
     printf 'FM_TEST_SLOWEST rank=%s script=%s duration_ms=%s\n' \
       "$rank" "$path" "$duration"
     rank=$((rank + 1))
   done
 fi
+
+printf 'FM_TEST_BUDGET_SUMMARY checked=%s exceeded=%s mode=%s\n' \
+  "$DURATION_BUDGET_CHECKED" "$DURATION_BUDGET_EXCEEDED" "$DURATION_BUDGET_MODE"
 
 if [ -n "$JSON_PATH" ]; then
   mkdir -p "$(dirname "$JSON_PATH")"
