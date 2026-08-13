@@ -1858,12 +1858,43 @@ assert_not_contains "$(cat "$home/bot.log")$(cat "$home/restarted.log")$out" "$T
 out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry 2>&1) \
   || fail "explicit retry did not safely quarantine invalid reconnect state"
 assert_contains "$out" "quarantined" "explicit retry silently discarded invalid reconnect state"
-assert_present "$home/state/.discord-bot-service/reconnect.invalid.json" \
-  "explicit retry did not preserve invalid reconnect state for inspection"
+quarantine_dir="$home/state/.discord-bot-service"
+[ "$(find "$quarantine_dir" -type f -name 'reconnect.invalid.*.json' | wc -l | tr -d ' ')" -eq 1 ] \
+  || fail "explicit retry did not preserve one invalid reconnect state for inspection"
 assert_absent "$home/state/.discord-bot-service/reconnect.json" \
   "explicit retry left invalid reconnect state active"
 assert_absent "$home/state/.discord-bot-service/terminal.json" \
   "explicit retry left invalid reconnect state suppression active"
+printf '%s\n' '{"second-invalid":"artifact-two"}' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  "$CONTROL" run > "$home/second-corruption.log" 2>&1 \
+  || fail "second invalid reconnect state exited into service-manager restart"
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry 2>&1) \
+  || fail "explicit retry could not recover a second invalid reconnect state"
+assert_contains "$out" "quarantined" "second explicit retry silently discarded invalid reconnect state"
+"$NODE_BIN" -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const directory = process.argv[1];
+  const names = fs.readdirSync(directory).filter((name) => /^reconnect\.invalid\.[0-9a-f]{32}\.json$/.test(name));
+  if (names.length !== 2 || new Set(names).size !== 2) process.exit(1);
+  const records = names.map((name) => {
+    const file = path.join(directory, name);
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600) process.exit(1);
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  });
+  if (!records.some((record) => record.invalid === process.argv[2])
+      || !records.some((record) => record["second-invalid"] === "artifact-two")) process.exit(1);
+' "$quarantine_dir" "$TOKEN" \
+  || fail "repeated recovery overwrote or weakened a private reconnect-state quarantine"
+assert_absent "$home/state/.discord-bot-service/reconnect.json" \
+  "second explicit retry left invalid reconnect state active"
+assert_absent "$home/state/.discord-bot-service/terminal.json" \
+  "second explicit retry left invalid reconnect state suppression active"
+[ "$(cat "$home/gateway/lookups")" -eq 0 ] || fail "repeated invalid reconnect recovery reached Gateway lookup"
 pass "invalid reconnect state stops restarts and reports one safe diagnostic"
 
 # A terminal Gateway close also stops after one connection, even when READY never occurred.

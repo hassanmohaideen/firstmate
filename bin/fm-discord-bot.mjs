@@ -294,6 +294,30 @@ async function atomicReplacePrivate(path, content) {
   }
 }
 
+async function quarantineInvalidReconnectState() {
+  await assertPrivateFile(RECONNECT_FILE);
+  for (;;) {
+    const quarantineFile = join(
+      OWNERSHIP_DIR,
+      `reconnect.invalid.${randomBytes(16).toString("hex")}.json`,
+    );
+    try {
+      await link(RECONNECT_FILE, quarantineFile);
+    } catch (error) {
+      if (error?.code === "EEXIST") continue;
+      throw error;
+    }
+    try {
+      await unlink(RECONNECT_FILE);
+      await assertPrivateFile(quarantineFile);
+      return;
+    } catch (error) {
+      await unlink(quarantineFile).catch(() => {});
+      throw error;
+    }
+  }
+}
+
 async function atomicPublishPrivateOnce(directory, basename, content) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(basename)) {
     throw new ConfigError("unsafe private artifact name");
@@ -2067,15 +2091,7 @@ async function main() {
         await readReconnectRecord();
       } catch (error) {
         if (!(error instanceof ConfigError)) throw error;
-        await assertPrivateFile(RECONNECT_FILE);
-        const quarantineFile = join(OWNERSHIP_DIR, "reconnect.invalid.json");
-        try {
-          await lstat(quarantineFile);
-          throw new ConfigError("invalid reconnect state must be repaired before suppression can be cleared");
-        } catch (quarantineError) {
-          if (quarantineError?.code !== "ENOENT") throw quarantineError;
-        }
-        await rename(RECONNECT_FILE, quarantineFile);
+        await quarantineInvalidReconnectState();
         safeLog("invalid reconnect state quarantined for operator inspection");
       }
       await removeMarker(TERMINAL_FILE);
