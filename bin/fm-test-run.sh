@@ -1594,6 +1594,7 @@ FAMILIES_TSV="$RUN_TMP/families.tsv"
 : >"$RECORDS"
 WORKER_PIDS=()
 
+# shellcheck disable=SC2329 # Used by cleanup/signal handlers invoked indirectly by traps.
 worker_group_is_running() {
   kill -0 -- "-$1" 2>/dev/null
 }
