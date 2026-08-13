@@ -400,8 +400,9 @@ test_jobs_are_deterministic_and_complete() {
     pass "SKIP (ShellCheck $REQUIRED not resolved): deterministic bounded jobs check"
     return
   fi
-  local tmp good bad_a bad_b out_clean_1 out_clean_2 out_fail_1 out_fail_2 out_fail_2b
-  local telemetry telemetry_out cleanup_tmp cleanup_out rc_clean_1 rc_clean_2 rc_fail_1 rc_fail_2 rc_fail_2b rc_bad_jobs
+  local tmp good bad_a bad_b out_clean_1 out_clean_2 out_clean_8 out_fail_1 out_fail_2 out_fail_2b out_fail_4 out_fail_8
+  local telemetry telemetry_out cleanup_tmp cleanup_out rc_clean_1 rc_clean_2 rc_clean_8
+  local rc_fail_1 rc_fail_2 rc_fail_2b rc_fail_4 rc_fail_8 rc_bad_jobs
   tmp=$(fm_test_tmproot fm-lint-jobs)
   mkdir -p "$tmp"
   good="$tmp/good.sh"
@@ -430,8 +431,12 @@ SH
   out_clean_1=$(FM_LINT_JOBS=1 "$LINT" "$good" 2>&1) || rc_clean_1=$?
   rc_clean_2=0
   out_clean_2=$(FM_LINT_JOBS=2 "$LINT" "$good" 2>&1) || rc_clean_2=$?
-  [ "$rc_clean_1" -eq 0 ] && [ "$rc_clean_2" -eq 0 ] || fail "clean jobs=1/jobs=2 paths must both pass"
-  [ "$out_clean_1" = "$out_clean_2" ] || fail "clean jobs=1/jobs=2 output differs"
+  rc_clean_8=0
+  out_clean_8=$(FM_LINT_JOBS=8 "$LINT" "$good" 2>&1) || rc_clean_8=$?
+  [ "$rc_clean_1" -eq 0 ] && [ "$rc_clean_2" -eq 0 ] && [ "$rc_clean_8" -eq 0 ] \
+    || fail "clean jobs=1/jobs=2/jobs=8 paths must all pass"
+  [ "$out_clean_1" = "$out_clean_2" ] && [ "$out_clean_2" = "$out_clean_8" ] \
+    || fail "clean jobs=1/jobs=2/jobs=8 output differs"
 
   rc_fail_1=0
   out_fail_1=$(FM_LINT_JOBS=1 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_1=$?
@@ -439,14 +444,20 @@ SH
   out_fail_2=$(FM_LINT_JOBS=2 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_2=$?
   rc_fail_2b=0
   out_fail_2b=$(FM_LINT_JOBS=2 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_2b=$?
+  rc_fail_4=0
+  out_fail_4=$(FM_LINT_JOBS=4 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_4=$?
+  rc_fail_8=0
+  out_fail_8=$(FM_LINT_JOBS=8 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_8=$?
   [ "$rc_fail_1" -ne 0 ] && [ "$rc_fail_1" -eq "$rc_fail_2" ] && [ "$rc_fail_2" -eq "$rc_fail_2b" ] \
-    || fail "failing jobs=1/jobs=2 exit results differ: $rc_fail_1/$rc_fail_2/$rc_fail_2b"
+    && [ "$rc_fail_2b" -eq "$rc_fail_4" ] && [ "$rc_fail_4" -eq "$rc_fail_8" ] \
+    || fail "failing exit results differ across worker counts: $rc_fail_1/$rc_fail_2/$rc_fail_2b/$rc_fail_4/$rc_fail_8"
   [ "$out_fail_1" = "$out_fail_2" ] && [ "$out_fail_2" = "$out_fail_2b" ] \
+    && [ "$out_fail_2b" = "$out_fail_4" ] && [ "$out_fail_4" = "$out_fail_8" ] \
     || fail "failing diagnostics are not byte-identical and deterministic across jobs"
   assert_contains "$out_fail_1" "SC1007" "the first failing root diagnostic was lost"
   assert_contains "$out_fail_1" "SC2086" "the later failing root diagnostic was lost"
   rc_bad_jobs=0
-  FM_LINT_JOBS=3 "$LINT" "$good" >/dev/null 2>&1 || rc_bad_jobs=$?
+  FM_LINT_JOBS=9 "$LINT" "$good" >/dev/null 2>&1 || rc_bad_jobs=$?
   [ "$rc_bad_jobs" -eq 2 ] || fail "the lint owner must reject unbounded worker counts"
 
   telemetry_out=$(FM_LINT_JOBS=2 FM_LINT_TELEMETRY="$telemetry" "$LINT" "$good" 2>&1) \
@@ -469,7 +480,7 @@ SH
   [ "$cleanup_out" = "$out_clean_2" ] || fail "cleanup fixture changed routine diagnostics"
   [ -z "$(find "$cleanup_tmp" -mindepth 1 -maxdepth 1 -name 'fm-lint.*' -print -quit)" ] \
     || fail "bounded lint left temporary worker state behind"
-  pass "jobs=1 and jobs=2 preserve deterministic diagnostics, failures, cleanup bounds, and quiet telemetry"
+  pass "every bounded worker count preserves deterministic diagnostics, failures, cleanup bounds, and quiet telemetry"
 }
 
 test_worker_trees_stop_on_signal() {
@@ -497,7 +508,7 @@ done
 SH
   chmod +x "$fakebin/shellcheck"
 
-  for jobs in 1 2; do
+  for jobs in 1 2 8; do
     for telemetry in off on; do
       lint_tmp="$tmp/lint-$jobs-$telemetry"
       pid_file="$tmp/shellcheck-$jobs-$telemetry.pid"
