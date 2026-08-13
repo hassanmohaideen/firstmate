@@ -55,7 +55,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 146-script inventory leaves 110 scripts in the portable serial remainder.
+The current 146-script inventory leaves 109 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 
@@ -72,10 +72,22 @@ Hints only affect balance: the coverage guard keeps the partition complete and d
 | `portable-serial-1of4` | 26 | 536169 ms (~536.2 s) |
 | `portable-serial-2of4` | 28 | 536163 ms (~536.2 s) |
 | `portable-serial-3of4` | 28 | 536163 ms (~536.2 s) |
-| `portable-serial-4of4` | 28 | 536168 ms (~536.2 s) |
-| imbalance | | 6 ms |
+| `portable-serial-4of4` | 27 | 536147 ms (~536.1 s) |
+| imbalance | | 22 ms |
 
 The single longest measured script, `tests/fm-pr-check-security.test.sh` at 194216 ms after its snapshot optimization, is the floor for any shard count.
+
+## Performance evidence
+
+The original complete local `bin/fm-test-run.sh --all` measurement took 1,527 seconds for 146 scripts. Focused before/after measurements retained from the optimization work are:
+
+| Script | Before | After |
+|---|---:|---:|
+| `tests/fm-backend-herdr.test.sh` | ~316.7 s | ~37.2 s |
+| `tests/fm-backend-herdr-presentation-e2e.test.sh` | ~269.6 s | ~238.9 s |
+| `tests/fm-pr-check-security.test.sh` | ~268.8 s | ~194.2 s |
+
+A subsequent portable regression attempt ran for about 1,500 seconds. Its failures were pre-existing failures unrelated to the scheduling and slow-test optimizations, so the attempt remains classified as incomplete evidence rather than a green regression result or justification to omit coverage.
 
 Refresh the hints by downloading the per-shard timing artifacts from a green CI run, replacing the `portable_serial_weight_hints` table in `bin/fm-test-run.sh` with the measured `path`/`duration_ms` pairs, and updating the table above:
 

@@ -171,8 +171,8 @@ family_for_basename() {
       printf '%s\n' watcher-wake-lock
       ;;
     fm-afk-inject-herdr-e2e.test.sh|fm-afk-launch.test.sh|fm-backend-autodetect-smoke.test.sh|\
-    fm-backend-herdr-eventwait-smoke.test.sh|fm-backend-herdr-presentation-e2e.test.sh|\
-    fm-backend-herdr-launcher-workspace-e2e.test.sh|\
+    fm-backend-herdr-eventwait-smoke.test.sh|fm-backend-herdr-focus-flash-e2e.test.sh|\
+    fm-backend-herdr-presentation-e2e.test.sh|fm-backend-herdr-launcher-workspace-e2e.test.sh|\
     fm-backend-herdr-prune-safety-e2e.test.sh|fm-backend-herdr-respawn-idem-e2e.test.sh|\
     fm-herdr-session-cleanup-e2e.test.sh|\
     fm-backend-herdr-smoke.test.sh|fm-backend-herdr-workspace-per-home-e2e.test.sh|\
@@ -466,7 +466,7 @@ EOF
 
 real_herdr_duration_hints() {
   cat <<'EOF'
-tests/fm-backend-herdr-presentation-e2e.test.sh 269600
+tests/fm-backend-herdr-presentation-e2e.test.sh 238900
 EOF
 }
 
@@ -1592,15 +1592,63 @@ WORKER_PIDS=()
 
 # shellcheck disable=SC2329 # Invoked indirectly by cleanup/signal traps.
 stop_active_workers() {
-  local pid
+  local pid ppid known changed n
   trap - INT TERM HUP
+  known=""
   for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
+    known="$known $pid"
+  done
+  changed=1
+  while [ "$changed" -eq 1 ]; do
+    changed=0
+    while read -r pid ppid; do
+      [ -n "$pid" ] && [ -n "$ppid" ] || continue
+      case " $known " in
+        *" $ppid "*)
+          case " $known " in
+            *" $pid "*) ;;
+            *) known="$known $pid"; changed=1 ;;
+          esac
+          ;;
+      esac
+    done < <(ps -axo pid=,ppid= 2>/dev/null || true)
+  done
+  for pid in $known; do
     kill -TERM "$pid" 2>/dev/null || true
   done
   for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
     wait "$pid" 2>/dev/null || true
+  done
+  n=0
+  while [ "$n" -lt 100 ]; do
+    changed=0
+    for pid in $known; do
+      if kill -0 "$pid" 2>/dev/null; then
+        changed=1
+        break
+      fi
+    done
+    [ "$changed" -eq 1 ] || break
+    sleep 0.01
+    n=$((n + 1))
+  done
+  for pid in $known; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  n=0
+  while [ "$n" -lt 100 ]; do
+    changed=0
+    for pid in $known; do
+      if kill -0 "$pid" 2>/dev/null; then
+        changed=1
+        break
+      fi
+    done
+    [ "$changed" -eq 1 ] || break
+    sleep 0.01
+    n=$((n + 1))
   done
   WORKER_PIDS=()
 }

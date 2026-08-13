@@ -379,8 +379,12 @@ test_portable_shard_union_and_coverage_guard() {
   # No herdr in portable lanes.
   printf '%s\n' "$s1" "$s2" "$serial" | grep -Fq 'tests/fm-backend-herdr-smoke.test.sh' \
     && fail "portable lanes must not include real-herdr-gated smoke"
+  printf '%s\n' "$s1" "$s2" "$serial" | grep -Fq 'tests/fm-backend-herdr-focus-flash-e2e.test.sh' \
+    && fail "portable lanes must not include the real-Herdr focus-flash regression"
   printf '%s\n' "$herdr" | grep -Fq 'tests/fm-backend-herdr-smoke.test.sh' \
     || fail "herdr family must include smoke"
+  printf '%s\n' "$herdr" | grep -Fq 'tests/fm-backend-herdr-focus-flash-e2e.test.sh' \
+    || fail "herdr family must own the real-Herdr focus-flash regression"
   out=$("$RUNNER" --check-coverage)
   assert_contains "$out" "FM_TEST_COVERAGE ok" "coverage guard success marker"
   all_count=$("$RUNNER" --list --all | wc -l | tr -d ' ')
@@ -742,21 +746,25 @@ test_mixed_complete_scheduler_exact_once_and_failures() {
 }
 
 test_parallel_signal_cleanup() {
-  local tmp repo evidence runner pid rc n script
+  local tmp repo evidence runner pid child rc n
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-signal.XXXXXX")
   repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
-  for script in fm-brief.test.sh fm-composer-lib.test.sh; do
-    cat > "$repo/tests/$script" <<'SH'
+  cat > "$repo/tests/fm-brief.test.sh" <<'SH'
 #!/usr/bin/env bash
-name=$(basename "$0" .test.sh)
-cleanup() { touch "$SIGNAL_EVIDENCE/$name.cleaned"; exit 143; }
+sleep 300 &
+printf '%s\n' "$!" > "$SIGNAL_EVIDENCE/child.pid"
+touch "$SIGNAL_EVIDENCE/fm-brief.ready"
+wait
+SH
+  cat > "$repo/tests/fm-composer-lib.test.sh" <<'SH'
+#!/usr/bin/env bash
+cleanup() { touch "$SIGNAL_EVIDENCE/fm-composer-lib.cleaned"; exit 143; }
 trap cleanup TERM INT HUP
-touch "$SIGNAL_EVIDENCE/$name.ready"
+touch "$SIGNAL_EVIDENCE/fm-composer-lib.ready"
 while :; do sleep 1; done
 SH
-    chmod +x "$repo/tests/$script"
-  done
+  chmod +x "$repo"/tests/*.test.sh
   SIGNAL_EVIDENCE="$evidence" "$runner" --jobs 2 \
     tests/fm-brief.test.sh tests/fm-composer-lib.test.sh > "$tmp/out" 2> "$tmp/err" &
   pid=$!
@@ -767,21 +775,49 @@ SH
   done
   [ -e "$evidence/fm-brief.ready" ] && [ -e "$evidence/fm-composer-lib.ready" ] \
     || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"; fail "parallel cleanup fixtures never started"; }
+  child=$(cat "$evidence/child.pid")
   kill -TERM "$pid"
   set +e
   wait "$pid"
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "interrupted runner exited successfully"
-  n=0
-  while { [ ! -e "$evidence/fm-brief.cleaned" ] || [ ! -e "$evidence/fm-composer-lib.cleaned" ]; } && [ "$n" -lt 300 ]; do
-    sleep 0.01
-    n=$((n + 1))
-  done
-  [ -e "$evidence/fm-brief.cleaned" ] && [ -e "$evidence/fm-composer-lib.cleaned" ] \
-    || fail "interrupted runner left a parallel worker alive"
+  [ -e "$evidence/fm-composer-lib.cleaned" ] \
+    || fail "interrupted runner did not run the trapping fixture cleanup"
+  if kill -0 "$child" 2>/dev/null; then
+    kill -KILL "$child" 2>/dev/null || true
+    fail "interrupted runner left a non-trapping fixture child alive"
+  fi
   rm -rf "$tmp"
-  pass "parallel signal cleanup terminates and waits for every active worker"
+  pass "parallel signal cleanup terminates and waits for every active process tree"
+}
+
+test_environment_isolation_in_serial_and_parallel_children() {
+  local tmp repo evidence runner name
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-env.XXXXXX")
+  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
+  for name in fm-brief fm-daemon; do
+    cat > "$repo/tests/$name.test.sh" <<'SH'
+#!/usr/bin/env bash
+for key in FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND; do
+  eval "value=\${$key-}"
+  [ -z "$value" ] || exit 9
+done
+touch "$ENV_EVIDENCE/$(basename "$0").isolated"
+SH
+    chmod +x "$repo/tests/$name.test.sh"
+  done
+  FM_HOME=poison FM_STATE_OVERRIDE=poison FM_DATA_OVERRIDE=poison FM_ROOT_OVERRIDE=poison \
+    FM_PROJECTS_OVERRIDE=poison FM_CONFIG_OVERRIDE=poison FM_BACKEND=poison \
+    ENV_EVIDENCE="$evidence" "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
+    || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "isolated environment fixture failed"; }
+  [ -e "$evidence/fm-brief.test.sh.isolated" ] \
+    || fail "parallel child did not observe an isolated fleet environment"
+  [ -e "$evidence/fm-daemon.test.sh.isolated" ] \
+    || fail "serial child did not observe an isolated fleet environment"
+  rm -rf "$tmp"
+  pass "serial and parallel children isolate ambient fleet routing"
 }
 
 test_duration_budget_warns_and_ci_enforces() {
@@ -893,5 +929,6 @@ test_jobs_parallel_scheduler_and_failure_propagation
 test_default_changed_and_portable_selection
 test_mixed_complete_scheduler_exact_once_and_failures
 test_parallel_signal_cleanup
+test_environment_isolation_in_serial_and_parallel_children
 test_duration_budget_warns_and_ci_enforces
 test_aggregate_json
