@@ -528,7 +528,7 @@ tests/fm-test-isolation-proof.test.sh 299
 tests/fm-tmux-agent-liveness.test.sh 1039
 tests/fm-trace-context-lib.test.sh 224
 tests/fm-trace-context-spawn.test.sh 42180
-tests/fm-turnend-guard.test.sh 17604
+tests/fm-turnend-guard.test.sh 39640
 tests/fm-update.test.sh 4994
 tests/fm-vendor-auth-probe.test.sh 43344
 tests/fm-wake-daemon-lifecycle-e2e.test.sh 9358
