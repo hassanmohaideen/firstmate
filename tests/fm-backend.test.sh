@@ -35,6 +35,7 @@ fm_git_identity fmtest fmtest@example.invalid
 
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-backend.sh"
+unset FM_BACKEND_DISABLE_CMUX_FALLBACK
 
 TMP_ROOT=$(fm_test_tmproot fm-backend-tests)
 

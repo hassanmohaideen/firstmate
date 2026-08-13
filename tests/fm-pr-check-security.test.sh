@@ -48,18 +48,34 @@ file_mode() {
 }
 
 state_snapshot() {
-  local state=$1 file
-  (
-    cd "$state" || exit 1
-    find . \( -type f -o -type l \) -print | LC_ALL=C sort | while IFS= read -r file; do
-      if [ -L "$file" ]; then
-        printf 'link %s %s\n' "$file" "$(readlink "$file")"
-      else
-        printf 'file %s %s ' "$file" "$(file_mode "$file")"
-        shasum -a 256 "$file" | awk '{print $1}'
-      fi
-    done
-  )
+  local state=$1
+  python3 - "$state" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+base = os.path.abspath(sys.argv[1])
+entries = []
+for root, dirs, files in os.walk(base, followlinks=False):
+    for name in list(dirs):
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            entries.append(path)
+            dirs.remove(name)
+    entries.extend(os.path.join(root, name) for name in files)
+for path in sorted(entries, key=lambda item: os.path.relpath(item, base)):
+    rel = "./" + os.path.relpath(path, base)
+    if os.path.islink(path):
+        print(f"link {rel} {os.readlink(path)}")
+        continue
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    mode = format(stat.S_IMODE(os.stat(path).st_mode), "o")
+    print(f"file {rel} {mode} {digest.hexdigest()}")
+PY
 }
 
 make_case() {
