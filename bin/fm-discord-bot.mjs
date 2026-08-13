@@ -1101,7 +1101,8 @@ class GatewayRunner {
   }
 
   async persistFallbackSuppression(operatorCode = "reconnect-state-unavailable") {
-    const deadlineActive = this.serverNotBefore !== null && this.serverWaitMs !== null;
+    const terminal = operatorCode !== "reconnect-state-unavailable";
+    const deadlineActive = !terminal && this.serverNotBefore !== null && this.serverWaitMs !== null;
     await atomicReplacePrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
       schema: "firstmate.discord-reconnect-suppression.v1",
       authentication_fingerprint: authenticationFingerprint(this.config),
@@ -1235,11 +1236,17 @@ class GatewayRunner {
     this.serverRebootFallbackUsed = record?.server_reboot_fallback_used ?? false;
     if (this.serverNotBefore !== null
         && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
-      this.serverWaitMs = this.serverRebootFallbackUsed ? 0 : this.serverWaitMs;
-      this.serverRebootFallbackUsed = true;
+      if (this.serverRebootFallbackUsed) {
+        this.serverWaitMs = Math.min(
+          this.serverWaitMs,
+          Math.max(0, this.serverNotBefore - Date.now()),
+        );
+      } else {
+        this.serverRebootFallbackUsed = true;
+        this.serverNotBefore = Date.now() + this.serverWaitMs;
+      }
       this.serverBootId = this.bootId;
       this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
-      this.serverNotBefore = Date.now() + this.serverWaitMs;
       stateNeedsRebase = true;
     }
     let suppression;
@@ -1279,16 +1286,33 @@ class GatewayRunner {
         const fallbackSameBoot = suppression.server_boot_id === this.bootId
           && Number.isSafeInteger(suppression.server_monotonic_not_before);
         const fallbackPreviouslyUsed = suppression.server_reboot_fallback_used ?? false;
-        const fallbackRemaining = fallbackSameBoot
-          ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
-          : fallbackPreviouslyUsed ? 0 : suppression.server_wait_ms;
+        let fallbackRemaining;
+        let fallbackNotBefore = suppression.server_not_before;
+        if (fallbackSameBoot) {
+          fallbackRemaining = Math.max(
+            0,
+            suppression.server_monotonic_not_before - monotonicMilliseconds(),
+          );
+        } else if (fallbackPreviouslyUsed) {
+          fallbackRemaining = Math.min(
+            suppression.server_wait_ms,
+            Math.max(0, suppression.server_not_before - Date.now()),
+          );
+        } else {
+          fallbackRemaining = suppression.server_wait_ms;
+          fallbackNotBefore = Date.now() + fallbackRemaining;
+        }
         const currentRemaining = this.serverDelayRemaining();
-        this.serverWaitMs = Math.max(currentRemaining, fallbackRemaining);
+        if (fallbackRemaining > currentRemaining) {
+          this.serverWaitMs = fallbackRemaining;
+          this.serverNotBefore = fallbackNotBefore;
+        } else {
+          this.serverWaitMs = currentRemaining;
+        }
         this.serverRebootFallbackUsed = this.serverRebootFallbackUsed
           || fallbackPreviouslyUsed || !fallbackSameBoot;
         this.serverBootId = this.bootId;
         this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
-        this.serverNotBefore = Date.now() + this.serverWaitMs;
         this.fallbackSuppressionActive = true;
         stateNeedsRebase = true;
         try {

@@ -279,6 +279,11 @@ server.on("upgrade",(req,socket)=>{
         fs.writeFileSync(countFile.replace(/connections$/, "identify.json"), JSON.stringify({token_ok:true,intents:packet.d.intents,properties:packet.d.properties}));
         if (mode === "terminal-auth-close") { setTimeout(()=>close(socket,4004),10); continue; }
         text(socket,{op:0,t:"READY",s:connection,d:{user:{id:self},session_id:`session-${connection}`,resume_gateway_url:resumeUrl}});
+        if (mode === "invalid-then-terminal-close") {
+          text(socket,{op:9,d:false});
+          close(socket,4004);
+          continue;
+        }
         if (mode === "sequence-persistence-failure") {
           fs.writeFileSync(countFile.replace(/connections$/, "sequence-ready"),"ready\n");
           const release=setInterval(()=>{
@@ -1595,14 +1600,18 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/second.log" 2>&1 &
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
-wait_for_value "$home/gateway/lookups" 1 || fail "repeated reboot kept replenishing the server wait"
+sleep 0.25
+assert_absent "$home/gateway/lookups" "second reboot bypassed the outstanding server wait"
+wait_for_value "$home/gateway/lookups" 1 || fail "completed reboot fallback did not reconnect"
 second_reboot_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
-[ $((second_reboot_lookup - second_reboot_started)) -lt 1000 ] \
+[ $((second_reboot_lookup - second_reboot_started)) -ge 1000 ] \
+  || fail "repeated reboot collapsed the server retry minimum"
+[ $((second_reboot_lookup - reboot_now)) -lt 3000 ] \
   || fail "repeated reboot replenished the bounded server fallback"
 kill -TERM "$rate_worker"
 wait "$rate_worker" || true
 WORKER_PIDS=()
-pass "server retry waits consume one bounded reboot fallback"
+pass "server retry waits survive repeated reboots without early lookup"
 
 home=$(new_home gateway-session-reboots)
 write_config "$home"
@@ -1626,15 +1635,6 @@ wait_for_value "$home/gateway/lookups" 1 || fail "first reboot did not query ses
 sleep 0.12
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] \
   || fail "first reboot skipped its conservative session-start wait"
-i=0
-while [ "$i" -lt 100 ]; do
-  fallback_used=$(jq -r '.session_start_limit.resetRebootFallbackUsed // false' \
-    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf false)
-  [ "$fallback_used" = true ] && break
-  sleep 0.01
-  i=$((i + 1))
-done
-[ "$fallback_used" = true ] || fail "first reboot did not consume the bounded session reset fallback"
 kill -TERM "$limit_worker"
 wait "$limit_worker" || true
 WORKER_PIDS=()
@@ -1652,7 +1652,7 @@ second_reboot_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .
 kill -TERM "$limit_worker"
 wait "$limit_worker" || true
 WORKER_PIDS=()
-pass "session-start reset waits consume one bounded reboot fallback"
+pass "session-start reset waits re-query across repeated reboots"
 
 home=$(new_home gateway-stable-recovery)
 write_config "$home"
@@ -1761,7 +1761,7 @@ pass "diagnostic persistence failures preserve terminal reconnect suppression"
 
 home=$(new_home gateway-terminal-persistence)
 write_config "$home"
-make_gateway_server "$home/gateway" auth-fail
+make_gateway_server "$home/gateway" invalid-then-terminal-close
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_TERMINAL_WRITE_FAILURE=1 \
   "$CONTROL" run > "$home/first.log" 2>&1 &
@@ -1798,7 +1798,7 @@ assert_absent "$home/state/.discord-bot-service/reconnect-suppression.json" \
   "retry left terminal write fallback active"
 assert_not_contains "$(cat "$home/first.log")$(cat "$home/second.log")" "$TOKEN" \
   "terminal write fallback exposed the bot token"
-pass "terminal write failures preserve operator suppression across restarts"
+pass "terminal fallback dominates invalid-session delays across restarts"
 
 # macOS LaunchAgent rendering contains no credential or deployment id.
 home=$(new_home launchagent)
