@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Contract tests for bin/fm-test-run.sh - the single owner of behavior suite
-# selection, portable lane composition, proven-isolated --jobs, timing markers,
+# selection, CI lane composition, proven-isolated --jobs, timing markers,
 # JSON artifacts, coverage guard, and aggregate exit status.
 #
 # These tests intentionally exercise the runner with fixtures, --list, and
@@ -498,6 +498,82 @@ test_portable_serial_shard_lane_refusals() {
   [ "$rc" -eq 2 ] || fail "shard lane without a count must refuse (exit 2), got $rc"
   rm -rf "$tmp"
   pass "portable serial shard lanes refuse mismatched, out-of-range, and countless names"
+}
+
+test_real_herdr_shards_partition_the_family() {
+  local lanes count family shard shard_lane listed union dups out
+  lanes=$("$RUNNER" --list-lanes)
+  count=$(printf '%s\n' "$lanes" | grep -c '^real-herdr-gated-[0-9]*of[0-9]*$')
+  [ "$count" -ge 2 ] || fail "expected at least two real-Herdr shard lanes, got $count"
+  printf '%s\n' "$lanes" | grep -q "^real-herdr-gated-1of${count}\$" \
+    || fail "real-Herdr shard lane names must carry the shard count ${count}: $lanes"
+
+  family=$("$RUNNER" --list --family real-herdr-gated | LC_ALL=C sort)
+  union=""
+  shard=1
+  while [ "$shard" -le "$count" ]; do
+    shard_lane="real-herdr-gated-${shard}of${count}"
+    listed=$("$RUNNER" --list --lane "$shard_lane")
+    [ -n "$listed" ] || fail "$shard_lane selected no tests"
+    union=$(printf '%s\n%s' "$union" "$listed")
+    shard=$((shard + 1))
+  done
+  union=$(printf '%s\n' "$union" | grep -v '^$' || true)
+
+  # Exactly once: disjoint shards whose union is the whole required family.
+  dups=$(printf '%s\n' "$union" | LC_ALL=C sort | uniq -d || true)
+  [ -z "$dups" ] || fail "real-Herdr shards run the same script twice: $dups"
+  [ "$(printf '%s\n' "$union" | LC_ALL=C sort)" = "$family" ] \
+    || fail "real-Herdr shards must exactly cover the real-herdr-gated family"
+
+  # Assignment is deterministic across invocations.
+  [ "$("$RUNNER" --list --lane "real-herdr-gated-1of${count}")" = \
+    "$("$RUNNER" --list --lane "real-herdr-gated-1of${count}")" ] \
+    || fail "real-Herdr shard membership must be deterministic"
+
+  # The whole-family lane stays available for local operators.
+  [ "$("$RUNNER" --list --lane real-herdr-gated | LC_ALL=C sort)" = "$family" ] \
+    || fail "the real-herdr-gated lane must still select the whole family"
+
+  # The coverage guard proves the shard partition alongside the serial one.
+  out=$("$RUNNER" --check-coverage)
+  printf '%s\n' "$out" | grep -q "herdr_shards=${count}" \
+    || fail "coverage guard must report the real-Herdr shard count: $out"
+  pass "real-Herdr shards are a deterministic disjoint cover of the required family"
+}
+
+test_real_herdr_shard_lane_refusals() {
+  local tmp count rc other
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-herdr-lane.XXXXXX")
+  count=$("$RUNNER" --list-lanes | grep -c '^real-herdr-gated-[0-9]*of[0-9]*$')
+  other=$((count + 1))
+
+  # A lane built for a different shard count must refuse rather than run a
+  # partial family: this keeps a CI matrix from silently dropping coverage.
+  set +e
+  "$RUNNER" --list --lane "real-herdr-gated-1of${other}" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "mismatched real-Herdr shard count must refuse (exit 2), got $rc"
+  [ ! -s "$tmp/out" ] || fail "mismatched real-Herdr shard count must not list tests"
+  grep -Fq "configured for $count" "$tmp/err" \
+    || fail "mismatch refusal must name the configured count: $(cat "$tmp/err")"
+
+  set +e
+  "$RUNNER" --list --lane "real-herdr-gated-$((count + 1))of${count}" >"$tmp/out2" 2>"$tmp/err2"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "out-of-range real-Herdr shard index must refuse (exit 2), got $rc"
+  grep -Fq "outside 1..$count" "$tmp/err2" \
+    || fail "range refusal message missing: $(cat "$tmp/err2")"
+
+  set +e
+  "$RUNNER" --list --lane real-herdr-gated-1 >"$tmp/out3" 2>"$tmp/err3"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "real-Herdr shard lane without a count must refuse (exit 2), got $rc"
+  rm -rf "$tmp"
+  pass "real-Herdr shard lanes refuse mismatched, out-of-range, and countless names"
 }
 
 test_jobs_requires_proven_isolated() {
@@ -1149,6 +1225,8 @@ test_exclude_family
 test_portable_shard_union_and_coverage_guard
 test_portable_serial_shards_partition_the_serial_lane
 test_portable_serial_shard_lane_refusals
+test_real_herdr_shards_partition_the_family
+test_real_herdr_shard_lane_refusals
 test_jobs_requires_proven_isolated
 test_jobs_parallel_scheduler_and_failure_propagation
 test_default_changed_and_portable_selection

@@ -22,11 +22,17 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       # Single owner of the lint definition (file set + config + version). Do not
       # re-spell the shellcheck command here; keep CI and the pre-push gate on it.
-      - run: bin/fm-lint.sh
+      # FM_LINT_JOBS only widens the bounded worker pool to the runner's four
+      # vCPUs; composition, diagnostics order, and exit selection are identical
+      # at every worker count (bin/fm-lint.sh header).
+      - env:
+          FM_LINT_JOBS: 4
+        run: bin/fm-lint.sh
 
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates,
-  # and that the portable serial CI shards partition that serial lane exactly.
+  # and that the portable serial and real-Herdr CI shards each partition their
+  # required lane exactly.
   test-coverage:
     name: Test coverage guard
     runs-on: ubuntu-latest
@@ -114,15 +120,15 @@ jobs:
   tests-portable-serial:
     name: Behavior portable serial ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # Current measured hints total about 36 min of serial work; the balanced
-    # shards are about 9 min each. Cap is a hang tripwire with margin, not the
-    # expected healthy end of the lane.
+    # Current measured hints total about 37 min of serial work; the balanced
+    # shards are about 3.7 min each. Cap is a hang tripwire with margin, not
+    # the expected healthy end of the lane.
     timeout-minutes: 30
     strategy:
       # Every shard reports so one failure never hides another shard's result.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -166,16 +172,25 @@ jobs:
           path: ${{ runner.temp }}/fm-test/fm-test-timing-portable-serial-${{ matrix.shard }}.json
           if-no-files-found: warn
 
-  # Required real-Herdr lane: pinned install, serial real-herdr-gated family,
-  # hard-fail on "skip: herdr not found". Starts on Linux x86_64; if a genuine
+  # Required real-Herdr lane: pinned install, serial real-herdr-gated shards,
+  # hard-fail on "skip: herdr not found". Each shard is strictly serial on its
+  # own runner with its own default session, snapshot, and cleanup; shard
+  # membership and the shard count belong to bin/fm-test-run.sh, which refuses
+  # a lane whose "ofN" disagrees with it. Starts on Linux x86_64; if a genuine
   # platform invariant fails (focus, cleanup, default-session tripwire), keep
   # the failure evidence and move the job to macOS rather than skip assertions.
   tests-herdr:
-    name: Behavior tests (Herdr)
+    name: Behavior tests (Herdr ${{ matrix.shard }})
     runs-on: ubuntu-latest
     # Real Herdr is slower than the portable suite; this is a hang tripwire,
-    # not the expected healthy end of the lane (estimate 15-40 min first cut).
-    timeout-minutes: 75
+    # not the expected healthy end of the lane (balanced shards are under
+    # five minutes each).
+    timeout-minutes: 30
+    strategy:
+      # Every shard reports so one failure never hides another shard's result.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -254,16 +269,22 @@ jobs:
           set -eu
           mkdir -p "$RUNNER_TEMP/fm-herdr"
           bin/fm-herdr-ci-cleanup.sh snapshot "$RUNNER_TEMP/fm-herdr/sessions-before.json"
-      - name: Run real-Herdr family (serial, required)
+      - name: Run real-Herdr shard ${{ matrix.shard }} (serial, required)
+        env:
+          # job-total rather than a literal, so shrinking or growing the matrix
+          # without matching bin/fm-test-run.sh is refused instead of quietly
+          # leaving a shard of the required lane unrun.
+          FM_HERDR_LANE: real-herdr-gated-${{ matrix.shard }}of${{ strategy.job-total }}
+          FM_HERDR_SHARD: ${{ matrix.shard }}
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/fm-test"
           # Serial only. Fail if any script reports herdr not found. Live
           # harness credential tests stay outside this family (opt-in env only).
-          bin/fm-test-run.sh --family real-herdr-gated \
+          bin/fm-test-run.sh --lane "$FM_HERDR_LANE" \
             --fail-on-gate-skip 'herdr not found' \
             --enforce-duration-budgets \
-            --json "$RUNNER_TEMP/fm-test/fm-test-timing-herdr.json"
+            --json "$RUNNER_TEMP/fm-test/fm-test-timing-herdr-${FM_HERDR_SHARD}.json"
       - name: Cleanup job-owned Herdr lab sessions
         if: always()
         run: |
@@ -274,13 +295,13 @@ jobs:
             herdr session list --json || true
             exit 1
           }
-      - name: Upload Herdr timing and diagnostics
+      - name: Upload Herdr shard ${{ matrix.shard }} timing and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fm-test-timing-herdr
+          name: fm-test-timing-herdr-${{ matrix.shard }}
           path: |
-            ${{ runner.temp }}/fm-test/fm-test-timing-herdr.json
+            ${{ runner.temp }}/fm-test/fm-test-timing-herdr-${{ matrix.shard }}.json
             ${{ runner.temp }}/fm-herdr/sessions-before.json
             ${{ runner.temp }}/fm-herdr/default-server.log
           if-no-files-found: warn
@@ -307,8 +328,15 @@ jobs:
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/fm-test"
-          shopt -s nullglob
-          inputs=("$RUNNER_TEMP"/fm-test-aggregate/fm-test-timing-*.json)
+          # Recursive: the Herdr shard artifacts nest their timing JSON under a
+          # subdirectory, and a top-level-only glob silently dropped that lane
+          # from the aggregate.
+          inputs=()
+          if [ -d "$RUNNER_TEMP/fm-test-aggregate" ]; then
+            while IFS= read -r f; do
+              inputs+=("$f")
+            done < <(find "$RUNNER_TEMP/fm-test-aggregate" -name 'fm-test-timing-*.json' -type f | LC_ALL=C sort)
+          fi
           if [ "${#inputs[@]}" -eq 0 ]; then
             echo "::warning::no per-lane timing JSON found to aggregate"
             exit 0

@@ -21,10 +21,12 @@
 # Explicit paths always bypass this file-set selection and lint exactly the
 # given paths, matching the same config.
 #
-# Canonical lint defaults to two bounded workers over two stable logical shards.
-# Each shard writes separate diagnostics, and the parent replays those outputs in
-# deterministic shard and root order after every worker finishes. FM_LINT_JOBS=1
-# runs the same shards serially with byte-identical diagnostics and exit selection.
+# Canonical lint splits its file set into eight stable logical shards and
+# defaults to two bounded workers over them. Each shard writes separate
+# diagnostics, and the parent replays those outputs in deterministic shard and
+# root order after every worker finishes. Every worker count from FM_LINT_JOBS=1
+# through 8 runs the same shards and replays byte-identical diagnostics and exit
+# selection; workers change wall-clock only, never composition or order.
 #
 # Optional quiet telemetry writes one bounded TSV snapshot of content and source
 # graph identity, wall/CPU/RSS, shard load, and competing ShellCheck processes.
@@ -32,7 +34,7 @@
 # Usage:
 #   fm-lint.sh                         lint the context-selected file set (see above)
 #   fm-lint.sh <path>...               lint explicit roots with the same config
-#   fm-lint.sh --jobs <1|2> [path]...  override bounded worker count
+#   fm-lint.sh --jobs <1..8> [path]... override bounded worker count
 #   fm-lint.sh --telemetry <path> ...  write a quiet metrics snapshot
 #   fm-lint.sh --required-version      print the ShellCheck pin
 #   fm-lint.sh --list-files            print the file set that would be linted
@@ -54,30 +56,41 @@ fm_lint_worker_stop() {
   FM_LINT_WORKER_SHELLCHECK_PID=
 }
 
-fm_lint_worker() {  # <manifest> <output-dir> <shard-index>
-  local manifest=$1 output_dir=$2 shard_index=$3 tab index path output rc=0
+# One bounded worker runs every shard whose index is congruent to its worker
+# index modulo the stride, strictly serially, so a worker count below the shard
+# count still covers every shard exactly once.
+fm_lint_worker() {  # <manifest-dir> <output-dir> <worker-index> <stride>
+  local manifest_dir=$1 output_dir=$2 worker_index=$3 stride=$4
+  local manifest shard_index tab index path output rc worker_rc=0
   local -a roots
-  roots=()
   tab=$(printf '\t')
-  while IFS="$tab" read -r index path || [ -n "${index:-}${path:-}" ]; do
-    [ -n "${index:-}" ] || continue
-    roots+=("$path")
-  done < "$manifest"
-  output="$output_dir/shard.$shard_index"
-  if [ "${#roots[@]}" -gt 0 ]; then
-    trap 'fm_lint_worker_stop; exit 129' HUP
-    trap 'fm_lint_worker_stop; exit 130' INT
-    trap 'fm_lint_worker_stop; exit 143' TERM
-    "$FM_LINT_SHELLCHECK" --norc --external-sources -- "${roots[@]}" > "$output.out" 2>&1 &
-    FM_LINT_WORKER_SHELLCHECK_PID=$!
-    wait "$FM_LINT_WORKER_SHELLCHECK_PID" || rc=$?
-    FM_LINT_WORKER_SHELLCHECK_PID=
-    trap - HUP INT TERM
-  else
-    : > "$output.out"
-  fi
-  printf '%s\n' "$rc" > "$output.rc"
-  return "$rc"
+  trap 'fm_lint_worker_stop; exit 129' HUP
+  trap 'fm_lint_worker_stop; exit 130' INT
+  trap 'fm_lint_worker_stop; exit 143' TERM
+  shard_index=$worker_index
+  while [ "$shard_index" -lt "$FM_LINT_SHARD_COUNT" ]; do
+    manifest="$manifest_dir/manifest.$shard_index"
+    output="$output_dir/shard.$shard_index"
+    roots=()
+    while IFS="$tab" read -r index path || [ -n "${index:-}${path:-}" ]; do
+      [ -n "${index:-}" ] || continue
+      roots+=("$path")
+    done < "$manifest"
+    rc=0
+    if [ "${#roots[@]}" -gt 0 ]; then
+      "$FM_LINT_SHELLCHECK" --norc --external-sources -- "${roots[@]}" > "$output.out" 2>&1 &
+      FM_LINT_WORKER_SHELLCHECK_PID=$!
+      wait "$FM_LINT_WORKER_SHELLCHECK_PID" || rc=$?
+      FM_LINT_WORKER_SHELLCHECK_PID=
+    else
+      : > "$output.out"
+    fi
+    printf '%s\n' "$rc" > "$output.rc"
+    [ "$rc" -eq 0 ] || worker_rc=$rc
+    shard_index=$((shard_index + stride))
+  done
+  trap - HUP INT TERM
+  return "$worker_rc"
 }
 
 # Private subprocess mode used only by the bounded parent above.
@@ -86,8 +99,8 @@ if [ "${1:-}" = "--internal-worker" ]; then
     printf 'fm-lint.sh: --internal-worker is private to the lint owner.\n' >&2
     exit 2
   }
-  [ "$#" -eq 4 ] && [ -n "${FM_LINT_SHELLCHECK:-}" ] || exit 2
-  fm_lint_worker "$2" "$3" "$4"
+  [ "$#" -eq 5 ] && [ -n "${FM_LINT_SHELLCHECK:-}" ] && [ -n "${FM_LINT_SHARD_COUNT:-}" ] || exit 2
+  fm_lint_worker "$2" "$3" "$4" "$5"
   exit $?
 fi
 
@@ -97,7 +110,7 @@ if [ "${1:-}" = "--required-version" ]; then
 fi
 
 fm_lint_usage() {
-  sed -n '2,39{s/^# \{0,1\}//;p;}' "$SELF"
+  sed -n '2,41{s/^# \{0,1\}//;p;}' "$SELF"
 }
 
 JOBS=${FM_LINT_JOBS:-2}
@@ -106,7 +119,7 @@ LIST_FILES=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --jobs)
-      [ "$#" -ge 2 ] || { printf 'fm-lint.sh: --jobs requires 1 or 2.\n' >&2; exit 2; }
+      [ "$#" -ge 2 ] || { printf 'fm-lint.sh: --jobs requires a worker count from 1 to 8.\n' >&2; exit 2; }
       JOBS=$2
       shift 2
       ;;
@@ -140,8 +153,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$JOBS" in
-  1|2) ;;
-  *) printf 'fm-lint.sh: jobs must be 1 or 2, got %s.\n' "$JOBS" >&2; exit 2 ;;
+  1|2|3|4|5|6|7|8) ;;
+  *) printf 'fm-lint.sh: jobs must be a worker count from 1 to 8, got %s.\n' "$JOBS" >&2; exit 2 ;;
 esac
 
 # fm_lint_changed_base_ref prints the ref to diff the working branch against:
@@ -278,11 +291,13 @@ TAB=$(printf '\t')
 WEIGHTS="$TMP_ROOT/weights"
 OUTPUT_DIR="$TMP_ROOT/output"
 mkdir -p "$OUTPUT_DIR"
-SHARD_COUNT=2
-worker=0
-while [ "$worker" -lt "$SHARD_COUNT" ]; do
-  : > "$TMP_ROOT/manifest.$worker"
-  worker=$((worker + 1))
+# Stable logical shard count: composition and replay order never depend on the
+# worker count, so every FM_LINT_JOBS value emits byte-identical diagnostics.
+SHARD_COUNT=8
+shard=0
+while [ "$shard" -lt "$SHARD_COUNT" ]; do
+  : > "$TMP_ROOT/manifest.$shard"
+  shard=$((shard + 1))
 done
 
 index=1
@@ -304,24 +319,36 @@ for path in "${ROOTS[@]}"; do
   index=$((index + 1))
 done
 
-# Largest-first deterministic greedy assignment keeps the two bounded workers
+# Largest-first deterministic greedy assignment keeps the stable logical shards
 # balanced without affecting replay order. Direct bytes are a stable portable
-# proxy after the expensive dynamic adapter source fan-out is cut.
-WORKER_LOADS=(0 0)
+# proxy after the expensive dynamic adapter source fan-out is cut. Ties between
+# equally loaded shards always take the lowest shard index.
+SHARD_LOADS=()
+shard=0
+while [ "$shard" -lt "$SHARD_COUNT" ]; do
+  SHARD_LOADS[shard]=0
+  shard=$((shard + 1))
+done
 LC_ALL=C sort -t "$TAB" -k1,1nr -k2,2n "$WEIGHTS" > "$WEIGHTS.sorted"
 while IFS="$TAB" read -r weight index path; do
-  worker=0
-  if [ "${WORKER_LOADS[1]}" -lt "${WORKER_LOADS[0]}" ]; then
-    worker=1
-  fi
-  printf '%s\t%s\n' "$index" "$path" >> "$TMP_ROOT/manifest.$worker"
-  WORKER_LOADS[worker]=$((WORKER_LOADS[worker] + weight))
+  best=0
+  best_load=${SHARD_LOADS[0]}
+  shard=1
+  while [ "$shard" -lt "$SHARD_COUNT" ]; do
+    if [ "${SHARD_LOADS[shard]}" -lt "$best_load" ]; then
+      best_load=${SHARD_LOADS[shard]}
+      best=$shard
+    fi
+    shard=$((shard + 1))
+  done
+  printf '%s\t%s\n' "$index" "$path" >> "$TMP_ROOT/manifest.$best"
+  SHARD_LOADS[best]=$((best_load + weight))
 done < "$WEIGHTS.sorted"
-worker=0
-while [ "$worker" -lt "$SHARD_COUNT" ]; do
-  LC_ALL=C sort -t "$TAB" -k1,1n "$TMP_ROOT/manifest.$worker" > "$TMP_ROOT/manifest.$worker.sorted"
-  mv "$TMP_ROOT/manifest.$worker.sorted" "$TMP_ROOT/manifest.$worker"
-  worker=$((worker + 1))
+shard=0
+while [ "$shard" -lt "$SHARD_COUNT" ]; do
+  LC_ALL=C sort -t "$TAB" -k1,1n "$TMP_ROOT/manifest.$shard" > "$TMP_ROOT/manifest.$shard.sorted"
+  mv "$TMP_ROOT/manifest.$shard.sorted" "$TMP_ROOT/manifest.$shard"
+  shard=$((shard + 1))
 done
 
 fm_lint_shellcheck_count() {
@@ -357,32 +384,31 @@ if [ -n "$TELEMETRY" ]; then
   TELEMETRY_CPU_START=$(fm_lint_aggregate_cpu)
 fi
 
-fm_lint_run_worker() {  # <worker-index>
-  local worker_index=$1 manifest timing
-  manifest="$TMP_ROOT/manifest.$worker_index"
+fm_lint_run_worker() {  # <worker-index> <stride>
+  local worker_index=$1 stride=$2 timing
   timing="$TMP_ROOT/timing.$worker_index"
   if [ -n "$TELEMETRY" ] && [ -x /usr/bin/time ]; then
     if [ "$(uname)" = Darwin ]; then
       exec "$PERL_BIN" -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
         /usr/bin/time -lp -o "$timing" \
-        env FM_LINT_INTERNAL=1 FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
-        "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
+        env FM_LINT_INTERNAL=1 FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" FM_LINT_SHARD_COUNT="$SHARD_COUNT" \
+        "${BASH:-bash}" "$SELF" --internal-worker "$TMP_ROOT" "$OUTPUT_DIR" "$worker_index" "$stride"
     else
       exec "$PERL_BIN" -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
         /usr/bin/time -f 'wall_seconds=%e\nuser_seconds=%U\nsystem_seconds=%S\nmax_rss_kib=%M' -o "$timing" \
-        env FM_LINT_INTERNAL=1 FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
-        "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
+        env FM_LINT_INTERNAL=1 FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" FM_LINT_SHARD_COUNT="$SHARD_COUNT" \
+        "${BASH:-bash}" "$SELF" --internal-worker "$TMP_ROOT" "$OUTPUT_DIR" "$worker_index" "$stride"
     fi
   else
     [ -z "$TELEMETRY" ] || printf 'timing_unavailable=1\n' > "$timing"
     exec "$PERL_BIN" -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
-      env FM_LINT_INTERNAL=1 FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" \
-      "${BASH:-bash}" "$SELF" --internal-worker "$manifest" "$OUTPUT_DIR" "$worker_index"
+      env FM_LINT_INTERNAL=1 FM_LINT_SHELLCHECK="$SHELLCHECK_BIN" FM_LINT_SHARD_COUNT="$SHARD_COUNT" \
+      "${BASH:-bash}" "$SELF" --internal-worker "$TMP_ROOT" "$OUTPUT_DIR" "$worker_index" "$stride"
   fi
 }
 
 fm_lint_start_worker() {
-  fm_lint_run_worker "$1" &
+  fm_lint_run_worker "$1" "$2" &
   ACTIVE_PIDS+=("$!")
 }
 
@@ -395,23 +421,19 @@ fm_lint_wait_workers() {
   done
 }
 
-if [ "$JOBS" -eq 1 ]; then
-  worker=0
-  while [ "$worker" -lt "$SHARD_COUNT" ]; do
-    fm_lint_start_worker "$worker"
-    fm_lint_wait_workers
-    worker=$((worker + 1))
-  done
-else
-  worker=0
-  while [ "$worker" -lt "$SHARD_COUNT" ]; do
-    fm_lint_start_worker "$worker"
-    worker=$((worker + 1))
-  done
-  fm_lint_wait_workers
-fi
+# Each bounded worker serially covers the shards congruent to its index modulo
+# the worker count, so any worker count covers every shard exactly once and
+# JOBS=1 degenerates to one strictly serial pass over all shards.
+WORKER_COUNT=$JOBS
+[ "$WORKER_COUNT" -le "$SHARD_COUNT" ] || WORKER_COUNT=$SHARD_COUNT
+worker=0
+while [ "$worker" -lt "$WORKER_COUNT" ]; do
+  fm_lint_start_worker "$worker" "$WORKER_COUNT"
+  worker=$((worker + 1))
+done
+fm_lint_wait_workers
 
-# Replay both stable shards in deterministic order and select the first nonzero
+# Replay the stable shards in deterministic order and select the first nonzero
 # shard status. ShellCheck processes every root in a shard after earlier findings.
 overall_rc=0
 worker=0
@@ -515,8 +537,11 @@ EOF
     printf 'source_boundary_directives\t%s\n' "$source_boundaries"
     printf 'source_followed_directives\t%s\n' "$source_followed"
     printf 'source_target_count\t%s\n' "$source_targets"
-    printf 'shard_1_weight_bytes\t%s\n' "${WORKER_LOADS[0]}"
-    printf 'shard_2_weight_bytes\t%s\n' "${WORKER_LOADS[1]:-0}"
+    shard=0
+    while [ "$shard" -lt "$SHARD_COUNT" ]; do
+      printf 'shard_%s_weight_bytes\t%s\n' "$((shard + 1))" "${SHARD_LOADS[shard]:-0}"
+      shard=$((shard + 1))
+    done
     printf 'wall_seconds\t%s\n' "$((TELEMETRY_END_EPOCH - TELEMETRY_START_EPOCH))"
     printf 'worker_wall_sum_seconds\t%s\n' "$timing_worker_wall"
     printf 'max_worker_wall_seconds\t%s\n' "$max_worker_wall"

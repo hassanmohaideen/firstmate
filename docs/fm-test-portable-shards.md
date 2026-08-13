@@ -1,6 +1,6 @@
-# Firstmate portable test shards
+# Firstmate test shards
 
-`bin/fm-test-run.sh` owns portable lane composition and execution.
+`bin/fm-test-run.sh` owns behavior-test lane composition and execution.
 `bin/fm-test-isolation-proof.sh` owns the proven-isolated candidate set.
 
 ## Verification inputs
@@ -55,7 +55,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 146-script inventory leaves 109 scripts in the portable serial remainder.
+The current 147-script inventory leaves 110 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 
@@ -63,19 +63,40 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 `.github/workflows/ci.yml` derives the same `n` from `strategy.job-total` rather than a literal, so changing the shard count in either file without the other fails the lane loudly instead of leaving part of the required suite unrun.
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
-The hints combine the prior green CI artifact with focused 2026-08-13 measurements of the dominant scripts from the reported 1,527-second local run.
+The hints are the complete per-script measurements from the retained per-shard timing artifacts of green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), refreshed through the procedure below.
 A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of4` | 27 | 515445 ms (~515.4 s) |
-| `portable-serial-2of4` | 26 | 515445 ms (~515.4 s) |
-| `portable-serial-3of4` | 27 | 515455 ms (~515.5 s) |
-| `portable-serial-4of4` | 29 | 515462 ms (~515.5 s) |
-| imbalance | | 17 ms |
+| `portable-serial-1of10` | 10 | 221044 ms (~221.0 s) |
+| `portable-serial-2of10` | 11 | 221049 ms (~221.0 s) |
+| `portable-serial-3of10` | 7 | 221526 ms (~221.5 s) |
+| `portable-serial-4of10` | 12 | 221048 ms (~221.0 s) |
+| `portable-serial-5of10` | 15 | 221055 ms (~221.1 s) |
+| `portable-serial-6of10` | 8 | 221483 ms (~221.5 s) |
+| `portable-serial-7of10` | 12 | 221056 ms (~221.1 s) |
+| `portable-serial-8of10` | 9 | 221143 ms (~221.1 s) |
+| `portable-serial-9of10` | 12 | 221053 ms (~221.1 s) |
+| `portable-serial-10of10` | 14 | 221053 ms (~221.1 s) |
+| imbalance | | 482 ms |
 
-The single longest measured script, `tests/fm-pr-check-security.test.sh` at 194216 ms after its snapshot optimization, is the floor for any shard count.
+The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210119 ms in that run, is the floor for any serial shard count.
+Ten shards sit just above that floor, so more serial runners would stop paying off without first splitting or speeding that script.
+
+## Real-Herdr CI shards
+
+`real-herdr-gated-<k>of<n>` splits the required real-Herdr family across `n` separate CI runners under the same contract as the serial shards.
+Each shard is strictly serial in itself, and each runner provisions its own pinned Herdr, default session, pre-suite snapshot, and cleanup, so the split needs no concurrency isolation proof and every default-session tripwire stays job-local.
+`bin/fm-test-run.sh` owns this `n` with the same `of<n>` refusal, `.github/workflows/ci.yml` derives it from `strategy.job-total`, and every shard keeps `--fail-on-gate-skip 'herdr not found'` so a missing pin can never pass as a gate skip.
+Assignment reuses the longest-processing-time packing over `real_herdr_duration_hints`.
+
+| Lane | Script count | Estimated duration |
+|---|---:|---:|
+| `real-herdr-gated-1of2` | 1 | 260721 ms (~260.7 s) |
+| `real-herdr-gated-2of2` | 12 | 178105 ms (~178.1 s) |
+
+The presentation E2E dominates its shard alone, so its retained measured baseline is the floor for the whole real-Herdr surface at any shard count.
 
 ## Performance evidence
 
@@ -118,6 +139,16 @@ Focus-flash was measured separately on macOS aarch64 with Herdr 0.8.0 protocol 1
 A subsequent portable regression attempt ran for about 1,500 seconds.
 Its failures were pre-existing failures unrelated to the scheduling and slow-test optimizations, so the attempt remains classified as incomplete evidence rather than a green regression result or justification to omit coverage.
 
+## CI wall-clock evidence
+
+Green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13) completed in 10 minutes 48 seconds of wall-clock at four serial shards.
+Its critical path was portable serial shard 2's test step at 10 minutes 18 seconds, with shards 1 and 4 near 9 minutes 35 seconds, the single Herdr lane at 6 minutes 25 seconds, and the full-set lint job at 6 minutes 54 seconds under two bounded workers.
+The 2026-08-13 recomposition answers each of those: ten balanced serial shards near 221 seconds of hinted work each, two real-Herdr shards, and four lint workers over eight stable shards.
+A local full-set lint measurement on an arm64 host fell from 209.7 seconds at two workers to 126.4 seconds at four workers with byte-identical diagnostics.
+The per-lane timing artifacts and aggregate of the next green CI run are the after measurement for this recomposition.
+The aggregate now finds nested timing JSON recursively; the prior top-level-only glob silently dropped the Herdr lane from the aggregate artifact.
+The floor for the complete run at this composition is the presentation E2E's retained 260,721 ms baseline plus per-job setup and the aggregate tail.
+
 Refresh the hints by downloading the per-shard timing artifacts from a green CI run, replacing the `portable_serial_weight_hints` table in `bin/fm-test-run.sh` with the measured `path`/`duration_ms` pairs, and updating the table above:
 
 ```sh
@@ -131,10 +162,11 @@ bin/fm-test-run.sh --check-coverage
 `bin/fm-test-run.sh --check-coverage` verifies that both parallel lanes partition the proven-isolated set.
 It also verifies that the parallel lanes, portable serial lane, and real-Herdr family are disjoint and cover every `tests/*.test.sh` script.
 It separately verifies that the portable serial CI shards are non-empty, disjoint, and together equal the portable serial lane.
+It verifies the real-Herdr CI shards the same way against the real-herdr-gated family.
 
 ## Timing artifacts and budgets
 
-Portable shards, each portable serial shard, and the Herdr lane upload runner-generated timing JSON.
+Portable shards, each portable serial shard, and each real-Herdr shard upload runner-generated timing JSON.
 `bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
 The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from archived timing artifacts.
 An unmeasured script has no budget: local execution reports it as missing, enforced execution fails after the functional result, and the coverage guard rejects it from every required lane.
@@ -150,8 +182,8 @@ Budget overruns warn during local runs and are enforced by required CI lanes wit
 
 | Job | timeout-minutes | Rationale |
 |---|---:|---|
-| portable parallel 1/2 | 10 | The measured shard sums are about three minutes and the timeout is a hang tripwire. |
-| portable serial 1-4 | 30 | Each balanced shard is about 8.6 minutes, leaving a generous hang-tripwire margin. |
-| Herdr | 75 | The real-Herdr lane keeps its dedicated timeout. |
+| portable parallel 1/2 | 10 | The measured shard sums are under two minutes and the timeout is a hang tripwire. |
+| portable serial 1-10 | 30 | Each balanced shard is about 3.7 minutes, leaving a generous hang-tripwire margin. |
+| Herdr 1/2 | 30 | The longest shard is about 4.3 minutes and keeps a generous hang-tripwire margin. |
 
 Timeouts are hang tripwires rather than expected healthy durations.
