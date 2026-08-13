@@ -42,7 +42,6 @@ OWNERSHIP_DIR="$OWNERSHIP_STATE/.discord-bot-service"
 OWNERSHIP_LOCK="$OWNERSHIP_DIR/owner.lock"
 START_LOCK="$OWNERSHIP_DIR/start.lock"
 OWNER_READY="$OWNERSHIP_DIR/owner.ready"
-TERMINAL_FILE="$OWNERSHIP_DIR/terminal.json"
 
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/fm-discord-config-lib.sh"
