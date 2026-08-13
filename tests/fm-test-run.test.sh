@@ -873,7 +873,7 @@ SH
 }
 
 test_completed_worker_descendant_cleanup() {
-  local mode tmp repo evidence runner pid child rc n watchdog options
+  local mode tmp repo evidence runner pid child rc n watchdog
   for mode in serial parallel; do
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-completed-group.XXXXXX")
     repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
@@ -898,10 +898,9 @@ touch "$SIGNAL_EVIDENCE/blocker.ready"
 while :; do sleep 1; done
 SH
     chmod +x "$repo"/tests/*.test.sh
-    options=
-    [ "$mode" = parallel ] && options='--jobs 2'
-    SIGNAL_EVIDENCE="$evidence" "$runner" $options \
-      tests/fm-brief.test.sh tests/fm-composer-lib.test.sh >"$tmp/out" 2>"$tmp/err" &
+    set -- tests/fm-brief.test.sh tests/fm-composer-lib.test.sh
+    [ "$mode" = parallel ] && set -- --jobs 2 "$@"
+    SIGNAL_EVIDENCE="$evidence" "$runner" "$@" >"$tmp/out" 2>"$tmp/err" &
     pid=$!
     n=0
     while { [ ! -e "$evidence/blocker.ready" ] || ! grep -q 'FM_TEST_END .*tests/fm-brief.test.sh' "$tmp/out" 2>/dev/null; } \
