@@ -42,6 +42,8 @@ ok - valid Gateway Resume state survives abrupt process replacement
 ok - non-resumable invalid-session waits survive abrupt process replacement
 ok - fresh Identify honors Discord session-start exhaustion
 ok - session-start reservations survive process restarts while Resume stays available
+ok - Identify reservation persistence failures remain stopped until termination
+ok - Gateway sequence persistence coalesces bursts to bounded writes
 ok - Gateway lookup rate limits preserve server-provided retry direction
 ok - server retry deadlines survive abrupt process and service-manager restarts
 ok - retry deadline persistence failures remain stopped until termination
@@ -75,10 +77,11 @@ It bounds an hour of rapid successful handshakes to at most 12 connections, prov
 The real local Gateway storm pass repeatedly sends READY or RESUMED and disconnects, then asserts the connection count remains bounded and TERM interrupts the active cooldown promptly.
 The restart pass builds pressure against that Gateway, replaces the worker, and observes the next connection retain the accumulated delay through the private canonical ownership record.
 The directed reconnect pass proves Opcode 7 and resumable Opcode 9 retain the session, while non-resumable Opcode 9 clears it before the next Identify.
-The session-limit passes prove exhausted authenticated metadata blocks fresh Identify until reset and that a pre-crash reservation cannot be reused after worker replacement, while the directed reconnect pass continues to prove Resume remains available.
+The session-limit passes prove exhausted authenticated metadata blocks fresh Identify until reset, a pre-crash reservation cannot be reused after worker replacement, and reservation persistence failure prevents both a Gateway attempt and service-manager restart, while the directed reconnect pass continues to prove Resume remains available.
+The sequence-burst pass delivers 100 dispatches faster than deliberately slowed durable writes, observes the latest sequence become durable, and bounds actual private-state replacements rather than allowing one queued write per event.
 The local HTTP 429 pass sets Discord's direction above every configured local cap and proves the authenticated Gateway lookup does not retry before that minimum.
 The stable-recovery pass creates a transient HTTP failure, reaches READY with its diagnostic still present, and observes that diagnostic clear only after the configured sustained-health interval.
-The authentication-failure pass returns HTTP 401 once, publishes one `authentication-rejected` notification, persists terminal suppression, and proves a second service-manager invocation makes no HTTP or Gateway request.
+The authentication-failure pass returns HTTP 401 once, publishes one `authentication-rejected` notification, persists terminal suppression, and proves service-manager replacement, alternate state selection, and owner/guild/channel filtering overrides make no further HTTP or Gateway request for the unchanged bot authentication identity.
 The terminal close pass sends Gateway close code 4004 before READY and observes one connection with no retry.
 The fixed output, health output, private service record, and property-list assertions reject the generated token and authorization ids.
 The worker pass starts the real shell single-instance wrapper, proves a second start is refused, sends TERM, and verifies enabled and ready markers retire.

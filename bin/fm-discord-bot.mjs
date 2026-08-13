@@ -812,12 +812,6 @@ function sleep(milliseconds) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
-function configFingerprint(config) {
-  return createHash("sha256")
-    .update([config.token, config.ownerId, config.guildId, config.channelId].join("\0"))
-    .digest("hex");
-}
-
 function authenticationFingerprint(config) {
   return createHash("sha256").update(config.token).digest("hex");
 }
@@ -831,11 +825,11 @@ async function activeTerminalSuppression(config) {
     if (error?.code === "ENOENT") return "";
     return "terminal-suppression-invalid";
   }
-  if (record?.schema !== "firstmate.discord-terminal.v1" || !SAFE_CODE_RE.test(record?.code || "")
-      || !INCIDENT_ID_RE.test(record?.config_fingerprint || "")) {
+  if (record?.schema !== "firstmate.discord-terminal.v2" || !SAFE_CODE_RE.test(record?.code || "")
+      || !INCIDENT_ID_RE.test(record?.authentication_fingerprint || "")) {
     return "terminal-suppression-invalid";
   }
-  if (record.config_fingerprint === configFingerprint(config)) return record.code;
+  if (record.authentication_fingerprint === authenticationFingerprint(config)) return record.code;
   await removeMarker(TERMINAL_FILE);
   await clearDiagnostic();
   return "";
@@ -844,9 +838,9 @@ async function activeTerminalSuppression(config) {
 async function writeTerminalSuppression(config, code) {
   await ensureOwnershipDirectory();
   await atomicReplacePrivate(TERMINAL_FILE, `${JSON.stringify({
-    schema: "firstmate.discord-terminal.v1",
+    schema: "firstmate.discord-terminal.v2",
     code,
-    config_fingerprint: configFingerprint(config),
+    authentication_fingerprint: authenticationFingerprint(config),
     recorded_at: diagnosticEpochSeconds(),
   })}\n`);
 }
@@ -877,6 +871,8 @@ class GatewayRunner {
     this.serverWaitMs = null;
     this.sessionStartLimit = null;
     this.durableTransitions = Promise.resolve();
+    this.sequencePersistPending = false;
+    this.sequencePersistTask = null;
     this.connected = false;
     this.inbound = Promise.resolve();
     this.waiters = new Set();
@@ -945,7 +941,20 @@ class GatewayRunner {
 
   persistDurableState() {
     const content = `${JSON.stringify(this.durableRecord())}\n`;
-    const transition = this.durableTransitions.then(() => atomicReplacePrivate(RECONNECT_FILE, content));
+    const transition = this.durableTransitions.then(async () => {
+      if (TEST_MODE && process.env.FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS) {
+        await sleep(testDuration("FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS", 1, 1, 1000));
+      }
+      await atomicReplacePrivate(RECONNECT_FILE, content);
+      if (TEST_MODE && process.env.FM_DISCORD_TEST_DURABLE_WRITE_LOG === "1") {
+        const log = await open(join(STATE, "discord-bot.durable-writes"), "a", 0o600);
+        try {
+          await log.writeFile("write\n");
+        } finally {
+          await log.close();
+        }
+      }
+    });
     this.durableTransitions = transition.catch(() => {});
     return transition;
   }
@@ -969,6 +978,22 @@ class GatewayRunner {
       }
       return await this.failClosedWait;
     }
+  }
+
+  queueSequencePersistence() {
+    this.sequencePersistPending = true;
+    if (this.sequencePersistTask) return;
+    this.sequencePersistTask = (async () => {
+      while (this.sequencePersistPending && !this.stopping && !this.failClosed) {
+        this.sequencePersistPending = false;
+        if (!await this.persistDurableStateOrStop()) break;
+      }
+    })().finally(() => {
+      this.sequencePersistTask = null;
+      if (this.sequencePersistPending && !this.stopping && !this.failClosed) {
+        this.queueSequencePersistence();
+      }
+    });
   }
 
   async loadDurableState() {
@@ -1057,9 +1082,12 @@ class GatewayRunner {
       limit.resetAt = Date.now();
     }
     if (limit.remaining === 0) return false;
+    if (TEST_MODE && process.env.FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS) {
+      await sleep(testDuration("FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS", 1, 1, 1000));
+      if (this.stopping) return false;
+    }
     limit.remaining -= 1;
-    await this.persistDurableState();
-    return true;
+    return await this.persistDurableStateOrStop();
   }
 
   serverDelayRemaining() {
@@ -1180,7 +1208,7 @@ class GatewayRunner {
         }
         if (Number.isInteger(packet.s)) {
           this.sequence = packet.s;
-          void this.persistDurableStateOrStop();
+          this.queueSequencePersistence();
         }
         switch (packet.op) {
           case 10: {
@@ -1387,6 +1415,7 @@ class GatewayRunner {
     clearInterval(pruneTimer);
     clearInterval(reconcileTimer);
     await this.inbound;
+    if (this.sequencePersistTask) await this.sequencePersistTask;
     await this.durableTransitions;
     await diagnosticTransitions;
     safeLog("service stopped");

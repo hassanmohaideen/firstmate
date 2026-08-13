@@ -287,6 +287,12 @@ server.on("upgrade",(req,socket)=>{
             text(socket,{op:0,t:"PRESENCE_UPDATE",s:connection+1,d:{}});
           },5);
         }
+        if (mode === "sequence-burst") {
+          for (let sequence=2;sequence<=101;sequence+=1) {
+            text(socket,{op:0,t:"PRESENCE_UPDATE",s:sequence,d:{}});
+          }
+          fs.writeFileSync(countFile.replace(/connections$/, "sequence-burst-sent"),"sent\n");
+        }
       } else if (packet.op === 6 && packet.d?.token === token && packet.d?.session_id) {
         handshakeComplete=true;
         fs.appendFileSync(eventFile,JSON.stringify({connection,op:"resume",session:packet.d.session_id,sequence:packet.d.seq})+"\n");
@@ -966,6 +972,63 @@ wait "$limit_worker" || true
 WORKER_PIDS=()
 pass "session-start reservations survive process restarts while Resume stays available"
 
+home=$(new_home gateway-session-reservation-persistence-failure)
+write_config "$home"
+make_gateway_server "$home/gateway" session-one-stale
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS=300 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+limit_worker=$!
+WORKER_PIDS+=("$limit_worker")
+i=0
+while [ "$i" -lt 100 ]; do
+  remaining=$(jq -r '.session_start_limit.remaining // -1' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf '%s' -1)
+  [ "$remaining" -eq 1 ] 2>/dev/null && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ "$remaining" -eq 1 ] 2>/dev/null || fail "Identify reservation fixture did not persist Discord metadata"
+rm -f "$home/state/.discord-bot-service/reconnect.json"
+mkdir "$home/state/.discord-bot-service/reconnect.json"
+wait_for_file "$home/state/discord-bot.error" || fail "Identify reservation persistence failure did not fail closed"
+kill -0 "$limit_worker" 2>/dev/null || fail "Identify reservation persistence failure exited into service-manager restart"
+assert_absent "$home/gateway/connections" "Gateway attempt proceeded without a durable Identify reservation"
+[ "$(jq -r .code "$home/state/discord-bot.error")" = reconnect-state-unavailable ] \
+  || fail "Identify reservation persistence failure lacked its safe diagnostic"
+kill -TERM "$limit_worker"
+wait "$limit_worker" || true
+WORKER_PIDS=()
+pass "Identify reservation persistence failures remain stopped until termination"
+
+home=$(new_home gateway-sequence-coalescing)
+write_config "$home"
+make_gateway_server "$home/gateway" sequence-burst
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS=30 FM_DISCORD_TEST_DURABLE_WRITE_LOG=1 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+sequence_worker=$!
+WORKER_PIDS+=("$sequence_worker")
+wait_for_file "$home/gateway/sequence-burst-sent" || fail "sequence coalescing fixture did not send its burst"
+i=0
+while [ "$i" -lt 200 ]; do
+  durable_sequence=$(jq -r '.resume_session.sequence // -1' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf '%s' -1)
+  [ "$durable_sequence" -eq 101 ] 2>/dev/null && break
+  sleep 0.02
+  i=$((i + 1))
+done
+[ "$durable_sequence" -eq 101 ] 2>/dev/null || fail "coalesced persistence lost the latest Gateway sequence"
+sleep 0.15
+write_count=$(wc -l < "$home/state/discord-bot.durable-writes")
+[ "$write_count" -le 10 ] || fail "Gateway sequence burst queued $write_count durable writes"
+kill -TERM "$sequence_worker"
+wait "$sequence_worker" || true
+WORKER_PIDS=()
+pass "Gateway sequence persistence coalesces bursts to bounded writes"
+
 home=$(new_home gateway-rate-limit)
 write_config "$home"
 make_gateway_server "$home/gateway" rate-limit
@@ -1188,6 +1251,15 @@ out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/alternate-state" FM_ROOT_OVERRIDE
   "$NODE_BIN" "$BOT" run 2>&1)
 assert_contains "$out" "reconnects stopped" "alternate state override did not honor terminal suppression"
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "alternate state override bypassed terminal suppression"
+alternate_owner=$(printf '6%.0s' {1..18})
+alternate_guild=$(printf '7%.0s' {1..18})
+alternate_channel=$(printf '8%.0s' {1..18})
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_OWNER_USER_ID="$alternate_owner" \
+  FM_DISCORD_GUILD_ID="$alternate_guild" FM_DISCORD_CHANNEL_ID="$alternate_channel" \
+  "$NODE_BIN" "$BOT" run 2>&1)
+assert_contains "$out" "reconnects stopped" "filter overrides did not honor authentication-bound suppression"
+[ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "filter overrides bypassed unchanged-token suppression"
 printf '%s\n' '{"code":"gateway-unavailable"}' > "$home/alternate-state/discord-bot.error"
 chmod 600 "$home/alternate-state/discord-bot.error"
 out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/alternate-state" FM_ROOT_OVERRIDE="$ROOT" \
