@@ -46,6 +46,7 @@ const ENABLED_FILE = join(STATE, "discord-bot.enabled");
 const READY_FILE = join(STATE, "discord-bot.ready");
 const ERROR_FILE = join(STATE, "discord-bot.error");
 const ERROR_NOTIFIED_FILE = join(STATE, "discord-bot.error.notified");
+const TERMINAL_FILE = join(STATE, "discord-bot.terminal");
 const WAKE_DEDUP_DIR = join(STATE, ".wake-dedup");
 const NOTIFIER = join(ROOT, "bin", "fm-discord-notify.sh");
 const TEST_MODE = process.env.FM_DISCORD_TEST_MODE === "1";
@@ -75,9 +76,10 @@ let diagnosticTransitions = Promise.resolve();
 class DisabledError extends Error {}
 class ConfigError extends Error {}
 class DiscordHttpError extends Error {
-  constructor(status) {
+  constructor(status, retryAfterMs = 0) {
     super(`Discord HTTP ${status}`);
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -685,23 +687,141 @@ async function gatewayUrl(config) {
   } catch {
     throw new Error("gateway lookup unavailable");
   }
-  if (!response.ok) throw new DiscordHttpError(response.status);
+  if (!response.ok) {
+    let retryAfterMs = 0;
+    if (response.status === 429) {
+      const headerDelay = Number(response.headers.get("retry-after"));
+      if (Number.isFinite(headerDelay) && headerDelay > 0) retryAfterMs = Math.ceil(headerDelay * 1000);
+      try {
+        const errorBody = await response.json();
+        const bodyDelay = Number(errorBody?.retry_after);
+        if (Number.isFinite(bodyDelay) && bodyDelay > 0) retryAfterMs = Math.ceil(bodyDelay * 1000);
+      } catch {}
+    }
+    throw new DiscordHttpError(response.status, Math.min(15 * 60_000, retryAfterMs));
+  }
   const body = await response.json();
   validateProductionEndpoint(body.url, "gateway");
   return body.url;
 }
 
-function backoffMilliseconds(attempt) {
-  if (TEST_MODE && /^[0-9]+$/.test(process.env.FM_DISCORD_TEST_BACKOFF_MS || "")) {
-    return Math.max(1, Math.min(1000, Number(process.env.FM_DISCORD_TEST_BACKOFF_MS)));
+function testDuration(name, fallback, minimum = 1, maximum = fallback) {
+  const value = process.env[name] || "";
+  if (!TEST_MODE || !/^[0-9]+$/.test(value)) return fallback;
+  return Math.max(minimum, Math.min(maximum, Number(value)));
+}
+
+const TEST_BACKOFF_MS = testDuration("FM_DISCORD_TEST_BACKOFF_MS", 5000, 1, 1000);
+const RECONNECT_POLICY = {
+  minimumIntervalMs: TEST_MODE && process.env.FM_DISCORD_TEST_BACKOFF_MS
+    ? TEST_BACKOFF_MS
+    : testDuration("FM_DISCORD_TEST_MIN_CONNECTION_MS", 5000, 1, 5000),
+  baseDelayMs: TEST_BACKOFF_MS,
+  maximumDelayMs: TEST_MODE && process.env.FM_DISCORD_TEST_BACKOFF_MS
+    ? Math.max(TEST_BACKOFF_MS, testDuration("FM_DISCORD_TEST_MAX_BACKOFF_MS", 1000, 1, 5000))
+    : 300_000,
+  cooldownAfter: 8,
+  cooldownMs: testDuration("FM_DISCORD_TEST_COOLDOWN_MS", 15 * 60_000, 1, 15 * 60_000),
+};
+const STABLE_CONNECTION_MS = testDuration("FM_DISCORD_TEST_STABLE_MS", 5 * 60_000, 50, 5 * 60_000);
+const HEARTBEAT_STABLE_MS = testDuration("FM_DISCORD_TEST_HEARTBEAT_STABLE_MS", 2 * 60_000, 50, 2 * 60_000);
+
+function randomFraction() {
+  const fixture = process.env.FM_DISCORD_TEST_RANDOM || "";
+  if (TEST_MODE && /^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(fixture)) return Number(fixture);
+  return Math.random();
+}
+
+function reconnectDelayMilliseconds({ pressure, random, now, lastConnectionAt, serverDelayMs = 0, policy = RECONNECT_POLICY }) {
+  const exponent = Math.min(16, Math.max(0, pressure - 1));
+  const unjittered = Math.min(policy.maximumDelayMs, policy.baseDelayMs * (2 ** exponent));
+  const jittered = Math.floor(unjittered * (0.5 + Math.max(0, Math.min(1, random)) * 0.5));
+  const intervalRemaining = lastConnectionAt === null
+    ? 0
+    : Math.max(0, policy.minimumIntervalMs - (now - lastConnectionAt));
+  const cooldown = pressure >= policy.cooldownAfter
+    ? Math.floor(policy.cooldownMs * (0.8 + Math.max(0, Math.min(1, random)) * 0.2))
+    : 0;
+  return Math.max(1, jittered, intervalRemaining, Math.min(policy.cooldownMs, Math.max(0, serverDelayMs)), cooldown);
+}
+
+function simulateReconnectPolicy(input) {
+  const policy = {
+    minimumIntervalMs: Number(input.minimum_interval_ms ?? 5000),
+    baseDelayMs: Number(input.base_delay_ms ?? 5000),
+    maximumDelayMs: Number(input.maximum_delay_ms ?? 300_000),
+    cooldownAfter: Number(input.cooldown_after ?? 8),
+    cooldownMs: Number(input.cooldown_ms ?? 15 * 60_000),
+  };
+  const duration = Number(input.duration_ms ?? 60 * 60_000);
+  const uptime = Number(input.unstable_uptime_ms ?? 50);
+  const stableAt = Number(input.stable_at_connection ?? 0);
+  const maximumConnections = Number(input.maximum_connections ?? 10_000);
+  const random = Number(input.random ?? 0.5);
+  let now = 0;
+  let pressure = 0;
+  let connections = 0;
+  const delays = [];
+  while (now < duration && connections < maximumConnections) {
+    const lastConnectionAt = now;
+    connections += 1;
+    now += uptime;
+    if (connections === stableAt) pressure = 0;
+    pressure += 1;
+    const delay = reconnectDelayMilliseconds({ pressure, random, now, lastConnectionAt, policy });
+    if (delays.length < 16) delays.push(delay);
+    now += delay;
   }
-  const exponent = Math.min(6, Math.max(0, attempt));
-  const base = Math.min(60_000, 1000 * (2 ** exponent));
-  return Math.min(60_000, Math.floor(base * (0.75 + Math.random() * 0.5)));
+  return { connections, elapsed_ms: now, final_pressure: pressure, delays };
 }
 
 function sleep(milliseconds) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function configFingerprint(config) {
+  return createHash("sha256")
+    .update([config.token, config.ownerId, config.guildId, config.channelId].join("\0"))
+    .digest("hex");
+}
+
+async function activeTerminalSuppression(config) {
+  let record;
+  try {
+    await assertPrivateFile(TERMINAL_FILE);
+    record = JSON.parse(await readFile(TERMINAL_FILE, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return "";
+    return "terminal-suppression-invalid";
+  }
+  if (record?.schema !== "firstmate.discord-terminal.v1" || !SAFE_CODE_RE.test(record?.code || "")
+      || !INCIDENT_ID_RE.test(record?.config_fingerprint || "")) {
+    return "terminal-suppression-invalid";
+  }
+  if (record.config_fingerprint === configFingerprint(config)) return record.code;
+  await removeMarker(TERMINAL_FILE);
+  await clearDiagnostic();
+  return "";
+}
+
+async function writeTerminalSuppression(config, code) {
+  await atomicReplacePrivate(TERMINAL_FILE, `${JSON.stringify({
+    schema: "firstmate.discord-terminal.v1",
+    code,
+    config_fingerprint: configFingerprint(config),
+    recorded_at: diagnosticEpochSeconds(),
+  })}\n`);
+}
+
+function terminalDiagnosticForClose(code) {
+  return new Map([
+    [4004, "authentication-rejected"],
+    [4010, "gateway-sharding-invalid"],
+    [4011, "gateway-sharding-required"],
+    [4012, "gateway-version-invalid"],
+    [4013, "gateway-intents-invalid"],
+    [4014, "message-content-intent-disabled"],
+  ]).get(code) || "";
 }
 
 class GatewayRunner {
@@ -713,7 +833,8 @@ class GatewayRunner {
     this.resumeUrl = "";
     this.sequence = null;
     this.selfUserId = "";
-    this.attempt = 0;
+    this.failurePressure = 0;
+    this.lastConnectionAt = null;
     this.connected = false;
     this.inbound = Promise.resolve();
     this.backoffTimer = null;
@@ -731,6 +852,12 @@ class GatewayRunner {
     }
   }
 
+  clearSession() {
+    this.sessionId = "";
+    this.resumeUrl = "";
+    this.sequence = null;
+  }
+
   async waitForReconnect(milliseconds) {
     if (this.stopping) return;
     await new Promise((resolvePromise) => {
@@ -739,6 +866,16 @@ class GatewayRunner {
     });
     this.backoffTimer = null;
     this.backoffResolve = null;
+  }
+
+  reconnectDelay(serverDelayMs = 0) {
+    return reconnectDelayMilliseconds({
+      pressure: this.failurePressure,
+      random: randomFraction(),
+      now: Date.now(),
+      lastConnectionAt: this.lastConnectionAt,
+      serverDelayMs,
+    });
   }
 
   send(payload) {
@@ -770,20 +907,41 @@ class GatewayRunner {
       let heartbeatTimeout = null;
       let heartbeatInterval = null;
       let handshakeTimeout = null;
+      let stableTimeout = null;
       let heartbeatAcknowledged = true;
+      let heartbeatAcks = 0;
       let opened = false;
       let ready = false;
+      let stable = false;
+      let readyAt = 0;
+      let serverDelayMs = 0;
       let settled = false;
-      const clearHeartbeat = () => {
+      const clearTimers = () => {
         if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (handshakeTimeout) clearTimeout(handshakeTimeout);
+        if (stableTimeout) clearTimeout(stableTimeout);
       };
       const finish = (result) => {
         if (settled) return;
         settled = true;
-        clearHeartbeat();
+        clearTimers();
         resolvePromise(result);
+      };
+      const markStable = () => {
+        if (stable || !ready || settled) return;
+        stable = true;
+        this.failurePressure = 0;
+        clearDiagnostic();
+      };
+      const markReady = () => {
+        ready = true;
+        readyAt = Date.now();
+        this.connected = true;
+        if (handshakeTimeout) clearTimeout(handshakeTimeout);
+        handshakeTimeout = null;
+        stableTimeout = setTimeout(markStable, STABLE_CONNECTION_MS);
+        writeMarker(READY_FILE, "connected").catch(() => safeLog("cannot publish the ready marker"));
       };
       let socket;
       try {
@@ -824,12 +982,14 @@ class GatewayRunner {
             heartbeatTimeout = setTimeout(() => {
               beat();
               heartbeatInterval = setInterval(beat, interval);
-            }, Math.floor(Math.random() * interval));
+            }, Math.floor(randomFraction() * interval));
             if (this.sessionId) this.resume(); else this.identify();
             break;
           }
           case 11:
             heartbeatAcknowledged = true;
+            heartbeatAcks += 1;
+            if (ready && heartbeatAcks >= 3 && Date.now() - readyAt >= HEARTBEAT_STABLE_MS) markStable();
             break;
           case 1:
             this.send({ op: 1, d: this.sequence });
@@ -838,11 +998,10 @@ class GatewayRunner {
             socket.close(4000, "server reconnect");
             break;
           case 9:
-            if (packet.d !== true) {
-              this.sessionId = "";
-              this.resumeUrl = "";
-              this.sequence = null;
-            }
+            serverDelayMs = TEST_MODE && process.env.FM_DISCORD_TEST_INVALID_SESSION_MS
+              ? testDuration("FM_DISCORD_TEST_INVALID_SESSION_MS", 1000, 1, 1000)
+              : 1000 + Math.floor(randomFraction() * 4001);
+            if (packet.d !== true) this.clearSession();
             socket.close(4000, "invalid session");
             break;
           case 0:
@@ -863,19 +1022,9 @@ class GatewayRunner {
               this.selfUserId = userId;
               this.sessionId = sessionId;
               this.resumeUrl = resumeUrl;
-              ready = true;
-              this.connected = true;
-              if (handshakeTimeout) clearTimeout(handshakeTimeout);
-              handshakeTimeout = null;
-              writeMarker(READY_FILE, "connected").catch(() => safeLog("cannot publish the ready marker"));
-              clearDiagnostic();
+              markReady();
             } else if (packet.t === "RESUMED") {
-              ready = true;
-              this.connected = true;
-              if (handshakeTimeout) clearTimeout(handshakeTimeout);
-              handshakeTimeout = null;
-              writeMarker(READY_FILE, "connected").catch(() => safeLog("cannot publish the ready marker"));
-              clearDiagnostic();
+              markReady();
             } else if (packet.t === "MESSAGE_CREATE" && this.selfUserId) {
               this.inbound = this.inbound
                 .then(() => ingestMessage(packet.d, this.config, this.selfUserId))
@@ -892,18 +1041,39 @@ class GatewayRunner {
       });
       socket.addEventListener("close", (event) => {
         this.connected = false;
+        if (this.socket === socket) this.socket = null;
         removeMarker(READY_FILE).catch(() => {});
-        if ([4007, 4009].includes(event.code)) {
-          this.sessionId = "";
-          this.resumeUrl = "";
-          this.sequence = null;
-        }
-        if ([4004].includes(event.code)) reportDiagnostic("authentication-rejected");
-        if ([4013].includes(event.code)) reportDiagnostic("gateway-intents-invalid");
-        if ([4014].includes(event.code)) reportDiagnostic("message-content-intent-disabled");
-        finish({ opened, ready, code: event.code });
+        if ([4007, 4009].includes(event.code)) this.clearSession();
+        finish({
+          opened,
+          ready,
+          stable,
+          code: event.code,
+          terminalCode: terminalDiagnosticForClose(event.code),
+          serverDelayMs,
+        });
       });
     });
+  }
+
+  async suppressTerminal(code) {
+    try {
+      await writeTerminalSuppression(this.config, code);
+    } catch {
+      await reportDiagnostic(code);
+      safeLog("terminal reconnect suppression could not be persisted; Gateway retries remain stopped");
+      while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);
+      return;
+    }
+    await reportDiagnostic(code);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = await readDiagnostic(ERROR_FILE).catch(() => null);
+      const notified = await readDiagnostic(ERROR_NOTIFIED_FILE).catch(() => null);
+      if (current?.incidentId && current.incidentId === notified?.incidentId) break;
+      await this.waitForReconnect(Math.min(1000, RECONCILE_INTERVAL_MS));
+      if (this.stopping) break;
+      await reconcileDiagnostic();
+    }
   }
 
   async run() {
@@ -931,22 +1101,34 @@ class GatewayRunner {
         url = this.resumeUrl || await gatewayUrl(this.config);
       } catch (error) {
         if (error instanceof DiscordHttpError && [401, 403].includes(error.status)) {
-          await reportDiagnostic("authentication-rejected");
-        } else {
-          await reportDiagnostic("discord-api-unavailable");
+          await this.suppressTerminal("authentication-rejected");
+          break;
         }
-        await this.waitForReconnect(backoffMilliseconds(this.attempt++));
+        if (error instanceof ConfigError) {
+          await this.suppressTerminal("gateway-configuration-invalid");
+          break;
+        }
+        await reportDiagnostic("discord-api-unavailable");
+        this.failurePressure += 1;
+        await this.waitForReconnect(this.reconnectDelay(error instanceof DiscordHttpError ? error.retryAfterMs : 0));
         continue;
       }
+      let serverDelayMs = 0;
       try {
+        this.lastConnectionAt = Date.now();
         const result = await this.connect(url);
-        if (result.ready) this.attempt = 0;
-        else this.attempt += 1;
+        if (this.stopping) break;
+        if (result.terminalCode) {
+          await this.suppressTerminal(result.terminalCode);
+          break;
+        }
+        serverDelayMs = result.serverDelayMs;
+        this.failurePressure += 1;
       } catch {
         await reportDiagnostic("gateway-connect-failed");
-        this.attempt += 1;
+        this.failurePressure += 1;
       }
-      if (!this.stopping) await this.waitForReconnect(backoffMilliseconds(this.attempt));
+      if (!this.stopping) await this.waitForReconnect(this.reconnectDelay(serverDelayMs));
     }
     clearInterval(pruneTimer);
     clearInterval(reconcileTimer);
@@ -1095,8 +1277,25 @@ async function main() {
       process.stdout.write("self-hosted Discord configuration is valid\n");
       return;
     }
+    case "terminal-check": {
+      const config = await loadConfig();
+      if (await activeTerminalSuppression(config)) process.exitCode = 4;
+      return;
+    }
+    case "terminal-reset": {
+      await loadConfig();
+      await removeMarker(TERMINAL_FILE);
+      await clearDiagnostic();
+      return;
+    }
     case "run": {
       const config = await loadConfig();
+      const suppressedCode = await activeTerminalSuppression(config);
+      if (suppressedCode) {
+        await reportDiagnostic(suppressedCode);
+        safeLog(`reconnects stopped: ${suppressedCode}; operator intervention is required`);
+        return;
+      }
       const runner = new GatewayRunner(config);
       const stop = () => {
         runner.stop();
@@ -1142,6 +1341,14 @@ async function main() {
     case "prune": {
       if (!TEST_MODE || args.length) throw new ConfigError("prune is available only in hermetic test mode");
       await pruneContexts();
+      return;
+    }
+    case "reconnect-policy": {
+      if (!TEST_MODE) throw new ConfigError("reconnect-policy is available only in hermetic test mode");
+      const fixtureFile = args.shift() || "";
+      if (!fixtureFile || args.length) throw new ConfigError("test reconnect-policy requires one fixture file");
+      const fixture = JSON.parse(await readFile(fixtureFile, "utf8"));
+      process.stdout.write(`${JSON.stringify(simulateReconnectPolicy(fixture))}\n`);
       return;
     }
     case "ingest": {

@@ -381,7 +381,7 @@ Reply and follow-up helpers use this record when no explicit path is supplied an
 
 `bin/fm-discord-bot.sh configure` is the supported interactive writer.
 It reads the token with terminal echo disabled, writes a mode-`0600` temporary, validates all four values through the runtime owner, and replaces the configured file atomically only after validation succeeds.
-`start`, `stop`, `check`, and `run` own service lifecycle and safe diagnostics; their exact mechanics and flags live in the script header and `--help` output.
+`start`, `stop`, `check`, `retry`, and `run` own service lifecycle, terminal-suppression acknowledgement, and safe diagnostics; their exact mechanics and flags live in the script header and `--help` output.
 The runtime requires Node.js with built-in `fetch` and `WebSocket` support, currently Node.js 22 or newer, and the operator command refuses before service mutation when that feature is unavailable.
 This optional requirement does not change the universal bootstrap toolchain for homes that never enable the transport.
 
@@ -395,7 +395,9 @@ The append and receipt are recovered under the queue lock, so a crash between th
 Answered context and notification records are pruned after seven days, while a still-pending inbox or a task metadata file carrying that `discord_request=` prevents its context from being pruned.
 
 `state/discord-bot.enabled` is a private service-liveness presence marker, `state/discord-bot.ready` records a currently connected Gateway session, and `state/discord-bot.error` carries one safe diagnostic code without credentials, ids, payloads, or remote response bodies.
-The service removes enabled/ready markers on a clean stop.
+`state/discord-bot.terminal` is a mode-`0600` suppression record containing a safe code, an opaque SHA-256 fingerprint of the active configuration, and a timestamp.
+A matching record stops Gateway attempts across process restarts, a changed configuration retires it automatically, and the explicit `retry` command retires it after an operator corrects an external application setting.
+The service removes enabled/ready markers on a clean stop but preserves terminal suppression until one of those intervention paths clears it.
 `bin/fm-supervision-lib.sh` treats either a genuine enabled marker or any pending private inbox record as supervision need, so stopping the service cannot strand an already accepted message.
 The durable event is an ordinary `check` row whose payload is only `discord-message <message-id>` or `discord-error <safe-code>`; raw Discord text never enters the queue.
 

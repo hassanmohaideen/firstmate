@@ -9,7 +9,7 @@ This record supports the active guarantees for Firstmate's optional direct self-
 
 ## Hermetic protocol and safety pass
 
-The executable transport suite ran on 2026-08-12 with Node.js v25.9.0, jq 1.7.1, and macOS Bash 3.2 compatibility syntax.
+The executable transport suite ran on 2026-08-13 with Node.js v25.9.0, jq 1.7.1, and macOS Bash 3.2 compatibility syntax.
 It used generated fake tokens and ids inside private temporary homes.
 It made no live Discord, myfirstmate.io, Relay, GitHub, browser, account, bot, server, or channel change.
 
@@ -33,9 +33,14 @@ ok - terminal Discord replies survive bounded REST retries and clear their exact
 ok - the Gateway reconnects, remains single-instance, and shuts down cleanly
 ok - foreground service accepts Discord's regional resume endpoint independently of private-state pruning
 ok - Gateway resume remains limited to Discord-owned endpoints
-ok - Discord diagnostics retry transient publication failures without duplicate wakes
-ok - diagnostic persistence failures remain contained during reconnect
-ok - Discord diagnostic transitions preserve rapid same-second recurrences
+ok - reconnect policy retains READY failure pressure, resets only after stability, and applies bounded jitter
+ok - rapid Gateway disconnects remain bounded and stop promptly during cooldown
+ok - server reconnect and invalid-session directions choose resume or fresh identify correctly
+ok - Gateway lookup rate limits preserve server-provided retry direction
+ok - READY retains failure pressure until sustained stable Gateway operation
+ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
+ok - terminal Gateway close performs no reconnect
+ok - diagnostic persistence failures preserve terminal reconnect suppression
 ok - the macOS service path reaches connected without copying credentials or deployment ids
 ok - reply helpers resolve only strict shared custom configuration records
 ok - self-hosted Discord and Relay coexist while sharing only durable supervision
@@ -55,13 +60,20 @@ The accepted path asserts a mode-`0700` private inbox directory, mode-`0600` inb
 The outbound pass drives the same REST code as `fm-discord-reply.sh` and asserts the exact channel endpoint, guild/channel/message reference, direct bot authentication, disabled outbound mention parsing, `replied_user=false`, enforced stable nonce, private phase-sent receipt, post-success inbox removal, and retained durable context.
 The terminal pass first proves ordinary task cleanup refuses while the Discord outcome is owed, then returns HTTP 500 once and success, proving one bounded retry with the same final-scope nonce before only the exact task binding clears.
 
-The authentication-failure pass returns HTTP 401 repeatedly while reconnect cadence is reduced only through the test seam.
-It asserts one durable `authentication-rejected` notification across retries and verifies the fake token is absent from service output.
+The fake-time policy pass drives fixed random samples and unstable durations through the executable test seam.
+It bounds an hour of rapid successful handshakes to at most 12 connections, proves READY alone does not reset pressure, proves a stable interval does reset pressure, and checks the jitter endpoints remain within the configured cap.
+The real local Gateway storm pass repeatedly sends READY or RESUMED and disconnects, then asserts the connection count remains bounded and TERM interrupts the active cooldown promptly.
+The directed reconnect pass proves Opcode 7 and resumable Opcode 9 retain the session, while non-resumable Opcode 9 clears it before the next Identify.
+The local HTTP 429 pass proves the authenticated Gateway lookup honors Discord's bounded retry direction instead of using only client backoff.
+The stable-recovery pass creates a transient HTTP failure, reaches READY with its diagnostic still present, and observes that diagnostic clear only after the configured sustained-health interval.
+The authentication-failure pass returns HTTP 401 once, publishes one `authentication-rejected` notification, persists terminal suppression, and proves a second service-manager invocation makes no HTTP or Gateway request.
+The terminal close pass sends Gateway close code 4004 before READY and observes one connection with no retry.
+The fixed output, health output, private service record, and property-list assertions reject the generated token and authorization ids.
 The worker pass starts the real shell single-instance wrapper, proves a second start is refused, sends TERM, and verifies enabled and ready markers retire.
 The regional READY pass also leaves the pruning-warning precondition active and still reaches connected, proving that cleanup warning is not the handshake cause.
 
 The LaunchAgent pass uses a private `HOME` and fake `launchctl` while driving the real `start`, worker, Node runtime, health check, and `stop` entrypoints against the fake Gateway.
-It asserts the persistent path reaches connected, plus `RunAtLoad`, `KeepAlive`, restart throttling, per-home naming, and complete absence of token, owner id, guild id, and channel id from the property list.
+It asserts the persistent path reaches connected, plus `RunAtLoad`, restart-on-failure `KeepAlive`, restart throttling, per-home naming, and complete absence of token, owner id, guild id, and channel id from the property list.
 This is executable contract evidence, not a claim that a real Aqua login launchd service or live Discord bot was changed during development.
 The operator-run real-account smoke remains `bin/fm-discord-bot.sh start`, `check`, one owner mention in the bound channel, and `stop` after the captain performs the documented Developer Portal setup.
 
