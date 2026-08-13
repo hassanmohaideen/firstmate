@@ -117,7 +117,7 @@ bin/fm-discord-bot.sh check
 The check reports one of the disabled, invalid, stopped, terminally stopped, connecting, reconnecting, or connected outcomes without printing credentials or deployment ids.
 Authentication rejection, missing Message Content intent, invalid Gateway intents, invalid Gateway version or sharding configuration, unavailable Discord API, Gateway connection failure, and private inbox publication failure use bounded safe diagnostic codes.
 Authentication rejection and other non-retryable Gateway configuration close codes stop all Gateway reconnects and persist that suppression across service-manager restarts.
-A changed private configuration clears the matching suppression, while an unchanged configuration remains stopped until the operator explicitly runs `bin/fm-discord-bot.sh retry` after correcting an external setting.
+Only a changed bot authentication identity or explicit operator intervention through `bin/fm-discord-bot.sh retry` or `bin/fm-discord-bot.sh configure` clears terminal suppression; owner, guild, and channel filtering changes do not clear it.
 A new service diagnostic reaches the active Firstmate through the existing durable notification queue exactly once until the code changes or stable recovery clears it.
 
 Stop the service and prevent the LaunchAgent from returning at the next login with:
