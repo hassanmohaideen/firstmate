@@ -646,6 +646,21 @@ assert_contains "$out" "another self-hosted Discord bot" \
   "state-override contention did not report canonical home ownership"
 assert_absent "$home/alternate-state/discord-bot.config-path" \
   "a rejected state-override contender published its configuration selection"
+connections_before=$(cat "$home/gateway/connections")
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" "$NODE_BIN" "$BOT" run > "$home/direct-one.log" 2>&1 &
+direct_one=$!
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" "$NODE_BIN" "$BOT" run > "$home/direct-two.log" 2>&1 &
+direct_two=$!
+wait "$direct_one"; direct_one_rc=$?
+wait "$direct_two"; direct_two_rc=$?
+[ "$direct_one_rc" -ne 0 ] && [ "$direct_two_rc" -ne 0 ] \
+  || fail "direct Discord runtimes bypassed the service ownership lease"
+assert_contains "$(cat "$home/direct-one.log")$(cat "$home/direct-two.log")" \
+  "single-instance service wrapper" "direct runtime refusal did not identify the required owner"
+[ "$(cat "$home/gateway/connections")" = "$connections_before" ] \
+  || fail "unleased direct runtimes opened a Discord Gateway connection"
 kill -TERM "$worker"
 wait "$worker" || true
 WORKER_PIDS=()
@@ -1085,6 +1100,16 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 limit_worker=$!
 WORKER_PIDS+=("$limit_worker")
 wait_for_value "$home/gateway/connections" 1 || fail "session reservation fixture did not identify"
+i=0
+persisted_session=''
+while [ "$i" -lt 100 ]; do
+  persisted_session=$(jq -r '.resume_session.session_id // empty' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || true)
+  [ -n "$persisted_session" ] && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ -n "$persisted_session" ] || fail "session reservation fixture did not persist its resumable session"
 kill -TERM "$limit_worker"
 wait "$limit_worker" || true
 WORKER_PIDS=()
@@ -1383,7 +1408,7 @@ make_gateway_server "$home/gateway" auth-fail
 mkdir "$home/state/.wake-queue"
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_RECONCILE_MS=20 \
-  FM_DISCORD_NODE_BIN=/unavailable/node "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1 &
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
 auth_worker=$!
 WORKER_PIDS+=("$auth_worker")
 wait_for_file "$home/state/discord-bot.error" || fail "Discord authentication failure did not persist its safe diagnostic"
@@ -1439,7 +1464,7 @@ home=$(new_home gateway-terminal-close)
 write_config "$home"
 make_gateway_server "$home/gateway" terminal-auth-close
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
-  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" "$CONTROL" run > "$home/bot.log" 2>&1
 [ "$(cat "$home/gateway/connections")" -eq 1 ] || fail "terminal Gateway close reconnected"
 [ "$(jq -r .code "$home/state/discord-bot.error")" = authentication-rejected ] \
   || fail "terminal Gateway close published the wrong safe diagnostic"
@@ -1451,7 +1476,7 @@ make_gateway_server "$home/gateway" auth-fail
 mkdir "$home/state/discord-bot.error"
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_RECONCILE_MS=20 \
-  "$NODE_BIN" "$BOT" run > "$home/bot.log" 2>&1
+  "$CONTROL" run > "$home/bot.log" 2>&1
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "diagnostic persistence failure retried authentication"
 assert_present "$home/state/.discord-bot-service/terminal.json" "diagnostic persistence failure lost terminal suppression"
 assert_contains "$(cat "$home/bot.log")" "cannot persist or publish the Discord diagnostic safely" \

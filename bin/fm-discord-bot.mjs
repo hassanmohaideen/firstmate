@@ -7,9 +7,9 @@
 // It delegates notification publication to bin/fm-discord-notify.sh so the
 // existing durable wake queue remains the only Firstmate notification plane.
 //
-// Operator lifecycle is owned by bin/fm-discord-bot.sh. Direct use:
+// Operator lifecycle and Gateway ownership are owned by bin/fm-discord-bot.sh.
+// Direct use is limited to non-Gateway operations:
 //   fm-discord-bot.mjs validate
-//   fm-discord-bot.mjs run
 //   fm-discord-bot.mjs send <message-id> --text-file <path> [--nonce-scope initial|final]
 //
 // FM_DISCORD_TEST_* variables and `ingest` are hermetic-test seams only. They
@@ -24,6 +24,8 @@ import {
   open,
   readFile,
   readdir,
+  readlink,
+  realpath,
   rename,
   rm,
   stat,
@@ -157,6 +159,28 @@ async function ensureOwnershipDirectory() {
     if (error?.code !== "EEXIST") throw error;
   }
   await assertPlainDirectory(OWNERSHIP_DIR, 0o700);
+}
+
+async function requireGatewayOwnership() {
+  const ownerPid = process.env.FM_DISCORD_OWNER_PID || "";
+  if (!/^[1-9][0-9]*$/.test(ownerPid) || Number(ownerPid) !== process.ppid) {
+    throw new ConfigError("Gateway run requires the single-instance service wrapper");
+  }
+  const lock = join(OWNERSHIP_DIR, "owner.lock");
+  const info = await lstat(lock).catch(() => null);
+  if (!info?.isSymbolicLink()) {
+    throw new ConfigError("Gateway run requires the single-instance service wrapper");
+  }
+  const ownerTarget = resolve(dirname(lock), await readlink(lock));
+  const canonicalOwnershipDir = await realpath(OWNERSHIP_DIR);
+  if (dirname(ownerTarget) !== canonicalOwnershipDir || !/^owner\.lock\.owner\.[A-Za-z0-9]+$/.test(ownerTarget.split("/").pop())) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
+  await assertPlainDirectory(ownerTarget, 0o700);
+  const recordedPid = (await readFile(join(ownerTarget, "pid"), "utf8")).trim();
+  if (recordedPid !== ownerPid) {
+    throw new ConfigError("Gateway ownership lease is invalid");
+  }
 }
 
 async function atomicReplacePrivate(path, content) {
@@ -1629,6 +1653,7 @@ async function main() {
         safeLog(`reconnects stopped: ${suppressedCode}; operator intervention is required`);
         return;
       }
+      await requireGatewayOwnership();
       const runner = new GatewayRunner(config);
       const stop = () => {
         runner.stop();

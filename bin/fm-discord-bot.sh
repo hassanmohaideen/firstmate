@@ -273,7 +273,8 @@ configure() {
 }
 
 run_worker() {
-  local lock child='' rc=0 terminating=0 start_guard_held=0
+  local lock child='' rc=0 terminating=0 start_guard_held=0 owner_pid
+  owner_pid=${BASHPID:-$$}
   validate_config >/dev/null
   mkdir -p "$STATE" || die "cannot create $STATE"
   prepare_ownership_boundary
@@ -320,6 +321,7 @@ run_worker() {
   [ "$terminating" -eq 0 ] || exit 0
   FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
     FM_CONFIG_OVERRIDE="$CONFIG" FM_DISCORD_CONFIG_FILE="$CONFIG_FILE" \
+    FM_DISCORD_OWNER_PID="$owner_pid" \
     "$NODE_BIN" "$NODE_SCRIPT" run &
   child=$!
   wait "$child" || rc=$?

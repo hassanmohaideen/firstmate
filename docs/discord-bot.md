@@ -106,7 +106,7 @@ Reconnect pressure and the last connection attempt survive process and service-m
 Unstable connections use randomized exponential delays with a five-second minimum connection interval, a five-minute local delay cap, and a separately jittered cooldown capped at 15 minutes after eight consecutive unstable outcomes; a longer Discord `retry_after` remains the minimum wait.
 Discord-directed reconnect and invalid-session responses retain or clear session material as required and still pass through the same pacing policy.
 Fresh Identify attempts reserve Discord's authenticated `session_start_limit` durably and wait through an exhausted reset window, while a valid Resume remains available without consuming a new session start.
-It also holds a recoverable per-home process lock so a manual start and LaunchAgent cannot create two Gateway sessions.
+It also holds a recoverable per-home process lock so a manual start and LaunchAgent cannot create two Gateway sessions. Gateway execution requires the lease held by this shell lifecycle, so invoking the Node runtime directly cannot bypass ownership.
 
 Check configuration and current service health with:
 
