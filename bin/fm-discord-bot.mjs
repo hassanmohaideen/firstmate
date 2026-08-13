@@ -771,7 +771,7 @@ function reconnectDelayMilliseconds({ pressure, random, now, lastConnectionAt, s
   const jittered = Math.floor(unjittered * (0.5 + Math.max(0, Math.min(1, random)) * 0.5));
   const intervalRemaining = lastConnectionAt === null
     ? 0
-    : Math.max(0, policy.minimumIntervalMs - (now - lastConnectionAt));
+    : Math.max(0, Math.min(policy.minimumIntervalMs, policy.minimumIntervalMs - (now - lastConnectionAt)));
   const cooldown = pressure >= policy.cooldownAfter
     ? Math.floor(policy.cooldownMs * (0.8 + Math.max(0, Math.min(1, random)) * 0.2))
     : 0;
@@ -816,6 +816,10 @@ function configFingerprint(config) {
   return createHash("sha256")
     .update([config.token, config.ownerId, config.guildId, config.channelId].join("\0"))
     .digest("hex");
+}
+
+function authenticationFingerprint(config) {
+  return createHash("sha256").update(config.token).digest("hex");
 }
 
 async function activeTerminalSuppression(config) {
@@ -909,8 +913,8 @@ class GatewayRunner {
 
   durableRecord() {
     return {
-      schema: "firstmate.discord-reconnect.v1",
-      config_fingerprint: configFingerprint(this.config),
+      schema: "firstmate.discord-reconnect.v2",
+      authentication_fingerprint: authenticationFingerprint(this.config),
       failure_pressure: this.failurePressure,
       last_connection_at: this.lastConnectionAt,
       session_start_limit: this.sessionStartLimit,
@@ -932,10 +936,13 @@ class GatewayRunner {
     } catch (error) {
       if (error?.code !== "ENOENT") throw new ConfigError("reconnect state is invalid");
     }
-    if (record && record.config_fingerprint !== configFingerprint(this.config)) record = null;
+    const legacy = record?.schema === "firstmate.discord-reconnect.v1";
+    const authenticationBound = record?.schema === "firstmate.discord-reconnect.v2"
+      && record.authentication_fingerprint === authenticationFingerprint(this.config);
     const limit = record?.session_start_limit;
-    if (record && (record.schema !== "firstmate.discord-reconnect.v1"
-        || !INCIDENT_ID_RE.test(record.config_fingerprint || "")
+    if (record && ((!legacy && record.schema !== "firstmate.discord-reconnect.v2")
+        || (legacy && !INCIDENT_ID_RE.test(record.config_fingerprint || ""))
+        || (!legacy && !INCIDENT_ID_RE.test(record.authentication_fingerprint || ""))
         || !Number.isInteger(record.failure_pressure) || record.failure_pressure < 0
         || (record.last_connection_at !== null
           && (!Number.isInteger(record.last_connection_at) || record.last_connection_at < 0))
@@ -946,8 +953,8 @@ class GatewayRunner {
     }
     this.failurePressure = record?.failure_pressure || 0;
     this.lastConnectionAt = record?.last_connection_at ?? null;
-    this.sessionStartLimit = limit || null;
-    if (!record) await this.persistDurableState();
+    this.sessionStartLimit = authenticationBound ? limit : null;
+    if (!record || legacy || !authenticationBound) await this.persistDurableState();
   }
 
   async updateSessionStartLimit(limit) {

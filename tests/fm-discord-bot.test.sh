@@ -66,6 +66,20 @@ wait_for_value() {
   return 1
 }
 
+wait_for_minimum_value() {
+  local file=$1 minimum=$2 i=0 value
+  while [ "$i" -lt 200 ]; do
+    value=$(cat "$file" 2>/dev/null || true)
+    case "$value" in
+      ''|*[!0-9]*) ;;
+      *) [ "$value" -ge "$minimum" ] && return 0 ;;
+    esac
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
 path_mode() {
   if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi
 }
@@ -701,10 +715,15 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   "$CONTROL" run > "$home/first.log" 2>&1 &
 pressure_worker=$!
 WORKER_PIDS+=("$pressure_worker")
-wait_for_value "$home/gateway/connections" 3 || fail "restart-pressure fixture did not build reconnect pressure"
+wait_for_minimum_value "$home/gateway/connections" 3 || fail "restart-pressure fixture did not build reconnect pressure"
 kill -TERM "$pressure_worker"
 wait "$pressure_worker" || true
 WORKER_PIDS=()
+connections_before_restart=$(cat "$home/gateway/connections")
+next_connection=$((connections_before_restart + 1))
+prior_owner=$OWNER
+changed_owner=$(printf '6%.0s' {1..18})
+perl -pi -e "s/$prior_owner/$changed_owner/" "$home/config/discord-bot.env"
 restarted_at=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
@@ -712,8 +731,8 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   "$CONTROL" run > "$home/second.log" 2>&1 &
 pressure_worker=$!
 WORKER_PIDS+=("$pressure_worker")
-wait_for_value "$home/gateway/connections" 4 || fail "restarted Gateway did not reconnect"
-restarted_connection=$(sed -n '4p' "$home/gateway/connection-events.jsonl" | jq -r .at)
+wait_for_minimum_value "$home/gateway/connections" "$next_connection" || fail "restarted Gateway did not reconnect"
+restarted_connection=$(sed -n "${next_connection}p" "$home/gateway/connection-events.jsonl" | jq -r .at)
 [ $((restarted_connection - restarted_at)) -ge 25 ] \
   || fail "process restart discarded reconnect pressure: $((restarted_connection - restarted_at))ms"
 kill -TERM "$pressure_worker"
@@ -721,7 +740,49 @@ wait "$pressure_worker" || true
 WORKER_PIDS=()
 [ "$(path_mode "$home/state/.discord-bot-service/reconnect.json")" = 600 ] \
   || fail "durable reconnect pressure was not private"
-pass "reconnect pressure survives process and service-manager restarts"
+reconnect_record=$(cat "$home/state/.discord-bot-service/reconnect.json")
+assert_not_contains "$reconnect_record" "$TOKEN" "durable reconnect state exposed the bot token"
+assert_not_contains "$reconnect_record" "$prior_owner" "durable reconnect state exposed the prior owner id"
+assert_not_contains "$reconnect_record" "$changed_owner" "durable reconnect state exposed the changed owner id"
+pass "reconnect pressure survives filtering changes and process restarts"
+
+home=$(new_home gateway-future-attempt)
+write_config "$home"
+make_gateway_server "$home/gateway" steady
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=40 \
+  FM_DISCORD_TEST_RANDOM=0.5 "$CONTROL" run > "$home/first.log" 2>&1 &
+future_worker=$!
+WORKER_PIDS+=("$future_worker")
+wait_for_value "$home/gateway/connections" 1 || fail "future-attempt fixture did not connect"
+kill -TERM "$future_worker"
+wait "$future_worker" || true
+WORKER_PIDS=()
+future_at=$(( $("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))') + 3600000 ))
+jq --argjson future_at "$future_at" '.last_connection_at=$future_at' \
+  "$home/state/.discord-bot-service/reconnect.json" > "$home/reconnect.next"
+chmod 600 "$home/reconnect.next"
+mv "$home/reconnect.next" "$home/state/.discord-bot-service/reconnect.json"
+restarted_at=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=40 \
+  FM_DISCORD_TEST_RANDOM=0.5 "$CONTROL" run > "$home/second.log" 2>&1 &
+future_worker=$!
+WORKER_PIDS+=("$future_worker")
+i=0
+while [ "$i" -lt 50 ] && [ "$(cat "$home/gateway/connections" 2>/dev/null || true)" != 2 ]; do
+  sleep 0.02
+  i=$((i + 1))
+done
+[ "$(cat "$home/gateway/connections" 2>/dev/null || true)" = 2 ] \
+  || fail "future-dated reconnect attempt caused an excessive wait"
+restarted_connection=$(sed -n '2p' "$home/gateway/connection-events.jsonl" | jq -r .at)
+[ $((restarted_connection - restarted_at)) -ge 25 ] \
+  || fail "future-dated reconnect attempt bypassed the minimum interval"
+kill -TERM "$future_worker"
+wait "$future_worker" || true
+WORKER_PIDS=()
+pass "future-dated reconnect attempts clamp to the minimum interval"
 
 # Discord-directed reconnect and invalid-session choices preserve only valid sessions.
 for mode in server-reconnect invalid-session-resumable invalid-session-fresh; do
