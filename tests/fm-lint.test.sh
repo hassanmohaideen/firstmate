@@ -556,7 +556,7 @@ SH
         || fail "jobs=$jobs telemetry=$telemetry left temporary worker state"
     done
   done
-  pass "jobs=1 and jobs=2 stop complete worker trees with and without telemetry"
+  pass "bounded worker counts stop complete worker trees with and without telemetry"
 }
 
 test_seeded_module_boundary_parity() {
