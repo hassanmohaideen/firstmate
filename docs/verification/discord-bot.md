@@ -40,6 +40,8 @@ ok - future-dated reconnect attempts clamp to the minimum interval
 ok - server reconnect and invalid-session directions choose resume or fresh identify correctly
 ok - valid Gateway Resume state survives abrupt process replacement
 ok - Resume checkpoints advance only after durable message publication
+ok - stale READY persistence cannot publish health or reset pressure
+ok - queued intake remains bound to its originating session generation
 ok - non-resumable invalid-session waits survive abrupt process replacement
 ok - fresh Identify honors Discord session-start exhaustion
 ok - session-start reservations survive process restarts while Resume stays available
@@ -49,6 +51,7 @@ ok - Gateway lookup rate limits preserve server-provided retry direction
 ok - server retry deadlines survive abrupt process and service-manager restarts
 ok - retry deadline persistence failures remain stopped until termination
 ok - sequence persistence failure keeps one promptly cancellable fail-closed wait
+ok - invalid-session persistence failure settles promptly after stop
 ok - server retry deadlines retire safely across clock movement
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
@@ -79,6 +82,7 @@ The real local Gateway storm pass repeatedly sends READY or RESUMED and disconne
 The restart pass builds pressure against that Gateway, replaces the worker, and observes the next connection retain the accumulated delay through the private canonical ownership record.
 The directed reconnect pass proves Opcode 7 and resumable Opcode 9 retain the session, while non-resumable Opcode 9 clears it before the next Identify.
 The message replay pass forces durable notification publication to fail, replaces the worker, observes Resume from the prior checkpoint, and proves the replay commits once before that checkpoint advances.
+The asynchronous lifecycle passes prove a closed socket cannot publish delayed READY health, queued intake from an invalidated session cannot mutate its replacement, and a failed invalid-session state clear settles promptly when stopped.
 The session-limit passes prove exhausted authenticated metadata blocks fresh Identify until reset, a pre-crash reservation cannot be reused after worker replacement, and reservation persistence failure prevents both a Gateway attempt and service-manager restart, while the directed reconnect pass continues to prove Resume remains available.
 The sequence-burst pass delivers 100 dispatches faster than deliberately slowed durable writes, observes the latest sequence become durable, and bounds actual private-state replacements rather than allowing one queued write per event.
 The local HTTP 429 pass sets Discord's direction above every configured local cap and proves the authenticated Gateway lookup does not retry before that minimum.

@@ -298,6 +298,19 @@ server.on("upgrade",(req,socket)=>{
             author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> replay intake`}});
           fs.writeFileSync(countFile.replace(/connections$/, "message-sent"),"sent\n");
         }
+        if (mode === "stale-session-race" && connection === 1) {
+          text(socket,{op:0,t:"MESSAGE_CREATE",s:99,d:{id:message,guild_id:guild,channel_id:channel,type:0,
+            author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> stale intake`}});
+          setTimeout(()=>close(socket,4007),10);
+        }
+        if (mode === "invalid-close-persistence-failure") {
+          fs.writeFileSync(countFile.replace(/connections$/, "invalid-close-ready"),"ready\n");
+          const release=setInterval(()=>{
+            if (!fs.existsSync(countFile.replace(/connections$/, "release-invalid-close"))) return;
+            clearInterval(release);
+            close(socket,4007);
+          },5);
+        }
       } else if (packet.op === 6 && packet.d?.token === token && packet.d?.session_id) {
         handshakeComplete=true;
         fs.appendFileSync(eventFile,JSON.stringify({connection,op:"resume",session:packet.d.session_id,sequence:packet.d.seq})+"\n");
@@ -309,6 +322,7 @@ server.on("upgrade",(req,socket)=>{
       }
       if (handshakeComplete && mode === "reconnect" && connection === 1) setTimeout(()=>close(socket,1001),50);
       if (handshakeComplete && mode === "storm") setTimeout(()=>close(socket,1001),10);
+      if (handshakeComplete && mode === "stale-ready-close" && connection === 1) setTimeout(()=>close(socket,1001),10);
       if (handshakeComplete && mode === "server-reconnect" && connection === 1) setTimeout(()=>text(socket,{op:7,d:null}),10);
       if (handshakeComplete && mode === "invalid-session-resumable" && connection === 1) setTimeout(()=>text(socket,{op:9,d:true}),10);
       if (handshakeComplete && mode === "invalid-session-fresh" && connection === 1) setTimeout(()=>text(socket,{op:9,d:false}),10);
@@ -935,6 +949,46 @@ wait "$resume_worker" || true
 WORKER_PIDS=()
 pass "Resume checkpoints advance only after durable message publication"
 
+home=$(new_home gateway-stale-ready-completion)
+write_config "$home"
+make_gateway_server "$home/gateway" stale-ready-close
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=1000 \
+  FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS=150 FM_DISCORD_TEST_STABLE_MS=50 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+stale_worker=$!
+WORKER_PIDS+=("$stale_worker")
+wait_for_value "$home/gateway/connections" 1 || fail "stale READY fixture did not connect"
+sleep 0.45
+assert_absent "$home/state/discord-bot.ready" "closed socket published a stale READY marker"
+[ "$(jq -r '.failure_pressure' "$home/state/.discord-bot-service/reconnect.json")" -gt 0 ] \
+  || fail "stale READY persistence completion forgave reconnect pressure"
+kill -TERM "$stale_worker"
+wait "$stale_worker" || true
+WORKER_PIDS=()
+pass "stale READY persistence cannot publish health or reset pressure"
+
+home=$(new_home gateway-stale-session-checkpoint)
+write_config "$home"
+make_gateway_server "$home/gateway" stale-session-race
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_INGEST_DELAY_MS=300 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+stale_worker=$!
+WORKER_PIDS+=("$stale_worker")
+wait_for_value "$home/gateway/connections" 2 || fail "stale session fixture did not replace its invalid session"
+sleep 0.4
+[ "$(jq -r '.resume_session.session_id' "$home/state/.discord-bot-service/reconnect.json")" = session-2 ] \
+  || fail "stale inbound work replaced the current session"
+[ "$(jq -r '.resume_session.sequence' "$home/state/.discord-bot-service/reconnect.json")" -eq 2 ] \
+  || fail "stale inbound work advanced the replacement session checkpoint"
+assert_absent "$home/state/discord-inbox/$MESSAGE.json" "invalidated session published stale queued intake"
+kill -TERM "$stale_worker"
+wait "$stale_worker" || true
+WORKER_PIDS=()
+pass "queued intake remains bound to its originating session generation"
+
 home=$(new_home gateway-invalid-session-restart)
 write_config "$home"
 make_gateway_server "$home/gateway" invalid-session-fresh
@@ -1193,6 +1247,28 @@ WORKER_PIDS=()
 [ $((stop_finished - stop_started)) -lt 1500 ] \
   || fail "sequence persistence fail-closed wait delayed termination"
 pass "sequence persistence failure keeps one promptly cancellable fail-closed wait"
+
+home=$(new_home gateway-invalid-close-persistence-stop)
+write_config "$home"
+make_gateway_server "$home/gateway" invalid-close-persistence-failure
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+invalid_worker=$!
+WORKER_PIDS+=("$invalid_worker")
+wait_for_file "$home/gateway/invalid-close-ready" || fail "invalid-close persistence fixture did not reach READY"
+rm -f "$home/state/.discord-bot-service/reconnect.json"
+mkdir "$home/state/.discord-bot-service/reconnect.json"
+printf 'release\n' > "$home/gateway/release-invalid-close"
+wait_for_file "$home/state/discord-bot.error" || fail "invalid-session clear persistence failure did not fail closed"
+stop_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+kill -TERM "$invalid_worker"
+wait "$invalid_worker" || true
+stop_finished=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+WORKER_PIDS=()
+[ $((stop_finished - stop_started)) -lt 1500 ] \
+  || fail "invalid-session clear persistence failure delayed termination"
+pass "invalid-session persistence failure settles promptly after stop"
 
 home=$(new_home gateway-rate-limit-clock)
 write_config "$home"

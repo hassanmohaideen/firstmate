@@ -866,6 +866,7 @@ class GatewayRunner {
     this.sequence = null;
     this.resumeSequence = null;
     this.selfUserId = "";
+    this.sessionGeneration = 0;
     this.failurePressure = 0;
     this.lastConnectionAt = null;
     this.serverNotBefore = null;
@@ -890,6 +891,7 @@ class GatewayRunner {
   }
 
   clearSession() {
+    this.sessionGeneration += 1;
     this.sessionId = "";
     this.resumeUrl = "";
     this.sequence = null;
@@ -1055,6 +1057,7 @@ class GatewayRunner {
       this.sequence = resume.sequence;
       this.resumeSequence = resume.sequence;
       this.selfUserId = resume.self_user_id;
+      this.sessionGeneration = 1;
     }
     if (!record || legacy || !authenticationBound || (authenticationBound && resume && !resumable)) {
       await this.persistDurableState();
@@ -1176,7 +1179,7 @@ class GatewayRunner {
         resolvePromise(result);
       };
       const markStable = () => {
-        if (stable || !ready || settled) return;
+        if (stable || !ready || settled || this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
         stable = true;
         this.failurePressure = 0;
         void this.persistDurableState()
@@ -1184,6 +1187,7 @@ class GatewayRunner {
           .catch(() => reportDiagnostic("reconnect-state-unavailable"));
       };
       const markReady = () => {
+        if (settled || this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
         ready = true;
         readyAt = Date.now();
         this.connected = true;
@@ -1271,6 +1275,7 @@ class GatewayRunner {
                 socket.close(4002, "invalid resume endpoint");
                 return;
               }
+              if (this.sessionId !== sessionId) this.sessionGeneration += 1;
               this.selfUserId = userId;
               this.sessionId = sessionId;
               this.resumeUrl = resumeUrl;
@@ -1281,18 +1286,25 @@ class GatewayRunner {
             } else if (packet.t === "RESUMED") {
               markReady();
               if (Number.isInteger(packet.s)) {
+                const originGeneration = this.sessionGeneration;
                 this.inbound = this.inbound.then(() => {
-                  if (checkpointBlocked) return;
+                  if (checkpointBlocked || this.sessionGeneration !== originGeneration) return;
                   this.resumeSequence = packet.s;
                   this.queueSequencePersistence();
                 });
               }
             } else if (packet.t === "MESSAGE_CREATE" && this.selfUserId) {
               const dispatchSequence = packet.s;
+              const originGeneration = this.sessionGeneration;
+              const originSelfUserId = this.selfUserId;
               this.inbound = this.inbound.then(async () => {
-                if (checkpointBlocked) return;
-                await ingestMessage(packet.d, this.config, this.selfUserId);
-                if (Number.isInteger(dispatchSequence)) {
+                if (checkpointBlocked || this.sessionGeneration !== originGeneration) return;
+                if (TEST_MODE && process.env.FM_DISCORD_TEST_INGEST_DELAY_MS) {
+                  await sleep(testDuration("FM_DISCORD_TEST_INGEST_DELAY_MS", 1, 1, 1000));
+                  if (this.sessionGeneration !== originGeneration) return;
+                }
+                await ingestMessage(packet.d, this.config, originSelfUserId);
+                if (Number.isInteger(dispatchSequence) && this.sessionGeneration === originGeneration) {
                   this.resumeSequence = dispatchSequence;
                   this.queueSequencePersistence();
                 }
@@ -1302,8 +1314,9 @@ class GatewayRunner {
                 if (socket.readyState < WebSocket.CLOSING) socket.close(4000, "inbox publication failed");
               });
             } else if (Number.isInteger(packet.s)) {
+              const originGeneration = this.sessionGeneration;
               this.inbound = this.inbound.then(() => {
-                if (checkpointBlocked) return;
+                if (checkpointBlocked || this.sessionGeneration !== originGeneration) return;
                 this.resumeSequence = packet.s;
                 this.queueSequencePersistence();
               });
@@ -1324,7 +1337,10 @@ class GatewayRunner {
         const complete = async () => {
           if ([4007, 4009].includes(event.code)) {
             this.clearSession();
-            if (!await this.persistDurableStateOrStop()) return;
+            if (!await this.persistDurableStateOrStop()) {
+              finish({ opened, ready, stable, code: event.code, terminalCode: "", serverDelayMs });
+              return;
+            }
           }
           finish({
             opened,
