@@ -872,6 +872,77 @@ SH
   pass "serial signal cleanup terminates and waits for its complete process group"
 }
 
+test_completed_worker_descendant_cleanup() {
+  local mode tmp repo evidence runner pid child rc n watchdog options
+  for mode in serial parallel; do
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-completed-group.XXXXXX")
+    repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
+    cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
+    cat >"$repo/tests/fm-brief.test.sh" <<'SH'
+#!/usr/bin/env bash
+bash -c 'trap "" TERM INT HUP; touch "$SIGNAL_EVIDENCE/descendant.ready"; while :; do sleep 1; done' \
+  >/dev/null 2>&1 &
+printf '%s\n' "$!" >"$SIGNAL_EVIDENCE/descendant.pid"
+n=0
+while [ ! -e "$SIGNAL_EVIDENCE/descendant.ready" ] && [ "$n" -lt 300 ]; do
+  sleep 0.01
+  n=$((n + 1))
+done
+[ -e "$SIGNAL_EVIDENCE/descendant.ready" ] || exit 9
+exit 0
+SH
+    cat >"$repo/tests/fm-composer-lib.test.sh" <<'SH'
+#!/usr/bin/env bash
+trap 'exit 143' TERM INT HUP
+touch "$SIGNAL_EVIDENCE/blocker.ready"
+while :; do sleep 1; done
+SH
+    chmod +x "$repo"/tests/*.test.sh
+    options=
+    [ "$mode" = parallel ] && options='--jobs 2'
+    SIGNAL_EVIDENCE="$evidence" "$runner" $options \
+      tests/fm-brief.test.sh tests/fm-composer-lib.test.sh >"$tmp/out" 2>"$tmp/err" &
+    pid=$!
+    n=0
+    while { [ ! -e "$evidence/blocker.ready" ] || ! grep -q 'FM_TEST_END .*tests/fm-brief.test.sh' "$tmp/out" 2>/dev/null; } \
+      && [ "$n" -lt 500 ]; do
+      sleep 0.01
+      n=$((n + 1))
+    done
+    if [ ! -e "$evidence/blocker.ready" ] || ! grep -q 'FM_TEST_END .*tests/fm-brief.test.sh' "$tmp/out" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -rf "$tmp"
+      fail "$mode completed-group fixture never reached its interruptible state"
+    fi
+    child=$(cat "$evidence/descendant.pid")
+    kill -TERM "$pid"
+    (
+      sleep 5
+      if kill -0 "$pid" 2>/dev/null; then
+        touch "$evidence/cleanup-timed-out"
+        kill -KILL "$child" 2>/dev/null || true
+      fi
+    ) &
+    watchdog=$!
+    set +e
+    wait "$pid"
+    rc=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    set -e
+    [ "$rc" -ne 0 ] || fail "$mode interrupted runner exited successfully"
+    [ ! -e "$evidence/cleanup-timed-out" ] \
+      || fail "$mode cleanup hung on a completed worker's TERM-resistant descendant"
+    if kill -0 "$child" 2>/dev/null; then
+      kill -KILL "$child" 2>/dev/null || true
+      fail "$mode cleanup lost a completed worker's TERM-resistant descendant"
+    fi
+    rm -rf "$tmp"
+  done
+  pass "completed worker groups remain owned through serial and parallel interruption"
+}
+
 test_environment_isolation_in_serial_and_parallel_children() {
   local tmp repo evidence runner fakebin name
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-env.XXXXXX")
@@ -1085,6 +1156,7 @@ test_default_changed_and_portable_selection
 test_mixed_complete_scheduler_exact_once_and_failures
 test_parallel_signal_cleanup
 test_serial_signal_cleanup
+test_completed_worker_descendant_cleanup
 test_environment_isolation_in_serial_and_parallel_children
 test_duration_budget_warns_and_ci_enforces
 test_aggregate_json

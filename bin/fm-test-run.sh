@@ -1656,10 +1656,30 @@ RECORDS="$RUN_TMP/records.tsv"
 FAMILIES_TSV="$RUN_TMP/families.tsv"
 : >"$RECORDS"
 WORKER_PIDS=()
+WORKER_GROUP_PIDS=()
 
 # shellcheck disable=SC2329 # Used by cleanup/signal handlers invoked indirectly by traps.
 worker_group_is_running() {
   kill -0 -- "-$1" 2>/dev/null
+}
+
+register_worker_group() {
+  local pid=$1 registered
+  for registered in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
+    [ "$registered" = "$pid" ] && return
+  done
+  WORKER_GROUP_PIDS+=("$pid")
+}
+
+retire_empty_worker_groups() {
+  local pid
+  local -a retained=()
+  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
+    if worker_group_is_running "$pid"; then
+      retained+=("$pid")
+    fi
+  done
+  WORKER_GROUP_PIDS=("${retained[@]+"${retained[@]}"}")
 }
 
 # shellcheck disable=SC2329 # Invoked indirectly by cleanup/signal traps.
@@ -1678,15 +1698,16 @@ stop_active_workers() {
       fi
     done
     [ "$known" -eq 1 ] || WORKER_PIDS+=("$pid")
+    register_worker_group "$pid"
   done <"$jobs_file"
-  for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
     kill -TERM -- "-$pid" 2>/dev/null || true
   done
   n=0
   while [ "$n" -lt 100 ]; do
     running=0
-    for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+    for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
       [ -n "$pid" ] || continue
       if worker_group_is_running "$pid"; then
         running=1
@@ -1697,7 +1718,7 @@ stop_active_workers() {
     sleep 0.01
     n=$((n + 1))
   done
-  for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
     if worker_group_is_running "$pid"; then
       kill -KILL -- "-$pid" 2>/dev/null || true
@@ -1710,7 +1731,7 @@ stop_active_workers() {
   n=0
   while [ "$n" -lt 100 ]; do
     running=0
-    for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+    for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
       [ -n "$pid" ] || continue
       if worker_group_is_running "$pid"; then
         running=1
@@ -1722,6 +1743,7 @@ stop_active_workers() {
     n=$((n + 1))
   done
   WORKER_PIDS=()
+  retire_empty_worker_groups
 }
 
 # shellcheck disable=SC2329 # Invoked indirectly by EXIT and signal traps.
@@ -1878,12 +1900,14 @@ run_one_serial() {
   worker_pid=$!
   set +m
   WORKER_PIDS[0]=$worker_pid
+  register_worker_group "$worker_pid"
   : >"$work/start"
   set +e
   wait "$worker_pid"
   rc=$?
   set -e
   unset 'WORKER_PIDS[0]'
+  retire_empty_worker_groups
   if [ -f "$work/exit" ]; then
     rc=$(cat "$work/exit")
   fi
@@ -1939,6 +1963,7 @@ else
     set +e
     wait "$pid"
     set -e
+    retire_empty_worker_groups
     work="$RUN_TMP/w$idx"
     rc=$(cat "$work/exit" 2>/dev/null || echo 1)
     duration=$(cat "$work/duration_ms" 2>/dev/null || echo 0)
@@ -2038,6 +2063,7 @@ else
     worker_pid=$!
     set +m
     WORKER_PIDS[worker_n]=$worker_pid
+    register_worker_group "$worker_pid"
     WORKER_IDX[worker_n]=$worker_n
     WORKER_SCRIPTS[worker_n]=$script
     active_workers=$((active_workers + 1))
