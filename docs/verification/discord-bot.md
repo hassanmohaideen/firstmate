@@ -64,7 +64,9 @@ ok - session-start reset waits re-query across repeated reboots
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
 ok - invalid reconnect state stops restarts and reports one safe diagnostic
+ok - concurrent reconnect recovery preserves one private quarantine
 ok - terminal Gateway close performs no reconnect
+ok - canonical terminal suppression survives selected state removal
 ok - diagnostic persistence failures preserve terminal reconnect suppression
 ok - terminal fallback dominates invalid-session delays across restarts
 ok - the macOS service path reaches connected without copying credentials or deployment ids
