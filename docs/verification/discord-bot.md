@@ -58,10 +58,13 @@ ok - sequence persistence failure keeps one promptly cancellable fail-closed wai
 ok - invalid-session persistence failure settles promptly after stop
 ok - server retry deadlines use monotonic time across wall-clock movement
 ok - server retry waits do not replenish across same-boot restarts
+ok - server retry waits consume one bounded reboot fallback
+ok - session-start reset waits consume one bounded reboot fallback
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
 ok - terminal Gateway close performs no reconnect
 ok - diagnostic persistence failures preserve terminal reconnect suppression
+ok - terminal write failures preserve operator suppression across restarts
 ok - the macOS service path reaches connected without copying credentials or deployment ids
 ok - reply helpers resolve only strict shared custom configuration records
 ok - self-hosted Discord and Relay coexist while sharing only durable supervision

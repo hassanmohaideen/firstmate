@@ -954,6 +954,9 @@ async function activeTerminalSuppression(config) {
 
 async function writeTerminalSuppression(config, code) {
   await ensureOwnershipDirectory();
+  if (TEST_MODE && process.env.FM_DISCORD_TEST_TERMINAL_WRITE_FAILURE === "1") {
+    throw new Error("injected terminal state failure");
+  }
   await atomicReplacePrivate(TERMINAL_FILE, `${JSON.stringify({
     schema: "firstmate.discord-terminal.v2",
     code,
@@ -990,6 +993,7 @@ class GatewayRunner {
     this.serverWaitMs = null;
     this.serverBootId = null;
     this.serverMonotonicNotBefore = null;
+    this.serverRebootFallbackUsed = false;
     this.bootId = null;
     this.sessionStartLimit = null;
     this.durableTransitions = Promise.resolve();
@@ -1066,6 +1070,7 @@ class GatewayRunner {
       server_wait_ms: this.serverWaitMs,
       server_boot_id: this.serverBootId,
       server_monotonic_not_before: this.serverMonotonicNotBefore,
+      server_reboot_fallback_used: this.serverRebootFallbackUsed,
       session_start_limit: this.sessionStartLimit,
       resume_session: this.resumeSessionRecord(),
     };
@@ -1095,7 +1100,7 @@ class GatewayRunner {
     return transition;
   }
 
-  async persistFallbackSuppression() {
+  async persistFallbackSuppression(operatorCode = "reconnect-state-unavailable") {
     const deadlineActive = this.serverNotBefore !== null && this.serverWaitMs !== null;
     await atomicReplacePrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
       schema: "firstmate.discord-reconnect-suppression.v1",
@@ -1104,20 +1109,22 @@ class GatewayRunner {
       server_wait_ms: deadlineActive ? this.serverWaitMs : null,
       server_boot_id: deadlineActive ? this.serverBootId : null,
       server_monotonic_not_before: deadlineActive ? this.serverMonotonicNotBefore : null,
+      server_reboot_fallback_used: deadlineActive ? this.serverRebootFallbackUsed : false,
       operator_intervention_required: !deadlineActive,
+      operator_code: deadlineActive ? null : operatorCode,
       recorded_at: diagnosticEpochSeconds(),
     })}\n`);
     this.fallbackSuppressionActive = true;
   }
 
-  activateFailClosed() {
+  activateFailClosed(code = "reconnect-state-unavailable") {
     this.failClosed = true;
     if (this.socket && this.socket.readyState < WebSocket.CLOSING) {
       this.socket.close(4000, "reconnect state unavailable");
     }
     if (!this.failClosedWait) {
       this.failClosedWait = (async () => {
-        await reportDiagnostic("reconnect-state-unavailable");
+        await reportDiagnostic(code);
         safeLog("reconnect state could not be persisted; Gateway retries remain stopped");
         while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);
         return false;
@@ -1190,6 +1197,8 @@ class GatewayRunner {
           && record.server_monotonic_not_before !== null
           && (!Number.isSafeInteger(record.server_monotonic_not_before)
             || record.server_monotonic_not_before < 0))
+        || (record.server_reboot_fallback_used !== undefined
+          && typeof record.server_reboot_fallback_used !== "boolean")
         || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
           || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
           || !Number.isInteger(limit.resetAt) || limit.resetAt < 0
@@ -1198,7 +1207,9 @@ class GatewayRunner {
           || (limit.resetBootId !== undefined && limit.resetBootId !== null
             && !BOOT_ID_RE.test(limit.resetBootId))
           || (limit.resetMonotonicAt !== undefined && limit.resetMonotonicAt !== null
-            && (!Number.isSafeInteger(limit.resetMonotonicAt) || limit.resetMonotonicAt < 0))))
+            && (!Number.isSafeInteger(limit.resetMonotonicAt) || limit.resetMonotonicAt < 0))
+          || (limit.resetRebootFallbackUsed !== undefined
+            && typeof limit.resetRebootFallbackUsed !== "boolean")))
         || (resume !== undefined && resume !== null
           && (!resume || typeof resume.session_id !== "string" || !resume.session_id
             || typeof resume.resume_url !== "string" || !resume.resume_url
@@ -1221,8 +1232,11 @@ class GatewayRunner {
       : record?.server_wait_ms ?? Math.max(0, this.serverNotBefore - Date.now());
     this.serverBootId = record?.server_boot_id ?? null;
     this.serverMonotonicNotBefore = record?.server_monotonic_not_before ?? null;
+    this.serverRebootFallbackUsed = record?.server_reboot_fallback_used ?? false;
     if (this.serverNotBefore !== null
         && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
+      this.serverWaitMs = this.serverRebootFallbackUsed ? 0 : this.serverWaitMs;
+      this.serverRebootFallbackUsed = true;
       this.serverBootId = this.bootId;
       this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
       this.serverNotBefore = Date.now() + this.serverWaitMs;
@@ -1239,6 +1253,8 @@ class GatewayRunner {
       const valid = suppression.schema === "firstmate.discord-reconnect-suppression.v1"
         && INCIDENT_ID_RE.test(suppression.authentication_fingerprint || "")
         && typeof suppression.operator_intervention_required === "boolean"
+        && (suppression.operator_code === undefined || suppression.operator_code === null
+          || SAFE_CODE_RE.test(suppression.operator_code))
         && (suppression.server_not_before === null
           ? suppression.server_wait_ms === null && suppression.operator_intervention_required
           : Number.isSafeInteger(suppression.server_not_before) && suppression.server_not_before >= 0
@@ -1249,6 +1265,8 @@ class GatewayRunner {
               || suppression.server_monotonic_not_before === null
               || Number.isSafeInteger(suppression.server_monotonic_not_before)
                 && suppression.server_monotonic_not_before >= 0)
+            && (suppression.server_reboot_fallback_used === undefined
+              || typeof suppression.server_reboot_fallback_used === "boolean")
             && !suppression.operator_intervention_required);
       if (!valid) {
         this.activateFailClosed();
@@ -1256,15 +1274,18 @@ class GatewayRunner {
         await removeMarker(RECONNECT_SUPPRESSION_FILE);
       } else if (suppression.operator_intervention_required) {
         this.fallbackSuppressionActive = true;
-        this.activateFailClosed();
+        this.activateFailClosed(suppression.operator_code || "reconnect-state-unavailable");
       } else {
         const fallbackSameBoot = suppression.server_boot_id === this.bootId
           && Number.isSafeInteger(suppression.server_monotonic_not_before);
+        const fallbackPreviouslyUsed = suppression.server_reboot_fallback_used ?? false;
         const fallbackRemaining = fallbackSameBoot
           ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
-          : suppression.server_wait_ms;
+          : fallbackPreviouslyUsed ? 0 : suppression.server_wait_ms;
         const currentRemaining = this.serverDelayRemaining();
         this.serverWaitMs = Math.max(currentRemaining, fallbackRemaining);
+        this.serverRebootFallbackUsed = this.serverRebootFallbackUsed
+          || fallbackPreviouslyUsed || !fallbackSameBoot;
         this.serverBootId = this.bootId;
         this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
         this.serverNotBefore = Date.now() + this.serverWaitMs;
@@ -1282,12 +1303,14 @@ class GatewayRunner {
       const sameBoot = this.sessionStartLimit.resetBootId === this.bootId
         && Number.isSafeInteger(this.sessionStartLimit.resetMonotonicAt);
       if (!sameBoot) {
-        const conservativeWait = this.sessionStartLimit.resetWaitMs
+        const fallbackUsed = this.sessionStartLimit.resetRebootFallbackUsed ?? false;
+        const conservativeWait = fallbackUsed ? 0 : this.sessionStartLimit.resetWaitMs
           ?? Math.max(0, this.sessionStartLimit.resetAt - Date.now());
         this.sessionStartLimit.resetWaitMs = conservativeWait;
         this.sessionStartLimit.resetBootId = this.bootId;
         this.sessionStartLimit.resetMonotonicAt = monotonicMilliseconds() + conservativeWait;
         this.sessionStartLimit.resetAt = Date.now() + conservativeWait;
+        this.sessionStartLimit.resetRebootFallbackUsed = true;
         stateNeedsRebase = true;
       }
     }
@@ -1316,6 +1339,7 @@ class GatewayRunner {
       resetWaitMs,
       resetBootId: this.bootId,
       resetMonotonicAt: monotonicMilliseconds() + resetWaitMs,
+      resetRebootFallbackUsed: false,
     };
     const previous = this.sessionStartLimit;
     if (previous && previous.total === normalized.total
@@ -1367,6 +1391,7 @@ class GatewayRunner {
     this.serverWaitMs = Math.max(retainedRemaining, delay);
     this.serverBootId = this.bootId;
     this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+    this.serverRebootFallbackUsed = false;
     this.serverNotBefore = now + this.serverWaitMs;
   }
 
@@ -1375,6 +1400,7 @@ class GatewayRunner {
     this.serverWaitMs = null;
     this.serverBootId = null;
     this.serverMonotonicNotBefore = null;
+    this.serverRebootFallbackUsed = false;
     if (!await this.persistDurableStateOrStop()) return false;
     if (this.fallbackSuppressionActive) {
       try {
@@ -1646,6 +1672,9 @@ class GatewayRunner {
     try {
       await writeTerminalSuppression(this.config, code);
     } catch {
+      try {
+        await this.persistFallbackSuppression(code);
+      } catch {}
       await reportDiagnostic(code);
       safeLog("terminal reconnect suppression could not be persisted; Gateway retries remain stopped");
       while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);

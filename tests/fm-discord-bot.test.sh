@@ -1556,6 +1556,104 @@ wait "$rate_worker" || true
 WORKER_PIDS=()
 pass "server retry waits do not replenish across same-boot restarts"
 
+home=$(new_home gateway-rate-limit-reboots)
+write_config "$home"
+make_gateway_server "$home/gateway" reconnect
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+auth_fingerprint=$(discord_digest "$TOKEN")
+reboot_now=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((reboot_now + 1500))" '
+  {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
+   failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
+   server_wait_ms:1500,server_boot_id:"original-boot",server_monotonic_not_before:1500,
+   server_reboot_fallback_used:false,session_start_limit:null}
+' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=first-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/first.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+sleep 0.12
+assert_absent "$home/gateway/lookups" "first reboot skipped its conservative server wait"
+i=0
+while [ "$i" -lt 100 ]; do
+  fallback_used=$(jq -r '.server_reboot_fallback_used // false' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf false)
+  [ "$fallback_used" = true ] && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ "$fallback_used" = true ] || fail "first reboot did not consume the bounded server fallback"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+second_reboot_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=second-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/second.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "repeated reboot kept replenishing the server wait"
+second_reboot_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+[ $((second_reboot_lookup - second_reboot_started)) -lt 1000 ] \
+  || fail "repeated reboot replenished the bounded server fallback"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+pass "server retry waits consume one bounded reboot fallback"
+
+home=$(new_home gateway-session-reboots)
+write_config "$home"
+make_gateway_server "$home/gateway" session-limit-zero
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+jq -cn --arg fingerprint "$auth_fingerprint" '
+  {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
+   failure_pressure:0,last_connection_at:null,server_not_before:null,server_wait_ms:null,
+   server_boot_id:null,server_monotonic_not_before:null,server_reboot_fallback_used:false,
+   session_start_limit:{total:1,remaining:0,resetAt:0,resetWaitMs:1500,
+     resetBootId:"original-boot",resetMonotonicAt:1500,resetRebootFallbackUsed:false},resume_session:null}
+' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=first-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/first.log" 2>&1 &
+limit_worker=$!
+WORKER_PIDS+=("$limit_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "first reboot did not query session-start metadata"
+sleep 0.12
+[ "$(cat "$home/gateway/lookups")" -eq 1 ] \
+  || fail "first reboot skipped its conservative session-start wait"
+i=0
+while [ "$i" -lt 100 ]; do
+  fallback_used=$(jq -r '.session_start_limit.resetRebootFallbackUsed // false' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf false)
+  [ "$fallback_used" = true ] && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ "$fallback_used" = true ] || fail "first reboot did not consume the bounded session reset fallback"
+kill -TERM "$limit_worker"
+wait "$limit_worker" || true
+WORKER_PIDS=()
+second_reboot_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=second-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/second.log" 2>&1 &
+limit_worker=$!
+WORKER_PIDS+=("$limit_worker")
+wait_for_minimum_value "$home/gateway/lookups" 2 \
+  || fail "repeated reboot kept replenishing the session reset wait"
+second_reboot_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+[ $((second_reboot_lookup - second_reboot_started)) -lt 1000 ] \
+  || fail "repeated reboot replenished the bounded session reset fallback"
+kill -TERM "$limit_worker"
+wait "$limit_worker" || true
+WORKER_PIDS=()
+pass "session-start reset waits consume one bounded reboot fallback"
+
 home=$(new_home gateway-stable-recovery)
 write_config "$home"
 make_gateway_server "$home/gateway" lookup-fail-once
@@ -1660,6 +1758,47 @@ assert_contains "$(cat "$home/bot.log")" "cannot persist or publish the Discord 
   "diagnostic persistence failure did not emit its fixed safe diagnostic"
 assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "diagnostic persistence failure exposed the bot token"
 pass "diagnostic persistence failures preserve terminal reconnect suppression"
+
+home=$(new_home gateway-terminal-persistence)
+write_config "$home"
+make_gateway_server "$home/gateway" auth-fail
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_TERMINAL_WRITE_FAILURE=1 \
+  "$CONTROL" run > "$home/first.log" 2>&1 &
+auth_worker=$!
+WORKER_PIDS+=("$auth_worker")
+wait_for_file "$home/state/.discord-bot-service/reconnect-suppression.json" \
+  || fail "terminal write failure did not persist independent suppression"
+assert_absent "$home/state/.discord-bot-service/terminal.json" \
+  "terminal write failure fixture unexpectedly persisted terminal state"
+[ "$(jq -r .operator_intervention_required "$home/state/.discord-bot-service/reconnect-suppression.json")" = true ] \
+  || fail "terminal write fallback did not require operator intervention"
+[ "$(jq -r .operator_code "$home/state/.discord-bot-service/reconnect-suppression.json")" = authentication-rejected ] \
+  || fail "terminal write fallback lost its safe actionable diagnostic"
+kill -TERM "$auth_worker"
+wait "$auth_worker" || true
+WORKER_PIDS=()
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" "$CONTROL" run > "$home/second.log" 2>&1 &
+auth_worker=$!
+WORKER_PIDS+=("$auth_worker")
+sleep 0.15
+[ "$(cat "$home/gateway/lookups")" -eq 1 ] \
+  || fail "restart bypassed terminal write fallback suppression"
+kill -0 "$auth_worker" 2>/dev/null \
+  || fail "terminal write fallback exited into service-manager restart"
+[ "$(jq -r .code "$home/state/discord-bot.error")" = authentication-rejected ] \
+  || fail "terminal write fallback restart lost its safe diagnostic"
+kill -TERM "$auth_worker"
+wait "$auth_worker" || true
+WORKER_PIDS=()
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry)
+assert_contains "$out" "suppression cleared" "retry did not clear terminal write fallback"
+assert_absent "$home/state/.discord-bot-service/reconnect-suppression.json" \
+  "retry left terminal write fallback active"
+assert_not_contains "$(cat "$home/first.log")$(cat "$home/second.log")" "$TOKEN" \
+  "terminal write fallback exposed the bot token"
+pass "terminal write failures preserve operator suppression across restarts"
 
 # macOS LaunchAgent rendering contains no credential or deployment id.
 home=$(new_home launchagent)
