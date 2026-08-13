@@ -332,9 +332,11 @@ jobs:
           # subdirectory, and a top-level-only glob silently dropped that lane
           # from the aggregate.
           inputs=()
-          while IFS= read -r f; do
-            inputs+=("$f")
-          done < <(find "$RUNNER_TEMP/fm-test-aggregate" -name 'fm-test-timing-*.json' -type f | LC_ALL=C sort)
+          if [ -d "$RUNNER_TEMP/fm-test-aggregate" ]; then
+            while IFS= read -r f; do
+              inputs+=("$f")
+            done < <(find "$RUNNER_TEMP/fm-test-aggregate" -name 'fm-test-timing-*.json' -type f | LC_ALL=C sort)
+          fi
           if [ "${#inputs[@]}" -eq 0 ]; then
             echo "::warning::no per-lane timing JSON found to aggregate"
             exit 0
