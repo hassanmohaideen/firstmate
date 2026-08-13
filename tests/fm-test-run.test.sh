@@ -746,12 +746,13 @@ test_mixed_complete_scheduler_exact_once_and_failures() {
 }
 
 test_parallel_signal_cleanup() {
-  local tmp repo evidence runner pid child rc n
+  local tmp repo evidence runner pid child rc n watchdog
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-signal.XXXXXX")
   repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
   cat > "$repo/tests/fm-brief.test.sh" <<'SH'
 #!/usr/bin/env bash
+trap '' TERM INT HUP
 sleep 300 &
 printf '%s\n' "$!" > "$SIGNAL_EVIDENCE/child.pid"
 touch "$SIGNAL_EVIDENCE/fm-brief.ready"
@@ -777,10 +778,21 @@ SH
     || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"; fail "parallel cleanup fixtures never started"; }
   child=$(cat "$evidence/child.pid")
   kill -TERM "$pid"
+  (
+    sleep 5
+    if kill -0 "$pid" 2>/dev/null; then
+      touch "$evidence/cleanup-timed-out"
+      kill -KILL "$child" 2>/dev/null || true
+    fi
+  ) &
+  watchdog=$!
   set +e
   wait "$pid"
   rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
   set -e
+  [ ! -e "$evidence/cleanup-timed-out" ] || fail "interrupted runner hung on a TERM-resistant descendant"
   [ "$rc" -ne 0 ] || fail "interrupted runner exited successfully"
   [ -e "$evidence/fm-composer-lib.cleaned" ] \
     || fail "interrupted runner did not run the trapping fixture cleanup"

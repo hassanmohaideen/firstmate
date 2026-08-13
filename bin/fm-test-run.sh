@@ -1590,32 +1590,37 @@ FAMILIES_TSV="$RUN_TMP/families.tsv"
 : >"$RECORDS"
 WORKER_PIDS=()
 
+worker_group_is_running() {
+  kill -0 -- "-$1" 2>/dev/null
+}
+
 # shellcheck disable=SC2329 # Invoked indirectly by cleanup/signal traps.
 stop_active_workers() {
-  local pid ppid known changed n
+  local pid n running
   trap - INT TERM HUP
-  known=""
   for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
-    known="$known $pid"
+    kill -TERM -- "-$pid" 2>/dev/null || true
   done
-  changed=1
-  while [ "$changed" -eq 1 ]; do
-    changed=0
-    while read -r pid ppid; do
-      [ -n "$pid" ] && [ -n "$ppid" ] || continue
-      case " $known " in
-        *" $ppid "*)
-          case " $known " in
-            *" $pid "*) ;;
-            *) known="$known $pid"; changed=1 ;;
-          esac
-          ;;
-      esac
-    done < <(ps -axo pid=,ppid= 2>/dev/null || true)
+  n=0
+  while [ "$n" -lt 100 ]; do
+    running=0
+    for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+      [ -n "$pid" ] || continue
+      if worker_group_is_running "$pid"; then
+        running=1
+        break
+      fi
+    done
+    [ "$running" -eq 1 ] || break
+    sleep 0.01
+    n=$((n + 1))
   done
-  for pid in $known; do
-    kill -TERM "$pid" 2>/dev/null || true
+  for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+    [ -n "$pid" ] || continue
+    if worker_group_is_running "$pid"; then
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
   done
   for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
@@ -1623,30 +1628,15 @@ stop_active_workers() {
   done
   n=0
   while [ "$n" -lt 100 ]; do
-    changed=0
-    for pid in $known; do
-      if kill -0 "$pid" 2>/dev/null; then
-        changed=1
+    running=0
+    for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
+      [ -n "$pid" ] || continue
+      if worker_group_is_running "$pid"; then
+        running=1
         break
       fi
     done
-    [ "$changed" -eq 1 ] || break
-    sleep 0.01
-    n=$((n + 1))
-  done
-  for pid in $known; do
-    kill -KILL "$pid" 2>/dev/null || true
-  done
-  n=0
-  while [ "$n" -lt 100 ]; do
-    changed=0
-    for pid in $known; do
-      if kill -0 "$pid" 2>/dev/null; then
-        changed=1
-        break
-      fi
-    done
-    [ "$changed" -eq 1 ] || break
+    [ "$running" -eq 1 ] || break
     sleep 0.01
     n=$((n + 1))
   done
@@ -1898,6 +1888,7 @@ else
     expected=$(expected_gate_skip_for_family "$family")
     printf 'FM_TEST_BEGIN %s %s family=%s expected_gate_skip=%s\n' \
       "$(now_iso)" "$script" "$family" "$expected"
+    set -m
     (
       set +e
       child_pid=
@@ -1931,7 +1922,9 @@ else
       printf '%s\n' "$rc" >"$work/exit"
       exit 0
     ) &
-    WORKER_PIDS[worker_n]=$!
+    worker_pid=$!
+    set +m
+    WORKER_PIDS[worker_n]=$worker_pid
     WORKER_IDX[worker_n]=$worker_n
     WORKER_SCRIPTS[worker_n]=$script
     active_workers=$((active_workers + 1))
