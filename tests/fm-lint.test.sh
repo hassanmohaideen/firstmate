@@ -400,72 +400,91 @@ test_jobs_are_deterministic_and_complete() {
     pass "SKIP (ShellCheck $REQUIRED not resolved): deterministic bounded jobs check"
     return
   fi
-  local tmp good bad_a bad_b out_clean_1 out_clean_2 out_clean_8 out_fail_1 out_fail_2 out_fail_2b out_fail_4 out_fail_8
-  local telemetry telemetry_out cleanup_tmp cleanup_out rc_clean_1 rc_clean_2 rc_clean_8
-  local rc_fail_1 rc_fail_2 rc_fail_2b rc_fail_4 rc_fail_8 rc_bad_jobs
+  local tmp telemetry telemetry_out cleanup_tmp cleanup_out baseline_clean baseline_fail out
+  local jobs i rc baseline_rc occurrences rc_bad_jobs
+  local -a good_roots bad_roots
   tmp=$(fm_test_tmproot fm-lint-jobs)
   mkdir -p "$tmp"
-  good="$tmp/good.sh"
-  bad_a="$tmp/bad-a.sh"
-  bad_b="$tmp/bad-b.sh"
   telemetry="$tmp/telemetry.tsv"
-  cat > "$good" <<'SH'
+  good_roots=()
+  bad_roots=()
+  i=1
+  while [ "$i" -le 8 ]; do
+    good_roots+=("$tmp/good-$i.sh")
+    bad_roots+=("$tmp/bad-$i.sh")
+    cat > "${good_roots[$((i - 1))]}" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${1:-ok}"
 SH
-  cat > "$bad_a" <<'SH'
+    if [ "$i" -eq 1 ]; then
+      cat > "${bad_roots[$((i - 1))]}" <<'SH'
 #!/usr/bin/env bash
-bad_a() {
+bad() {
   local a= b=
   printf '%s\n' "$a$b"
 }
 SH
-  cat > "$bad_b" <<'SH'
+    else
+      cat > "${bad_roots[$((i - 1))]}" <<'SH'
 #!/usr/bin/env bash
-bad_b() {
+bad() {
   printf '%s\n' $1
 }
 SH
+    fi
+    i=$((i + 1))
+  done
 
-  rc_clean_1=0
-  out_clean_1=$(FM_LINT_JOBS=1 "$LINT" "$good" 2>&1) || rc_clean_1=$?
-  rc_clean_2=0
-  out_clean_2=$(FM_LINT_JOBS=2 "$LINT" "$good" 2>&1) || rc_clean_2=$?
-  rc_clean_8=0
-  out_clean_8=$(FM_LINT_JOBS=8 "$LINT" "$good" 2>&1) || rc_clean_8=$?
-  [ "$rc_clean_1" -eq 0 ] && [ "$rc_clean_2" -eq 0 ] && [ "$rc_clean_8" -eq 0 ] \
-    || fail "clean jobs=1/jobs=2/jobs=8 paths must all pass"
-  [ "$out_clean_1" = "$out_clean_2" ] && [ "$out_clean_2" = "$out_clean_8" ] \
-    || fail "clean jobs=1/jobs=2/jobs=8 output differs"
+  baseline_clean=
+  baseline_fail=
+  baseline_rc=0
+  jobs=1
+  while [ "$jobs" -le 8 ]; do
+    rc=0
+    out=$(FM_LINT_JOBS="$jobs" "$LINT" "${good_roots[@]}" 2>&1) || rc=$?
+    [ "$rc" -eq 0 ] || fail "clean jobs=$jobs path failed with $rc"
+    if [ "$jobs" -eq 1 ]; then
+      baseline_clean=$out
+    else
+      [ "$out" = "$baseline_clean" ] || fail "clean jobs=$jobs output differs from jobs=1"
+    fi
 
-  rc_fail_1=0
-  out_fail_1=$(FM_LINT_JOBS=1 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_1=$?
-  rc_fail_2=0
-  out_fail_2=$(FM_LINT_JOBS=2 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_2=$?
-  rc_fail_2b=0
-  out_fail_2b=$(FM_LINT_JOBS=2 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_2b=$?
-  rc_fail_4=0
-  out_fail_4=$(FM_LINT_JOBS=4 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_4=$?
-  rc_fail_8=0
-  out_fail_8=$(FM_LINT_JOBS=8 "$LINT" "$bad_a" "$bad_b" 2>&1) || rc_fail_8=$?
-  [ "$rc_fail_1" -ne 0 ] && [ "$rc_fail_1" -eq "$rc_fail_2" ] && [ "$rc_fail_2" -eq "$rc_fail_2b" ] \
-    && [ "$rc_fail_2b" -eq "$rc_fail_4" ] && [ "$rc_fail_4" -eq "$rc_fail_8" ] \
-    || fail "failing exit results differ across worker counts: $rc_fail_1/$rc_fail_2/$rc_fail_2b/$rc_fail_4/$rc_fail_8"
-  [ "$out_fail_1" = "$out_fail_2" ] && [ "$out_fail_2" = "$out_fail_2b" ] \
-    && [ "$out_fail_2b" = "$out_fail_4" ] && [ "$out_fail_4" = "$out_fail_8" ] \
-    || fail "failing diagnostics are not byte-identical and deterministic across jobs"
-  assert_contains "$out_fail_1" "SC1007" "the first failing root diagnostic was lost"
-  assert_contains "$out_fail_1" "SC2086" "the later failing root diagnostic was lost"
+    rc=0
+    out=$(FM_LINT_JOBS="$jobs" "$LINT" "${bad_roots[@]}" 2>&1) || rc=$?
+    if [ "$jobs" -eq 1 ]; then
+      [ "$rc" -ne 0 ] || fail "failing jobs=1 path unexpectedly passed"
+      baseline_rc=$rc
+      baseline_fail=$out
+    else
+      [ "$rc" -eq "$baseline_rc" ] || fail "failing jobs=$jobs exit $rc differs from jobs=1 exit $baseline_rc"
+      [ "$out" = "$baseline_fail" ] || fail "failing jobs=$jobs diagnostics differ from jobs=1"
+    fi
+    jobs=$((jobs + 1))
+  done
+
+  rc=0
+  out=$(FM_LINT_JOBS=4 "$LINT" "${bad_roots[@]}" 2>&1) || rc=$?
+  [ "$rc" -eq "$baseline_rc" ] && [ "$out" = "$baseline_fail" ] \
+    || fail "repeated CI jobs=4 lint was not deterministic"
+  i=0
+  while [ "$i" -lt 8 ]; do
+    occurrences=$(printf '%s\n' "$baseline_fail" | grep -F -c "${bad_roots[$i]}" || true)
+    [ "$occurrences" -eq 1 ] \
+      || fail "failing root ${bad_roots[$i]} appeared $occurrences times instead of exactly once"
+    i=$((i + 1))
+  done
+  assert_contains "$baseline_fail" "SC1007" "the first failing shard diagnostic was lost"
+  assert_contains "$baseline_fail" "SC2086" "a later failing shard diagnostic was lost"
   rc_bad_jobs=0
-  FM_LINT_JOBS=9 "$LINT" "$good" >/dev/null 2>&1 || rc_bad_jobs=$?
+  FM_LINT_JOBS=9 "$LINT" "${good_roots[@]}" >/dev/null 2>&1 || rc_bad_jobs=$?
   [ "$rc_bad_jobs" -eq 2 ] || fail "the lint owner must reject unbounded worker counts"
 
-  telemetry_out=$(FM_LINT_JOBS=2 FM_LINT_TELEMETRY="$telemetry" "$LINT" "$good" 2>&1) \
+  telemetry_out=$(FM_LINT_JOBS=2 FM_LINT_TELEMETRY="$telemetry" "$LINT" "${good_roots[@]}" 2>&1) \
     || fail "telemetry-enabled clean lint failed"
-  [ "$telemetry_out" = "$out_clean_2" ] || fail "quiet telemetry changed routine lint output"
+  [ "$telemetry_out" = "$baseline_clean" ] || fail "quiet telemetry changed routine lint output"
   assert_grep $'format\tfm-lint-telemetry-v1' "$telemetry" "telemetry format marker is missing"
   assert_grep $'jobs\t2' "$telemetry" "telemetry did not record bounded jobs"
-  assert_grep $'root_count\t1' "$telemetry" "telemetry did not record root count"
+  assert_grep $'root_count\t8' "$telemetry" "telemetry did not record root count"
   assert_grep $'wall_seconds\t' "$telemetry" "telemetry did not record wall time"
   assert_grep $'user_seconds\t' "$telemetry" "telemetry did not record user CPU"
   assert_grep $'system_seconds\t' "$telemetry" "telemetry did not record system CPU"
@@ -475,88 +494,113 @@ SH
 
   cleanup_tmp="$tmp/lint-tmp"
   mkdir -p "$cleanup_tmp"
-  cleanup_out=$(TMPDIR="$cleanup_tmp" FM_LINT_JOBS=2 "$LINT" "$good" 2>&1) \
+  cleanup_out=$(TMPDIR="$cleanup_tmp" FM_LINT_JOBS=2 "$LINT" "${good_roots[@]}" 2>&1) \
     || fail "cleanup fixture lint failed"
-  [ "$cleanup_out" = "$out_clean_2" ] || fail "cleanup fixture changed routine diagnostics"
+  [ "$cleanup_out" = "$baseline_clean" ] || fail "cleanup fixture changed routine diagnostics"
   [ -z "$(find "$cleanup_tmp" -mindepth 1 -maxdepth 1 -name 'fm-lint.*' -print -quit)" ] \
     || fail "bounded lint left temporary worker state behind"
-  pass "every bounded worker count preserves deterministic diagnostics, failures, cleanup bounds, and quiet telemetry"
+  pass "every bounded worker count preserves deterministic diagnostics, complete partitions, failures, and cleanup"
 }
 
 test_worker_trees_stop_on_signal() {
-  local tmp fakebin fixture jobs telemetry lint_tmp pid_file out_file telemetry_file
-  local parent_pid shellcheck_pid i parent_rc survivor
+  local tmp fakebin fixture jobs telemetry lint_tmp pid_dir out_file telemetry_file pid_record
+  local parent_pid shellcheck_pid child_pid i parent_rc survivor_count record_count
+  local -a fixtures process_pids
   tmp=$(fm_test_tmproot fm-lint-signal)
   mkdir -p "$tmp"
   fakebin=$(fm_fakebin "$tmp")
-  fixture="$tmp/good.sh"
-  cat > "$fixture" <<'SH'
+  fixtures=()
+  i=1
+  while [ "$i" -le 8 ]; do
+    fixture="$tmp/good-$i.sh"
+    fixtures+=("$fixture")
+    cat > "$fixture" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${1:-ok}"
 SH
+    i=$((i + 1))
+  done
   cat > "$fakebin/shellcheck" <<'SH'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--version" ]; then
   printf 'ShellCheck - shell script analysis tool\nversion: 0.11.0\n'
   exit 0
 fi
-printf '%s\n' "$$" > "$FM_TEST_SHELLCHECK_PID"
-trap 'exit 143' HUP INT TERM
-while :; do
-  sleep 1
-done
+sleep 300 &
+child_pid=$!
+printf '%s %s\n' "$$" "$child_pid" > "$FM_TEST_SHELLCHECK_PID_DIR/$$"
+trap 'kill -TERM "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; exit 143' HUP INT TERM
+wait "$child_pid"
 SH
   chmod +x "$fakebin/shellcheck"
 
   for jobs in 1 2 8; do
     for telemetry in off on; do
       lint_tmp="$tmp/lint-$jobs-$telemetry"
-      pid_file="$tmp/shellcheck-$jobs-$telemetry.pid"
+      pid_dir="$tmp/shellcheck-$jobs-$telemetry"
       out_file="$tmp/output-$jobs-$telemetry"
       telemetry_file=
-      mkdir -p "$lint_tmp"
+      mkdir -p "$lint_tmp" "$pid_dir"
       if [ "$telemetry" = on ]; then
         telemetry_file="$tmp/telemetry-$jobs.tsv"
       fi
       PATH="$fakebin:$PATH" TMPDIR="$lint_tmp" FM_LINT_JOBS="$jobs" \
-        FM_LINT_TELEMETRY="$telemetry_file" FM_TEST_SHELLCHECK_PID="$pid_file" \
-        "$LINT" "$fixture" > "$out_file" 2>&1 &
+        FM_LINT_TELEMETRY="$telemetry_file" FM_TEST_SHELLCHECK_PID_DIR="$pid_dir" \
+        "$LINT" "${fixtures[@]}" > "$out_file" 2>&1 &
       parent_pid=$!
       i=0
-      while [ "$i" -lt 500 ] && [ ! -s "$pid_file" ]; do
+      record_count=0
+      while [ "$i" -lt 500 ]; do
+        record_count=$(find "$pid_dir" -type f | wc -l | tr -d '[:space:]')
+        [ "$record_count" -eq "$jobs" ] && break
         kill -0 "$parent_pid" 2>/dev/null || break
         sleep 0.01
         i=$((i + 1))
       done
-      [ -s "$pid_file" ] || {
+      if [ "$record_count" -ne "$jobs" ]; then
         kill -TERM "$parent_pid" 2>/dev/null || true
         wait "$parent_pid" 2>/dev/null || true
-        fail "jobs=$jobs telemetry=$telemetry did not start ShellCheck"
-      }
-      shellcheck_pid=$(cat "$pid_file")
+        fail "jobs=$jobs telemetry=$telemetry started $record_count of $jobs ShellCheck workers"
+      fi
+      process_pids=()
+      while IFS= read -r pid_record; do
+        read -r shellcheck_pid child_pid < "$pid_record"
+        case "$shellcheck_pid:$child_pid" in
+          *[!0-9:]*|:*|*:) fail "jobs=$jobs telemetry=$telemetry recorded invalid process IDs" ;;
+        esac
+        process_pids+=("$shellcheck_pid" "$child_pid")
+      done < <(find "$pid_dir" -type f -print | LC_ALL=C sort)
+      [ "${#process_pids[@]}" -eq $((jobs * 2)) ] \
+        || fail "jobs=$jobs telemetry=$telemetry did not record every process tree"
+
       kill -TERM "$parent_pid" 2>/dev/null \
         || fail "jobs=$jobs telemetry=$telemetry parent could not be interrupted"
       parent_rc=0
       wait "$parent_pid" 2>/dev/null || parent_rc=$?
-      survivor=0
       i=0
-      while [ "$i" -lt 100 ] && kill -0 "$shellcheck_pid" 2>/dev/null; do
+      while [ "$i" -lt 100 ]; do
+        survivor_count=0
+        for shellcheck_pid in "${process_pids[@]}"; do
+          kill -0 "$shellcheck_pid" 2>/dev/null && survivor_count=$((survivor_count + 1))
+        done
+        [ "$survivor_count" -eq 0 ] && break
         sleep 0.01
         i=$((i + 1))
       done
-      if kill -0 "$shellcheck_pid" 2>/dev/null; then
-        survivor=1
-        kill -KILL "$shellcheck_pid" 2>/dev/null || true
+      if [ "$survivor_count" -ne 0 ]; then
+        for shellcheck_pid in "${process_pids[@]}"; do
+          kill -KILL "$shellcheck_pid" 2>/dev/null || true
+        done
       fi
       [ "$parent_rc" -eq 143 ] \
         || fail "jobs=$jobs telemetry=$telemetry signal exit was $parent_rc, expected 143"
-      [ "$survivor" -eq 0 ] \
-        || fail "jobs=$jobs telemetry=$telemetry left ShellCheck running"
+      [ "$survivor_count" -eq 0 ] \
+        || fail "jobs=$jobs telemetry=$telemetry left $survivor_count recorded processes running"
       [ -z "$(find "$lint_tmp" -mindepth 1 -maxdepth 1 -name 'fm-lint.*' -print -quit)" ] \
         || fail "jobs=$jobs telemetry=$telemetry left temporary worker state"
     done
   done
-  pass "bounded worker counts stop complete worker trees with and without telemetry"
+  pass "bounded workers stop every complete process tree with and without telemetry"
 }
 
 test_seeded_module_boundary_parity() {
