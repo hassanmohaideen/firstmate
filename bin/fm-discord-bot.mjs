@@ -51,6 +51,7 @@ const ERROR_NOTIFIED_FILE = join(STATE, "discord-bot.error.notified");
 const OWNERSHIP_DIR = join(HOME, "state", ".discord-bot-service");
 const TERMINAL_FILE = join(OWNERSHIP_DIR, "terminal.json");
 const RECONNECT_FILE = join(OWNERSHIP_DIR, "reconnect.json");
+const RECONNECT_SUPPRESSION_FILE = join(OWNERSHIP_DIR, "reconnect-suppression.json");
 const WAKE_DEDUP_DIR = join(STATE, ".wake-dedup");
 const NOTIFIER = join(ROOT, "bin", "fm-discord-notify.sh");
 const TEST_MODE = process.env.FM_DISCORD_TEST_MODE === "1";
@@ -958,6 +959,7 @@ class GatewayRunner {
     this.waiters = new Set();
     this.failClosed = false;
     this.failClosedWait = null;
+    this.fallbackSuppressionActive = false;
     this.durableWriteCount = 0;
   }
 
@@ -1050,6 +1052,35 @@ class GatewayRunner {
     return transition;
   }
 
+  async persistFallbackSuppression() {
+    const deadlineActive = this.serverNotBefore !== null && this.serverWaitMs !== null;
+    await atomicReplacePrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
+      schema: "firstmate.discord-reconnect-suppression.v1",
+      authentication_fingerprint: authenticationFingerprint(this.config),
+      server_not_before: deadlineActive ? this.serverNotBefore : null,
+      server_wait_ms: deadlineActive ? this.serverWaitMs : null,
+      operator_intervention_required: !deadlineActive,
+      recorded_at: diagnosticEpochSeconds(),
+    })}\n`);
+    this.fallbackSuppressionActive = true;
+  }
+
+  activateFailClosed() {
+    this.failClosed = true;
+    if (this.socket && this.socket.readyState < WebSocket.CLOSING) {
+      this.socket.close(4000, "reconnect state unavailable");
+    }
+    if (!this.failClosedWait) {
+      this.failClosedWait = (async () => {
+        await reportDiagnostic("reconnect-state-unavailable");
+        safeLog("reconnect state could not be persisted; Gateway retries remain stopped");
+        while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);
+        return false;
+      })();
+    }
+    return this.failClosedWait;
+  }
+
   async persistDurableStateOrStop() {
     if (this.failClosed) return await this.failClosedWait;
     try {
@@ -1057,19 +1088,10 @@ class GatewayRunner {
       if (this.failClosed) return await this.failClosedWait;
       return true;
     } catch {
-      this.failClosed = true;
-      if (this.socket && this.socket.readyState < WebSocket.CLOSING) {
-        this.socket.close(4000, "reconnect state unavailable");
-      }
-      if (!this.failClosedWait) {
-        this.failClosedWait = (async () => {
-          await reportDiagnostic("reconnect-state-unavailable");
-          safeLog("reconnect state could not be persisted; Gateway retries remain stopped");
-          while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);
-          return false;
-        })();
-      }
-      return await this.failClosedWait;
+      try {
+        await this.persistFallbackSuppression();
+      } catch {}
+      return await this.activateFailClosed();
     }
   }
 
@@ -1138,6 +1160,42 @@ class GatewayRunner {
     this.serverWaitMs = this.serverNotBefore === null
       ? null
       : record?.server_wait_ms ?? Math.max(0, this.serverNotBefore - Date.now());
+    let suppression;
+    try {
+      await assertPrivateFile(RECONNECT_SUPPRESSION_FILE);
+      suppression = JSON.parse(await readFile(RECONNECT_SUPPRESSION_FILE, "utf8"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") this.activateFailClosed();
+    }
+    if (suppression) {
+      const valid = suppression.schema === "firstmate.discord-reconnect-suppression.v1"
+        && INCIDENT_ID_RE.test(suppression.authentication_fingerprint || "")
+        && typeof suppression.operator_intervention_required === "boolean"
+        && (suppression.server_not_before === null
+          ? suppression.server_wait_ms === null && suppression.operator_intervention_required
+          : Number.isSafeInteger(suppression.server_not_before) && suppression.server_not_before >= 0
+            && Number.isSafeInteger(suppression.server_wait_ms) && suppression.server_wait_ms >= 0
+            && !suppression.operator_intervention_required);
+      if (!valid) {
+        this.activateFailClosed();
+      } else if (suppression.authentication_fingerprint !== authenticationFingerprint(this.config)) {
+        await removeMarker(RECONNECT_SUPPRESSION_FILE);
+      } else if (suppression.operator_intervention_required) {
+        this.fallbackSuppressionActive = true;
+        this.activateFailClosed();
+      } else {
+        const fallbackRemaining = Math.max(0, Math.min(
+          suppression.server_wait_ms,
+          suppression.server_not_before - Date.now(),
+        ));
+        const currentRemaining = this.serverNotBefore === null
+          ? 0
+          : Math.max(0, Math.min(this.serverWaitMs, this.serverNotBefore - Date.now()));
+        this.serverNotBefore = Math.max(this.serverNotBefore || 0, suppression.server_not_before);
+        this.serverWaitMs = Math.max(currentRemaining, fallbackRemaining);
+        this.fallbackSuppressionActive = true;
+      }
+    }
     this.sessionStartLimit = authenticationBound ? limit : null;
     const resumable = authenticationBound && resume && SNOWFLAKE_RE.test(resume.self_user_id || "");
     if (resumable) {
@@ -1203,7 +1261,20 @@ class GatewayRunner {
   async retireServerDelay() {
     this.serverNotBefore = null;
     this.serverWaitMs = null;
-    return await this.persistDurableStateOrStop();
+    if (!await this.persistDurableStateOrStop()) return false;
+    if (this.fallbackSuppressionActive) {
+      try {
+        await removeMarker(RECONNECT_SUPPRESSION_FILE);
+        this.fallbackSuppressionActive = false;
+      } catch {
+        try {
+          await this.persistFallbackSuppression();
+        } catch {}
+        await this.activateFailClosed();
+        return false;
+      }
+    }
+    return true;
   }
 
   reconnectDelay(serverDelayMs = this.serverDelayRemaining()) {
@@ -1497,6 +1568,7 @@ class GatewayRunner {
     }, RECONCILE_INTERVAL_MS);
     reconcileTimer.unref?.();
     safeLog("service started");
+    if (this.failClosed) await this.failClosedWait;
     if (this.failurePressure > 0 || this.serverNotBefore !== null) {
       const delay = this.serverDelayRemaining();
       if (this.failurePressure > 0 || delay > 0) {
@@ -1721,6 +1793,7 @@ async function main() {
     case "terminal-reset": {
       await loadConfig();
       await removeMarker(TERMINAL_FILE);
+      await removeMarker(RECONNECT_SUPPRESSION_FILE);
       await clearDiagnostic();
       return;
     }

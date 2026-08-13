@@ -226,7 +226,7 @@ const server=http.createServer((req,res)=>{
     if (mode === "auth-fail") { res.writeHead(401); res.end("{}"); return; }
     if (mode === "lookup-fail-once" && lookups === 1) { res.writeHead(500); res.end("{}"); return; }
     if (mode === "rate-limit" || (["rate-limit-once","rate-limit-delayed-once"].includes(mode) && lookups === 1)) {
-      const retryAfter=mode === "rate-limit" ? 0.18 : 0.45;
+      const retryAfter=mode === "rate-limit" ? 0.18 : mode === "rate-limit-delayed-once" ? 1.2 : 0.45;
       const respond=()=>{
         res.writeHead(429,{"content-type":"application/json","retry-after":String(retryAfter)});
         res.end(JSON.stringify({retry_after:retryAfter}));
@@ -1334,6 +1334,7 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
 wait_for_value "$home/gateway/lookups" 1 || fail "persistence-failure fixture did not receive its lookup"
+cp "$home/state/.discord-bot-service/reconnect.json" "$home/reconnect.before-failure"
 rm -f "$home/state/.discord-bot-service/reconnect.json"
 mkdir "$home/state/.discord-bot-service/reconnect.json"
 i=0
@@ -1347,10 +1348,35 @@ kill -0 "$rate_worker" 2>/dev/null || fail "retry deadline persistence failure e
 [ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "retry deadline persistence failure made another Gateway lookup"
 [ "$(jq -r .code "$home/state/discord-bot.error")" = reconnect-state-unavailable ] \
   || fail "retry deadline persistence failure lacked its safe diagnostic"
+wait_for_file "$home/state/.discord-bot-service/reconnect-suppression.json" \
+  || fail "retry deadline persistence failure lacked durable fallback suppression"
+fallback_record=$(cat "$home/state/.discord-bot-service/reconnect-suppression.json")
+fallback_deadline=$(printf '%s' "$fallback_record" | jq -r .server_not_before)
+[ "$fallback_deadline" -gt 0 ] 2>/dev/null || fail "fallback suppression omitted the server deadline"
+assert_not_contains "$fallback_record" "$TOKEN" "fallback retry suppression exposed the bot token"
+assert_not_contains "$fallback_record" "$OWNER" "fallback retry suppression exposed a deployment id"
+rate_child=$(pgrep -P "$rate_worker" | head -n 1)
+[ -n "$rate_child" ] || fail "persistence-failure fixture had no runtime process"
+kill -KILL "$rate_child"
+wait "$rate_worker" 2>/dev/null || true
+WORKER_PIDS=()
+rmdir "$home/state/.discord-bot-service/reconnect.json"
+mv "$home/reconnect.before-failure" "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/restarted.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 2 || fail "fallback-suppressed restart did not resume after expiry"
+second_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+[ "$second_lookup" -ge "$fallback_deadline" ] \
+  || fail "crash restart bypassed the fallback server retry deadline"
+assert_absent "$home/state/.discord-bot-service/reconnect-suppression.json" \
+  "expired fallback server retry deadline was not retired"
 kill -TERM "$rate_worker"
 wait "$rate_worker" || true
 WORKER_PIDS=()
-pass "retry deadline persistence failures remain stopped until termination"
+pass "failed retry persistence survives crashes and retires after expiry"
 
 home=$(new_home gateway-sequence-persistence-stop)
 write_config "$home"

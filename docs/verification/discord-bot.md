@@ -52,7 +52,7 @@ ok - Identify reservation persistence failures remain stopped until termination
 ok - Gateway sequence persistence coalesces bursts to bounded writes
 ok - Gateway lookup rate limits preserve server-provided retry direction
 ok - server retry deadlines survive abrupt process and service-manager restarts
-ok - retry deadline persistence failures remain stopped until termination
+ok - failed retry persistence survives crashes and retires after expiry
 ok - sequence persistence failure keeps one promptly cancellable fail-closed wait
 ok - invalid-session persistence failure settles promptly after stop
 ok - server retry deadlines retire safely across clock movement
