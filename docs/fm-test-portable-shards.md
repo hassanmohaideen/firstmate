@@ -82,15 +82,15 @@ The single longest measured script, `tests/fm-pr-check-security.test.sh` at 1942
 The original complete local `bin/fm-test-run.sh --all` measurement took 1,527 seconds for 146 scripts.
 Focused before/after measurements retained from the optimization work are:
 
-| Script | Before | After |
+| Script | Before | Retained after |
 |---|---:|---:|
 | `tests/fm-backend-herdr.test.sh` | ~316.7 s | ~37.2 s |
-| `tests/fm-backend-herdr-presentation-e2e.test.sh` | ~269.6 s | ~238.9 s |
+| `tests/fm-backend-herdr-presentation-e2e.test.sh` | ~269.6 s | ~260.7 s |
 | `tests/fm-pr-check-security.test.sh` | ~268.8 s | ~194.2 s |
 
-Successful run [`31650453019`](https://github.com/hassanmohaideen/firstmate/actions/runs/31650453019) supplied the 2026-08-12 `fm-test-timing-herdr` baselines below except for focus-flash and presentation E2E. Its presentation E2E result was 228,569 ms, not the 238,900 ms focused result in the optimization summary. The raw artifact for that focused result was not retained, so it is not used as a budget baseline.
+Successful run [`31650453019`](https://github.com/hassanmohaideen/firstmate/actions/runs/31650453019) supplied the 2026-08-12 `fm-test-timing-herdr` baselines below except for focus-flash and presentation E2E. Its presentation E2E result was 228,569 ms. A separate historical observation of about 238.9 seconds has no retained raw artifact and is not treated as measured evidence or used as a budget baseline.
 
-Presentation E2E was remeasured twice on 2026-08-13 through `/Users/hassanmohaideen/.hassanmohaideen-agent-workspace/bin/fm-herdr-lab.sh` (SHA-256 `3aadae228853e3f8a91199b116b816f18d91df844f1e7bf22b3b6105044ef6d6`) with Herdr 0.8.0 and Treehouse 2.1.1. Both genuine non-default lab runs completed every functional assertion and the default-session tripwire in [261,092 ms](verification/fm-test-timing-herdr-presentation-e2e-2026-08-13.json) and [260,721 ms](verification/fm-test-timing-herdr-presentation-e2e-2026-08-13-rerun.json); the latest result is the budget baseline. Focus-flash was measured separately on macOS aarch64 with Herdr 0.8.0 protocol 19 through the same named helper path.
+Presentation E2E was remeasured twice on 2026-08-13 through `/Users/hassanmohaideen/.hassanmohaideen-agent-workspace/bin/fm-herdr-lab.sh` (SHA-256 `3aadae228853e3f8a91199b116b816f18d91df844f1e7bf22b3b6105044ef6d6`) with Herdr 0.8.0 and Treehouse 2.1.1. Both genuine non-default lab runs completed every functional assertion and the default-session tripwire in [261,092 ms](verification/fm-test-timing-herdr-presentation-e2e-2026-08-13.json) and [260,721 ms](verification/fm-test-timing-herdr-presentation-e2e-2026-08-13-rerun.json); the latest result is the current budget baseline. The artifacts' `duration_baseline_ms` fields faithfully record the provisional 238,900 ms runner setting used during those runs, not another observed duration or the current baseline. Focus-flash was measured separately on macOS aarch64 with Herdr 0.8.0 protocol 19 through the same named helper path.
 
 | Script | Measured live-path baseline |
 |---|---:|
