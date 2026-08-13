@@ -201,13 +201,13 @@ test_empty_selection_emits_summary() {
   printf 'documentation only\n' >"$repo/README.md"
   out=$(cd "$repo" && bin/fm-test-run.sh --changed --base HEAD --json "$tmp/artifacts/timing.json" 2>"$tmp/err") \
     || fail "empty valid changed selection must pass"
-  [ "$out" = "$(printf 'FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0\nFM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 mode=warn')" ] \
+  [ "$out" = "$(printf 'FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0\nFM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=0 mode=warn')" ] \
     || fail "empty selection summary is missing or non-deterministic: $out"
   json="$tmp/artifacts/timing.json"
   python3 -c '
 import json, sys
 doc = json.load(open(sys.argv[1]))
-assert doc["summary"] == {"duration_budget_exceeded": 0, "duration_ms": 0, "failed": 0, "skipped_gate": 0, "total": 0}
+assert doc["summary"] == {"duration_budget_exceeded": 0, "duration_budget_missing": 0, "duration_ms": 0, "failed": 0, "skipped_gate": 0, "total": 0}
 assert doc["scripts"] == []
 assert doc["families"] == []
 ' "$json" || { rm -rf "$tmp"; fail "empty selection JSON summary is wrong"; }
@@ -936,7 +936,11 @@ echo "ok - measured budget fixture"
 SH
   cat > "$repo/tests/fm-backend-herdr-smoke.test.sh" <<'SH'
 #!/usr/bin/env bash
-echo "ok - default budget fixture"
+echo "ok - measured real-Herdr fixture"
+SH
+  cat > "$repo/tests/fm-new-required.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo "ok - unmeasured fixture"
 SH
   cat > "$repo/tests/fm-afk-inject-herdr-e2e.test.sh" <<'SH'
 #!/usr/bin/env bash
@@ -963,7 +967,7 @@ SH
 
   PATH="$fakebin:$PATH" "$runner" tests/fm-backend-herdr.test.sh > "$tmp/warn.out" 2> "$tmp/warn.err" \
     || fail "local duration budget warning must not fail a functional pass"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=warn' "$tmp/warn.out" \
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 missing=0 mode=warn' "$tmp/warn.out" \
     || fail "local duration budget warning summary was missing"
   grep -q 'duration budget exceeded:' "$tmp/warn.err" || fail "duration overrun was not actionable"
 
@@ -976,31 +980,41 @@ SH
   [ "$rc" -ne 0 ] || fail "CI duration budget enforcement did not fail"
   grep -q 'FM_TEST_SUMMARY total=1 failed=0' "$tmp/enforce.out" \
     || fail "duration enforcement hid or rewrote the functional result"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=enforce' "$tmp/enforce.out" \
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 missing=0 mode=enforce' "$tmp/enforce.out" \
     || fail "duration enforcement summary was missing"
+
+  rm -f "$tmp/clock"
+  PATH="$fakebin:$PATH" "$runner" tests/fm-new-required.test.sh > "$tmp/missing-warn.out" 2> "$tmp/missing-warn.err" \
+    || fail "local execution must only warn for an unmeasured script"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=1 mode=warn' "$tmp/missing-warn.out" \
+    || fail "local execution did not report an explicitly missing measurement"
+  grep -q 'duration budget missing:' "$tmp/missing-warn.err" \
+    || fail "missing local duration measurement was not actionable"
 
   rm -f "$tmp/clock"
   set +e
   PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
-    tests/fm-backend-herdr-smoke.test.sh > "$tmp/default.out" 2> "$tmp/default.err"
+    tests/fm-new-required.test.sh > "$tmp/missing-enforce.out" 2> "$tmp/missing-enforce.err"
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || fail "required CI script without a measured hint escaped enforcement"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 mode=enforce' "$tmp/default.out" \
-    || fail "default duration budget did not cover an unmeasured required CI script"
+  [ "$rc" -ne 0 ] || fail "enforced execution accepted an unmeasured script"
+  grep -q 'FM_TEST_SUMMARY total=1 failed=0' "$tmp/missing-enforce.out" \
+    || fail "missing-budget enforcement hid the functional result"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=1 mode=enforce' "$tmp/missing-enforce.out" \
+    || fail "enforced execution did not report the missing measurement"
 
   rm -f "$tmp/clock"
   FAKE_DURATION_MS=65000 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
     tests/fm-afk-inject-herdr-e2e.test.sh > "$tmp/herdr.out" 2> "$tmp/herdr.err" \
     || fail "measured long Herdr duration was rejected by the default fallback budget"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 mode=enforce' "$tmp/herdr.out" \
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 missing=0 mode=enforce' "$tmp/herdr.out" \
     || fail "long Herdr duration did not use its measured budget"
 
   rm -f "$tmp/clock"
   FAKE_DURATION_MS=17520 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
     tests/fm-backend-herdr-focus-flash-e2e.test.sh > "$tmp/focus.out" 2> "$tmp/focus.err" \
     || fail "measured focus-flash budget rejected its inclusive boundary"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 mode=enforce' "$tmp/focus.out" \
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 missing=0 mode=enforce' "$tmp/focus.out" \
     || fail "focus-flash duration did not use its measured real-Herdr budget"
   rm -rf "$tmp"
   pass "duration budgets warn locally and enforce every required CI script"

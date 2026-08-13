@@ -57,7 +57,7 @@
 #   FM_TEST_SUMMARY total=<n> failed=<n> skipped_gate=<n> duration_ms=<n>
 #   FM_TEST_SUMMARY_FAMILY family=<name> count=<n> duration_ms=<n> failed=<n>
 #   FM_TEST_SLOWEST rank=<k> script=<path> duration_ms=<n>
-#   FM_TEST_BUDGET_SUMMARY checked=<n> exceeded=<n> mode=warn|enforce
+#   FM_TEST_BUDGET_SUMMARY checked=<n> exceeded=<n> missing=<n> mode=warn|enforce
 #
 # Exit status is non-zero if any selected script exits non-zero or a configured
 # --fail-on-gate-skip token appears. Other gate skips (first meaningful line
@@ -101,6 +101,7 @@ JOBS_MAX=8
 DURATION_BUDGET_MODE=warn
 DURATION_BUDGET_CHECKED=0
 DURATION_BUDGET_EXCEEDED=0
+DURATION_BUDGET_MISSING=0
 
 # How many separate-runner shards the portable serial remainder splits into.
 # One owner: CI lane names carry this count and are refused when they disagree.
@@ -110,7 +111,6 @@ PORTABLE_SERIAL_SHARDS=4
 # the measured per-script mean so a newly added test neither starves nor
 # overloads the shard it lands in.
 PORTABLE_SERIAL_DEFAULT_WEIGHT_MS=20000
-DURATION_BUDGET_DEFAULT_BASELINE_MS=20000
 
 usage() {
   awk '
@@ -391,45 +391,45 @@ list_portable_serial() {
 portable_serial_weight_hints() {
   cat <<'EOF'
 tests/fm-afk-inject-e2e.test.sh 34019
-tests/fm-classify-decision-key.test.sh 20000
-tests/fm-cmux-claude-composer-live-e2e.test.sh 20000
-tests/fm-composer-matrix-live-e2e.test.sh 20000
-tests/fm-control-relaunch.test.sh 20000
-tests/fm-control.test.sh 20000
-tests/fm-harness-liveness-drift-live-e2e.test.sh 20000
-tests/fm-herdr-version-floor-live-e2e.test.sh 20000
-tests/fm-inactive-reconcile.test.sh 20000
-tests/fm-muse-harness.test.sh 20000
-tests/fm-muse-signals-live-e2e.test.sh 20000
-tests/fm-on.test.sh 20000
-tests/fm-procevent-when.test.sh 20000
-tests/fm-project-origin.test.sh 20000
-tests/fm-remote-backlog-handoff.test.sh 20000
-tests/fm-remote-doctor.test.sh 20000
-tests/fm-remote-entrypoint.test.sh 20000
-tests/fm-remote-job-orphan-reap.test.sh 20000
-tests/fm-remote-job.test.sh 20000
-tests/fm-remote-reply.test.sh 20000
-tests/fm-remote-secondmate-lifecycle-e2e.test.sh 20000
-tests/fm-remote-secondmate-parent-binding.test.sh 20000
-tests/fm-remote-secondmate-trace-context.test.sh 20000
-tests/fm-rtk-exec-trace.test.sh 20000
-tests/fm-rtk-fs-events.test.sh 20000
-tests/fm-rtk.test.sh 20000
-tests/fm-send-resolve-key.test.sh 20000
-tests/fm-session-lock-ancestry.test.sh 20000
-tests/fm-sessionstart-hook-live-e2e.test.sh 20000
-tests/fm-spawn-pool-base-freshen.test.sh 20000
-tests/fm-startup-network.test.sh 20000
-tests/fm-stow-cascade.test.sh 20000
-tests/fm-task-delivery.test.sh 20000
-tests/fm-test-fixture-cleanup.test.sh 20000
-tests/fm-tmux-agent-liveness.test.sh 20000
-tests/fm-trace-context-lib.test.sh 20000
-tests/fm-trace-context-spawn.test.sh 20000
-tests/fm-wake-drain-open-decisions-cursor.test.sh 20000
-tests/fm-wake-drain-open-decisions.test.sh 20000
-tests/fm-watch-arm.test.sh 20000
+tests/fm-classify-decision-key.test.sh 613
+tests/fm-cmux-claude-composer-live-e2e.test.sh 22
+tests/fm-composer-matrix-live-e2e.test.sh 20
+tests/fm-control-relaunch.test.sh 28988
+tests/fm-control.test.sh 36436
+tests/fm-harness-liveness-drift-live-e2e.test.sh 21
+tests/fm-herdr-version-floor-live-e2e.test.sh 21
+tests/fm-inactive-reconcile.test.sh 40355
+tests/fm-muse-harness.test.sh 27552
+tests/fm-muse-signals-live-e2e.test.sh 24
+tests/fm-on.test.sh 8109
+tests/fm-procevent-when.test.sh 15002
+tests/fm-project-origin.test.sh 109
+tests/fm-remote-backlog-handoff.test.sh 20234
+tests/fm-remote-doctor.test.sh 4545
+tests/fm-remote-entrypoint.test.sh 125
+tests/fm-remote-job-orphan-reap.test.sh 2928
+tests/fm-remote-job.test.sh 48297
+tests/fm-remote-reply.test.sh 24405
+tests/fm-remote-secondmate-lifecycle-e2e.test.sh 188051
+tests/fm-remote-secondmate-parent-binding.test.sh 13375
+tests/fm-remote-secondmate-trace-context.test.sh 39232
+tests/fm-rtk-exec-trace.test.sh 22
+tests/fm-rtk-fs-events.test.sh 2384
+tests/fm-rtk.test.sh 9304
+tests/fm-send-resolve-key.test.sh 9921
+tests/fm-session-lock-ancestry.test.sh 1132
+tests/fm-sessionstart-hook-live-e2e.test.sh 20
+tests/fm-spawn-pool-base-freshen.test.sh 13399
+tests/fm-startup-network.test.sh 49576
+tests/fm-stow-cascade.test.sh 2970
+tests/fm-task-delivery.test.sh 2111
+tests/fm-test-fixture-cleanup.test.sh 547
+tests/fm-tmux-agent-liveness.test.sh 2155
+tests/fm-trace-context-lib.test.sh 188
+tests/fm-trace-context-spawn.test.sh 34651
+tests/fm-wake-drain-open-decisions-cursor.test.sh 7967
+tests/fm-wake-drain-open-decisions.test.sh 7386
+tests/fm-watch-arm.test.sh 54968
 tests/fm-afk-pi-herdr-return-e2e.test.sh 42
 tests/fm-afk-return.test.sh 1105
 tests/fm-ask-user-authority.test.sh 68
@@ -505,17 +505,17 @@ EOF
 
 real_herdr_duration_hints() {
   cat <<'EOF'
-tests/fm-afk-inject-herdr-e2e.test.sh 65000
-tests/fm-afk-launch.test.sh 20000
-tests/fm-backend-autodetect-smoke.test.sh 20000
-tests/fm-backend-herdr-eventwait-smoke.test.sh 20000
-tests/fm-backend-herdr-launcher-workspace-e2e.test.sh 20000
-tests/fm-backend-herdr-prune-safety-e2e.test.sh 20000
-tests/fm-backend-herdr-respawn-idem-e2e.test.sh 20000
-tests/fm-backend-herdr-smoke.test.sh 20000
-tests/fm-backend-herdr-workspace-per-home-e2e.test.sh 20000
-tests/fm-control-herdr-smoke.test.sh 20000
-tests/fm-herdr-session-cleanup-e2e.test.sh 20000
+tests/fm-afk-inject-herdr-e2e.test.sh 61514
+tests/fm-afk-launch.test.sh 33459
+tests/fm-backend-autodetect-smoke.test.sh 7678
+tests/fm-backend-herdr-eventwait-smoke.test.sh 1703
+tests/fm-backend-herdr-launcher-workspace-e2e.test.sh 33330
+tests/fm-backend-herdr-prune-safety-e2e.test.sh 6385
+tests/fm-backend-herdr-respawn-idem-e2e.test.sh 2222
+tests/fm-backend-herdr-smoke.test.sh 4699
+tests/fm-backend-herdr-workspace-per-home-e2e.test.sh 15487
+tests/fm-control-herdr-smoke.test.sh 5821
+tests/fm-herdr-session-cleanup-e2e.test.sh 2047
 tests/fm-backend-herdr-focus-flash-e2e.test.sh 3760
 tests/fm-backend-herdr-presentation-e2e.test.sh 238900
 EOF
@@ -578,9 +578,7 @@ script_duration_baseline_ms() {
 # without turning ordinary machine variance into a brittle wall-clock test.
 duration_budget_ms_for() {
   local script=$1 baseline
-  if ! baseline=$(script_duration_baseline_ms "$script"); then
-    baseline=$DURATION_BUDGET_DEFAULT_BASELINE_MS
-  fi
+  baseline=$(script_duration_baseline_ms "$script") || return 1
   printf '%s\t%s\n' "$baseline" "$((baseline * 2 + 10000))"
 }
 
@@ -859,6 +857,7 @@ all_scripts = []
 failed = 0
 skipped = 0
 budget_exceeded = 0
+budget_missing = 0
 total = 0
 wall_ms = 0
 for path in inputs:
@@ -877,6 +876,7 @@ for path in inputs:
     failed += int(summary.get("failed") or 0)
     skipped += int(summary.get("skipped_gate") or 0)
     budget_exceeded += int(summary.get("duration_budget_exceeded") or 0)
+    budget_missing += int(summary.get("duration_budget_missing") or 0)
     wall_ms = max(wall_ms, int(summary.get("duration_ms") or 0))
     for s in doc.get("scripts") or []:
         row = dict(s)
@@ -895,6 +895,7 @@ agg = {
         "failed": failed,
         "skipped_gate": skipped,
         "duration_budget_exceeded": budget_exceeded,
+        "duration_budget_missing": budget_missing,
         "critical_path_duration_ms": wall_ms,
     },
     "scripts": all_scripts,
@@ -1324,6 +1325,7 @@ with open(records_file, encoding="utf-8") as fh:
             "exit": int(exit_s),
             "gate_skip": gate == "true",
             "duration_budget_exceeded": exceeded == "true",
+            "duration_baseline_measured": bool(baseline_s),
         }
         if baseline_s:
             row["duration_baseline_ms"] = int(baseline_s)
@@ -1357,6 +1359,7 @@ doc = {
         "skipped_gate": int(skipped),
         "duration_ms": int(duration),
         "duration_budget_exceeded": sum(1 for s in scripts if s["duration_budget_exceeded"]),
+        "duration_budget_missing": sum(1 for s in scripts if not s["duration_baseline_measured"]),
     },
     "scripts": scripts,
     "families": families,
@@ -1618,7 +1621,7 @@ fi
 if [ "${#SCRIPTS[@]}" -eq 0 ]; then
   log "nothing to run"
   printf 'FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0\n'
-  printf 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 mode=%s\n' "$DURATION_BUDGET_MODE"
+  printf 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=0 mode=%s\n' "$DURATION_BUDGET_MODE"
   if [ -n "$JSON_PATH" ]; then
     empty_rec=$(mktemp)
     empty_fam=$(mktemp)
@@ -1821,6 +1824,12 @@ record_script_result() {
       if [ "$DURATION_BUDGET_MODE" = enforce ]; then
         AGG_RC=1
       fi
+    fi
+  else
+    DURATION_BUDGET_MISSING=$((DURATION_BUDGET_MISSING + 1))
+    log "duration budget missing: $script mode=$DURATION_BUDGET_MODE"
+    if [ "$DURATION_BUDGET_MODE" = enforce ]; then
+      AGG_RC=1
     fi
   fi
 
@@ -2072,8 +2081,8 @@ if [ -s "$RECORDS" ]; then
   done
 fi
 
-printf 'FM_TEST_BUDGET_SUMMARY checked=%s exceeded=%s mode=%s\n' \
-  "$DURATION_BUDGET_CHECKED" "$DURATION_BUDGET_EXCEEDED" "$DURATION_BUDGET_MODE"
+printf 'FM_TEST_BUDGET_SUMMARY checked=%s exceeded=%s missing=%s mode=%s\n' \
+  "$DURATION_BUDGET_CHECKED" "$DURATION_BUDGET_EXCEEDED" "$DURATION_BUDGET_MISSING" "$DURATION_BUDGET_MODE"
 
 if [ -n "$JSON_PATH" ]; then
   mkdir -p "$(dirname "$JSON_PATH")"

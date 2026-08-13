@@ -69,11 +69,11 @@ Hints only affect balance: the coverage guard keeps the partition complete and d
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of4` | 26 | 536169 ms (~536.2 s) |
-| `portable-serial-2of4` | 28 | 536163 ms (~536.2 s) |
-| `portable-serial-3of4` | 28 | 536163 ms (~536.2 s) |
-| `portable-serial-4of4` | 27 | 536147 ms (~536.1 s) |
-| imbalance | | 22 ms |
+| `portable-serial-1of4` | 27 | 515445 ms (~515.4 s) |
+| `portable-serial-2of4` | 26 | 515445 ms (~515.4 s) |
+| `portable-serial-3of4` | 27 | 515455 ms (~515.5 s) |
+| `portable-serial-4of4` | 29 | 515462 ms (~515.5 s) |
+| imbalance | | 17 ms |
 
 The single longest measured script, `tests/fm-pr-check-security.test.sh` at 194216 ms after its snapshot optimization, is the floor for any shard count.
 
@@ -88,16 +88,25 @@ Focused before/after measurements retained from the optimization work are:
 | `tests/fm-backend-herdr-presentation-e2e.test.sh` | ~269.6 s | ~238.9 s |
 | `tests/fm-pr-check-security.test.sh` | ~268.8 s | ~194.2 s |
 
-The required-lane focus-flash baseline was measured separately on 2026-08-13 on macOS aarch64 with the installed Herdr 0.8.0 protocol 19 pin.
-The generated non-default lab contract used the mandatory helper and completed all functional and default-session tripwire checks:
+The required real-Herdr baselines came from successful run `31650453019`'s `fm-test-timing-herdr` artifact on 2026-08-12. Every script completed its genuine live path in a non-default named lab with functional success and the default-session fleet tripwire intact. The generated lab helper used by that run is byte-identical to `/Users/hassanmohaideen/.hassanmohaideen-agent-workspace/bin/fm-herdr-lab.sh` (SHA-256 `3aadae228853e3f8a91199b116b816f18d91df844f1e7bf22b3b6105044ef6d6`). Focus-flash was measured separately on 2026-08-13 on macOS aarch64 with Herdr 0.8.0 protocol 19 through that named helper path.
 
-```sh
-HERDR_LAB_HELPER=/Users/hassanmohaideen/.hassanmohaideen-agent-workspace/bin/fm-herdr-lab.sh \
-  tests/fm-backend-herdr-focus-flash-e2e.test.sh
-```
+| Script | Measured live-path baseline |
+|---|---:|
+| `tests/fm-afk-inject-herdr-e2e.test.sh` | 61,514 ms |
+| `tests/fm-afk-launch.test.sh` | 33,459 ms |
+| `tests/fm-backend-autodetect-smoke.test.sh` | 7,678 ms |
+| `tests/fm-backend-herdr-eventwait-smoke.test.sh` | 1,703 ms |
+| `tests/fm-backend-herdr-focus-flash-e2e.test.sh` | 3,760 ms |
+| `tests/fm-backend-herdr-launcher-workspace-e2e.test.sh` | 33,330 ms |
+| `tests/fm-backend-herdr-presentation-e2e.test.sh` | 238,900 ms |
+| `tests/fm-backend-herdr-prune-safety-e2e.test.sh` | 6,385 ms |
+| `tests/fm-backend-herdr-respawn-idem-e2e.test.sh` | 2,222 ms |
+| `tests/fm-backend-herdr-smoke.test.sh` | 4,699 ms |
+| `tests/fm-backend-herdr-workspace-per-home-e2e.test.sh` | 15,487 ms |
+| `tests/fm-control-herdr-smoke.test.sh` | 5,821 ms |
+| `tests/fm-herdr-session-cleanup-e2e.test.sh` | 2,047 ms |
 
-The successful live path took 3,760 ms.
-`real_herdr_duration_hints` retains that measured baseline for the runner-owned CI budget.
+`real_herdr_duration_hints` retains these measurements for runner-owned CI budgets.
 
 A subsequent portable regression attempt ran for about 1,500 seconds.
 Its failures were pre-existing failures unrelated to the scheduling and slow-test optimizations, so the attempt remains classified as incomplete evidence rather than a green regression result or justification to omit coverage.
@@ -120,8 +129,8 @@ It separately verifies that the portable serial CI shards are non-empty, disjoin
 
 Portable shards, each portable serial shard, and the Herdr lane upload runner-generated timing JSON.
 `bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
-The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from the archived isolation proof timings.
-Scripts awaiting an individual measurement use the measured 20-second portable-suite mean, so every required CI script remains covered while fresh timing artifacts provide the next per-script refresh.
+The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from archived timing artifacts.
+An unmeasured script has no budget: local execution reports it as missing, enforced execution fails after the functional result, and the coverage guard rejects it from every required lane.
 Budget overruns warn during local runs and are enforced by required CI lanes without replacing or hiding functional failures.
 `.github/workflows/ci.yml` owns the exact artifact names, enforcement wiring, and aggregation wiring.
 
@@ -135,7 +144,7 @@ Budget overruns warn during local runs and are enforced by required CI lanes wit
 | Job | timeout-minutes | Rationale |
 |---|---:|---|
 | portable parallel 1/2 | 10 | The measured shard sums are about three minutes and the timeout is a hang tripwire. |
-| portable serial 1-4 | 30 | Each balanced shard is about nine minutes, leaving a generous hang-tripwire margin. |
+| portable serial 1-4 | 30 | Each balanced shard is about 8.6 minutes, leaving a generous hang-tripwire margin. |
 | Herdr | 75 | The real-Herdr lane keeps its dedicated timeout. |
 
 Timeouts are hang tripwires rather than expected healthy durations.
