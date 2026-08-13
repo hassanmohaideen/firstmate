@@ -301,6 +301,22 @@ test_unresolvable_relative_overrides_fail_loudly() {
   pass "unresolvable relative spawn overrides fail with named diagnostics"
 }
 
+test_tracked_dispatch_profile_requires_explicit_harness() {
+  local rec id out status
+  id=profile-required-tracked-z10
+  rec=$(make_spawn_case profile-required-tracked claude "$id")
+  read_case_record "$rec"
+
+  out=$(FM_TEST_DISPATCH_DEFAULTS_PATH="$ROOT/defaults/crew-dispatch.json" \
+    run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 1 "$status" "ship spawn without explicit harness should fail when tracked dispatch defaults are active"
+  assert_contains "$out" "defaults/crew-dispatch.json is active - pass an explicit harness resolved from the dispatch rules" \
+    "spawn did not enforce consultation of the tracked dispatch default"
+  assert_absent "$HOME_DIR/state/$id.meta" "tracked-profile refusal should happen before meta is written"
+  pass "tracked crew-dispatch defaults require an explicit resolved harness"
+}
+
 test_active_dispatch_profile_requires_explicit_harness_for_ship() {
   local rec id out status
   id=profile-required-ship-z11
@@ -729,6 +745,7 @@ test_relative_home_overrides_launch_with_absolute_cross_process_paths
 test_home_defaults_preserve_absolute_or_resolve_relative_paths
 test_absolute_override_spelling_is_preserved_in_launch_paths
 test_unresolvable_relative_overrides_fail_loudly
+test_tracked_dispatch_profile_requires_explicit_harness
 test_active_dispatch_profile_requires_explicit_harness_for_ship
 test_active_dispatch_profile_requires_explicit_harness_for_scout
 test_active_dispatch_profile_allows_explicit_harness

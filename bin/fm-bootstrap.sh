@@ -140,6 +140,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
+# shellcheck source=bin/fm-dispatch-config-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-dispatch-config-lib.sh"
 # shellcheck source=bin/fm-secondmate-nudge-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-secondmate-nudge-lib.sh"
 # shellcheck source=bin/fm-startup-memory-budget-lib.sh disable=SC1091
@@ -984,16 +986,10 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
-crew_dispatch_validate() {
-  local file err
-  file="$CONFIG/crew-dispatch.json"
-  [ -f "$file" ] || return 0
-  if ! command -v jq >/dev/null 2>&1; then
-    echo "MISSING: jq (install: $(install_cmd jq))"
-    return 0
-  fi
+crew_dispatch_validate_file() {
+  local file=$1 label=$2 err
   if ! jq -e . "$file" >/dev/null 2>&1; then
-    echo "CREW_DISPATCH: invalid config/crew-dispatch.json - malformed JSON"
+    echo "CREW_DISPATCH: invalid $label - malformed JSON"
     return 0
   fi
   err=$(jq -r '
@@ -1058,11 +1054,11 @@ crew_dispatch_validate() {
     end
   ' "$file" 2>/dev/null || true)
   if [ -n "$err" ]; then
-    echo "CREW_DISPATCH: invalid config/crew-dispatch.json - $err"
+    echo "CREW_DISPATCH: invalid $label - $err"
     return 0
   fi
   if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ]; then
-    jq -r '
+    jq --arg label "$label" -r '
     def profile($p):
       ($p.harness | tostring)
       + (if ($p.model? != null) then "/" + ($p.model | tostring)
@@ -1074,12 +1070,29 @@ crew_dispatch_validate() {
         (($selector // "quota-balanced") + "[" + ([$value[] | profile(.)] | join(", ")) + "]")
       else profile($value)
       end;
-    (["BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json"]
+    (["BOOTSTRAP_INFO: crew dispatch active " + $label]
       + [(.rules // [])[]? | "BOOTSTRAP_INFO: crew dispatch rule: " + (.when | tostring) + " -> " + profile_set(.use; .select?)]
       + (if has("default") then ["BOOTSTRAP_INFO: crew dispatch default: " + profile_set(.default; null)] else [] end))
     | .[]
   ' "$file"
   fi
+}
+
+crew_dispatch_validate() {
+  local file label paths
+  paths=$(fm_dispatch_config_paths "$CONFIG" "$FM_ROOT")
+  [ -n "$paths" ] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "MISSING: jq (install: $(install_cmd jq))"
+    return 0
+  fi
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    label=$(fm_dispatch_config_label "$file" "$CONFIG" "$FM_ROOT")
+    crew_dispatch_validate_file "$file" "$label"
+  done <<EOF
+$paths
+EOF
 }
 
 startup_memory_budget_setup() {
