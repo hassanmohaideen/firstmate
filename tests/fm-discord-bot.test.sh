@@ -224,10 +224,14 @@ const server=http.createServer((req,res)=>{
     fs.appendFileSync(lookupEventFile,JSON.stringify({lookup:lookups,at:Date.now()})+"\n");
     if (mode === "auth-fail") { res.writeHead(401); res.end("{}"); return; }
     if (mode === "lookup-fail-once" && lookups === 1) { res.writeHead(500); res.end("{}"); return; }
-    if (mode === "rate-limit" || (mode === "rate-limit-once" && lookups === 1)) {
-      const retryAfter=mode === "rate-limit-once" ? 0.45 : 0.18;
-      res.writeHead(429,{"content-type":"application/json","retry-after":String(retryAfter)});
-      res.end(JSON.stringify({retry_after:retryAfter})); return;
+    if (mode === "rate-limit" || (["rate-limit-once","rate-limit-delayed-once"].includes(mode) && lookups === 1)) {
+      const retryAfter=mode === "rate-limit" ? 0.18 : 0.45;
+      const respond=()=>{
+        res.writeHead(429,{"content-type":"application/json","retry-after":String(retryAfter)});
+        res.end(JSON.stringify({retry_after:retryAfter}));
+      };
+      if (mode === "rate-limit-delayed-once") setTimeout(respond,150); else respond();
+      return;
     }
     const url=`ws://127.0.0.1:${server.address().port}`;
     const resetAfter=Math.max(0,sessionResetAt-Date.now());
@@ -919,6 +923,87 @@ reconnect_record=$(cat "$home/state/.discord-bot-service/reconnect.json")
 assert_not_contains "$reconnect_record" "$TOKEN" "durable server retry state exposed the bot token"
 assert_not_contains "$reconnect_record" "$OWNER" "durable server retry state exposed a deployment id"
 pass "server retry deadlines survive abrupt process and service-manager restarts"
+
+home=$(new_home gateway-rate-limit-persistence-failure)
+write_config "$home"
+make_gateway_server "$home/gateway" rate-limit-delayed-once
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "persistence-failure fixture did not receive its lookup"
+rm -f "$home/state/.discord-bot-service/reconnect.json"
+mkdir "$home/state/.discord-bot-service/reconnect.json"
+i=0
+while [ "$i" -lt 200 ] && ! grep -q "Gateway retries remain stopped" "$home/bot.log" 2>/dev/null; do
+  sleep 0.05
+  i=$((i + 1))
+done
+assert_contains "$(cat "$home/bot.log")" "Gateway retries remain stopped" \
+  "retry deadline persistence failure did not fail closed"
+kill -0 "$rate_worker" 2>/dev/null || fail "retry deadline persistence failure exited into service-manager restart"
+[ "$(cat "$home/gateway/lookups")" -eq 1 ] || fail "retry deadline persistence failure made another Gateway lookup"
+[ "$(jq -r .code "$home/state/discord-bot.error")" = reconnect-state-unavailable ] \
+  || fail "retry deadline persistence failure lacked its safe diagnostic"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+pass "retry deadline persistence failures remain stopped until termination"
+
+home=$(new_home gateway-rate-limit-clock)
+write_config "$home"
+make_gateway_server "$home/gateway" reconnect
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+auth_fingerprint=$(discord_digest "$TOKEN")
+clock_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+clock_deadline=$((clock_started + 5000))
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$clock_deadline" '
+  {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
+   failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
+   server_wait_ms:120,session_start_limit:null}
+' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "clock-bounded retry deadline did not resume"
+clock_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+[ $((clock_lookup - clock_started)) -ge 100 ] || fail "clock-bounded retry deadline resumed too early"
+[ $((clock_lookup - clock_started)) -lt 1500 ] || fail "future wall clock extended the retry deadline"
+[ "$(jq -r '.server_not_before' "$home/state/.discord-bot-service/reconnect.json")" = null ] \
+  || fail "satisfied server retry deadline remained durable before Gateway lookup"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+
+home=$(new_home gateway-rate-limit-expired)
+write_config "$home"
+make_gateway_server "$home/gateway" reconnect
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+expired_now=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((expired_now - 1000))" '
+  {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
+   failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
+   server_wait_ms:5000,session_start_limit:null}
+' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "expired retry deadline blocked Gateway lookup"
+[ "$(jq -r '.server_not_before' "$home/state/.discord-bot-service/reconnect.json")" = null ] \
+  || fail "expired retry deadline was not durably retired"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+pass "server retry deadlines retire safely across clock movement"
 
 home=$(new_home gateway-stable-recovery)
 write_config "$home"

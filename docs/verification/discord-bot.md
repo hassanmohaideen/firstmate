@@ -42,6 +42,8 @@ ok - fresh Identify honors Discord session-start exhaustion
 ok - session-start reservations survive process restarts while Resume stays available
 ok - Gateway lookup rate limits preserve server-provided retry direction
 ok - server retry deadlines survive abrupt process and service-manager restarts
+ok - retry deadline persistence failures remain stopped until termination
+ok - server retry deadlines retire safely across clock movement
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
 ok - terminal Gateway close performs no reconnect

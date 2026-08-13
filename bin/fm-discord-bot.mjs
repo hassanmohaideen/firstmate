@@ -874,6 +874,7 @@ class GatewayRunner {
     this.failurePressure = 0;
     this.lastConnectionAt = null;
     this.serverNotBefore = null;
+    this.serverWaitMs = null;
     this.sessionStartLimit = null;
     this.durableTransitions = Promise.resolve();
     this.connected = false;
@@ -900,9 +901,9 @@ class GatewayRunner {
   }
 
   async waitForReconnect(milliseconds) {
-    const deadline = Date.now() + milliseconds;
+    const startedAt = performance.now();
     while (!this.stopping) {
-      const remaining = deadline - Date.now();
+      const remaining = milliseconds - (performance.now() - startedAt);
       if (remaining <= 0) break;
       await new Promise((resolvePromise) => {
         this.backoffResolve = resolvePromise;
@@ -920,14 +921,28 @@ class GatewayRunner {
       failure_pressure: this.failurePressure,
       last_connection_at: this.lastConnectionAt,
       server_not_before: this.serverNotBefore,
+      server_wait_ms: this.serverWaitMs,
       session_start_limit: this.sessionStartLimit,
     };
   }
 
   persistDurableState() {
     const content = `${JSON.stringify(this.durableRecord())}\n`;
-    this.durableTransitions = this.durableTransitions.then(() => atomicReplacePrivate(RECONNECT_FILE, content));
-    return this.durableTransitions;
+    const transition = this.durableTransitions.then(() => atomicReplacePrivate(RECONNECT_FILE, content));
+    this.durableTransitions = transition.catch(() => {});
+    return transition;
+  }
+
+  async persistDurableStateOrStop() {
+    try {
+      await this.persistDurableState();
+      return true;
+    } catch {
+      await reportDiagnostic("reconnect-state-unavailable");
+      safeLog("reconnect state could not be persisted; Gateway retries remain stopped");
+      while (!this.stopping) await this.waitForReconnect(24 * 60 * 60_000);
+      return false;
+    }
   }
 
   async loadDurableState() {
@@ -951,6 +966,10 @@ class GatewayRunner {
           && (!Number.isSafeInteger(record.last_connection_at) || record.last_connection_at < 0))
         || (record.server_not_before !== undefined && record.server_not_before !== null
           && (!Number.isSafeInteger(record.server_not_before) || record.server_not_before < 0))
+        || (record.server_wait_ms !== undefined && record.server_wait_ms !== null
+          && (!Number.isSafeInteger(record.server_wait_ms) || record.server_wait_ms < 0))
+        || (record.server_not_before !== undefined && record.server_wait_ms !== undefined
+          && ((record.server_not_before === null) !== (record.server_wait_ms === null)))
         || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
           || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
           || !Number.isInteger(limit.resetAt) || limit.resetAt < 0)))) {
@@ -959,6 +978,9 @@ class GatewayRunner {
     this.failurePressure = record?.failure_pressure || 0;
     this.lastConnectionAt = record?.last_connection_at ?? null;
     this.serverNotBefore = record?.server_not_before ?? null;
+    this.serverWaitMs = this.serverNotBefore === null
+      ? null
+      : record?.server_wait_ms ?? Math.max(0, this.serverNotBefore - Date.now());
     this.sessionStartLimit = authenticationBound ? limit : null;
     if (!record || legacy || !authenticationBound) await this.persistDurableState();
   }
@@ -993,13 +1015,24 @@ class GatewayRunner {
   }
 
   serverDelayRemaining() {
-    return this.serverNotBefore === null ? 0 : Math.max(0, this.serverNotBefore - Date.now());
+    if (this.serverNotBefore === null || this.serverWaitMs === null) return 0;
+    return Math.max(0, Math.min(this.serverWaitMs, this.serverNotBefore - Date.now()));
   }
 
   retainServerDelay(milliseconds) {
     if (!Number.isFinite(milliseconds) || milliseconds <= 0) return;
-    const deadline = Math.min(Number.MAX_SAFE_INTEGER, Date.now() + Math.ceil(milliseconds));
+    const now = Date.now();
+    const delay = Math.min(Number.MAX_SAFE_INTEGER - now, Math.ceil(milliseconds));
+    const deadline = now + delay;
+    const retainedRemaining = this.serverDelayRemaining();
     this.serverNotBefore = Math.max(this.serverNotBefore || 0, deadline);
+    this.serverWaitMs = Math.max(retainedRemaining, delay);
+  }
+
+  async retireServerDelay() {
+    this.serverNotBefore = null;
+    this.serverWaitMs = null;
+    return await this.persistDurableStateOrStop();
   }
 
   reconnectDelay(serverDelayMs = this.serverDelayRemaining()) {
@@ -1232,14 +1265,14 @@ class GatewayRunner {
     }, RECONCILE_INTERVAL_MS);
     reconcileTimer.unref?.();
     safeLog("service started");
-    if (this.failurePressure > 0 || this.serverDelayRemaining() > 0) {
-      await this.waitForReconnect(this.reconnectDelay());
+    if (this.failurePressure > 0 || this.serverNotBefore !== null) {
+      const delay = this.serverDelayRemaining();
+      if (this.failurePressure > 0 || delay > 0) {
+        await this.waitForReconnect(this.reconnectDelay(delay));
+      }
+      if (!this.stopping && this.serverNotBefore !== null) await this.retireServerDelay();
     }
     while (!this.stopping) {
-      if (this.serverDelayRemaining() > 0) {
-        await this.waitForReconnect(this.serverDelayRemaining());
-        if (this.stopping) break;
-      }
       let gateway;
       try {
         gateway = this.resumeUrl
@@ -1258,8 +1291,11 @@ class GatewayRunner {
         await reportDiagnostic("discord-api-unavailable");
         this.failurePressure += 1;
         if (error instanceof DiscordHttpError) this.retainServerDelay(error.retryAfterMs);
-        await this.persistDurableState();
-        await this.waitForReconnect(this.reconnectDelay());
+        if (!await this.persistDurableStateOrStop()) break;
+        const retainedServerDelay = this.serverDelayRemaining();
+        await this.waitForReconnect(this.reconnectDelay(retainedServerDelay));
+        if (this.stopping) break;
+        if (this.serverNotBefore !== null && !await this.retireServerDelay()) break;
         continue;
       }
       if (!this.sessionId && !await this.reserveIdentify()) break;
