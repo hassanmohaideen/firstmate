@@ -47,6 +47,8 @@ const READY_FILE = join(STATE, "discord-bot.ready");
 const ERROR_FILE = join(STATE, "discord-bot.error");
 const ERROR_NOTIFIED_FILE = join(STATE, "discord-bot.error.notified");
 const TERMINAL_FILE = join(STATE, "discord-bot.terminal");
+const OWNERSHIP_DIR = join(HOME, "state", ".discord-bot-service");
+const RECONNECT_FILE = join(OWNERSHIP_DIR, "reconnect.json");
 const WAKE_DEDUP_DIR = join(STATE, ".wake-dedup");
 const NOTIFIER = join(ROOT, "bin", "fm-discord-notify.sh");
 const TEST_MODE = process.env.FM_DISCORD_TEST_MODE === "1";
@@ -138,6 +140,22 @@ async function ensurePrivateDirectory(path) {
     if (error?.code !== "EEXIST") throw error;
   }
   await assertPlainDirectory(path, 0o700);
+}
+
+async function ensureOwnershipDirectory() {
+  const ownershipState = join(HOME, "state");
+  try {
+    await mkdir(ownershipState, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  await assertPlainDirectory(ownershipState);
+  try {
+    await mkdir(OWNERSHIP_DIR, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  await assertPlainDirectory(OWNERSHIP_DIR, 0o700);
 }
 
 async function atomicReplacePrivate(path, content) {
@@ -676,7 +694,7 @@ async function fetchWithTimeout(url, options, timeoutMs = 10_000) {
 async function gatewayUrl(config) {
   if (TEST_GATEWAY_URL) {
     validateProductionEndpoint(TEST_GATEWAY_URL, "gateway");
-    return TEST_GATEWAY_URL;
+    return { url: TEST_GATEWAY_URL, sessionStartLimit: null };
   }
   validateProductionEndpoint(API_BASE, "api");
   let response;
@@ -695,14 +713,29 @@ async function gatewayUrl(config) {
       try {
         const errorBody = await response.json();
         const bodyDelay = Number(errorBody?.retry_after);
-        if (Number.isFinite(bodyDelay) && bodyDelay > 0) retryAfterMs = Math.ceil(bodyDelay * 1000);
+        if (Number.isFinite(bodyDelay) && bodyDelay > 0) {
+          retryAfterMs = Math.max(retryAfterMs, Math.ceil(bodyDelay * 1000));
+        }
       } catch {}
     }
-    throw new DiscordHttpError(response.status, Math.min(15 * 60_000, retryAfterMs));
+    throw new DiscordHttpError(response.status, retryAfterMs);
   }
   const body = await response.json();
   validateProductionEndpoint(body.url, "gateway");
-  return body.url;
+  const limit = body.session_start_limit;
+  if (!limit || !Number.isInteger(limit.total) || limit.total < 1
+      || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
+      || !Number.isFinite(limit.reset_after) || limit.reset_after < 0) {
+    throw new ConfigError("gateway session-start limit is invalid");
+  }
+  return {
+    url: body.url,
+    sessionStartLimit: {
+      total: limit.total,
+      remaining: limit.remaining,
+      resetAt: Date.now() + Math.ceil(limit.reset_after),
+    },
+  };
 }
 
 function testDuration(name, fallback, minimum = 1, maximum = fallback) {
@@ -742,7 +775,7 @@ function reconnectDelayMilliseconds({ pressure, random, now, lastConnectionAt, s
   const cooldown = pressure >= policy.cooldownAfter
     ? Math.floor(policy.cooldownMs * (0.8 + Math.max(0, Math.min(1, random)) * 0.2))
     : 0;
-  return Math.max(1, jittered, intervalRemaining, Math.min(policy.cooldownMs, Math.max(0, serverDelayMs)), cooldown);
+  return Math.max(1, jittered, intervalRemaining, Math.max(0, serverDelayMs), cooldown);
 }
 
 function simulateReconnectPolicy(input) {
@@ -835,6 +868,8 @@ class GatewayRunner {
     this.selfUserId = "";
     this.failurePressure = 0;
     this.lastConnectionAt = null;
+    this.sessionStartLimit = null;
+    this.durableTransitions = Promise.resolve();
     this.connected = false;
     this.inbound = Promise.resolve();
     this.backoffTimer = null;
@@ -859,13 +894,89 @@ class GatewayRunner {
   }
 
   async waitForReconnect(milliseconds) {
-    if (this.stopping) return;
-    await new Promise((resolvePromise) => {
-      this.backoffResolve = resolvePromise;
-      this.backoffTimer = setTimeout(resolvePromise, milliseconds);
-    });
-    this.backoffTimer = null;
-    this.backoffResolve = null;
+    const deadline = Date.now() + milliseconds;
+    while (!this.stopping) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise((resolvePromise) => {
+        this.backoffResolve = resolvePromise;
+        this.backoffTimer = setTimeout(resolvePromise, Math.min(remaining, 2_147_000_000));
+      });
+      this.backoffTimer = null;
+      this.backoffResolve = null;
+    }
+  }
+
+  durableRecord() {
+    return {
+      schema: "firstmate.discord-reconnect.v1",
+      config_fingerprint: configFingerprint(this.config),
+      failure_pressure: this.failurePressure,
+      last_connection_at: this.lastConnectionAt,
+      session_start_limit: this.sessionStartLimit,
+    };
+  }
+
+  persistDurableState() {
+    const content = `${JSON.stringify(this.durableRecord())}\n`;
+    this.durableTransitions = this.durableTransitions.then(() => atomicReplacePrivate(RECONNECT_FILE, content));
+    return this.durableTransitions;
+  }
+
+  async loadDurableState() {
+    await ensureOwnershipDirectory();
+    let record;
+    try {
+      await assertPrivateFile(RECONNECT_FILE);
+      record = JSON.parse(await readFile(RECONNECT_FILE, "utf8"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw new ConfigError("reconnect state is invalid");
+    }
+    if (record && record.config_fingerprint !== configFingerprint(this.config)) record = null;
+    const limit = record?.session_start_limit;
+    if (record && (record.schema !== "firstmate.discord-reconnect.v1"
+        || !INCIDENT_ID_RE.test(record.config_fingerprint || "")
+        || !Number.isInteger(record.failure_pressure) || record.failure_pressure < 0
+        || (record.last_connection_at !== null
+          && (!Number.isInteger(record.last_connection_at) || record.last_connection_at < 0))
+        || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
+          || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
+          || !Number.isInteger(limit.resetAt) || limit.resetAt < 0)))) {
+      throw new ConfigError("reconnect state is invalid");
+    }
+    this.failurePressure = record?.failure_pressure || 0;
+    this.lastConnectionAt = record?.last_connection_at ?? null;
+    this.sessionStartLimit = limit || null;
+    if (!record) await this.persistDurableState();
+  }
+
+  async updateSessionStartLimit(limit) {
+    if (!limit) return;
+    const previous = this.sessionStartLimit;
+    if (previous && previous.total === limit.total && Date.now() < previous.resetAt
+        && Math.abs(previous.resetAt - limit.resetAt) <= 5000) {
+      limit.remaining = Math.min(previous.remaining, limit.remaining);
+      limit.resetAt = Math.max(previous.resetAt, limit.resetAt);
+    }
+    this.sessionStartLimit = limit;
+    await this.persistDurableState();
+  }
+
+  async reserveIdentify() {
+    const limit = this.sessionStartLimit;
+    if (!limit) return true;
+    if (limit.remaining === 0 && Date.now() < limit.resetAt) {
+      await this.waitForReconnect(limit.resetAt - Date.now());
+      if (this.stopping) return false;
+    }
+    if (Date.now() >= limit.resetAt) {
+      limit.remaining = limit.total;
+      limit.resetAt = Date.now();
+    }
+    if (limit.remaining === 0) return false;
+    limit.remaining -= 1;
+    await this.persistDurableState();
+    return true;
   }
 
   reconnectDelay(serverDelayMs = 0) {
@@ -932,7 +1043,9 @@ class GatewayRunner {
         if (stable || !ready || settled) return;
         stable = true;
         this.failurePressure = 0;
-        clearDiagnostic();
+        void this.persistDurableState()
+          .then(() => clearDiagnostic())
+          .catch(() => reportDiagnostic("reconnect-state-unavailable"));
       };
       const markReady = () => {
         ready = true;
@@ -1077,6 +1190,7 @@ class GatewayRunner {
   }
 
   async run() {
+    await this.loadDurableState();
     await writeMarker(ENABLED_FILE, "enabled");
     await pruneContexts();
     await reconcileInbox(this.config);
@@ -1095,10 +1209,14 @@ class GatewayRunner {
     }, RECONCILE_INTERVAL_MS);
     reconcileTimer.unref?.();
     safeLog("service started");
+    if (this.failurePressure > 0) await this.waitForReconnect(this.reconnectDelay());
     while (!this.stopping) {
-      let url;
+      let gateway;
       try {
-        url = this.resumeUrl || await gatewayUrl(this.config);
+        gateway = this.resumeUrl
+          ? { url: this.resumeUrl, sessionStartLimit: null }
+          : await gatewayUrl(this.config);
+        await this.updateSessionStartLimit(gateway.sessionStartLimit);
       } catch (error) {
         if (error instanceof DiscordHttpError && [401, 403].includes(error.status)) {
           await this.suppressTerminal("authentication-rejected");
@@ -1110,29 +1228,32 @@ class GatewayRunner {
         }
         await reportDiagnostic("discord-api-unavailable");
         this.failurePressure += 1;
+        await this.persistDurableState();
         await this.waitForReconnect(this.reconnectDelay(error instanceof DiscordHttpError ? error.retryAfterMs : 0));
         continue;
       }
+      if (!this.sessionId && !await this.reserveIdentify()) break;
       let serverDelayMs = 0;
       try {
+        this.failurePressure += 1;
         this.lastConnectionAt = Date.now();
-        const result = await this.connect(url);
+        await this.persistDurableState();
+        const result = await this.connect(gateway.url);
         if (this.stopping) break;
         if (result.terminalCode) {
           await this.suppressTerminal(result.terminalCode);
           break;
         }
         serverDelayMs = result.serverDelayMs;
-        this.failurePressure += 1;
       } catch {
         await reportDiagnostic("gateway-connect-failed");
-        this.failurePressure += 1;
       }
       if (!this.stopping) await this.waitForReconnect(this.reconnectDelay(serverDelayMs));
     }
     clearInterval(pruneTimer);
     clearInterval(reconcileTimer);
     await this.inbound;
+    await this.durableTransitions;
     await diagnosticTransitions;
     safeLog("service stopped");
   }

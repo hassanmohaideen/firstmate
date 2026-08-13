@@ -169,6 +169,7 @@ const eventFile=countFile.replace(/connections$/, "events.jsonl");
 const lookupFile=countFile.replace(/connections$/, "lookups");
 const lookupEventFile=countFile.replace(/connections$/, "lookup-events.jsonl");
 let connections=0, lookups=0;
+const sessionResetAt=Date.now()+(mode === "session-one-stale" ? 700 : 300);
 const sockets=new Set();
 function frame(opcode,payload) {
   const data=Buffer.from(payload);
@@ -210,11 +211,18 @@ const server=http.createServer((req,res)=>{
     if (mode === "auth-fail") { res.writeHead(401); res.end("{}"); return; }
     if (mode === "lookup-fail-once" && lookups === 1) { res.writeHead(500); res.end("{}"); return; }
     if (mode === "rate-limit") {
-      res.writeHead(429,{"content-type":"application/json","retry-after":"0.08"});
-      res.end(JSON.stringify({retry_after:0.08})); return;
+      res.writeHead(429,{"content-type":"application/json","retry-after":"0.18"});
+      res.end(JSON.stringify({retry_after:0.18})); return;
     }
     const url=`ws://127.0.0.1:${server.address().port}`;
-    res.writeHead(200,{"content-type":"application/json"}); res.end(JSON.stringify({url})); return;
+    const resetAfter=Math.max(0,sessionResetAt-Date.now());
+    const sessionStartLimit=mode === "session-limit-zero"
+      ? {total:1,remaining:resetAfter > 0 ? 0 : 1,reset_after:resetAfter}
+      : mode === "session-one-stale"
+        ? {total:1,remaining:1,reset_after:resetAfter}
+        : {total:1000,remaining:1000,reset_after:60000};
+    res.writeHead(200,{"content-type":"application/json"});
+    res.end(JSON.stringify({url,session_start_limit:sessionStartLimit})); return;
   }
   res.writeHead(404); res.end();
 });
@@ -224,6 +232,7 @@ server.on("upgrade",(req,socket)=>{
   const accept=crypto.createHash("sha1").update(req.headers["sec-websocket-key"]+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
   socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+accept+"\r\n\r\n");
   connections+=1; fs.writeFileSync(countFile,String(connections));
+  fs.appendFileSync(countFile.replace(/connections$/, "connection-events.jsonl"),JSON.stringify({connection:connections,at:Date.now()})+"\n");
   const connection=connections;
   const localUrl=`ws://127.0.0.1:${server.address().port}`;
   const resumeUrl=mode === "regional-resume"
@@ -683,6 +692,37 @@ WORKER_PIDS=()
 assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "storm/cooldown logs exposed the bot token"
 pass "rapid Gateway disconnects remain bounded and stop promptly during cooldown"
 
+home=$(new_home gateway-restart-pressure)
+write_config "$home"
+make_gateway_server "$home/gateway" storm
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_MAX_BACKOFF_MS=160 FM_DISCORD_TEST_RANDOM=0.5 \
+  "$CONTROL" run > "$home/first.log" 2>&1 &
+pressure_worker=$!
+WORKER_PIDS+=("$pressure_worker")
+wait_for_value "$home/gateway/connections" 3 || fail "restart-pressure fixture did not build reconnect pressure"
+kill -TERM "$pressure_worker"
+wait "$pressure_worker" || true
+WORKER_PIDS=()
+restarted_at=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_MAX_BACKOFF_MS=160 FM_DISCORD_TEST_RANDOM=0.5 \
+  "$CONTROL" run > "$home/second.log" 2>&1 &
+pressure_worker=$!
+WORKER_PIDS+=("$pressure_worker")
+wait_for_value "$home/gateway/connections" 4 || fail "restarted Gateway did not reconnect"
+restarted_connection=$(sed -n '4p' "$home/gateway/connection-events.jsonl" | jq -r .at)
+[ $((restarted_connection - restarted_at)) -ge 25 ] \
+  || fail "process restart discarded reconnect pressure: $((restarted_connection - restarted_at))ms"
+kill -TERM "$pressure_worker"
+wait "$pressure_worker" || true
+WORKER_PIDS=()
+[ "$(path_mode "$home/state/.discord-bot-service/reconnect.json")" = 600 ] \
+  || fail "durable reconnect pressure was not private"
+pass "reconnect pressure survives process and service-manager restarts"
+
 # Discord-directed reconnect and invalid-session choices preserve only valid sessions.
 for mode in server-reconnect invalid-session-resumable invalid-session-fresh; do
   home=$(new_home "gateway-$mode")
@@ -711,18 +751,63 @@ for mode in server-reconnect invalid-session-resumable invalid-session-fresh; do
 done
 pass "server reconnect and invalid-session directions choose resume or fresh identify correctly"
 
+home=$(new_home gateway-session-limit)
+write_config "$home"
+make_gateway_server "$home/gateway" session-limit-zero
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+limit_worker=$!
+WORKER_PIDS+=("$limit_worker")
+sleep 0.12
+assert_absent "$home/gateway/connections" "Gateway identified while Discord reported no session starts"
+wait_for_value "$home/gateway/connections" 1 || fail "Gateway did not identify after the session-start reset"
+kill -TERM "$limit_worker"
+wait "$limit_worker" || true
+WORKER_PIDS=()
+pass "fresh Identify honors Discord session-start exhaustion"
+
+home=$(new_home gateway-session-durable)
+write_config "$home"
+make_gateway_server "$home/gateway" session-one-stale
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/first.log" 2>&1 &
+limit_worker=$!
+WORKER_PIDS+=("$limit_worker")
+wait_for_value "$home/gateway/connections" 1 || fail "session reservation fixture did not identify"
+kill -TERM "$limit_worker"
+wait "$limit_worker" || true
+WORKER_PIDS=()
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/second.log" 2>&1 &
+limit_worker=$!
+WORKER_PIDS+=("$limit_worker")
+sleep 0.1
+[ "$(cat "$home/gateway/connections")" -eq 1 ] \
+  || fail "process restart discarded the durable Identify reservation"
+wait_for_value "$home/gateway/connections" 2 || fail "durable Identify reservation did not reset"
+second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
+[ "$second_op" = identify ] || fail "fresh process did not use Identify after the session reset"
+kill -TERM "$limit_worker"
+wait "$limit_worker" || true
+WORKER_PIDS=()
+pass "session-start reservations survive process restarts while Resume stays available"
+
 home=$(new_home gateway-rate-limit)
 write_config "$home"
 make_gateway_server "$home/gateway" rate-limit
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_MAX_BACKOFF_MS=20 FM_DISCORD_TEST_COOLDOWN_MS=40 \
   FM_DISCORD_TEST_RANDOM=0.5 "$CONTROL" run > "$home/bot.log" 2>&1 &
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
 wait_for_value "$home/gateway/lookups" 2 || fail "rate-limited Gateway lookup did not retry"
 first_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
 second_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
-[ $((second_lookup - first_lookup)) -ge 70 ] \
+[ $((second_lookup - first_lookup)) -ge 160 ] \
   || fail "Gateway lookup ignored the server retry delay: $((second_lookup - first_lookup))ms"
 kill -TERM "$rate_worker"
 wait "$rate_worker" || true

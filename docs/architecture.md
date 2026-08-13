@@ -250,6 +250,7 @@ The self-hosted Discord transport is a separate opt-in path for a captain who wa
 
 `bin/fm-discord-bot.mjs` is the narrow protocol runtime.
 It validates the private owner/guild/channel configuration, maintains one Discord Gateway session with resume and lifecycle-wide reconnect pressure, rejects ineligible message events before model context, publishes private inbox and conversation-binding artifacts, and posts bound replies through Discord REST with mention expansion disabled.
+The canonical per-home ownership boundary durably retains reconnect pressure, the last attempt, and session-start reservations across worker replacement; fresh Identify obeys Discord's authenticated session-start window while valid Resume does not consume it.
 READY does not reset reconnect pressure; sustained connection or acknowledged-heartbeat evidence does, while terminal close codes persist a configuration-bound suppression record before the process exits normally.
 Production API and Gateway endpoints remain fixed to Discord: the authenticated lookup uses `discord.com`, while Gateway connections accept only the canonical `gateway.discord.gg` host or a Discord-owned regional `gateway-*.discord.gg` resume host returned by the authenticated READY handshake.
 Lookalike host suffixes remain invalid, and local endpoint overrides exist only behind the hermetic test mode.

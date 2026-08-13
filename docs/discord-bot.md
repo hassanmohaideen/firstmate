@@ -102,9 +102,10 @@ bin/fm-discord-bot.sh start
 The command validates Node.js and configuration first, writes a home-derived LaunchAgent under `~/Library/LaunchAgents/`, loads it in the current Aqua login domain, and starts it.
 The service uses `RunAtLoad`, restart-on-failure `KeepAlive`, and a 15-second launchd throttle, so it survives process crashes and starts again after machine restart and user login.
 The process reconnects ordinary Discord disconnects itself and resumes the existing session whenever Discord permits it.
-Reconnect pressure survives READY and RESUMED events until the connection remains healthy for five minutes or has at least three acknowledged heartbeats spanning two minutes.
-Unstable connections use randomized exponential delays with a five-second minimum connection interval, a five-minute delay cap, and a separately jittered cooldown capped at 15 minutes after eight consecutive unstable outcomes.
+Reconnect pressure and the last connection attempt survive process and service-manager restarts, as well as READY and RESUMED events, until the connection remains healthy for five minutes or has at least three acknowledged heartbeats spanning two minutes.
+Unstable connections use randomized exponential delays with a five-second minimum connection interval, a five-minute local delay cap, and a separately jittered cooldown capped at 15 minutes after eight consecutive unstable outcomes; a longer Discord `retry_after` remains the minimum wait.
 Discord-directed reconnect and invalid-session responses retain or clear session material as required and still pass through the same pacing policy.
+Fresh Identify attempts reserve Discord's authenticated `session_start_limit` durably and wait through an exhausted reset window, while a valid Resume remains available without consuming a new session start.
 It also holds a recoverable per-home process lock so a manual start and LaunchAgent cannot create two Gateway sessions.
 
 Check configuration and current service health with:

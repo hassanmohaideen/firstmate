@@ -35,7 +35,10 @@ ok - foreground service accepts Discord's regional resume endpoint independently
 ok - Gateway resume remains limited to Discord-owned endpoints
 ok - reconnect policy retains READY failure pressure, resets only after stability, and applies bounded jitter
 ok - rapid Gateway disconnects remain bounded and stop promptly during cooldown
+ok - reconnect pressure survives process and service-manager restarts
 ok - server reconnect and invalid-session directions choose resume or fresh identify correctly
+ok - fresh Identify honors Discord session-start exhaustion
+ok - session-start reservations survive process restarts while Resume stays available
 ok - Gateway lookup rate limits preserve server-provided retry direction
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
@@ -63,8 +66,10 @@ The terminal pass first proves ordinary task cleanup refuses while the Discord o
 The fake-time policy pass drives fixed random samples and unstable durations through the executable test seam.
 It bounds an hour of rapid successful handshakes to at most 12 connections, proves READY alone does not reset pressure, proves a stable interval does reset pressure, and checks the jitter endpoints remain within the configured cap.
 The real local Gateway storm pass repeatedly sends READY or RESUMED and disconnects, then asserts the connection count remains bounded and TERM interrupts the active cooldown promptly.
+The restart pass builds pressure against that Gateway, replaces the worker, and observes the next connection retain the accumulated delay through the private canonical ownership record.
 The directed reconnect pass proves Opcode 7 and resumable Opcode 9 retain the session, while non-resumable Opcode 9 clears it before the next Identify.
-The local HTTP 429 pass proves the authenticated Gateway lookup honors Discord's bounded retry direction instead of using only client backoff.
+The session-limit passes prove exhausted authenticated metadata blocks fresh Identify until reset and that a pre-crash reservation cannot be reused after worker replacement, while the directed reconnect pass continues to prove Resume remains available.
+The local HTTP 429 pass sets Discord's direction above every configured local cap and proves the authenticated Gateway lookup does not retry before that minimum.
 The stable-recovery pass creates a transient HTTP failure, reaches READY with its diagnostic still present, and observes that diagnostic clear only after the configured sustained-health interval.
 The authentication-failure pass returns HTTP 401 once, publishes one `authentication-rejected` notification, persists terminal suppression, and proves a second service-manager invocation makes no HTTP or Gateway request.
 The terminal close pass sends Gateway close code 4004 before READY and observes one connection with no retry.
