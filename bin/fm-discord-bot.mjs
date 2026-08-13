@@ -933,23 +933,60 @@ function authenticationFingerprint(config) {
   return createHash("sha256").update(config.token).digest("hex");
 }
 
+function validFallbackSuppression(record) {
+  return record?.schema === "firstmate.discord-reconnect-suppression.v1"
+    && INCIDENT_ID_RE.test(record.authentication_fingerprint || "")
+    && typeof record.operator_intervention_required === "boolean"
+    && (record.operator_code === undefined || record.operator_code === null
+      || SAFE_CODE_RE.test(record.operator_code))
+    && (record.server_not_before === null
+      ? record.server_wait_ms === null && record.operator_intervention_required
+      : Number.isSafeInteger(record.server_not_before) && record.server_not_before >= 0
+        && Number.isSafeInteger(record.server_wait_ms) && record.server_wait_ms >= 0
+        && (record.server_boot_id === undefined || record.server_boot_id === null
+          || BOOT_ID_RE.test(record.server_boot_id))
+        && (record.server_monotonic_not_before === undefined
+          || record.server_monotonic_not_before === null
+          || Number.isSafeInteger(record.server_monotonic_not_before)
+            && record.server_monotonic_not_before >= 0)
+        && (record.server_reboot_fallback_used === undefined
+          || typeof record.server_reboot_fallback_used === "boolean")
+        && !record.operator_intervention_required);
+}
+
 async function activeTerminalSuppression(config) {
   let record;
   try {
     await assertPrivateFile(TERMINAL_FILE);
     record = JSON.parse(await readFile(TERMINAL_FILE, "utf8"));
   } catch (error) {
+    if (error?.code !== "ENOENT") return "terminal-suppression-invalid";
+  }
+  if (record) {
+    if (record.schema !== "firstmate.discord-terminal.v2" || !SAFE_CODE_RE.test(record.code || "")
+        || !INCIDENT_ID_RE.test(record.authentication_fingerprint || "")) {
+      return "terminal-suppression-invalid";
+    }
+    if (record.authentication_fingerprint === authenticationFingerprint(config)) return record.code;
+    await removeMarker(TERMINAL_FILE);
+    await clearDiagnostic();
+  }
+  let fallback;
+  try {
+    await assertPrivateFile(RECONNECT_SUPPRESSION_FILE);
+    fallback = JSON.parse(await readFile(RECONNECT_SUPPRESSION_FILE, "utf8"));
+  } catch (error) {
     if (error?.code === "ENOENT") return "";
     return "terminal-suppression-invalid";
   }
-  if (record?.schema !== "firstmate.discord-terminal.v2" || !SAFE_CODE_RE.test(record?.code || "")
-      || !INCIDENT_ID_RE.test(record?.authentication_fingerprint || "")) {
-    return "terminal-suppression-invalid";
+  if (!validFallbackSuppression(fallback)) return "terminal-suppression-invalid";
+  if (fallback.authentication_fingerprint !== authenticationFingerprint(config)) {
+    await removeMarker(RECONNECT_SUPPRESSION_FILE);
+    return "";
   }
-  if (record.authentication_fingerprint === authenticationFingerprint(config)) return record.code;
-  await removeMarker(TERMINAL_FILE);
-  await clearDiagnostic();
-  return "";
+  return fallback.operator_intervention_required
+    ? fallback.operator_code || "reconnect-state-unavailable"
+    : "";
 }
 
 async function writeTerminalSuppression(config, code) {
@@ -997,6 +1034,7 @@ class GatewayRunner {
     this.bootId = null;
     this.sessionStartLimit = null;
     this.durableTransitions = Promise.resolve();
+    this.fallbackTransitions = Promise.resolve();
     this.sequencePersistPending = false;
     this.sequencePersistTask = null;
     this.connected = false;
@@ -1100,22 +1138,38 @@ class GatewayRunner {
     return transition;
   }
 
-  async persistFallbackSuppression(operatorCode = "reconnect-state-unavailable") {
+  persistFallbackSuppression(operatorCode = "reconnect-state-unavailable") {
     const terminal = operatorCode !== "reconnect-state-unavailable";
-    const deadlineActive = !terminal && this.serverNotBefore !== null && this.serverWaitMs !== null;
-    await atomicReplacePrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
-      schema: "firstmate.discord-reconnect-suppression.v1",
-      authentication_fingerprint: authenticationFingerprint(this.config),
-      server_not_before: deadlineActive ? this.serverNotBefore : null,
-      server_wait_ms: deadlineActive ? this.serverWaitMs : null,
-      server_boot_id: deadlineActive ? this.serverBootId : null,
-      server_monotonic_not_before: deadlineActive ? this.serverMonotonicNotBefore : null,
-      server_reboot_fallback_used: deadlineActive ? this.serverRebootFallbackUsed : false,
-      operator_intervention_required: !deadlineActive,
-      operator_code: deadlineActive ? null : operatorCode,
-      recorded_at: diagnosticEpochSeconds(),
-    })}\n`);
-    this.fallbackSuppressionActive = true;
+    const transition = this.fallbackTransitions.then(async () => {
+      let existing;
+      try {
+        await assertPrivateFile(RECONNECT_SUPPRESSION_FILE);
+        existing = JSON.parse(await readFile(RECONNECT_SUPPRESSION_FILE, "utf8"));
+      } catch {}
+      const fingerprint = authenticationFingerprint(this.config);
+      if (!terminal && validFallbackSuppression(existing)
+          && existing.authentication_fingerprint === fingerprint
+          && existing.operator_intervention_required) {
+        this.fallbackSuppressionActive = true;
+        return;
+      }
+      const deadlineActive = !terminal && this.serverNotBefore !== null && this.serverWaitMs !== null;
+      await atomicReplacePrivate(RECONNECT_SUPPRESSION_FILE, `${JSON.stringify({
+        schema: "firstmate.discord-reconnect-suppression.v1",
+        authentication_fingerprint: fingerprint,
+        server_not_before: deadlineActive ? this.serverNotBefore : null,
+        server_wait_ms: deadlineActive ? this.serverWaitMs : null,
+        server_boot_id: deadlineActive ? this.serverBootId : null,
+        server_monotonic_not_before: deadlineActive ? this.serverMonotonicNotBefore : null,
+        server_reboot_fallback_used: deadlineActive ? this.serverRebootFallbackUsed : false,
+        operator_intervention_required: !deadlineActive,
+        operator_code: deadlineActive ? null : operatorCode,
+        recorded_at: diagnosticEpochSeconds(),
+      })}\n`);
+      this.fallbackSuppressionActive = true;
+    });
+    this.fallbackTransitions = transition.catch(() => {});
+    return transition;
   }
 
   activateFailClosed(code = "reconnect-state-unavailable") {
@@ -1190,8 +1244,8 @@ class GatewayRunner {
           && (!Number.isSafeInteger(record.server_not_before) || record.server_not_before < 0))
         || (record.server_wait_ms !== undefined && record.server_wait_ms !== null
           && (!Number.isSafeInteger(record.server_wait_ms) || record.server_wait_ms < 0))
-        || (record.server_not_before !== undefined && record.server_wait_ms !== undefined
-          && ((record.server_not_before === null) !== (record.server_wait_ms === null)))
+        || ((record.server_not_before ?? null) === null
+          !== ((record.server_wait_ms ?? null) === null))
         || (record.server_boot_id !== undefined && record.server_boot_id !== null
           && !BOOT_ID_RE.test(record.server_boot_id))
         || (record.server_monotonic_not_before !== undefined
@@ -1228,23 +1282,14 @@ class GatewayRunner {
     this.failurePressure = record?.failure_pressure || 0;
     this.lastConnectionAt = record?.last_connection_at ?? null;
     this.serverNotBefore = record?.server_not_before ?? null;
-    this.serverWaitMs = this.serverNotBefore === null
-      ? null
-      : record?.server_wait_ms ?? Math.max(0, this.serverNotBefore - Date.now());
+    this.serverWaitMs = this.serverNotBefore === null ? null : record.server_wait_ms;
     this.serverBootId = record?.server_boot_id ?? null;
     this.serverMonotonicNotBefore = record?.server_monotonic_not_before ?? null;
     this.serverRebootFallbackUsed = record?.server_reboot_fallback_used ?? false;
     if (this.serverNotBefore !== null
         && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
-      if (this.serverRebootFallbackUsed) {
-        this.serverWaitMs = Math.min(
-          this.serverWaitMs,
-          Math.max(0, this.serverNotBefore - Date.now()),
-        );
-      } else {
-        this.serverRebootFallbackUsed = true;
-        this.serverNotBefore = Date.now() + this.serverWaitMs;
-      }
+      this.serverRebootFallbackUsed = true;
+      this.serverNotBefore = Date.now() + this.serverWaitMs;
       this.serverBootId = this.bootId;
       this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
       stateNeedsRebase = true;
@@ -1257,25 +1302,7 @@ class GatewayRunner {
       if (error?.code !== "ENOENT") this.activateFailClosed();
     }
     if (suppression) {
-      const valid = suppression.schema === "firstmate.discord-reconnect-suppression.v1"
-        && INCIDENT_ID_RE.test(suppression.authentication_fingerprint || "")
-        && typeof suppression.operator_intervention_required === "boolean"
-        && (suppression.operator_code === undefined || suppression.operator_code === null
-          || SAFE_CODE_RE.test(suppression.operator_code))
-        && (suppression.server_not_before === null
-          ? suppression.server_wait_ms === null && suppression.operator_intervention_required
-          : Number.isSafeInteger(suppression.server_not_before) && suppression.server_not_before >= 0
-            && Number.isSafeInteger(suppression.server_wait_ms) && suppression.server_wait_ms >= 0
-            && (suppression.server_boot_id === undefined || suppression.server_boot_id === null
-              || BOOT_ID_RE.test(suppression.server_boot_id))
-            && (suppression.server_monotonic_not_before === undefined
-              || suppression.server_monotonic_not_before === null
-              || Number.isSafeInteger(suppression.server_monotonic_not_before)
-                && suppression.server_monotonic_not_before >= 0)
-            && (suppression.server_reboot_fallback_used === undefined
-              || typeof suppression.server_reboot_fallback_used === "boolean")
-            && !suppression.operator_intervention_required);
-      if (!valid) {
+      if (!validFallbackSuppression(suppression)) {
         this.activateFailClosed();
       } else if (suppression.authentication_fingerprint !== authenticationFingerprint(this.config)) {
         await removeMarker(RECONNECT_SUPPRESSION_FILE);
@@ -1286,22 +1313,10 @@ class GatewayRunner {
         const fallbackSameBoot = suppression.server_boot_id === this.bootId
           && Number.isSafeInteger(suppression.server_monotonic_not_before);
         const fallbackPreviouslyUsed = suppression.server_reboot_fallback_used ?? false;
-        let fallbackRemaining;
-        let fallbackNotBefore = suppression.server_not_before;
-        if (fallbackSameBoot) {
-          fallbackRemaining = Math.max(
-            0,
-            suppression.server_monotonic_not_before - monotonicMilliseconds(),
-          );
-        } else if (fallbackPreviouslyUsed) {
-          fallbackRemaining = Math.min(
-            suppression.server_wait_ms,
-            Math.max(0, suppression.server_not_before - Date.now()),
-          );
-        } else {
-          fallbackRemaining = suppression.server_wait_ms;
-          fallbackNotBefore = Date.now() + fallbackRemaining;
-        }
+        const fallbackRemaining = fallbackSameBoot
+          ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
+          : suppression.server_wait_ms;
+        const fallbackNotBefore = Date.now() + fallbackRemaining;
         const currentRemaining = this.serverDelayRemaining();
         if (fallbackRemaining > currentRemaining) {
           this.serverWaitMs = fallbackRemaining;
@@ -1405,6 +1420,30 @@ class GatewayRunner {
       return this.serverWaitMs;
     }
     return Math.max(0, this.serverMonotonicNotBefore - monotonicMilliseconds());
+  }
+
+  async waitForServerDelay() {
+    const checkpointInterval = TEST_MODE ? 50 : 5000;
+    while (this.canUseGateway()) {
+      const remaining = this.serverDelayRemaining();
+      if (remaining <= 0) return true;
+      await this.waitForReconnect(Math.min(remaining, checkpointInterval));
+      const checkpointRemaining = this.serverDelayRemaining();
+      this.serverWaitMs = checkpointRemaining;
+      this.serverBootId = this.bootId;
+      this.serverMonotonicNotBefore = monotonicMilliseconds() + checkpointRemaining;
+      this.serverNotBefore = Date.now() + checkpointRemaining;
+      if (!await this.persistDurableStateOrStop()) return false;
+      if (this.fallbackSuppressionActive) {
+        try {
+          await this.persistFallbackSuppression();
+        } catch {
+          await this.activateFailClosed();
+          return false;
+        }
+      }
+    }
+    return false;
   }
 
   retainServerDelay(milliseconds) {
@@ -1737,17 +1776,16 @@ class GatewayRunner {
     safeLog("service started");
     if (this.failClosed) await this.failClosedWait;
     if (this.failurePressure > 0 || this.serverNotBefore !== null) {
-      const delay = this.serverDelayRemaining();
-      if (this.failurePressure > 0 || delay > 0) {
-        await this.waitForReconnect(this.reconnectDelay(delay));
+      if (this.serverNotBefore !== null) {
+        if (await this.waitForServerDelay()) await this.retireServerDelay();
       }
-      if (this.canUseGateway() && this.serverNotBefore !== null) await this.retireServerDelay();
+      if (this.canUseGateway() && this.failurePressure > 0) {
+        await this.waitForReconnect(this.reconnectDelay(0));
+      }
     }
     while (this.canUseGateway()) {
       if (this.serverNotBefore !== null) {
-        const delay = this.serverDelayRemaining();
-        if (delay > 0) await this.waitForReconnect(delay);
-        if (!this.canUseGateway() || !await this.retireServerDelay()) break;
+        if (!await this.waitForServerDelay() || !await this.retireServerDelay()) break;
       }
       if (!this.canUseGateway()) break;
       let gateway;
@@ -1770,10 +1808,10 @@ class GatewayRunner {
         this.failurePressure += 1;
         if (error instanceof DiscordHttpError) this.retainServerDelay(error.retryAfterMs);
         if (!await this.persistDurableStateOrStop()) break;
-        const retainedServerDelay = this.serverDelayRemaining();
-        await this.waitForReconnect(this.reconnectDelay(retainedServerDelay));
+        if (this.serverNotBefore !== null
+            && (!await this.waitForServerDelay() || !await this.retireServerDelay())) break;
+        await this.waitForReconnect(this.reconnectDelay(0));
         if (!this.canUseGateway()) break;
-        if (this.serverNotBefore !== null && !await this.retireServerDelay()) break;
         continue;
       }
       if (!this.canUseGateway()) break;
@@ -1782,7 +1820,6 @@ class GatewayRunner {
         break;
       }
       if (!this.canUseGateway()) break;
-      let serverDelayMs = 0;
       try {
         this.failurePressure += 1;
         this.lastConnectionAt = Date.now();
@@ -1793,13 +1830,14 @@ class GatewayRunner {
           await this.suppressTerminal(result.terminalCode);
           break;
         }
-        serverDelayMs = result.serverDelayMs;
       } catch {
         if (!this.canUseGateway()) break;
         await reportDiagnostic("gateway-connect-failed");
       }
       if (!this.canUseGateway()) break;
-      await this.waitForReconnect(this.reconnectDelay(serverDelayMs));
+      if (this.serverNotBefore !== null
+          && (!await this.waitForServerDelay() || !await this.retireServerDelay())) break;
+      await this.waitForReconnect(this.reconnectDelay(0));
       if (!this.canUseGateway()) break;
     }
     clearInterval(pruneTimer);
@@ -1807,6 +1845,7 @@ class GatewayRunner {
     await this.inbound;
     if (this.sequencePersistTask) await this.sequencePersistTask;
     await this.durableTransitions;
+    await this.fallbackTransitions;
     await diagnosticTransitions;
     safeLog("service stopped");
   }
