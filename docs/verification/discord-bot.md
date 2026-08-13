@@ -25,19 +25,28 @@ Observed bounded output:
 ok - self-hosted Discord is inert without explicit private configuration
 ok - Discord configuration rejects unsafe ambiguity without exposing secrets or ids
 ok - eligible owner mentions publish one private inbox and one durable notification
+ok - Discord notification acceptance remains idempotent across process death
+ok - Discord wake receipts retain sources and safely prune accepted and pending artifacts
 ok - Discord intake enforces owner, guild, channel, direct mention, and bot-loop prevention
 ok - outbound replies authenticate directly, suppress mentions, and preserve the bound conversation
 ok - terminal Discord replies survive bounded REST retries and clear their exact task binding
 ok - the Gateway reconnects, remains single-instance, and shuts down cleanly
-ok - Discord authentication failures reconnect with bounded cadence and one secret-safe diagnostic
-ok - the macOS service path persists safely without copying credentials or deployment ids
+ok - foreground service accepts Discord's regional resume endpoint independently of private-state pruning
+ok - Gateway resume remains limited to Discord-owned endpoints
+ok - Discord diagnostics retry transient publication failures without duplicate wakes
+ok - diagnostic persistence failures remain contained during reconnect
+ok - Discord diagnostic transitions preserve rapid same-second recurrences
+ok - the macOS service path reaches connected without copying credentials or deployment ids
+ok - reply helpers resolve only strict shared custom configuration records
 ok - self-hosted Discord and Relay coexist while sharing only durable supervision
 ```
 
 The fake REST endpoint records only an authentication-match boolean and parsed request body, never the fake token.
-The fake Gateway performs a real local WebSocket upgrade, sends Discord v10 Hello and Ready packets, closes the first connection, and observes a second connection.
-The production runtime's alternate API and Gateway inputs are refused unless its hermetic test-mode flag is set.
-Production destinations remain fixed to Discord.
+The fake Gateway performs a real local WebSocket upgrade, sends Discord v10 Hello, waits for an authenticated Identify carrying the minimum intent bitset `33281`, sends Ready, closes the first connection, and observes a valid Resume on the second connection.
+A separate READY fixture returns a Discord-owned regional resume hostname and reaches `connected` through both the foreground shell entrypoint and the real Node child launched behind the fake macOS service boundary.
+The same lifecycle rejects a lookalike hostname outside Discord's domain.
+The production runtime's alternate API and Gateway inputs have no effect unless its hermetic test-mode flag is set.
+Production destinations remain fixed to Discord's authenticated API and canonical or regional Discord-owned Gateway hosts.
 
 The authorization matrix drives the same executable `ingestMessage` owner used by Gateway `MESSAGE_CREATE` events.
 It positively admits one owner-authored, exact-guild, exact-channel, direct-bot-mention message and negatively drives wrong owner, wrong guild, wrong channel, missing mention, and bot-authored inputs.
@@ -49,9 +58,10 @@ The terminal pass first proves ordinary task cleanup refuses while the Discord o
 The authentication-failure pass returns HTTP 401 repeatedly while reconnect cadence is reduced only through the test seam.
 It asserts one durable `authentication-rejected` notification across retries and verifies the fake token is absent from service output.
 The worker pass starts the real shell single-instance wrapper, proves a second start is refused, sends TERM, and verifies enabled and ready markers retire.
+The regional READY pass also leaves the pruning-warning precondition active and still reaches connected, proving that cleanup warning is not the handshake cause.
 
-The LaunchAgent pass uses a private `HOME` and fake `launchctl` while driving the real `start` and `stop` entrypoints.
-It asserts `RunAtLoad`, `KeepAlive`, restart throttling, per-home naming, and complete absence of token, owner id, guild id, and channel id from the property list.
+The LaunchAgent pass uses a private `HOME` and fake `launchctl` while driving the real `start`, worker, Node runtime, health check, and `stop` entrypoints against the fake Gateway.
+It asserts the persistent path reaches connected, plus `RunAtLoad`, `KeepAlive`, restart throttling, per-home naming, and complete absence of token, owner id, guild id, and channel id from the property list.
 This is executable contract evidence, not a claim that a real Aqua login launchd service or live Discord bot was changed during development.
 The operator-run real-account smoke remains `bin/fm-discord-bot.sh start`, `check`, one owner mention in the bound channel, and `stop` after the captain performs the documented Developer Portal setup.
 
