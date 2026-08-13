@@ -1165,6 +1165,36 @@ wait "$limit_worker" || true
 WORKER_PIDS=()
 pass "fresh Identify honors Discord session-start exhaustion"
 
+home=$(new_home gateway-session-clock-jump)
+write_config "$home"
+make_gateway_server "$home/gateway" session-limit-zero
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+auth_fingerprint=$(discord_digest "$TOKEN")
+session_monotonic=$("$NODE_BIN" -e 'process.stdout.write(String(Math.floor(require("node:os").uptime()*1000)+120))')
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson monotonic "$session_monotonic" '
+  {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
+   failure_pressure:0,last_connection_at:null,server_not_before:null,server_wait_ms:null,
+   server_boot_id:null,server_monotonic_not_before:null,
+   session_start_limit:{total:1,remaining:0,resetAt:0,resetWaitMs:120,
+     resetBootId:"session-boot",resetMonotonicAt:$monotonic},resume_session:null}
+' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=session-boot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_SESSION_RESET_WALL_OFFSET_MS=-5000 FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+limit_worker=$!
+WORKER_PIDS+=("$limit_worker")
+sleep 0.15
+assert_absent "$home/gateway/connections" "wall-clock expiry synthesized a session-start refill"
+wait_for_minimum_value "$home/gateway/lookups" 2 || fail "exhausted session-start interval was not re-queried"
+wait_for_value "$home/gateway/connections" 1 || fail "server-refreshed session budget did not permit Identify"
+kill -TERM "$limit_worker"
+wait "$limit_worker" || true
+WORKER_PIDS=()
+pass "exhausted session starts re-query after monotonic reset waits"
+
 home=$(new_home gateway-session-durable)
 write_config "$home"
 make_gateway_server "$home/gateway" session-one-stale
@@ -1368,9 +1398,10 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
 wait_for_value "$home/gateway/lookups" 2 || fail "fallback-suppressed restart did not resume after expiry"
+first_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
 second_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
-[ "$second_lookup" -ge "$fallback_deadline" ] \
-  || fail "crash restart bypassed the fallback server retry deadline"
+[ $((second_lookup - first_lookup)) -ge 1300 ] \
+  || fail "crash restart bypassed the fallback server retry wait"
 assert_absent "$home/state/.discord-bot-service/reconnect-suppression.json" \
   "expired fallback server retry deadline was not retired"
 kill -TERM "$rate_worker"
@@ -1431,16 +1462,20 @@ mkdir "$home/state/.discord-bot-service"
 chmod 700 "$home/state/.discord-bot-service"
 auth_fingerprint=$(discord_digest "$TOKEN")
 clock_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
-clock_deadline=$((clock_started + 5000))
-jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$clock_deadline" '
+clock_monotonic=$("$NODE_BIN" -e 'process.stdout.write(String(Math.floor(require("node:os").uptime()*1000)))')
+clock_deadline=$((clock_started - 5000))
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$clock_deadline" \
+  --argjson monotonic "$((clock_monotonic + 120))" '
   {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
    failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
-   server_wait_ms:120,session_start_limit:null}
+   server_wait_ms:120,server_boot_id:"clock-boot",
+   server_monotonic_not_before:$monotonic,session_start_limit:null}
 ' > "$home/state/.discord-bot-service/reconnect.json"
 chmod 600 "$home/state/.discord-bot-service/reconnect.json"
 clock_launched=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
-  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_BOOT_ID=clock-boot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 \
   "$CONTROL" run > "$home/bot.log" 2>&1 &
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
@@ -1460,14 +1495,18 @@ make_gateway_server "$home/gateway" reconnect
 mkdir "$home/state/.discord-bot-service"
 chmod 700 "$home/state/.discord-bot-service"
 expired_now=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
-jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((expired_now - 1000))" '
+expired_monotonic=$("$NODE_BIN" -e 'process.stdout.write(String(Math.floor(require("node:os").uptime()*1000)-1000))')
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((expired_now + 60000))" \
+  --argjson monotonic "$expired_monotonic" '
   {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
    failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
-   server_wait_ms:5000,session_start_limit:null}
+   server_wait_ms:5000,server_boot_id:"clock-boot",
+   server_monotonic_not_before:$monotonic,session_start_limit:null}
 ' > "$home/state/.discord-bot-service/reconnect.json"
 chmod 600 "$home/state/.discord-bot-service/reconnect.json"
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
-  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_BOOT_ID=clock-boot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 \
   "$CONTROL" run > "$home/bot.log" 2>&1 &
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
@@ -1477,7 +1516,45 @@ wait_for_value "$home/gateway/lookups" 1 || fail "expired retry deadline blocked
 kill -TERM "$rate_worker"
 wait "$rate_worker" || true
 WORKER_PIDS=()
-pass "server retry deadlines retire safely across clock movement"
+pass "server retry deadlines use monotonic time across wall-clock movement"
+
+home=$(new_home gateway-rate-limit-restart-clock)
+write_config "$home"
+make_gateway_server "$home/gateway" reconnect
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+restart_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+restart_monotonic=$("$NODE_BIN" -e 'process.stdout.write(String(Math.floor(require("node:os").uptime()*1000)+400))')
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((restart_started - 5000))" \
+  --argjson monotonic "$restart_monotonic" '
+  {schema:"firstmate.discord-reconnect.v2",authentication_fingerprint:$fingerprint,
+   failure_pressure:0,last_connection_at:null,server_not_before:$deadline,
+   server_wait_ms:400,server_boot_id:"restart-boot",
+   server_monotonic_not_before:$monotonic,session_start_limit:null}
+' > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=restart-boot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/first.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+sleep 0.15
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=restart-boot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/second.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 || fail "same-boot retry restart did not resume"
+restart_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
+[ $((restart_lookup - restart_started)) -ge 350 ] \
+  || fail "same-boot restart replenished or bypassed the monotonic retry wait"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+pass "server retry waits do not replenish across same-boot restarts"
 
 home=$(new_home gateway-stable-recovery)
 write_config "$home"

@@ -47,6 +47,7 @@ ok - newer failure diagnostics survive pending stable transitions
 ok - queued intake remains bound to its originating session generation
 ok - non-resumable invalid-session waits survive abrupt process replacement
 ok - fresh Identify honors Discord session-start exhaustion
+ok - exhausted session starts re-query after monotonic reset waits
 ok - session-start reservations survive process restarts while Resume stays available
 ok - Identify reservation persistence failures remain stopped until termination
 ok - Gateway sequence persistence coalesces bursts to bounded writes
@@ -55,7 +56,8 @@ ok - server retry deadlines survive abrupt process and service-manager restarts
 ok - failed retry persistence survives crashes and retires after expiry
 ok - sequence persistence failure keeps one promptly cancellable fail-closed wait
 ok - invalid-session persistence failure settles promptly after stop
-ok - server retry deadlines retire safely across clock movement
+ok - server retry deadlines use monotonic time across wall-clock movement
+ok - server retry waits do not replenish across same-boot restarts
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
 ok - terminal Gateway close performs no reconnect

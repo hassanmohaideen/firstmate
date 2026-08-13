@@ -34,6 +34,7 @@ import {
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
+import { platform, uptime } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -76,6 +77,7 @@ const CONFIG_KEYS = [
 const SNOWFLAKE_RE = /^[0-9]{15,22}$/;
 const SAFE_CODE_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const INCIDENT_ID_RE = /^[0-9a-f]{64}$/;
+const BOOT_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 let diagnosticTransitions = Promise.resolve();
 let diagnosticGeneration = 0;
 
@@ -98,6 +100,36 @@ function diagnosticEpochSeconds() {
     return Number(process.env.FM_DISCORD_TEST_EPOCH_SECONDS);
   }
   return Math.floor(Date.now() / 1000);
+}
+
+function monotonicMilliseconds() {
+  return Math.floor(uptime() * 1000);
+}
+
+async function systemBootIdentity() {
+  const testIdentity = TEST_MODE ? process.env.FM_DISCORD_TEST_BOOT_ID || "" : "";
+  if (BOOT_ID_RE.test(testIdentity)) return testIdentity;
+  if (platform() === "linux") {
+    try {
+      const identity = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+      if (BOOT_ID_RE.test(identity)) return identity;
+    } catch {}
+  }
+  if (platform() === "darwin") {
+    try {
+      const identity = await new Promise((resolvePromise, rejectPromise) => {
+        const child = spawn("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], {
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        let output = "";
+        child.stdout.on("data", (chunk) => { output += chunk.toString("utf8"); });
+        child.once("error", rejectPromise);
+        child.once("close", (code) => code === 0 ? resolvePromise(output.trim()) : rejectPromise(new Error("sysctl failed")));
+      });
+      if (BOOT_ID_RE.test(identity)) return identity;
+    } catch {}
+  }
+  return `process-${process.pid}-${randomBytes(8).toString("hex")}`;
 }
 
 function modeBits(info) {
@@ -807,12 +839,18 @@ async function gatewayUrl(config) {
       || !Number.isFinite(limit.reset_after) || limit.reset_after < 0) {
     throw new ConfigError("gateway session-start limit is invalid");
   }
+  const resetAfter = Math.ceil(limit.reset_after);
+  const testWallOffset = TEST_MODE
+    && /^-?[0-9]+$/.test(process.env.FM_DISCORD_TEST_SESSION_RESET_WALL_OFFSET_MS || "")
+    ? Number(process.env.FM_DISCORD_TEST_SESSION_RESET_WALL_OFFSET_MS)
+    : 0;
   return {
     url: body.url,
     sessionStartLimit: {
       total: limit.total,
       remaining: limit.remaining,
-      resetAt: Date.now() + Math.ceil(limit.reset_after),
+      resetAfter,
+      resetAt: Date.now() + resetAfter + testWallOffset,
     },
   };
 }
@@ -950,6 +988,9 @@ class GatewayRunner {
     this.lastConnectionAt = null;
     this.serverNotBefore = null;
     this.serverWaitMs = null;
+    this.serverBootId = null;
+    this.serverMonotonicNotBefore = null;
+    this.bootId = null;
     this.sessionStartLimit = null;
     this.durableTransitions = Promise.resolve();
     this.sequencePersistPending = false;
@@ -1023,6 +1064,8 @@ class GatewayRunner {
       last_connection_at: this.lastConnectionAt,
       server_not_before: this.serverNotBefore,
       server_wait_ms: this.serverWaitMs,
+      server_boot_id: this.serverBootId,
+      server_monotonic_not_before: this.serverMonotonicNotBefore,
       session_start_limit: this.sessionStartLimit,
       resume_session: this.resumeSessionRecord(),
     };
@@ -1059,6 +1102,8 @@ class GatewayRunner {
       authentication_fingerprint: authenticationFingerprint(this.config),
       server_not_before: deadlineActive ? this.serverNotBefore : null,
       server_wait_ms: deadlineActive ? this.serverWaitMs : null,
+      server_boot_id: deadlineActive ? this.serverBootId : null,
+      server_monotonic_not_before: deadlineActive ? this.serverMonotonicNotBefore : null,
       operator_intervention_required: !deadlineActive,
       recorded_at: diagnosticEpochSeconds(),
     })}\n`);
@@ -1113,6 +1158,8 @@ class GatewayRunner {
 
   async loadDurableState() {
     await ensureOwnershipDirectory();
+    this.bootId = await systemBootIdentity();
+    let stateNeedsRebase = false;
     let record;
     try {
       await assertPrivateFile(RECONNECT_FILE);
@@ -1137,9 +1184,21 @@ class GatewayRunner {
           && (!Number.isSafeInteger(record.server_wait_ms) || record.server_wait_ms < 0))
         || (record.server_not_before !== undefined && record.server_wait_ms !== undefined
           && ((record.server_not_before === null) !== (record.server_wait_ms === null)))
+        || (record.server_boot_id !== undefined && record.server_boot_id !== null
+          && !BOOT_ID_RE.test(record.server_boot_id))
+        || (record.server_monotonic_not_before !== undefined
+          && record.server_monotonic_not_before !== null
+          && (!Number.isSafeInteger(record.server_monotonic_not_before)
+            || record.server_monotonic_not_before < 0))
         || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
           || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
-          || !Number.isInteger(limit.resetAt) || limit.resetAt < 0))
+          || !Number.isInteger(limit.resetAt) || limit.resetAt < 0
+          || (limit.resetWaitMs !== undefined
+            && (!Number.isSafeInteger(limit.resetWaitMs) || limit.resetWaitMs < 0))
+          || (limit.resetBootId !== undefined && limit.resetBootId !== null
+            && !BOOT_ID_RE.test(limit.resetBootId))
+          || (limit.resetMonotonicAt !== undefined && limit.resetMonotonicAt !== null
+            && (!Number.isSafeInteger(limit.resetMonotonicAt) || limit.resetMonotonicAt < 0))))
         || (resume !== undefined && resume !== null
           && (!resume || typeof resume.session_id !== "string" || !resume.session_id
             || typeof resume.resume_url !== "string" || !resume.resume_url
@@ -1160,6 +1219,15 @@ class GatewayRunner {
     this.serverWaitMs = this.serverNotBefore === null
       ? null
       : record?.server_wait_ms ?? Math.max(0, this.serverNotBefore - Date.now());
+    this.serverBootId = record?.server_boot_id ?? null;
+    this.serverMonotonicNotBefore = record?.server_monotonic_not_before ?? null;
+    if (this.serverNotBefore !== null
+        && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
+      this.serverBootId = this.bootId;
+      this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+      this.serverNotBefore = Date.now() + this.serverWaitMs;
+      stateNeedsRebase = true;
+    }
     let suppression;
     try {
       await assertPrivateFile(RECONNECT_SUPPRESSION_FILE);
@@ -1175,6 +1243,12 @@ class GatewayRunner {
           ? suppression.server_wait_ms === null && suppression.operator_intervention_required
           : Number.isSafeInteger(suppression.server_not_before) && suppression.server_not_before >= 0
             && Number.isSafeInteger(suppression.server_wait_ms) && suppression.server_wait_ms >= 0
+            && (suppression.server_boot_id === undefined || suppression.server_boot_id === null
+              || BOOT_ID_RE.test(suppression.server_boot_id))
+            && (suppression.server_monotonic_not_before === undefined
+              || suppression.server_monotonic_not_before === null
+              || Number.isSafeInteger(suppression.server_monotonic_not_before)
+                && suppression.server_monotonic_not_before >= 0)
             && !suppression.operator_intervention_required);
       if (!valid) {
         this.activateFailClosed();
@@ -1184,19 +1258,39 @@ class GatewayRunner {
         this.fallbackSuppressionActive = true;
         this.activateFailClosed();
       } else {
-        const fallbackRemaining = Math.max(0, Math.min(
-          suppression.server_wait_ms,
-          suppression.server_not_before - Date.now(),
-        ));
-        const currentRemaining = this.serverNotBefore === null
-          ? 0
-          : Math.max(0, Math.min(this.serverWaitMs, this.serverNotBefore - Date.now()));
-        this.serverNotBefore = Math.max(this.serverNotBefore || 0, suppression.server_not_before);
+        const fallbackSameBoot = suppression.server_boot_id === this.bootId
+          && Number.isSafeInteger(suppression.server_monotonic_not_before);
+        const fallbackRemaining = fallbackSameBoot
+          ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
+          : suppression.server_wait_ms;
+        const currentRemaining = this.serverDelayRemaining();
         this.serverWaitMs = Math.max(currentRemaining, fallbackRemaining);
+        this.serverBootId = this.bootId;
+        this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+        this.serverNotBefore = Date.now() + this.serverWaitMs;
         this.fallbackSuppressionActive = true;
+        stateNeedsRebase = true;
+        try {
+          await this.persistFallbackSuppression();
+        } catch {
+          this.activateFailClosed();
+        }
       }
     }
     this.sessionStartLimit = authenticationBound ? limit : null;
+    if (this.sessionStartLimit) {
+      const sameBoot = this.sessionStartLimit.resetBootId === this.bootId
+        && Number.isSafeInteger(this.sessionStartLimit.resetMonotonicAt);
+      if (!sameBoot) {
+        const conservativeWait = this.sessionStartLimit.resetWaitMs
+          ?? Math.max(0, this.sessionStartLimit.resetAt - Date.now());
+        this.sessionStartLimit.resetWaitMs = conservativeWait;
+        this.sessionStartLimit.resetBootId = this.bootId;
+        this.sessionStartLimit.resetMonotonicAt = monotonicMilliseconds() + conservativeWait;
+        this.sessionStartLimit.resetAt = Date.now() + conservativeWait;
+        stateNeedsRebase = true;
+      }
+    }
     const resumable = authenticationBound && resume && SNOWFLAKE_RE.test(resume.self_user_id || "");
     if (resumable) {
       this.sessionId = resume.session_id;
@@ -1206,35 +1300,49 @@ class GatewayRunner {
       this.selfUserId = resume.self_user_id;
       this.sessionGeneration = 1;
     }
-    if (!record || legacy || !authenticationBound || (authenticationBound && resume && !resumable)) {
+    if (!record || legacy || !authenticationBound || stateNeedsRebase
+        || (authenticationBound && resume && !resumable)) {
       await this.persistDurableState();
     }
   }
 
   async updateSessionStartLimit(limit) {
     if (!limit) return true;
+    const resetWaitMs = limit.resetAfter;
+    const normalized = {
+      total: limit.total,
+      remaining: limit.remaining,
+      resetAt: limit.resetAt,
+      resetWaitMs,
+      resetBootId: this.bootId,
+      resetMonotonicAt: monotonicMilliseconds() + resetWaitMs,
+    };
     const previous = this.sessionStartLimit;
-    if (previous && previous.total === limit.total && Date.now() < previous.resetAt
-        && Math.abs(previous.resetAt - limit.resetAt) <= 5000) {
-      limit.remaining = Math.min(previous.remaining, limit.remaining);
-      limit.resetAt = Math.max(previous.resetAt, limit.resetAt);
+    if (previous && previous.total === normalized.total
+        && previous.resetBootId === this.bootId
+        && previous.resetMonotonicAt > monotonicMilliseconds()
+        && Math.abs(previous.resetMonotonicAt - normalized.resetMonotonicAt) <= 5000) {
+      normalized.remaining = Math.min(previous.remaining, normalized.remaining);
+      if (previous.resetMonotonicAt > normalized.resetMonotonicAt) {
+        normalized.resetMonotonicAt = previous.resetMonotonicAt;
+        normalized.resetWaitMs = Math.max(0, previous.resetMonotonicAt - monotonicMilliseconds());
+        normalized.resetAt = Date.now() + normalized.resetWaitMs;
+      }
     }
-    this.sessionStartLimit = limit;
+    this.sessionStartLimit = normalized;
     return await this.persistDurableStateOrStop();
   }
 
   async reserveIdentify() {
     const limit = this.sessionStartLimit;
     if (!limit) return true;
-    if (limit.remaining === 0 && Date.now() < limit.resetAt) {
-      await this.waitForReconnect(limit.resetAt - Date.now());
-      if (!this.canUseGateway()) return false;
+    if (limit.remaining === 0) {
+      const remaining = limit.resetBootId === this.bootId
+        ? Math.max(0, limit.resetMonotonicAt - monotonicMilliseconds())
+        : limit.resetWaitMs;
+      if (remaining > 0) await this.waitForReconnect(remaining);
+      return false;
     }
-    if (Date.now() >= limit.resetAt) {
-      limit.remaining = limit.total;
-      limit.resetAt = Date.now();
-    }
-    if (limit.remaining === 0) return false;
     if (TEST_MODE && process.env.FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS) {
       await sleep(testDuration("FM_DISCORD_TEST_IDENTIFY_RESERVATION_DELAY_MS", 1, 1, 1000));
       if (!this.canUseGateway()) return false;
@@ -1245,22 +1353,28 @@ class GatewayRunner {
 
   serverDelayRemaining() {
     if (this.serverNotBefore === null || this.serverWaitMs === null) return 0;
-    return Math.max(0, Math.min(this.serverWaitMs, this.serverNotBefore - Date.now()));
+    if (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null) {
+      return this.serverWaitMs;
+    }
+    return Math.max(0, this.serverMonotonicNotBefore - monotonicMilliseconds());
   }
 
   retainServerDelay(milliseconds) {
     if (!Number.isFinite(milliseconds) || milliseconds <= 0) return;
     const now = Date.now();
     const delay = Math.min(Number.MAX_SAFE_INTEGER - now, Math.ceil(milliseconds));
-    const deadline = now + delay;
     const retainedRemaining = this.serverDelayRemaining();
-    this.serverNotBefore = Math.max(this.serverNotBefore || 0, deadline);
     this.serverWaitMs = Math.max(retainedRemaining, delay);
+    this.serverBootId = this.bootId;
+    this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+    this.serverNotBefore = now + this.serverWaitMs;
   }
 
   async retireServerDelay() {
     this.serverNotBefore = null;
     this.serverWaitMs = null;
+    this.serverBootId = null;
+    this.serverMonotonicNotBefore = null;
     if (!await this.persistDurableStateOrStop()) return false;
     if (this.fallbackSuppressionActive) {
       try {
@@ -1610,7 +1724,10 @@ class GatewayRunner {
         continue;
       }
       if (!this.canUseGateway()) break;
-      if (!this.sessionId && !await this.reserveIdentify()) break;
+      if (!this.sessionId && !await this.reserveIdentify()) {
+        if (this.canUseGateway()) continue;
+        break;
+      }
       if (!this.canUseGateway()) break;
       let serverDelayMs = 0;
       try {
