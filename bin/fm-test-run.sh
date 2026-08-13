@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fm-test-run.sh - single owner of Firstmate's behavior-test runner, lane
-# composition for portable CI shards, local --jobs for the proven-isolated set,
-# timing markers, and the complete-regression coverage guard.
+# composition, mixed complete-regression scheduling, timing and duration-budget
+# reporting, and the complete-regression coverage guard.
 #
 # Selection modes (exactly one of: --portable, --all, --family, --changed,
 # --lane, --proven-isolated, or script paths):
@@ -46,7 +46,8 @@
 #                   Cap is 8.
 #   --enforce-duration-budgets
 #                   fail after functional results are reported when a script
-#                   exceeds the data-driven baseline budget. The default warns.
+#                   exceeds or lacks a data-driven baseline budget. The default
+#                   warns.
 #   -h, --help      print this header
 #
 # Per-script machine-parseable markers (stdout):
@@ -59,9 +60,10 @@
 #   FM_TEST_SLOWEST rank=<k> script=<path> duration_ms=<n>
 #   FM_TEST_BUDGET_SUMMARY checked=<n> exceeded=<n> missing=<n> mode=warn|enforce
 #
-# Exit status is non-zero if any selected script exits non-zero or a configured
-# --fail-on-gate-skip token appears. Other gate skips (first meaningful line
-# matching ^skip:) remain successful and are counted as skipped_gate.
+# Exit status is non-zero if any selected script exits non-zero, a configured
+# --fail-on-gate-skip token appears, or enforced duration budgets are exceeded
+# or missing. Other gate skips (first meaningful line matching ^skip:) remain
+# successful and are counted as skipped_gate.
 #
 # Family labels, the changed-file map, and production portable-shard composition
 # live in this script only (one owner). The proven-isolated candidate set remains
@@ -1704,20 +1706,18 @@ stop_active_workers() {
     [ -n "$pid" ] || continue
     kill -TERM -- "-$pid" 2>/dev/null || true
   done
-  n=0
-  while [ "$n" -lt 100 ]; do
-    running=0
-    for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
-      [ -n "$pid" ] || continue
-      if worker_group_is_running "$pid"; then
-        running=1
-        break
-      fi
-    done
-    [ "$running" -eq 1 ] || break
-    sleep 0.01
-    n=$((n + 1))
+  running=0
+  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
+    [ -n "$pid" ] || continue
+    if worker_group_is_running "$pid"; then
+      running=1
+      break
+    fi
   done
+  # One sleep preserves the intended TERM grace without paying for 100
+  # external sleep processes (which can exceed the bounded cleanup window on
+  # a loaded macOS host).
+  [ "$running" -eq 0 ] || sleep 1
   for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
     [ -n "$pid" ] || continue
     if worker_group_is_running "$pid"; then
@@ -1729,7 +1729,7 @@ stop_active_workers() {
     wait "$pid" 2>/dev/null || true
   done
   n=0
-  while [ "$n" -lt 100 ]; do
+  while [ "$n" -lt 20 ]; do
     running=0
     for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
       [ -n "$pid" ] || continue
@@ -1739,7 +1739,7 @@ stop_active_workers() {
       fi
     done
     [ "$running" -eq 1 ] || break
-    sleep 0.01
+    sleep 0.05
     n=$((n + 1))
   done
   WORKER_PIDS=()
