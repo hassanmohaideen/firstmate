@@ -933,31 +933,16 @@ function authenticationFingerprint(config) {
   return createHash("sha256").update(config.token).digest("hex");
 }
 
-function rebootWaitRemaining(
-  waitMilliseconds, wallDeadline, wallObservedAt, evidenceEstablished, now = Date.now(),
-) {
-  const observedAt = Number.isSafeInteger(wallObservedAt)
-    ? wallObservedAt
-    : Math.max(0, wallDeadline - waitMilliseconds);
-  const elapsed = Math.max(0, now - observedAt);
-  if (!evidenceEstablished) return waitMilliseconds;
-  const maximumTrustedProgress = Math.max(1, Math.floor(waitMilliseconds / 2));
-  const corroboratedProgress = Math.floor(elapsed / 2);
-  return Math.max(0, waitMilliseconds - Math.min(corroboratedProgress, maximumTrustedProgress));
+function rebootWaitRemaining(waitMilliseconds) {
+  return waitMilliseconds;
 }
 
 function simulateRebootWaitPolicy(input) {
   let remaining = Number(input.remaining_ms);
-  const deadline = Number(input.deadline_ms);
-  let observedAt = Number(input.observed_at_ms);
-  let evidenceEstablished = Boolean(input.evidence_established);
   const remainingAfterObservations = [];
-  for (const now of input.reboot_observations_ms || []) {
-    remaining = rebootWaitRemaining(
-      remaining, deadline, observedAt, evidenceEstablished, Number(now),
-    );
-    evidenceEstablished = true;
-    observedAt = Math.max(observedAt, Number(now));
+  const observations = input.reboot_observations_ms || [];
+  for (let index = 0; index < observations.length; index += 1) {
+    remaining = rebootWaitRemaining(remaining);
     remainingAfterObservations.push(remaining);
   }
   return { remaining_ms: remaining, remaining_after_observations: remainingAfterObservations };
@@ -1334,13 +1319,7 @@ class GatewayRunner {
     if (this.serverNotBefore !== null
         && (this.serverBootId !== this.bootId || this.serverMonotonicNotBefore === null)) {
       const now = Date.now();
-      this.serverWaitMs = rebootWaitRemaining(
-        this.serverWaitMs,
-        this.serverNotBefore,
-        this.serverWallObservedAt,
-        this.serverRebootFallbackUsed,
-        now,
-      );
+      this.serverWaitMs = rebootWaitRemaining(this.serverWaitMs);
       this.serverRebootFallbackUsed = true;
       this.serverWallObservedAt = Math.max(this.serverWallObservedAt, now);
       this.serverBootId = this.bootId;
@@ -1369,13 +1348,7 @@ class GatewayRunner {
         const now = Date.now();
         const fallbackRemaining = fallbackSameBoot
           ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
-          : rebootWaitRemaining(
-            suppression.server_wait_ms,
-            suppression.server_not_before,
-            suppression.server_wall_observed_at,
-            fallbackPreviouslyUsed,
-            now,
-          );
+          : rebootWaitRemaining(suppression.server_wait_ms);
         const currentRemaining = this.serverDelayRemaining();
         if (fallbackRemaining > currentRemaining) {
           this.serverWaitMs = fallbackRemaining;

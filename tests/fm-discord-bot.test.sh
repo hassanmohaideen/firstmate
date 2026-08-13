@@ -797,20 +797,16 @@ low=$(jq -r '.delays[0]' "$home/jitter-0.out")
 high=$(jq -r '.delays[0]' "$home/jitter-1.out")
 [ "$low" -ge 2500 ] && [ "$high" -le 5000 ] && [ "$low" -lt "$high" ] \
   || fail "retry jitter was absent or outside its bounded delay: low=$low high=$high"
-cat > "$home/forward-clock.json" <<'JSON'
-{"remaining_ms":30000,"deadline_ms":30000,"observed_at_ms":0,"reboot_observations_ms":[30000,20000]}
+cat > "$home/reboot-clocks.json" <<'JSON'
+{"remaining_ms":30000,"deadline_ms":30000,"observed_at_ms":0,"reboot_observations_ms":[30000,-10000,60000,20000,120000,-20000]}
 JSON
-forward_clock=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
-  "$NODE_BIN" "$BOT" reboot-wait-policy "$home/forward-clock.json")
-[ "$(printf '%s' "$forward_clock" | jq -r .remaining_ms)" -eq 30000 ] \
-  || fail "an immediate 30-second wall jump consumed the server minimum: $forward_clock"
-cat > "$home/long-reboots.json" <<'JSON'
-{"remaining_ms":8000,"deadline_ms":8000,"observed_at_ms":0,"reboot_observations_ms":[61000,122000,183000,244000,305000]}
-JSON
-long_reboots=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
-  "$NODE_BIN" "$BOT" reboot-wait-policy "$home/long-reboots.json")
-[ "$(printf '%s' "$long_reboots" | jq -r .remaining_ms)" -eq 500 ] \
-  || fail "widely spaced reboot evidence replenished the durable server wait: $long_reboots"
+reboot_clocks=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  "$NODE_BIN" "$BOT" reboot-wait-policy "$home/reboot-clocks.json")
+[ "$(printf '%s' "$reboot_clocks" | jq -r .remaining_ms)" -eq 30000 ] \
+  || fail "repeated reboot clock jumps changed the server minimum: $reboot_clocks"
+[ "$(printf '%s' "$reboot_clocks" | jq -r \
+  '[.remaining_after_observations[] == 30000] | all')" = true ] \
+  || fail "a reboot boundary consumed or replenished the durable wait: $reboot_clocks"
 pass "reconnect policy retains READY failure pressure, resets only after stability, and applies bounded jitter"
 
 # A real local Gateway cannot turn rapid successful handshakes into a storm.
@@ -1620,6 +1616,7 @@ jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((reboot_now +
 ' > "$home/state/.discord-bot-service/reconnect.json"
 chmod 600 "$home/state/.discord-bot-service/reconnect.json"
 reboot=1
+previous_remaining=8000
 while [ "$reboot" -le 4 ]; do
   boot_id="rapid-reboot-$reboot"
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
@@ -1636,12 +1633,20 @@ while [ "$reboot" -le 4 ]; do
     i=$((i + 1))
   done
   [ "$persisted_boot" = "$boot_id" ] || fail "rapid reboot did not persist elapsed-wait evidence"
+  persisted_remaining=$(jq -r '.server_wait_ms' \
+    "$home/state/.discord-bot-service/reconnect.json")
+  [ "$persisted_remaining" -gt 0 ] && [ "$persisted_remaining" -le "$previous_remaining" ] \
+    || fail "rapid reboot replenished or collapsed the durable wait: $persisted_remaining"
+  previous_remaining=$persisted_remaining
   assert_absent "$home/gateway/lookups" "rapid reboot bypassed the outstanding server wait"
   kill -TERM "$rate_worker"
   wait "$rate_worker" || true
   WORKER_PIDS=()
   reboot=$((reboot + 1))
 done
+expected_stable_wait=$(jq -r '.server_wait_ms' \
+  "$home/state/.discord-bot-service/reconnect.json")
+final_reboot_started=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_BOOT_ID=final-reboot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
   FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/final.log" 2>&1 &
@@ -1650,10 +1655,12 @@ WORKER_PIDS+=("$rate_worker")
 wait_for_value "$home/gateway/lookups" 1 || fail "completed reboot fallback did not reconnect"
 reboot_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
 reboot_elapsed=$((reboot_lookup - reboot_now))
+stable_elapsed=$((reboot_lookup - final_reboot_started))
 [ "$reboot_elapsed" -ge 7800 ] \
   || fail "rapid reboots collapsed the server retry minimum ($reboot_elapsed ms)"
-[ "$reboot_elapsed" -lt 9000 ] \
-  || fail "rapid reboots replenished the bounded server fallback ($reboot_elapsed ms)"
+[ "$stable_elapsed" -ge $((expected_stable_wait - 250)) ] \
+  && [ "$stable_elapsed" -lt $((expected_stable_wait + 1000)) ] \
+  || fail "stable monotonic time did not retire the durable server wait ($stable_elapsed ms)"
 kill -TERM "$rate_worker"
 wait "$rate_worker" || true
 WORKER_PIDS=()
