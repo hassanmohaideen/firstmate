@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "when": "The task is ambiguous Playop architecture, design, migration, or investigation where deeper reasoning can materially change the result, excluding independent adversarial, security, final-diff, and test-coverage review.",
+      "use": { "harness": "claude", "model": "fable", "effort": "xhigh" },
+      "why": "Use Claude Code with Fable at xhigh only for genuinely ambiguous Playop work that benefits from deeper reasoning."
+    },
+    {
+      "when": "The task is Playop implementation, architecture, investigation, or remediation not matched by the ambiguous-work rule above, excluding independent adversarial, security, final-diff, and test-coverage review.",
+      "use": { "harness": "claude", "model": "fable" },
+      "why": "Use Claude Code with Fable and choose proportionate effort through the generic effort fallback for bounded Playop work."
+    }
+  ]
+}

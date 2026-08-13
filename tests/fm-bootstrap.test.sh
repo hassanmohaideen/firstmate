@@ -1093,6 +1093,50 @@ test_crew_dispatch_active_rules_are_verbose_bootstrap_info() {
   pass "bootstrap surfaces active crew-dispatch rules only as verbose BOOTSTRAP_INFO"
 }
 
+test_tracked_crew_dispatch_defaults_and_local_precedence() {
+  local case_dir fakebin out tracked malformed
+  case_dir="$TMP_ROOT/dispatch-tracked-default"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  add_real_jq "$fakebin"
+  tracked="$ROOT/defaults/crew-dispatch.json"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_TEST_DISPATCH_DEFAULTS_PATH="$tracked" FM_BOOTSTRAP_VERBOSE_FACTS=1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active defaults/crew-dispatch.json" \
+    "tracked dispatch default was not selected when local config was absent"
+  assert_contains "$out" "-> claude/fable/xhigh" \
+    "tracked ambiguous Playop profile lost Claude/Fable xhigh axes"
+  assert_contains "$out" "-> claude/fable" \
+    "tracked bounded Playop profile lost Claude/Fable with generic effort fallback"
+
+  printf '%s\n' '{"rules":[{"when":"local override","use":{"harness":"codex","model":"gpt-local","effort":"low"}}]}' \
+    > "$case_dir/home/config/crew-dispatch.json"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_TEST_DISPATCH_DEFAULTS_PATH="$tracked" FM_BOOTSTRAP_VERBOSE_FACTS=1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active config/crew-dispatch.json" \
+    "local dispatch config did not override the tracked default"
+  assert_contains "$out" "-> codex/gpt-local/low" \
+    "local override profile was not validated as the effective configuration"
+  assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active defaults/crew-dispatch.json" \
+    "tracked dispatch layer disappeared when local configuration was present"
+  assert_contains "$out" "-> claude/fable/xhigh" \
+    "tracked Playop rule was not validated alongside local configuration"
+
+  rm -f "$case_dir/home/config/crew-dispatch.json"
+  malformed="$case_dir/malformed-tracked.json"
+  printf '%s\n' '{"rules":[' > "$malformed"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_TEST_DISPATCH_DEFAULTS_PATH="$malformed" FM_FAKE_TREEHOUSE_LEASE_HELP=1 \
+    "$ROOT/bin/fm-bootstrap.sh")
+  [ "$out" = "CREW_DISPATCH: invalid defaults/crew-dispatch.json - malformed JSON" ] \
+    || fail "malformed tracked dispatch default was not refused: $out"
+  pass "bootstrap layers tracked and local dispatch profiles and refuses malformed tracked config"
+}
+
 test_crew_dispatch_validation() {
   local label body expect mode case_dir fakebin out n
   n=0
@@ -1173,4 +1217,5 @@ test_network_sweeps_recheck_lock_ownership
 test_network_phases_record_per_step_elapsed_times
 test_tasks_axi_verdict_handoff_is_consumed_once
 test_crew_dispatch_active_rules_are_verbose_bootstrap_info
+test_tracked_crew_dispatch_defaults_and_local_precedence
 test_crew_dispatch_validation

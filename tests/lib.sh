@@ -34,6 +34,11 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# Most behavior suites predate this repository's optional tracked dispatch
+# defaults and construct homes to test unrelated behavior. Keep those fixtures
+# profile-free unless a dispatch-default test opts back in explicitly.
+export FM_TEST_DISPATCH_DEFAULTS_PATH=/nonexistent/firstmate-test-dispatch-defaults.json
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034

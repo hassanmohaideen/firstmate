@@ -190,7 +190,8 @@ family_for_basename() {
     fm-herdr-version-floor-live-e2e.test.sh|\
     fm-opencode-primary-live-e2e.test.sh|fm-pi-primary-live-e2e.test.sh|\
     fm-sessionstart-hook-live-e2e.test.sh|fm-sessionstart-instruction-refresh-live-e2e.test.sh|\
-    fm-quota-array-dispatch-live-e2e.test.sh|fm-send-secondmate-marker-herdr-e2e.test.sh)
+    fm-playop-dispatch-live-e2e.test.sh|fm-quota-array-dispatch-live-e2e.test.sh|\
+    fm-send-secondmate-marker-herdr-e2e.test.sh)
       printf '%s\n' live-harness-optin
       ;;
     fm-backend-herdr.test.sh|fm-backend-tmux-smoke.test.sh|fm-backend.test.sh|\
@@ -415,6 +416,7 @@ tests/fm-pending-reply.test.sh 7328
 tests/fm-pi-primary-live-e2e.test.sh 19
 tests/fm-pi-watch-extension.test.sh 16386
 tests/fm-pr-check-security.test.sh 199573
+tests/fm-playop-dispatch-live-e2e.test.sh 19
 tests/fm-procevent.test.sh 42789
 tests/fm-public-followup.test.sh 23365
 tests/fm-quota-array-dispatch-live-e2e.test.sh 19
@@ -949,7 +951,7 @@ families_for_changed_path() {
       printf '%s\n' pure-contract-unit
       printf '%s\n' live-harness-optin
       ;;
-    bin/fm-spawn.sh|bin/fm-send.sh|bin/fm-harness.sh|\
+    bin/fm-spawn.sh|bin/fm-send.sh|bin/fm-harness.sh|bin/fm-dispatch-config-lib.sh|\
     bin/fm-peek.sh|bin/fm-composer*)
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
@@ -971,6 +973,11 @@ families_for_changed_path() {
     bin/fm-primary-scope-lib.sh|bin/fm-project-mode.sh|bin/fm-promote.sh|\
     bin/fm-ff-lib.sh|bin/fm-gotmp*|bin/*pretool*)
       printf '%s\n' pure-contract-unit
+      ;;
+    defaults/crew-dispatch.json)
+      printf '%s\n' backend-dispatch
+      printf '%s\n' session-bootstrap
+      printf '%s\n' live-harness-optin
       ;;
     .agents/skills/quota-array-dispatch/SKILL.md)
       printf '%s\n' pure-contract-unit
