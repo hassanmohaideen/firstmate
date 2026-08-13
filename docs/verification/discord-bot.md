@@ -38,6 +38,8 @@ ok - rapid Gateway disconnects remain bounded and stop promptly during cooldown
 ok - reconnect pressure survives filtering changes and process restarts
 ok - future-dated reconnect attempts clamp to the minimum interval
 ok - server reconnect and invalid-session directions choose resume or fresh identify correctly
+ok - valid Gateway Resume state survives abrupt process replacement
+ok - non-resumable invalid-session waits survive abrupt process replacement
 ok - fresh Identify honors Discord session-start exhaustion
 ok - session-start reservations survive process restarts while Resume stays available
 ok - Gateway lookup rate limits preserve server-provided retry direction

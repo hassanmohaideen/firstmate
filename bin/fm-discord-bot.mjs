@@ -900,6 +900,15 @@ class GatewayRunner {
     this.sequence = null;
   }
 
+  resumeSessionRecord() {
+    if (!this.sessionId) return null;
+    return {
+      session_id: this.sessionId,
+      resume_url: this.resumeUrl,
+      sequence: this.sequence,
+    };
+  }
+
   async waitForReconnect(milliseconds) {
     const startedAt = performance.now();
     while (!this.stopping) {
@@ -923,6 +932,7 @@ class GatewayRunner {
       server_not_before: this.serverNotBefore,
       server_wait_ms: this.serverWaitMs,
       session_start_limit: this.sessionStartLimit,
+      resume_session: this.resumeSessionRecord(),
     };
   }
 
@@ -958,6 +968,7 @@ class GatewayRunner {
     const authenticationBound = record?.schema === "firstmate.discord-reconnect.v2"
       && record.authentication_fingerprint === authenticationFingerprint(this.config);
     const limit = record?.session_start_limit;
+    const resume = record?.resume_session;
     if (record && ((!legacy && record.schema !== "firstmate.discord-reconnect.v2")
         || (legacy && !INCIDENT_ID_RE.test(record.config_fingerprint || ""))
         || (!legacy && !INCIDENT_ID_RE.test(record.authentication_fingerprint || ""))
@@ -972,8 +983,19 @@ class GatewayRunner {
           && ((record.server_not_before === null) !== (record.server_wait_ms === null)))
         || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
           || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
-          || !Number.isInteger(limit.resetAt) || limit.resetAt < 0)))) {
+          || !Number.isInteger(limit.resetAt) || limit.resetAt < 0))
+        || (resume !== undefined && resume !== null
+          && (!resume || typeof resume.session_id !== "string" || !resume.session_id
+            || typeof resume.resume_url !== "string" || !resume.resume_url
+            || (resume.sequence !== null && !Number.isSafeInteger(resume.sequence)))))) {
       throw new ConfigError("reconnect state is invalid");
+    }
+    if (resume) {
+      try {
+        validateProductionEndpoint(resume.resume_url, "gateway");
+      } catch {
+        throw new ConfigError("reconnect state is invalid");
+      }
     }
     this.failurePressure = record?.failure_pressure || 0;
     this.lastConnectionAt = record?.last_connection_at ?? null;
@@ -982,6 +1004,11 @@ class GatewayRunner {
       ? null
       : record?.server_wait_ms ?? Math.max(0, this.serverNotBefore - Date.now());
     this.sessionStartLimit = authenticationBound ? limit : null;
+    if (authenticationBound && resume) {
+      this.sessionId = resume.session_id;
+      this.resumeUrl = resume.resume_url;
+      this.sequence = resume.sequence;
+    }
     if (!record || legacy || !authenticationBound) await this.persistDurableState();
   }
 
@@ -1130,7 +1157,13 @@ class GatewayRunner {
           socket.close(4002, "invalid payload");
           return;
         }
-        if (Number.isInteger(packet.s)) this.sequence = packet.s;
+        if (Number.isInteger(packet.s)) {
+          this.sequence = packet.s;
+          void this.persistDurableState().catch(async () => {
+            socket.close(4000, "reconnect state unavailable");
+            await this.persistDurableStateOrStop();
+          });
+        }
         switch (packet.op) {
           case 10: {
             if (handshakeTimeout) clearTimeout(handshakeTimeout);
@@ -1171,7 +1204,10 @@ class GatewayRunner {
               ? testDuration("FM_DISCORD_TEST_INVALID_SESSION_MS", 1000, 1, 1000)
               : 1000 + Math.floor(randomFraction() * 4001);
             if (packet.d !== true) this.clearSession();
-            socket.close(4000, "invalid session");
+            this.retainServerDelay(serverDelayMs);
+            void this.persistDurableStateOrStop().then((persisted) => {
+              if (persisted) socket.close(4000, "invalid session");
+            });
             break;
           case 0:
             if (packet.t === "READY") {
@@ -1191,7 +1227,9 @@ class GatewayRunner {
               this.selfUserId = userId;
               this.sessionId = sessionId;
               this.resumeUrl = resumeUrl;
-              markReady();
+              void this.persistDurableStateOrStop().then((persisted) => {
+                if (persisted) markReady();
+              });
             } else if (packet.t === "RESUMED") {
               markReady();
             } else if (packet.t === "MESSAGE_CREATE" && this.selfUserId) {
@@ -1212,15 +1250,21 @@ class GatewayRunner {
         this.connected = false;
         if (this.socket === socket) this.socket = null;
         removeMarker(READY_FILE).catch(() => {});
-        if ([4007, 4009].includes(event.code)) this.clearSession();
-        finish({
-          opened,
-          ready,
-          stable,
-          code: event.code,
-          terminalCode: terminalDiagnosticForClose(event.code),
-          serverDelayMs,
-        });
+        const complete = async () => {
+          if ([4007, 4009].includes(event.code)) {
+            this.clearSession();
+            if (!await this.persistDurableStateOrStop()) return;
+          }
+          finish({
+            opened,
+            ready,
+            stable,
+            code: event.code,
+            terminalCode: terminalDiagnosticForClose(event.code),
+            serverDelayMs,
+          });
+        };
+        void complete();
       });
     });
   }
@@ -1273,6 +1317,11 @@ class GatewayRunner {
       if (!this.stopping && this.serverNotBefore !== null) await this.retireServerDelay();
     }
     while (!this.stopping) {
+      if (this.serverNotBefore !== null) {
+        const delay = this.serverDelayRemaining();
+        if (delay > 0) await this.waitForReconnect(delay);
+        if (this.stopping || !await this.retireServerDelay()) break;
+      }
       let gateway;
       try {
         gateway = this.resumeUrl

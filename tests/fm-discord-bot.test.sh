@@ -280,7 +280,7 @@ server.on("upgrade",(req,socket)=>{
         text(socket,{op:0,t:"READY",s:connection,d:{user:{id:self},session_id:`session-${connection}`,resume_gateway_url:resumeUrl}});
       } else if (packet.op === 6 && packet.d?.token === token && packet.d?.session_id) {
         handshakeComplete=true;
-        fs.appendFileSync(eventFile,JSON.stringify({connection,op:"resume",session:packet.d.session_id})+"\n");
+        fs.appendFileSync(eventFile,JSON.stringify({connection,op:"resume",session:packet.d.session_id,sequence:packet.d.seq})+"\n");
         text(socket,{op:0,t:"RESUMED",s:connection,d:{}});
       }
       if (handshakeComplete && mode === "reconnect" && connection === 1) setTimeout(()=>close(socket,1001),50);
@@ -716,8 +716,8 @@ write_config "$home"
 make_gateway_server "$home/gateway" storm
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
-  FM_DISCORD_TEST_MAX_BACKOFF_MS=160 FM_DISCORD_TEST_RANDOM=0.5 \
-  "$CONTROL" run > "$home/first.log" 2>&1 &
+  FM_DISCORD_TEST_MAX_BACKOFF_MS=160 FM_DISCORD_TEST_COOLDOWN_MS=160 \
+  FM_DISCORD_TEST_RANDOM=0.5 "$CONTROL" run > "$home/first.log" 2>&1 &
 pressure_worker=$!
 WORKER_PIDS+=("$pressure_worker")
 wait_for_minimum_value "$home/gateway/connections" 3 || fail "restart-pressure fixture did not build reconnect pressure"
@@ -732,8 +732,8 @@ perl -pi -e "s/$prior_owner/$changed_owner/" "$home/config/discord-bot.env"
 restarted_at=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
-  FM_DISCORD_TEST_MAX_BACKOFF_MS=160 FM_DISCORD_TEST_RANDOM=0.5 \
-  "$CONTROL" run > "$home/second.log" 2>&1 &
+  FM_DISCORD_TEST_MAX_BACKOFF_MS=160 FM_DISCORD_TEST_COOLDOWN_MS=160 \
+  FM_DISCORD_TEST_RANDOM=0.5 "$CONTROL" run > "$home/second.log" 2>&1 &
 pressure_worker=$!
 WORKER_PIDS+=("$pressure_worker")
 wait_for_minimum_value "$home/gateway/connections" "$next_connection" || fail "restarted Gateway did not reconnect"
@@ -817,6 +817,91 @@ for mode in server-reconnect invalid-session-resumable invalid-session-fresh; do
 done
 pass "server reconnect and invalid-session directions choose resume or fresh identify correctly"
 
+home=$(new_home gateway-resume-restart)
+write_config "$home"
+make_gateway_server "$home/gateway" steady
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/first.log" 2>&1 &
+resume_worker=$!
+WORKER_PIDS+=("$resume_worker")
+wait_for_file "$home/gateway/events.jsonl" || fail "resume restart fixture did not identify"
+i=0
+while [ "$i" -lt 100 ]; do
+  persisted_session=$(jq -r '.resume_session.session_id // empty' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || true)
+  [ -n "$persisted_session" ] && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ -n "$persisted_session" ] || fail "READY session was not durably recorded"
+resume_child=$(pgrep -P "$resume_worker" | head -n 1)
+[ -n "$resume_child" ] || fail "resume restart fixture had no runtime process"
+kill -KILL "$resume_child"
+wait "$resume_worker" 2>/dev/null || true
+WORKER_PIDS=()
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  "$CONTROL" run > "$home/second.log" 2>&1 &
+resume_worker=$!
+WORKER_PIDS+=("$resume_worker")
+wait_for_value "$home/gateway/connections" 2 || fail "replacement process did not reconnect"
+second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
+second_session=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .session)
+second_sequence=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .sequence)
+[ "$second_op" = resume ] || fail "replacement process consumed a fresh Identify instead of Resume"
+[ "$second_session" = "$persisted_session" ] || fail "replacement process resumed the wrong session"
+[ "$second_sequence" = 1 ] || fail "replacement process lost the durable Gateway sequence"
+kill -TERM "$resume_worker"
+wait "$resume_worker" || true
+WORKER_PIDS=()
+reconnect_record=$(cat "$home/state/.discord-bot-service/reconnect.json")
+assert_not_contains "$reconnect_record" "$TOKEN" "durable resume state exposed the bot token"
+assert_not_contains "$reconnect_record" "$OWNER" "durable resume state exposed a deployment id"
+pass "valid Gateway Resume state survives abrupt process replacement"
+
+home=$(new_home gateway-invalid-session-restart)
+write_config "$home"
+make_gateway_server "$home/gateway" invalid-session-fresh
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_INVALID_SESSION_MS=400 "$CONTROL" run > "$home/first.log" 2>&1 &
+invalid_worker=$!
+WORKER_PIDS+=("$invalid_worker")
+wait_for_value "$home/gateway/connections" 1 || fail "invalid-session restart fixture did not connect"
+i=0
+invalid_not_before=0
+while [ "$i" -lt 100 ]; do
+  invalid_not_before=$(jq -r '.server_not_before // 0' \
+    "$home/state/.discord-bot-service/reconnect.json" 2>/dev/null || printf '0')
+  [ "$invalid_not_before" -gt 0 ] 2>/dev/null && break
+  sleep 0.01
+  i=$((i + 1))
+done
+[ "$invalid_not_before" -gt 0 ] 2>/dev/null || fail "invalid-session wait was not durably recorded"
+[ "$(jq -r '.resume_session' "$home/state/.discord-bot-service/reconnect.json")" = null ] \
+  || fail "non-resumable invalid session remained durable"
+invalid_child=$(pgrep -P "$invalid_worker" | head -n 1)
+[ -n "$invalid_child" ] || fail "invalid-session restart fixture had no runtime process"
+kill -KILL "$invalid_child"
+wait "$invalid_worker" 2>/dev/null || true
+WORKER_PIDS=()
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=10 \
+  FM_DISCORD_TEST_INVALID_SESSION_MS=400 "$CONTROL" run > "$home/second.log" 2>&1 &
+invalid_worker=$!
+WORKER_PIDS+=("$invalid_worker")
+wait_for_value "$home/gateway/connections" 2 || fail "replacement process did not reconnect after invalid session"
+invalid_reconnect_at=$(sed -n '2p' "$home/gateway/connection-events.jsonl" | jq -r .at)
+[ "$invalid_reconnect_at" -ge "$invalid_not_before" ] \
+  || fail "replacement process bypassed the invalid-session wait"
+second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
+[ "$second_op" = identify ] || fail "replacement process retained a non-resumable session"
+kill -TERM "$invalid_worker"
+wait "$invalid_worker" || true
+WORKER_PIDS=()
+pass "non-resumable invalid-session waits survive abrupt process replacement"
+
 home=$(new_home gateway-session-limit)
 write_config "$home"
 make_gateway_server "$home/gateway" session-limit-zero
@@ -853,9 +938,11 @@ WORKER_PIDS+=("$limit_worker")
 sleep 0.1
 [ "$(cat "$home/gateway/connections")" -eq 1 ] \
   || fail "process restart discarded the durable Identify reservation"
-wait_for_value "$home/gateway/connections" 2 || fail "durable Identify reservation did not reset"
+wait_for_value "$home/gateway/connections" 2 || fail "durable session reservation did not permit Resume"
 second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
-[ "$second_op" = identify ] || fail "fresh process did not use Identify after the session reset"
+[ "$second_op" = resume ] || fail "fresh process consumed Identify despite a durable resumable session"
+[ "$(jq -r '.session_start_limit.remaining' "$home/state/.discord-bot-service/reconnect.json")" -eq 0 ] \
+  || fail "Resume consumed or reset the durable Identify reservation"
 kill -TERM "$limit_worker"
 wait "$limit_worker" || true
 WORKER_PIDS=()
