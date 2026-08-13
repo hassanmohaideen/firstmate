@@ -1350,25 +1350,33 @@ class GatewayRunner {
           ? Math.max(0, suppression.server_monotonic_not_before - monotonicMilliseconds())
           : rebootWaitRemaining(suppression.server_wait_ms);
         const currentRemaining = this.serverDelayRemaining();
-        if (fallbackRemaining > currentRemaining) {
-          this.serverWaitMs = fallbackRemaining;
-          this.serverNotBefore = suppression.server_not_before;
-          this.serverWallObservedAt = suppression.server_wall_observed_at
-            ?? Math.max(0, suppression.server_not_before - suppression.server_wait_ms);
+        if (fallbackRemaining === 0 && currentRemaining === 0) {
+          try {
+            await removeMarker(RECONNECT_SUPPRESSION_FILE);
+          } catch {
+            this.activateFailClosed();
+          }
         } else {
-          this.serverWaitMs = currentRemaining;
-        }
-        this.serverRebootFallbackUsed = this.serverRebootFallbackUsed
-          || fallbackPreviouslyUsed || !fallbackSameBoot;
-        this.serverWallObservedAt = Math.max(this.serverWallObservedAt, now);
-        this.serverBootId = this.bootId;
-        this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
-        this.fallbackSuppressionActive = true;
-        stateNeedsRebase = true;
-        try {
-          await this.persistFallbackSuppression();
-        } catch {
-          this.activateFailClosed();
+          if (fallbackRemaining > currentRemaining) {
+            this.serverWaitMs = fallbackRemaining;
+            this.serverNotBefore = suppression.server_not_before;
+            this.serverWallObservedAt = suppression.server_wall_observed_at
+              ?? Math.max(0, suppression.server_not_before - suppression.server_wait_ms);
+          } else {
+            this.serverWaitMs = currentRemaining;
+          }
+          this.serverRebootFallbackUsed = this.serverRebootFallbackUsed
+            || fallbackPreviouslyUsed || !fallbackSameBoot;
+          this.serverWallObservedAt = Math.max(this.serverWallObservedAt, now);
+          this.serverBootId = this.bootId;
+          this.serverMonotonicNotBefore = monotonicMilliseconds() + this.serverWaitMs;
+          this.fallbackSuppressionActive = true;
+          stateNeedsRebase = true;
+          try {
+            await this.persistFallbackSuppression();
+          } catch {
+            this.activateFailClosed();
+          }
         }
       }
     }

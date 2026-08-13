@@ -1424,6 +1424,44 @@ wait "$rate_worker" || true
 WORKER_PIDS=()
 pass "failed retry persistence survives crashes and retires after expiry"
 
+home=$(new_home gateway-expired-fallback-restart)
+write_config "$home"
+make_gateway_server "$home/gateway" reconnect
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+expired_fallback_now=$("$NODE_BIN" -e 'process.stdout.write(String(Date.now()))')
+expired_fallback_monotonic=$("$NODE_BIN" -e \
+  'process.stdout.write(String(Math.max(0, Math.floor(require("node:os").uptime()*1000)-1000)))')
+jq -cn --arg fingerprint "$auth_fingerprint" --argjson deadline "$((expired_fallback_now - 1000))" \
+  --argjson monotonic "$expired_fallback_monotonic" '
+  {schema:"firstmate.discord-reconnect-suppression.v1",authentication_fingerprint:$fingerprint,
+   server_not_before:$deadline,server_wait_ms:500,
+   server_wall_observed_at:($deadline-500),server_boot_id:"expired-fallback-boot",
+   server_monotonic_not_before:$monotonic,server_reboot_fallback_used:false,
+   operator_intervention_required:false,operator_code:null,recorded_at:1}
+' > "$home/state/.discord-bot-service/reconnect-suppression.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect-suppression.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_BOOT_ID=expired-fallback-boot FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  FM_DISCORD_TEST_BACKOFF_MS=10 "$CONTROL" run > "$home/bot.log" 2>&1 &
+rate_worker=$!
+WORKER_PIDS+=("$rate_worker")
+wait_for_value "$home/gateway/lookups" 1 \
+  || fail "stopped-process fallback expiry did not resume Gateway lookup"
+assert_absent "$home/state/.discord-bot-service/reconnect-suppression.json" \
+  "expired temporary fallback became permanent suppression"
+assert_absent "$home/state/.discord-bot-service/terminal.json" \
+  "expired temporary fallback created terminal suppression"
+assert_absent "$home/state/discord-bot.error" \
+  "expired temporary fallback published a terminal diagnostic"
+terminal_out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  "$NODE_BIN" "$BOT" terminal-check 2>&1) || fail "expired temporary fallback reported terminal health"
+[ -z "$terminal_out" ] || fail "expired temporary fallback emitted a terminal diagnostic"
+kill -TERM "$rate_worker"
+wait "$rate_worker" || true
+WORKER_PIDS=()
+pass "expired stopped-process retry fallback resumes without terminal suppression"
+
 home=$(new_home gateway-sequence-persistence-stop)
 write_config "$home"
 make_gateway_server "$home/gateway" sequence-persistence-failure
