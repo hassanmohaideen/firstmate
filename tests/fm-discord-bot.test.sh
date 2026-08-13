@@ -298,6 +298,11 @@ server.on("upgrade",(req,socket)=>{
             author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> replay intake`}});
           fs.writeFileSync(countFile.replace(/connections$/, "message-sent"),"sent\n");
         }
+        if (mode === "stable-diagnostic-race") setTimeout(()=>{
+          text(socket,{op:0,t:"MESSAGE_CREATE",s:2,d:{id:message,guild_id:guild,channel_id:channel,type:0,
+            author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> failed intake`}});
+          fs.writeFileSync(countFile.replace(/connections$/, "message-sent"),"sent\n");
+        },250);
         if (mode === "stale-session-race" && connection === 1) {
           text(socket,{op:0,t:"MESSAGE_CREATE",s:99,d:{id:message,guild_id:guild,channel_id:channel,type:0,
             author:{id:owner,username:"fixture-owner",bot:false},mentions:[{id:self,bot:true}],content:`<@${self}> stale intake`}});
@@ -967,6 +972,30 @@ kill -TERM "$stale_worker"
 wait "$stale_worker" || true
 WORKER_PIDS=()
 pass "stale READY persistence cannot publish health or reset pressure"
+
+home=$(new_home gateway-stable-diagnostic-race)
+write_config "$home"
+mkdir "$home/state/.wake-queue"
+make_gateway_server "$home/gateway" stable-diagnostic-race
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" FM_DISCORD_TEST_BACKOFF_MS=1000 \
+  FM_DISCORD_TEST_DURABLE_WRITE_DELAY_MS=150 FM_DISCORD_TEST_STABLE_MS=50 \
+  "$CONTROL" run > "$home/bot.log" 2>&1 &
+stable_worker=$!
+WORKER_PIDS+=("$stable_worker")
+wait_for_file "$home/gateway/message-sent" || fail "stable diagnostic race fixture did not send its message"
+wait_for_file "$home/state/discord-bot.error" || fail "newer intake failure did not publish its diagnostic"
+sleep 0.25
+[ "$(jq -r .code "$home/state/discord-bot.error")" = inbox-publication-failed ] \
+  || fail "an older stable transition cleared the newer failure diagnostic"
+[ "$(jq -r '.failure_pressure' "$home/state/.discord-bot-service/reconnect.json")" -eq 0 ] \
+  || fail "stable diagnostic race did not exercise the stable transition"
+kill -TERM "$stable_worker"
+wait "$stable_worker" || true
+WORKER_PIDS=()
+assert_not_contains "$(cat "$home/bot.log")" "$TOKEN" "stable diagnostic race logs exposed the bot token"
+assert_not_contains "$(cat "$home/bot.log")" "$OWNER" "stable diagnostic race logs exposed a deployment id"
+pass "newer failure diagnostics survive pending stable transitions"
 
 home=$(new_home gateway-stale-session-checkpoint)
 write_config "$home"

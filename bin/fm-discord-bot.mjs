@@ -74,6 +74,7 @@ const SNOWFLAKE_RE = /^[0-9]{15,22}$/;
 const SAFE_CODE_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const INCIDENT_ID_RE = /^[0-9a-f]{64}$/;
 let diagnosticTransitions = Promise.resolve();
+let diagnosticGeneration = 0;
 
 class DisabledError extends Error {}
 class ConfigError extends Error {}
@@ -360,6 +361,7 @@ async function publishDiagnostic(record) {
 }
 
 function reportDiagnostic(code) {
+  diagnosticGeneration += 1;
   return enqueueDiagnostic(async () => {
     if (!SAFE_CODE_RE.test(code)) code = "discord-service-error";
     try {
@@ -400,8 +402,9 @@ function reconcileDiagnostic() {
   });
 }
 
-function clearDiagnostic() {
+function clearDiagnostic(expectedGeneration = null) {
   return enqueueDiagnostic(async () => {
+    if (expectedGeneration !== null && expectedGeneration !== diagnosticGeneration) return;
     try {
       await removeMarker(ERROR_FILE);
       await removeMarker(ERROR_NOTIFIED_FILE);
@@ -1182,8 +1185,9 @@ class GatewayRunner {
         if (stable || !ready || settled || this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
         stable = true;
         this.failurePressure = 0;
+        const stableDiagnosticGeneration = diagnosticGeneration;
         void this.persistDurableState()
-          .then(() => clearDiagnostic())
+          .then(() => clearDiagnostic(stableDiagnosticGeneration))
           .catch(() => reportDiagnostic("reconnect-state-unavailable"));
       };
       const markReady = () => {
