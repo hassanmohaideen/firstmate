@@ -391,6 +391,45 @@ list_portable_serial() {
 portable_serial_weight_hints() {
   cat <<'EOF'
 tests/fm-afk-inject-e2e.test.sh 34019
+tests/fm-classify-decision-key.test.sh 20000
+tests/fm-cmux-claude-composer-live-e2e.test.sh 20000
+tests/fm-composer-matrix-live-e2e.test.sh 20000
+tests/fm-control-relaunch.test.sh 20000
+tests/fm-control.test.sh 20000
+tests/fm-harness-liveness-drift-live-e2e.test.sh 20000
+tests/fm-herdr-version-floor-live-e2e.test.sh 20000
+tests/fm-inactive-reconcile.test.sh 20000
+tests/fm-muse-harness.test.sh 20000
+tests/fm-muse-signals-live-e2e.test.sh 20000
+tests/fm-on.test.sh 20000
+tests/fm-procevent-when.test.sh 20000
+tests/fm-project-origin.test.sh 20000
+tests/fm-remote-backlog-handoff.test.sh 20000
+tests/fm-remote-doctor.test.sh 20000
+tests/fm-remote-entrypoint.test.sh 20000
+tests/fm-remote-job-orphan-reap.test.sh 20000
+tests/fm-remote-job.test.sh 20000
+tests/fm-remote-reply.test.sh 20000
+tests/fm-remote-secondmate-lifecycle-e2e.test.sh 20000
+tests/fm-remote-secondmate-parent-binding.test.sh 20000
+tests/fm-remote-secondmate-trace-context.test.sh 20000
+tests/fm-rtk-exec-trace.test.sh 20000
+tests/fm-rtk-fs-events.test.sh 20000
+tests/fm-rtk.test.sh 20000
+tests/fm-send-resolve-key.test.sh 20000
+tests/fm-session-lock-ancestry.test.sh 20000
+tests/fm-sessionstart-hook-live-e2e.test.sh 20000
+tests/fm-spawn-pool-base-freshen.test.sh 20000
+tests/fm-startup-network.test.sh 20000
+tests/fm-stow-cascade.test.sh 20000
+tests/fm-task-delivery.test.sh 20000
+tests/fm-test-fixture-cleanup.test.sh 20000
+tests/fm-tmux-agent-liveness.test.sh 20000
+tests/fm-trace-context-lib.test.sh 20000
+tests/fm-trace-context-spawn.test.sh 20000
+tests/fm-wake-drain-open-decisions-cursor.test.sh 20000
+tests/fm-wake-drain-open-decisions.test.sh 20000
+tests/fm-watch-arm.test.sh 20000
 tests/fm-afk-pi-herdr-return-e2e.test.sh 42
 tests/fm-afk-return.test.sh 1105
 tests/fm-ask-user-authority.test.sh 68
@@ -467,6 +506,16 @@ EOF
 real_herdr_duration_hints() {
   cat <<'EOF'
 tests/fm-afk-inject-herdr-e2e.test.sh 65000
+tests/fm-afk-launch.test.sh 20000
+tests/fm-backend-autodetect-smoke.test.sh 20000
+tests/fm-backend-herdr-eventwait-smoke.test.sh 20000
+tests/fm-backend-herdr-launcher-workspace-e2e.test.sh 20000
+tests/fm-backend-herdr-prune-safety-e2e.test.sh 20000
+tests/fm-backend-herdr-respawn-idem-e2e.test.sh 20000
+tests/fm-backend-herdr-smoke.test.sh 20000
+tests/fm-backend-herdr-workspace-per-home-e2e.test.sh 20000
+tests/fm-control-herdr-smoke.test.sh 20000
+tests/fm-herdr-session-cleanup-e2e.test.sh 20000
 tests/fm-backend-herdr-focus-flash-e2e.test.sh 3760
 tests/fm-backend-herdr-presentation-e2e.test.sh 238900
 EOF
@@ -759,6 +808,17 @@ run_coverage_guard() {
     log "coverage guard: union of portable shards + portable serial + Herdr must equal tests/*.test.sh"
     [ -z "$missing" ] || { log "missing from union:"; printf '%s\n' "$missing" >&2; }
     [ -z "$extra" ] || { log "extra beyond inventory:"; printf '%s\n' "$extra" >&2; }
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  : >"$tmp/missing_budgets"
+  while IFS= read -r script; do
+    script_duration_baseline_ms "$script" >/dev/null || printf '%s\n' "$script" >>"$tmp/missing_budgets"
+  done <"$tmp/union"
+  if [ -s "$tmp/missing_budgets" ]; then
+    log "coverage guard: required lane scripts lack duration baselines:"
+    cat "$tmp/missing_budgets" >&2
     rm -rf "$tmp"
     return 1
   fi
@@ -1782,27 +1842,42 @@ clear_ambient_fleet_environment() {
 
 run_one_serial() {
   local script=$1
-  local base family expected out begin_iso begin_ms end_ms end_iso duration rc
+  local base family expected out begin_iso begin_ms end_ms end_iso duration rc worker_pid work
   base=$(basename "$script")
   family=$(family_for_basename "$base")
   expected=$(expected_gate_skip_for_family "$family")
-  out="$RUN_TMP/out.$TOTAL"
+  work="$RUN_TMP/serial.$TOTAL"
+  out="$work/output"
+  mkdir -p "$work"
   begin_iso=$(now_iso)
   begin_ms=$(now_ms)
 
   printf 'FM_TEST_BEGIN %s %s family=%s expected_gate_skip=%s\n' \
     "$begin_iso" "$script" "$family" "$expected"
 
-  set +e
-  # Stream live output while retaining a copy for gate-skip detection. Clear
-  # ambient fleet routing exactly as parallel workers do, so a local complete
-  # run cannot point a test at the operator's live home.
+  set -m
   (
+    set +e
+    set +m
+    while [ ! -f "$work/start" ]; do
+      sleep 0.01
+    done
     clear_ambient_fleet_environment
-    bash "$script"
-  ) 2>&1 | tee "$out"
-  rc=${PIPESTATUS[0]}
+    bash "$script" 2>&1 | tee "$out"
+    printf '%s\n' "${PIPESTATUS[0]}" >"$work/exit"
+  ) &
+  worker_pid=$!
+  set +m
+  WORKER_PIDS[0]=$worker_pid
+  : >"$work/start"
+  set +e
+  wait "$worker_pid"
+  rc=$?
   set -e
+  unset 'WORKER_PIDS[0]'
+  if [ -f "$work/exit" ]; then
+    rc=$(cat "$work/exit")
+  fi
   : "${rc:=1}"
 
   end_ms=$(now_ms)

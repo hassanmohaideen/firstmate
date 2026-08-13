@@ -362,7 +362,7 @@ test_exclude_family() {
 }
 
 test_portable_shard_union_and_coverage_guard() {
-  local s1 s2 proven serial herdr all_count union_count overlap out first
+  local s1 s2 proven serial herdr all_count union_count overlap out first tmp rc
   s1=$("$RUNNER" --list --lane portable-parallel-1)
   s2=$("$RUNNER" --list --lane portable-parallel-2)
   proven=$("$RUNNER" --list --proven-isolated)
@@ -387,6 +387,25 @@ test_portable_shard_union_and_coverage_guard() {
     || fail "herdr family must own the real-Herdr focus-flash regression"
   out=$("$RUNNER" --check-coverage)
   assert_contains "$out" "FM_TEST_COVERAGE ok" "coverage guard success marker"
+
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-coverage.XXXXXX")
+  mkdir -p "$tmp/repo/bin" "$tmp/repo/tests"
+  cp "$RUNNER" "$tmp/repo/bin/fm-test-run.sh"
+  cp "$ROOT"/tests/*.test.sh "$tmp/repo/tests/"
+  cat >"$tmp/repo/tests/fm-new-required.test.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$tmp/repo/bin/fm-test-run.sh" "$tmp/repo/tests/fm-new-required.test.sh"
+  set +e
+  "$tmp/repo/bin/fm-test-run.sh" --check-coverage >"$tmp/missing.out" 2>"$tmp/missing.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "coverage guard accepted a required script without a duration baseline"
+  grep -q '^tests/fm-new-required.test.sh$' "$tmp/missing.err" \
+    || fail "coverage guard did not identify the required script missing its duration baseline"
+  rm -rf "$tmp"
+
   all_count=$("$RUNNER" --list --all | wc -l | tr -d ' ')
   union_count=$(printf '%s\n' "$s1" "$s2" "$serial" "$herdr" | LC_ALL=C sort -u | wc -l | tr -d ' ')
   [ "$union_count" = "$all_count" ] \
@@ -804,6 +823,55 @@ SH
   pass "parallel signal cleanup terminates and waits for every active process tree"
 }
 
+test_serial_signal_cleanup() {
+  local tmp repo evidence runner pid child rc n watchdog
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-serial-signal.XXXXXX")
+  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
+  cat >"$repo/tests/fm-daemon.test.sh" <<'SH'
+#!/usr/bin/env bash
+trap '' TERM INT HUP
+sleep 300 &
+printf '%s\n' "$!" >"$SIGNAL_EVIDENCE/child.pid"
+touch "$SIGNAL_EVIDENCE/ready"
+wait
+SH
+  chmod +x "$repo/tests/fm-daemon.test.sh"
+  SIGNAL_EVIDENCE="$evidence" "$runner" tests/fm-daemon.test.sh >"$tmp/out" 2>"$tmp/err" &
+  pid=$!
+  n=0
+  while [ ! -e "$evidence/ready" ] && [ "$n" -lt 300 ]; do
+    sleep 0.01
+    n=$((n + 1))
+  done
+  [ -e "$evidence/ready" ] \
+    || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"; fail "serial cleanup fixture never started"; }
+  child=$(cat "$evidence/child.pid")
+  kill -TERM "$pid"
+  (
+    sleep 5
+    if kill -0 "$pid" 2>/dev/null; then
+      touch "$evidence/cleanup-timed-out"
+      kill -KILL "$child" 2>/dev/null || true
+    fi
+  ) &
+  watchdog=$!
+  set +e
+  wait "$pid"
+  rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  set -e
+  [ ! -e "$evidence/cleanup-timed-out" ] || fail "interrupted serial runner hung on a TERM-resistant descendant"
+  [ "$rc" -ne 0 ] || fail "interrupted serial runner exited successfully"
+  if kill -0 "$child" 2>/dev/null; then
+    kill -KILL "$child" 2>/dev/null || true
+    fail "interrupted serial runner left a TERM-resistant descendant alive"
+  fi
+  rm -rf "$tmp"
+  pass "serial signal cleanup terminates and waits for its complete process group"
+}
+
 test_environment_isolation_in_serial_and_parallel_children() {
   local tmp repo evidence runner fakebin name
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-env.XXXXXX")
@@ -1002,6 +1070,7 @@ test_jobs_parallel_scheduler_and_failure_propagation
 test_default_changed_and_portable_selection
 test_mixed_complete_scheduler_exact_once_and_failures
 test_parallel_signal_cleanup
+test_serial_signal_cleanup
 test_environment_isolation_in_serial_and_parallel_children
 test_duration_budget_warns_and_ci_enforces
 test_aggregate_json
