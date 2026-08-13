@@ -455,7 +455,7 @@ tests/fm-composer-matrix-live-e2e.test.sh 38
 tests/fm-control-relaunch.test.sh 29506
 tests/fm-control.test.sh 34081
 tests/fm-daemon.test.sh 14894
-tests/fm-discord-bot.test.sh 7307
+tests/fm-discord-bot.test.sh 46859
 tests/fm-documentation-audiences.test.sh 693
 tests/fm-fleet-snapshot-view.test.sh 15503
 tests/fm-fleet-sync.test.sh 29043
