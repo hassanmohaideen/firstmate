@@ -63,6 +63,7 @@ ok - server retry waits survive rapid reboots without replenishment
 ok - session-start reset waits re-query across repeated reboots
 ok - READY retains failure pressure until sustained stable Gateway operation
 ok - terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic
+ok - invalid reconnect state stops restarts and reports one safe diagnostic
 ok - terminal Gateway close performs no reconnect
 ok - diagnostic persistence failures preserve terminal reconnect suppression
 ok - terminal fallback dominates invalid-session delays across restarts

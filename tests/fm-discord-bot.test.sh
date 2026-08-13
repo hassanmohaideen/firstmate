@@ -1825,6 +1825,47 @@ assert_absent "$home/state/.discord-bot-service/terminal.json" "explicit operato
 assert_absent "$home/state/discord-bot.error" "explicit operator retry left the old diagnostic active"
 pass "terminal authentication failure stops reconnects across service-manager restarts with one safe diagnostic"
 
+home=$(new_home gateway-invalid-reconnect-state)
+write_config "$home"
+make_gateway_server "$home/gateway" reconnect
+mkdir "$home/state/.discord-bot-service"
+chmod 700 "$home/state/.discord-bot-service"
+printf '{"invalid":"%s"}\n' "$TOKEN" > "$home/state/.discord-bot-service/reconnect.json"
+chmod 600 "$home/state/.discord-bot-service/reconnect.json"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  "$CONTROL" run > "$home/bot.log" 2>&1 \
+  || fail "invalid reconnect state exited into service-manager restart"
+[ "$(cat "$home/gateway/lookups")" -eq 0 ] || fail "invalid reconnect state reached authenticated Gateway lookup"
+[ "$(jq -r .code "$home/state/.discord-bot-service/terminal.json")" = reconnect-state-invalid ] \
+  || fail "invalid reconnect state lacked canonical terminal suppression"
+[ "$(jq -r .code "$home/state/discord-bot.error")" = reconnect-state-invalid ] \
+  || fail "invalid reconnect state lacked its safe diagnostic"
+FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
+  FM_DISCORD_TEST_API_BASE="$GATEWAY_API_BASE" \
+  "$CONTROL" run > "$home/restarted.log" 2>&1 \
+  || fail "suppressed invalid reconnect state exited into service-manager restart"
+[ "$(cat "$home/gateway/lookups")" -eq 0 ] || fail "restart bypassed invalid reconnect state suppression"
+mkdir "$home/alternate-state"
+chmod 700 "$home/alternate-state"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/alternate-state" FM_ROOT_OVERRIDE="$ROOT" \
+  "$CONTROL" check 2>&1); rc=$?
+[ "$rc" -ne 0 ] || fail "invalid reconnect state health reported healthy"
+assert_contains "$out" "diagnostic: reconnect-state-invalid" \
+  "alternate-state health lost the invalid reconnect state diagnostic"
+assert_not_contains "$(cat "$home/bot.log")$(cat "$home/restarted.log")$out" "$TOKEN" \
+  "invalid reconnect state diagnostics exposed credential material"
+out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$CONTROL" retry 2>&1) \
+  || fail "explicit retry did not safely quarantine invalid reconnect state"
+assert_contains "$out" "quarantined" "explicit retry silently discarded invalid reconnect state"
+assert_present "$home/state/.discord-bot-service/reconnect.invalid.json" \
+  "explicit retry did not preserve invalid reconnect state for inspection"
+assert_absent "$home/state/.discord-bot-service/reconnect.json" \
+  "explicit retry left invalid reconnect state active"
+assert_absent "$home/state/.discord-bot-service/terminal.json" \
+  "explicit retry left invalid reconnect state suppression active"
+pass "invalid reconnect state stops restarts and reports one safe diagnostic"
+
 # A terminal Gateway close also stops after one connection, even when READY never occurred.
 home=$(new_home gateway-terminal-close)
 write_config "$home"

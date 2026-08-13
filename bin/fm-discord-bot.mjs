@@ -1032,6 +1032,72 @@ function terminalDiagnosticForClose(code) {
   ]).get(code) || "";
 }
 
+function validReconnectRecord(record) {
+  if (!record) return true;
+  const legacy = record.schema === "firstmate.discord-reconnect.v1";
+  const limit = record.session_start_limit;
+  const resume = record.resume_session;
+  if ((!legacy && record.schema !== "firstmate.discord-reconnect.v2")
+      || (legacy && !INCIDENT_ID_RE.test(record.config_fingerprint || ""))
+      || (!legacy && !INCIDENT_ID_RE.test(record.authentication_fingerprint || ""))
+      || !Number.isInteger(record.failure_pressure) || record.failure_pressure < 0
+      || (record.last_connection_at !== null
+        && (!Number.isSafeInteger(record.last_connection_at) || record.last_connection_at < 0))
+      || (record.server_not_before !== undefined && record.server_not_before !== null
+        && (!Number.isSafeInteger(record.server_not_before) || record.server_not_before < 0))
+      || (record.server_wait_ms !== undefined && record.server_wait_ms !== null
+        && (!Number.isSafeInteger(record.server_wait_ms) || record.server_wait_ms < 0))
+      || (record.server_wall_observed_at !== undefined && record.server_wall_observed_at !== null
+        && (!Number.isSafeInteger(record.server_wall_observed_at) || record.server_wall_observed_at < 0))
+      || ((record.server_not_before ?? null) === null !== ((record.server_wait_ms ?? null) === null))
+      || (record.server_boot_id !== undefined && record.server_boot_id !== null
+        && !BOOT_ID_RE.test(record.server_boot_id))
+      || (record.server_monotonic_not_before !== undefined && record.server_monotonic_not_before !== null
+        && (!Number.isSafeInteger(record.server_monotonic_not_before)
+          || record.server_monotonic_not_before < 0))
+      || (record.server_reboot_fallback_used !== undefined
+        && typeof record.server_reboot_fallback_used !== "boolean")
+      || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
+        || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
+        || !Number.isInteger(limit.resetAt) || limit.resetAt < 0
+        || (limit.resetWaitMs !== undefined
+          && (!Number.isSafeInteger(limit.resetWaitMs) || limit.resetWaitMs < 0))
+        || (limit.resetBootId !== undefined && limit.resetBootId !== null
+          && !BOOT_ID_RE.test(limit.resetBootId))
+        || (limit.resetMonotonicAt !== undefined && limit.resetMonotonicAt !== null
+          && (!Number.isSafeInteger(limit.resetMonotonicAt) || limit.resetMonotonicAt < 0))
+        || (limit.resetRebootFallbackUsed !== undefined
+          && typeof limit.resetRebootFallbackUsed !== "boolean")))
+      || (resume !== undefined && resume !== null
+        && (!resume || typeof resume.session_id !== "string" || !resume.session_id
+          || typeof resume.resume_url !== "string" || !resume.resume_url
+          || (resume.sequence !== null && !Number.isSafeInteger(resume.sequence))
+          || (resume.self_user_id !== undefined && !SNOWFLAKE_RE.test(resume.self_user_id))))) {
+    return false;
+  }
+  if (resume) {
+    try {
+      validateProductionEndpoint(resume.resume_url, "gateway");
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function readReconnectRecord() {
+  let record;
+  try {
+    await assertPrivateFile(RECONNECT_FILE);
+    record = JSON.parse(await readFile(RECONNECT_FILE, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new ConfigError("reconnect state is invalid");
+  }
+  if (!validReconnectRecord(record)) throw new ConfigError("reconnect state is invalid");
+  return record;
+}
+
 class GatewayRunner {
   constructor(config) {
     this.config = config;
@@ -1244,67 +1310,12 @@ class GatewayRunner {
     await ensureOwnershipDirectory();
     this.bootId = await systemBootIdentity();
     let stateNeedsRebase = false;
-    let record;
-    try {
-      await assertPrivateFile(RECONNECT_FILE);
-      record = JSON.parse(await readFile(RECONNECT_FILE, "utf8"));
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw new ConfigError("reconnect state is invalid");
-    }
+    const record = await readReconnectRecord();
     const legacy = record?.schema === "firstmate.discord-reconnect.v1";
     const authenticationBound = record?.schema === "firstmate.discord-reconnect.v2"
       && record.authentication_fingerprint === authenticationFingerprint(this.config);
     const limit = record?.session_start_limit;
     const resume = record?.resume_session;
-    if (record && ((!legacy && record.schema !== "firstmate.discord-reconnect.v2")
-        || (legacy && !INCIDENT_ID_RE.test(record.config_fingerprint || ""))
-        || (!legacy && !INCIDENT_ID_RE.test(record.authentication_fingerprint || ""))
-        || !Number.isInteger(record.failure_pressure) || record.failure_pressure < 0
-        || (record.last_connection_at !== null
-          && (!Number.isSafeInteger(record.last_connection_at) || record.last_connection_at < 0))
-        || (record.server_not_before !== undefined && record.server_not_before !== null
-          && (!Number.isSafeInteger(record.server_not_before) || record.server_not_before < 0))
-        || (record.server_wait_ms !== undefined && record.server_wait_ms !== null
-          && (!Number.isSafeInteger(record.server_wait_ms) || record.server_wait_ms < 0))
-        || (record.server_wall_observed_at !== undefined
-          && record.server_wall_observed_at !== null
-          && (!Number.isSafeInteger(record.server_wall_observed_at)
-            || record.server_wall_observed_at < 0))
-        || ((record.server_not_before ?? null) === null
-          !== ((record.server_wait_ms ?? null) === null))
-        || (record.server_boot_id !== undefined && record.server_boot_id !== null
-          && !BOOT_ID_RE.test(record.server_boot_id))
-        || (record.server_monotonic_not_before !== undefined
-          && record.server_monotonic_not_before !== null
-          && (!Number.isSafeInteger(record.server_monotonic_not_before)
-            || record.server_monotonic_not_before < 0))
-        || (record.server_reboot_fallback_used !== undefined
-          && typeof record.server_reboot_fallback_used !== "boolean")
-        || (limit !== null && (!limit || !Number.isInteger(limit.total) || limit.total < 1
-          || !Number.isInteger(limit.remaining) || limit.remaining < 0 || limit.remaining > limit.total
-          || !Number.isInteger(limit.resetAt) || limit.resetAt < 0
-          || (limit.resetWaitMs !== undefined
-            && (!Number.isSafeInteger(limit.resetWaitMs) || limit.resetWaitMs < 0))
-          || (limit.resetBootId !== undefined && limit.resetBootId !== null
-            && !BOOT_ID_RE.test(limit.resetBootId))
-          || (limit.resetMonotonicAt !== undefined && limit.resetMonotonicAt !== null
-            && (!Number.isSafeInteger(limit.resetMonotonicAt) || limit.resetMonotonicAt < 0))
-          || (limit.resetRebootFallbackUsed !== undefined
-            && typeof limit.resetRebootFallbackUsed !== "boolean")))
-        || (resume !== undefined && resume !== null
-          && (!resume || typeof resume.session_id !== "string" || !resume.session_id
-            || typeof resume.resume_url !== "string" || !resume.resume_url
-            || (resume.sequence !== null && !Number.isSafeInteger(resume.sequence))
-            || (resume.self_user_id !== undefined && !SNOWFLAKE_RE.test(resume.self_user_id)))))) {
-      throw new ConfigError("reconnect state is invalid");
-    }
-    if (resume) {
-      try {
-        validateProductionEndpoint(resume.resume_url, "gateway");
-      } catch {
-        throw new ConfigError("reconnect state is invalid");
-      }
-    }
     this.failurePressure = record?.failure_pressure || 0;
     this.lastConnectionAt = record?.last_connection_at ?? null;
     this.serverNotBefore = record?.server_not_before ?? null;
@@ -1800,7 +1811,13 @@ class GatewayRunner {
   }
 
   async run() {
-    await this.loadDurableState();
+    try {
+      await this.loadDurableState();
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      await this.suppressTerminal("reconnect-state-invalid");
+      return;
+    }
     await writeMarker(ENABLED_FILE, "enabled");
     await pruneContexts();
     await reconcileInbox(this.config);
@@ -2046,6 +2063,21 @@ async function main() {
     }
     case "terminal-reset": {
       await loadConfig();
+      try {
+        await readReconnectRecord();
+      } catch (error) {
+        if (!(error instanceof ConfigError)) throw error;
+        await assertPrivateFile(RECONNECT_FILE);
+        const quarantineFile = join(OWNERSHIP_DIR, "reconnect.invalid.json");
+        try {
+          await lstat(quarantineFile);
+          throw new ConfigError("invalid reconnect state must be repaired before suppression can be cleared");
+        } catch (quarantineError) {
+          if (quarantineError?.code !== "ENOENT") throw quarantineError;
+        }
+        await rename(RECONNECT_FILE, quarantineFile);
+        safeLog("invalid reconnect state quarantined for operator inspection");
+      }
       await removeMarker(TERMINAL_FILE);
       await removeMarker(RECONNECT_SUPPRESSION_FILE);
       await clearDiagnostic();
