@@ -352,7 +352,15 @@ test_no_mistakes_dod_wording() {
   # guards the structure that makes it safe.
   assert_grep "firstmate's authority check" "$brief" \
     "no-mistakes DOD lost the apostrophe prose that the structural fix makes parse-safe"
-  pass "fm-brief.sh: no-mistakes DOD keeps its apostrophe prose, now parse-safe"
+  assert_grep "fm-no-mistakes-review.sh' respond" "$brief" \
+    "no-mistakes DOD did not require the guarded review response path"
+  assert_grep "never invoke \`no-mistakes axi respond\` directly" "$brief" \
+    "no-mistakes DOD still allows the unsafe whole-review response directly"
+  assert_grep "fm-no-mistakes-review.sh' audit-ready" "$brief" \
+    "no-mistakes DOD did not require the final review-ledger audit"
+  assert_grep "Only its \`ready:\` result authorizes" "$brief" \
+    "no-mistakes DOD allowed a PR-ready report before the deterministic audit"
+  pass "fm-brief.sh: no-mistakes DOD keeps its prose and enforces guarded review readiness"
 }
 
 test_ship_project_memory_wording() {

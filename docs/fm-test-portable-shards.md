@@ -90,7 +90,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 149-script inventory leaves 112 scripts in the portable serial remainder.
+The current 150-script inventory leaves 113 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 
@@ -99,22 +99,24 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
 The retained per-script measurements come from green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), with `fm-watch-triage.test.sh` refreshed to its 212357 ms local measurement after the credential-domain CI lane exposed its stale 145269 ms scheduling reservation, and are refreshed through the procedure below.
+They also include a focused 11,159 ms measurement for the subsequently added `tests/fm-no-mistakes-review.test.sh`.
+That focused measurement was produced on 2026-08-14 by `bin/fm-test-run.sh tests/fm-no-mistakes-review.test.sh tests/fm-brief.test.sh`; the runner reported the review test at 11,159 ms with exit 0.
 A script added since that run or otherwise lacking a hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of10` | 10 | 234508 ms (~234.5 s) |
-| `portable-serial-2of10` | 10 | 234502 ms (~234.5 s) |
-| `portable-serial-3of10` | 11 | 234510 ms (~234.5 s) |
-| `portable-serial-4of10` | 10 | 234509 ms (~234.5 s) |
-| `portable-serial-5of10` | 11 | 234494 ms (~234.5 s) |
-| `portable-serial-6of10` | 10 | 234493 ms (~234.5 s) |
-| `portable-serial-7of10` | 13 | 234494 ms (~234.5 s) |
-| `portable-serial-8of10` | 13 | 234507 ms (~234.5 s) |
-| `portable-serial-9of10` | 11 | 234493 ms (~234.5 s) |
-| `portable-serial-10of10` | 13 | 234506 ms (~234.5 s) |
-| imbalance | | 17 ms |
+| `portable-serial-1of10` | 8 | 235622 ms (~235.6 s) |
+| `portable-serial-2of10` | 9 | 235623 ms (~235.6 s) |
+| `portable-serial-3of10` | 9 | 235615 ms (~235.6 s) |
+| `portable-serial-4of10` | 10 | 235611 ms (~235.6 s) |
+| `portable-serial-5of10` | 13 | 235617 ms (~235.6 s) |
+| `portable-serial-6of10` | 13 | 235613 ms (~235.6 s) |
+| `portable-serial-7of10` | 14 | 235620 ms (~235.6 s) |
+| `portable-serial-8of10` | 12 | 235625 ms (~235.6 s) |
+| `portable-serial-9of10` | 12 | 235615 ms (~235.6 s) |
+| `portable-serial-10of10` | 13 | 235614 ms (~235.6 s) |
+| imbalance | | 14 ms |
 
 The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210119 ms in that run, is the floor for any serial shard count.
 Ten shards sit just above that floor, so more serial runners would stop paying off without first splitting or speeding that script.
@@ -179,7 +181,7 @@ Its failures were pre-existing failures unrelated to the scheduling and slow-tes
 
 Green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13) completed in 10 minutes 48 seconds of wall-clock at four serial shards.
 Its critical path was portable serial shard 2's test step at 10 minutes 18 seconds, with shards 1 and 4 near 9 minutes 35 seconds, the single Herdr lane at 6 minutes 25 seconds, and the full-set lint job at 6 minutes 54 seconds under two bounded workers.
-The current composition answers each of those: ten balanced serial shards near 228 seconds of hinted work each, two real-Herdr shards, and four lint workers over eight stable shards.
+The current composition answers each of those: ten balanced serial shards near 236 seconds of hinted work each, two real-Herdr shards, and four lint workers over eight stable shards.
 A local full-set lint measurement on an arm64 host fell from 209.7 seconds at two workers to 126.4 seconds at four workers with byte-identical diagnostics.
 The per-lane timing artifacts and aggregate of the next green CI run are the after measurement for this recomposition.
 The aggregate now finds nested timing JSON recursively; the prior top-level-only glob silently dropped the Herdr lane from the aggregate artifact.
