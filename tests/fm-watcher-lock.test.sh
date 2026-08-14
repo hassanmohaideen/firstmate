@@ -687,7 +687,10 @@ test_arm_starts_and_self_heals() {
     grep -F "watcher: started pid=$lock_pid (beacon fresh)" "$armout" >/dev/null \
       || fail "arm ($row) started line did not name the confirmed live watcher (lock '$lock_pid')"
     kill -0 "$lock_pid" 2>/dev/null || fail "arm ($row) confirmed-started watcher is not actually alive"
-    kill "$armpid" "$lock_pid" 2>/dev/null || true
+    # This branch only tears down a successfully observed cycle, so use an
+    # unconditional signal rather than letting the arm's graceful trap race its
+    # child and leave the serial CI shard blocked in wait.
+    kill -KILL "$armpid" "$lock_pid" 2>/dev/null || true
     wait "$armpid" 2>/dev/null || true
   done
   pass "arm starts cleanly and resurfaces recovery after a dead-pid lock"
