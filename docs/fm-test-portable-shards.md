@@ -90,7 +90,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 149-script inventory leaves 112 scripts in the portable serial remainder.
+The current 150-script inventory leaves 113 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 

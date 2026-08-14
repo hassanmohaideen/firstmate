@@ -173,7 +173,7 @@ family_for_basename_into() {
     fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-kimi-harness.test.sh|fm-muse-harness.test.sh|fm-herdr-lab.test.sh|fm-lint.test.sh|\
-    fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
+    fm-no-mistakes-review.test.sh|fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
     fm-rtk.test.sh|fm-rtk-fs-events.test.sh|fm-rtk-exec-trace.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
@@ -426,11 +426,12 @@ list_real_herdr_gated() {
   done < <(all_repo_tests)
 }
 
-# Measured portable-serial script durations in milliseconds, from the CI timing
-# artifact recorded in docs/fm-test-portable-shards.md. These are balance hints
-# only: the shard partition stays complete and disjoint whatever they say, so a
-# stale hint costs balance rather than coverage. That doc owns the refresh
-# procedure.
+# Measured portable-serial script durations in milliseconds, primarily from the
+# CI timing artifact recorded in docs/fm-test-portable-shards.md; a newly added
+# script may use its focused runner measurement until the next green-CI refresh.
+# These are balance hints only: the shard partition stays complete and disjoint
+# whatever they say, so a stale hint costs balance rather than coverage. That
+# doc owns the refresh procedure.
 portable_serial_weight_hints() {
   cat <<'EOF'
 tests/fm-afk-inject-e2e.test.sh 35158
@@ -478,6 +479,7 @@ tests/fm-inactive-reconcile.test.sh 44132
 tests/fm-kimi-harness.test.sh 19755
 tests/fm-muse-harness.test.sh 27450
 tests/fm-muse-signals-live-e2e.test.sh 37
+tests/fm-no-mistakes-review.test.sh 11159
 tests/fm-on.test.sh 5982
 tests/fm-opencode-primary-live-e2e.test.sh 14
 tests/fm-operational-input.test.sh 144
@@ -1254,7 +1256,7 @@ families_for_changed_path() {
       printf '%s\n' real-herdr-gated
       ;;
     bin/fm-lint.sh|bin/fm-install-shellcheck.sh|\
-    bin/fm-brief.sh|bin/fm-ensure-agents-md.sh|bin/fm-crew-state.sh|\
+    bin/fm-brief.sh|bin/fm-ensure-agents-md.sh|bin/fm-crew-state.sh|bin/fm-no-mistakes-review.sh|\
     bin/fm-decision-hold.sh|bin/fm-supervision*|bin/fm-transition-lib.sh|\
     bin/fm-tmux-lib.sh|bin/fm-marker-lib.sh|bin/fm-operational-input.sh|bin/fm-tasks-axi-lib.sh|\
     bin/fm-vendor-auth-probe.sh|\

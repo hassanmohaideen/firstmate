@@ -189,6 +189,7 @@ shell_quote() {
 }
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
+NM_REVIEW_DRIVER=$(shell_quote "$FM_ROOT/bin/fm-no-mistakes-review.sh")
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -428,13 +429,18 @@ Follow the guidance no-mistakes itself provides for the mechanics: it loads when
 When starting no-mistakes, make \`--intent\` preserve all relevant content from this brief's \`# Task\` section plus every later accepted Firstmate requirement, clarification, constraint, exclusion, and supersession, carrying only each requirement's current accepted form; retain direct requirements instead of substituting a diff summary, and exclude generic operational, status, delivery, and other scaffold boilerplate unless it is task-specific.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
 
+Every review response must go through \`$NM_REVIEW_DRIVER respond\`; never invoke \`no-mistakes axi respond\` directly.
+Read \`$NM_REVIEW_DRIVER --help\` for the exact response choices and finding-list format.
+The guard refuses partial or unrepresentable choices before no-mistakes acts and durably accounts for every review finding.
+
 Two firstmate-specific rules layer on top of that guidance:
 - ask-user findings are never yours to answer: escalate to firstmate (rule 6) and stop.
   Firstmate applies the authority contract in its \`AGENTS.md\` and obtains any required captain decision.
-  When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
+  When the decision comes back, feed it to the guarded response path and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: it would silently bypass firstmate's authority check and any required captain escalation.
 
-After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
+After /no-mistakes reports CI green, run \`$NM_REVIEW_DRIVER audit-ready\` before reporting the PR.
+Only its \`ready:\` result authorizes you to append \`done: PR {url} checks green\`; do not wait for no-mistakes to keep monitoring in the background until merge.
 EOF
     ;;
 esac
