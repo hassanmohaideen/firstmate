@@ -64,7 +64,7 @@ Run exactly one coverage review.
 Request a targeted specialist re-review only when a correction changes a foundational state, serialization, privacy, authorization, or replay contract.
 Do not add another complete manual re-review layer before no-mistakes.
 No-mistakes is the final complete-diff review and owns its normal tests, documentation, PR, and CI flow.
-No-mistakes may use its configured provider, including Codex, for that review and delivery validation.
+No-mistakes may use its configured provider, including Codex, for that review, its tests, delivery validation, and CI handling.
 Do not force no-mistakes internal agents through crew-dispatch configuration.
 
 ## Invariants under usage pressure
