@@ -1187,7 +1187,6 @@ with open(sys.argv[1], "w") as handle:
 time.sleep(300)
 PY
   while [ ! -s "$WATCHDOG_EVIDENCE/escaped.pid" ]; do sleep 0.01; done
-  sleep 0.2
 }
 trap spawn_escaped TERM
 bash -c 'trap "" TERM INT HUP; while :; do sleep 1; done' &

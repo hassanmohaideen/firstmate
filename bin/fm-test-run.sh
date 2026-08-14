@@ -1935,20 +1935,84 @@ snapshot_process_forest() { # <roots-file>
 }
 
 process_identity() { # <pid>
-  ps -o lstart= -p "$1" 2>/dev/null | awk '{$1=$1; print; exit}'
+  python3 - "$1" <<'PY'
+import ctypes
+import struct
+import sys
+
+pid = int(sys.argv[1])
+if sys.platform.startswith("linux"):
+    try:
+        data = open(f"/proc/{pid}/stat", "rb").read()
+        fields = data[data.rfind(b")") + 2:].split()
+        value = int(fields[19])
+    except (OSError, ValueError, IndexError):
+        raise SystemExit(1)
+    print(f"linux-starttime={value}")
+elif sys.platform == "darwin":
+    buffer = ctypes.create_string_buffer(136)
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    size = libproc.proc_pidinfo(pid, 3, 0, buffer, len(buffer))
+    if size < 136:
+        raise SystemExit(1)
+    sec, usec = struct.unpack_from("=QQ", buffer.raw, 120)
+    if sec <= 0 or usec >= 1_000_000:
+        raise SystemExit(1)
+    print(f"darwin-starttime={sec}.{usec:06d}")
+else:
+    raise SystemExit(1)
+PY
 }
 
 process_identity_matches() { # <pid> <identity>
-  local current
-  current=$(process_identity "$1")
-  [ -n "$current" ] && [ "$current" = "$2" ]
+  local current state
+  if ! current=$(process_identity "$1"); then
+    return 1
+  fi
+  [ -n "$current" ] && [ "$current" = "$2" ] || return 1
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  case "$state" in *Z*) return 1 ;; esac
+  return 0
 }
 
-retain_owned_snapshot() { # <root-pid> <identities-file> <snapshot-file>
-  local root=$1 identities_file=$2 snapshot_file=$3 line pid _ppid pgid _rest identity
+snapshot_marker_owners() { # <ownership-token>
+  python3 - "$1" <<'PY'
+import os
+import re
+import subprocess
+import sys
+
+needle = ("FM_TEST_OWNERSHIP_TOKEN=" + sys.argv[1]).encode()
+if sys.platform.startswith("linux"):
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            values = open(f"/proc/{name}/environ", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if needle in values:
+            print(name)
+elif sys.platform == "darwin":
+    try:
+        rows = subprocess.check_output(
+            ["ps", "eww", "-axo", "pid=,command="], stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        raise SystemExit(1)
+    pattern = re.compile(rb"(?:^|\s)" + re.escape(needle) + rb"(?:\s|$)")
+    for row in rows.splitlines():
+        fields = row.lstrip().split(None, 1)
+        if len(fields) == 2 and fields[0].isdigit() and pattern.search(fields[1]):
+            print(fields[0].decode())
+PY
+}
+
+retain_owned_snapshot() { # <root-pid> <ownership-token> <identities-file> <snapshot-file>
+  local root=$1 token=$2 identities_file=$3 snapshot_file=$4 line pid _ppid pgid _rest identity
   local roots_file="$snapshot_file.roots"
   : >"$snapshot_file"
   printf '%s\n' "$root" >"$roots_file"
+  snapshot_marker_owners "$token" >>"$roots_file" 2>/dev/null || true
   while IFS=$'\t' read -r pid identity _pgid; do
     [ -n "$pid" ] || continue
     process_identity_matches "$pid" "$identity" || continue
@@ -1960,7 +2024,9 @@ retain_owned_snapshot() { # <root-pid> <identities-file> <snapshot-file>
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     read -r pid _ppid pgid _rest <<<"$line"
-    identity=$(process_identity "$pid")
+    if ! identity=$(process_identity "$pid"); then
+      continue
+    fi
     [ -n "$identity" ] || continue
     if ! awk -F '\t' -v pid="$pid" -v identity="$identity" \
       '$1 == pid && $2 == identity { found=1 } END { exit !found }' "$identities_file"; then
@@ -1988,13 +2054,13 @@ signal_owned_tree() { # <signal> <identities-file>
 # terminate the complete tree without killing itself. TERM gets a bounded grace
 # before KILL, and both pre-termination and survivor snapshots remain artifact
 # evidence.
-watch_worker_group() { # <seconds> <group-pid> <script> <work>
-  local seconds=$1 group_pid=$2 script=$3 work=$4 n pid identity
+watch_worker_group() { # <seconds> <group-pid> <script> <work> <ownership-token>
+  local seconds=$1 group_pid=$2 script=$3 work=$4 token=$5 n pid identity live quiet
   sleep "$seconds"
   worker_group_is_running "$group_pid" || exit 0
   : >"$work/timeout"
   : >"$work/owned-identities"
-  retain_owned_snapshot "$group_pid" "$work/owned-identities" "$work/processes.before"
+  retain_owned_snapshot "$group_pid" "$token" "$work/owned-identities" "$work/processes.before"
   {
     printf 'active_script=%s watchdog_seconds=%s process_group=%s\n' "$script" "$seconds" "$group_pid"
     printf 'processes_before_term:\n'
@@ -2006,10 +2072,9 @@ watch_worker_group() { # <seconds> <group-pid> <script> <work>
   } >"$work/diagnostics"
   signal_owned_tree TERM "$work/owned-identities"
   n=0
-  while [ "$n" -lt 20 ]; do
+  while [ "$n" -lt 5 ]; do
     sleep 0.05
-    retain_owned_snapshot "$group_pid" "$work/owned-identities" "$work/processes.term.$n"
-    signal_owned_tree TERM "$work/owned-identities"
+    retain_owned_snapshot "$group_pid" "$token" "$work/owned-identities" "$work/processes.term.$n"
     n=$((n + 1))
   done
   printf 'processes_surviving_term:\n' >>"$work/diagnostics"
@@ -2021,8 +2086,19 @@ watch_worker_group() { # <seconds> <group-pid> <script> <work>
   done <"$work/owned-identities"
   signal_owned_tree KILL "$work/owned-identities"
   n=0
-  while worker_group_is_running "$group_pid" && [ "$n" -lt 20 ]; do
+  quiet=0
+  while [ "$n" -lt 5 ] && [ "$quiet" -lt 3 ]; do
     sleep 0.05
+    retain_owned_snapshot "$group_pid" "$token" "$work/owned-identities" "$work/processes.kill.$n"
+    signal_owned_tree KILL "$work/owned-identities"
+    live=0
+    while IFS=$'\t' read -r pid identity _pgid; do
+      [ -n "$pid" ] || continue
+      if process_identity_matches "$pid" "$identity"; then
+        live=$((live + 1))
+      fi
+    done <"$work/owned-identities"
+    if [ "$live" -eq 0 ]; then quiet=$((quiet + 1)); else quiet=0; fi
     n=$((n + 1))
   done
   printf 'processes_surviving_kill:' >>"$work/diagnostics"
@@ -2038,12 +2114,12 @@ watch_worker_group() { # <seconds> <group-pid> <script> <work>
   [ "$n" -ne 0 ] || printf ' none\n' >>"$work/diagnostics"
 }
 
-start_worker_watchdog() { # <script> <worker-pid> <work>
-  local script=$1 worker_pid=$2 work=$3 seconds watchdog_pid
+start_worker_watchdog() { # <script> <worker-pid> <work> <ownership-token>
+  local script=$1 worker_pid=$2 work=$3 token=$4 seconds watchdog_pid
   if ! seconds=$(watchdog_seconds_for "$script"); then
     return 0
   fi
-  watch_worker_group "$seconds" "$worker_pid" "$script" "$work" &
+  watch_worker_group "$seconds" "$worker_pid" "$script" "$work" "$token" &
   watchdog_pid=$!
   WATCHDOG_PIDS+=("$watchdog_pid")
   printf '%s\n' "$watchdog_pid" >"$work/watchdog.pid"
@@ -2195,7 +2271,7 @@ clear_ambient_fleet_environment() {
 
 run_one_serial() {
   local script=$1
-  local base family expected out begin_iso begin_ms end_ms end_iso duration rc worker_pid work
+  local base family expected out begin_iso begin_ms end_ms end_iso duration rc worker_pid work ownership_token
   base=$(basename "$script")
   family=$(family_for_basename "$base")
   expected=$(expected_gate_skip_for_family "$family")
@@ -2204,6 +2280,7 @@ run_one_serial() {
   mkdir -p "$work"
   begin_iso=$(now_iso)
   begin_ms=$(now_ms)
+  ownership_token="$RUN_ID-serial-$TOTAL-${RANDOM}${RANDOM}"
 
   printf 'FM_TEST_BEGIN %s %s family=%s expected_gate_skip=%s\n' \
     "$begin_iso" "$script" "$family" "$expected"
@@ -2216,6 +2293,7 @@ run_one_serial() {
       sleep 0.01
     done
     clear_ambient_fleet_environment
+    export FM_TEST_OWNERSHIP_TOKEN="$ownership_token"
     bash "$script" 2>&1 | tee "$out"
     printf '%s\n' "${PIPESTATUS[0]}" >"$work/exit"
   ) &
@@ -2223,7 +2301,7 @@ run_one_serial() {
   set +m
   WORKER_PIDS[0]=$worker_pid
   register_worker_group "$worker_pid"
-  start_worker_watchdog "$script" "$worker_pid" "$work"
+  start_worker_watchdog "$script" "$worker_pid" "$work" "$ownership_token"
   : >"$work/start"
   set +e
   wait "$worker_pid"
@@ -2356,6 +2434,7 @@ else
     expected=$(expected_gate_skip_for_family "$family")
     begin_iso=$(now_iso)
     begin_ms=$(now_ms)
+    ownership_token="$RUN_ID-parallel-$worker_n-${RANDOM}${RANDOM}"
     printf '%s\n' "$begin_iso" >"$work/began_at"
     printf '%s\n' "$begin_ms" >"$work/began_ms"
     printf 'FM_TEST_BEGIN %s %s family=%s expected_gate_skip=%s\n' \
@@ -2381,6 +2460,7 @@ else
       export TMPDIR="$work/tmp"
       export TMP="$work/tmp"
       clear_ambient_fleet_environment
+      export FM_TEST_OWNERSHIP_TOKEN="$ownership_token"
       cd "$ROOT" || exit 1
       begin_ms=$(now_ms)
       bash "$script" >"$work/output" 2>&1 &
@@ -2404,7 +2484,7 @@ else
     WORKER_IDX[worker_n]=$worker_n
     WORKER_SCRIPTS[worker_n]=$script
     active_workers=$((active_workers + 1))
-    start_worker_watchdog "$script" "$worker_pid" "$work"
+    start_worker_watchdog "$script" "$worker_pid" "$work" "$ownership_token"
     : >"$work/start"
   done
   while [ "$active_workers" -gt 0 ]; do
