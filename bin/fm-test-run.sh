@@ -618,8 +618,11 @@ duration_budget_ms_for() {
 # The hard watchdog deliberately reuses the measured-baseline owner. It keeps a
 # two-minute floor for loaded-runner variance, scales to five baselines plus 60
 # seconds, and caps at nine minutes. CI also supplies the absolute job deadline;
-# the watchdog reserves the final minute for bounded cleanup, evidence
-# finalization, and artifact upload. FM_TEST_WATCHDOG_SECONDS_OVERRIDE is a
+# the watchdog reserves the final 15 seconds for bounded cleanup, evidence
+# finalization, and artifact upload. The cleanup itself is bounded below one
+# second; this margin avoids terminating healthy late-shard scripts merely
+# because checkout or tool setup consumed an unusually large part of the job.
+# FM_TEST_WATCHDOG_SECONDS_OVERRIDE is a
 # positive-integer regression-test hook; production and CI leave it unset.
 watchdog_seconds_for() {
   local script=$1 baseline watchdog_ms seconds override=${FM_TEST_WATCHDOG_SECONDS_OVERRIDE:-}
@@ -637,7 +640,7 @@ watchdog_seconds_for() {
   if [ -n "$deadline" ]; then
     case "$deadline" in ''|*[!0-9]*|0) die "FM_TEST_JOB_DEADLINE_EPOCH must be a positive integer epoch" ;; esac
     now=$(date +%s)
-    remaining=$((deadline - now - 60))
+    remaining=$((deadline - now - 15))
     [ "$remaining" -ge 0 ] || remaining=0
     [ "$seconds" -le "$remaining" ] || seconds=$remaining
   fi

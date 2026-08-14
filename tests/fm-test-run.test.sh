@@ -1269,6 +1269,37 @@ assert [row["result"] for row in rows] == ["passed", "timeout"], rows
   pass "watchdog fails hung scripts, cleans descendants, and persists partial evidence"
 }
 
+test_deadline_reserve_allows_healthy_late_script() {
+  local tmp repo runner deadline rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-deadline-healthy.XXXXXX")
+  repo="$tmp/repo"; mkdir -p "$repo/bin" "$repo/tests"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  runner="$repo/bin/fm-test-run.sh"
+  chmod +x "$runner"
+  cat >"$repo/tests/fm-transition-lib.test.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+echo 'ok - healthy late script completed'
+SH
+  chmod +x "$repo/tests/fm-transition-lib.test.sh"
+
+  deadline=$(( $(date +%s) + 18 ))
+  set +e
+  FM_TEST_JOB_DEADLINE_EPOCH="$deadline" FM_TEST_WATCHDOG_SECONDS_OVERRIDE=30 \
+    "$runner" --json "$tmp/timing.json" tests/fm-transition-lib.test.sh \
+    >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "cleanup reserve terminated a healthy late script: $(cat "$tmp/err")"
+  python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))["scripts"]
+assert len(rows) == 1 and rows[0]["result"] == "passed", rows
+' "$tmp/timing.json" || fail "healthy late script did not retain passing timing evidence"
+  rm -rf "$tmp"
+  pass "absolute deadline retains enough usable budget for a healthy late script"
+}
+
 test_watchdog_honors_absolute_job_deadline() {
   local tmp repo runner evidence deadline started finished rc
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-deadline.XXXXXX")
@@ -1289,7 +1320,7 @@ while :; do sleep 1; done
 SH
   chmod +x "$repo"/tests/*.test.sh
 
-  deadline=$(( $(date +%s) + 64 ))
+  deadline=$(( $(date +%s) + 19 ))
   started=$(date +%s)
   set +e
   DEADLINE_EVIDENCE="$evidence" FM_TEST_JOB_DEADLINE_EPOCH="$deadline" \
@@ -1385,5 +1416,6 @@ test_completed_worker_descendant_cleanup
 test_environment_isolation_in_serial_and_parallel_children
 test_duration_budget_warns_and_ci_enforces
 test_watchdog_timeout_cleanup_and_incremental_evidence
+test_deadline_reserve_allows_healthy_late_script
 test_watchdog_honors_absolute_job_deadline
 test_aggregate_json
