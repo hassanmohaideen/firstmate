@@ -1,12 +1,12 @@
 {
   "rules": [
     {
-      "when": "The task is genuinely unresolved Playop architecture, design, migration, or investigation whose outcome can materially change the design, excluding an independent domain, security, final-diff, or coverage review.",
+      "when": "The task is genuinely unresolved Playop architecture, design, migration, or investigation whose outcome can materially change the design, excluding an independent domain, security, or coverage review.",
       "use": { "harness": "claude", "model": "fable", "effort": "xhigh" },
       "why": "Use Claude Code with Fable at xhigh only for genuinely unresolved Playop architecture."
     },
     {
-      "when": "The task is an independent Playop domain, security, final-diff, or coverage review.",
+      "when": "The task is an independent Playop domain, security, or coverage review.",
       "use": { "harness": "claude", "model": "fable", "effort": "medium" },
       "why": "Keep every required independent Playop review on Claude Code with Fable at medium effort."
     },

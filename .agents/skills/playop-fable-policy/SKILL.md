@@ -16,8 +16,9 @@ Apply the generic intake, delivery, approval, and supervision contracts in `AGEN
 
 ## Worker and quota boundary
 
-Keep every Playop implementation, architecture, investigation, remediation, independent domain review, independent security review, final-diff review, coverage review, and validation task on Claude Code with Fable.
+Keep every Playop implementation, architecture, investigation, remediation, independent domain review, independent security review, coverage review, and pre-gate validation task on Claude Code with Fable.
 Apply the concrete effort class selected by the best-fit tracked Playop dispatch rule.
+This worker route does not govern no-mistakes gate agents.
 An explicit current captain override still has the precedence defined by `AGENTS.md` and `docs/configuration.md`.
 Quota exhaustion never silently routes Playop work to another provider or a weaker model.
 If the selected Claude/Fable route cannot proceed, stop and report the concrete constraint and its consequence.
@@ -63,6 +64,8 @@ Run exactly one coverage review.
 Request a targeted specialist re-review only when a correction changes a foundational state, serialization, privacy, authorization, or replay contract.
 Do not add another complete manual re-review layer before no-mistakes.
 No-mistakes is the final complete-diff review and owns its normal tests, documentation, PR, and CI flow.
+No-mistakes may use its configured provider, including Codex, for that review and delivery validation.
+Do not force no-mistakes internal agents through crew-dispatch configuration.
 
 ## Invariants under usage pressure
 
