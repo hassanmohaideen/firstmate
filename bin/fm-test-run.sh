@@ -224,7 +224,7 @@ family_for_basename_into() {
     fm-sessionstart-hook-live-e2e.test.sh|fm-sessionstart-instruction-refresh-live-e2e.test.sh|\
     fm-playop-dispatch-live-e2e.test.sh|fm-quota-array-dispatch-live-e2e.test.sh|\
     fm-send-secondmate-marker-herdr-e2e.test.sh)
-      FAMILY_FOR_BASENAME=live-harness-optin
+      FAMILY_FOR_BASENAME='live-harness-optin'
       ;;
     fm-backend-herdr.test.sh|fm-backend-tmux-smoke.test.sh|fm-backend.test.sh|\
     fm-tmux-agent-liveness.test.sh|\
@@ -2323,8 +2323,7 @@ run_one_serial() {
       sleep 0.01
     done
     clear_ambient_fleet_environment
-    export FM_TEST_OWNERSHIP_TOKEN="$ownership_token"
-    bash "$script" 2>&1 | tee "$out"
+    FM_TEST_OWNERSHIP_TOKEN="$ownership_token" bash "$script" 2>&1 | tee "$out"
     printf '%s\n' "${PIPESTATUS[0]}" >"$work/exit"
   ) &
   worker_pid=$!
@@ -2490,10 +2489,9 @@ else
       export TMPDIR="$work/tmp"
       export TMP="$work/tmp"
       clear_ambient_fleet_environment
-      export FM_TEST_OWNERSHIP_TOKEN="$ownership_token"
       cd "$ROOT" || exit 1
       begin_ms=$(now_ms)
-      bash "$script" >"$work/output" 2>&1 &
+      FM_TEST_OWNERSHIP_TOKEN="$ownership_token" bash "$script" >"$work/output" 2>&1 &
       child_pid=$!
       wait "$child_pid"
       rc=$?
