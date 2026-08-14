@@ -1,14 +1,24 @@
 {
   "rules": [
     {
-      "when": "The task is ambiguous Playop architecture, design, migration, or investigation where deeper reasoning can materially change the result, excluding independent adversarial, security, final-diff, and test-coverage review.",
+      "when": "The task is genuinely unresolved Playop architecture, design, migration, or investigation whose outcome can materially change the design, excluding an independent domain, security, or coverage review.",
       "use": { "harness": "claude", "model": "fable", "effort": "xhigh" },
-      "why": "Use Claude Code with Fable at xhigh only for genuinely ambiguous Playop work that benefits from deeper reasoning."
+      "why": "Use Claude Code with Fable at xhigh only for genuinely unresolved Playop architecture."
     },
     {
-      "when": "The task is Playop implementation, architecture, investigation, or remediation not matched by the ambiguous-work rule above, excluding independent adversarial, security, final-diff, and test-coverage review.",
-      "use": { "harness": "claude", "model": "fable" },
-      "why": "Use Claude Code with Fable and choose proportionate effort through the generic effort fallback for bounded Playop work."
+      "when": "The task is an independent Playop domain, security, or coverage review.",
+      "use": { "harness": "claude", "model": "fable", "effort": "medium" },
+      "why": "Keep every required independent Playop review on Claude Code with Fable at medium effort."
+    },
+    {
+      "when": "The Playop task is battle resolution or implementation, architecture, investigation, remediation, or validation whose accepted scope involves source-side privacy, persistence, authorization, replay, or authoritative undo.",
+      "use": { "harness": "claude", "model": "fable", "effort": "high" },
+      "why": "Use Claude Code with Fable at high effort for foundational Playop authority and state contracts."
+    },
+    {
+      "when": "The task is any other Playop implementation, architecture, investigation, remediation, validation, bounded contract, protocol, UI, fixture, documentation, or test work.",
+      "use": { "harness": "claude", "model": "fable", "effort": "medium" },
+      "why": "Use Claude Code with Fable at medium effort for bounded Playop work."
     }
   ]
 }

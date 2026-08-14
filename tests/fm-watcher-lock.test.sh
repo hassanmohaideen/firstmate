@@ -593,7 +593,10 @@ test_arm_attaches_and_waits_for_live_fresh_watcher() {
   is_live_non_zombie "$armpid" || fail "arm exited while the seed watcher was still healthy"
   # After the seed dies without a successor, the attached arm must fail loudly.
   kill "$wpid" 2>/dev/null || true
-  wait "$wpid" 2>/dev/null || true
+  # A loaded runner can leave the watcher's graceful trap waiting on a child.
+  # Keep fixture teardown bounded so the arm observes either graceful exit or
+  # the helper's forced exit instead of blocking this serial shard forever.
+  wait_for_exit "$wpid" 80 >/dev/null 2>&1 || true
   wait_for_exit "$armpid" 80
   status=$?
   [ "$status" -ne 0 ] && [ "$status" -ne 124 ] || fail "attached arm did not fail after seed died (status $status)"
@@ -687,7 +690,10 @@ test_arm_starts_and_self_heals() {
     grep -F "watcher: started pid=$lock_pid (beacon fresh)" "$armout" >/dev/null \
       || fail "arm ($row) started line did not name the confirmed live watcher (lock '$lock_pid')"
     kill -0 "$lock_pid" 2>/dev/null || fail "arm ($row) confirmed-started watcher is not actually alive"
-    kill "$armpid" "$lock_pid" 2>/dev/null || true
+    # This branch only tears down a successfully observed cycle, so use an
+    # unconditional signal rather than letting the arm's graceful trap race its
+    # child and leave the serial CI shard blocked in wait.
+    kill -KILL "$armpid" "$lock_pid" 2>/dev/null || true
     wait "$armpid" 2>/dev/null || true
   done
   pass "arm starts cleanly and resurfaces recovery after a dead-pid lock"
