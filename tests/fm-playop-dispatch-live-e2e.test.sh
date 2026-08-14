@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Credentialed behavior regression for the repository-owned Playop dispatch default.
+# Credentialed behavior regression for the repository-owned Playop dispatch policy.
 #
 # This drives Pi's public instruction-loading interface against the effective
-# tracked configuration and its dispatch owners. It does not parse source bytes
+# tracked configuration and its policy owners. It does not parse source bytes
 # or recreate natural-language matching in shell.
 set -u
 
@@ -25,11 +25,14 @@ PROJECT="$LAB/project"
 cleanup() { rm -rf "$LAB"; }
 trap cleanup EXIT
 mkdir -p "$PROJECT/defaults" "$PROJECT/.agents/skills/harness-adapters" \
+  "$PROJECT/.agents/skills/playop-fable-policy" \
   "$PROJECT/.agents/skills/quota-array-dispatch" "$PROJECT/docs"
 cp "$ROOT/AGENTS.md" "$PROJECT/AGENTS.md"
 cp "$ROOT/defaults/crew-dispatch.json" "$PROJECT/defaults/crew-dispatch.json"
 cp "$ROOT/.agents/skills/harness-adapters/SKILL.md" \
   "$PROJECT/.agents/skills/harness-adapters/SKILL.md"
+cp "$ROOT/.agents/skills/playop-fable-policy/SKILL.md" \
+  "$PROJECT/.agents/skills/playop-fable-policy/SKILL.md"
 cp "$ROOT/.agents/skills/quota-array-dispatch/SKILL.md" \
   "$PROJECT/.agents/skills/quota-array-dispatch/SKILL.md"
 cp "$ROOT/docs/configuration.md" "$PROJECT/docs/configuration.md"
@@ -40,24 +43,27 @@ out=$(
   cd "$PROJECT" &&
     pi --print --approve --no-session --no-extensions --no-skills \
       --model openai-codex/gpt-5.6-sol --thinking high \
-      "Read the tracked Firstmate instructions, dispatch default, and referenced dispatch owners in this project. Evaluate each independent intake under the stated evidence, without running vendor or quota commands. Return exactly the ten requested lines and no prose. (1) A genuinely ambiguous Playop architecture migration can materially change the design; no override exists; catalogs and authentication are usable: AMBIGUOUS=<harness>|<model>|<effort>. (2) A bounded, well-understood Playop remediation has an explicit path; no override exists: BOUNDED=<harness>|<model>|<effort>. (3) An independent adversarial security and final-diff review of Playop is requested, and the existing Pi review tuple openai-codex/gpt-5.6-sol is catalog-supported and usable: REVIEW_FABLE_REQUIRED=<yes|no> and REVIEW_SOL_ELIGIBLE=<yes|no>. (4) The captain explicitly overrides one Playop implementation to Codex GPT; OVERRIDE=<wins|loses>. A future local rule is equally specific to bounded Playop remediation and selects Codex; LOCAL_OVERRIDE=<wins|loses>. (5) An authoritative probe concretely proves the selected Claude credential unusable for Playop while the safe interactive commands are claude auth login and claude auth status; LOGIN_REQUEST=<command>, SILENT_REROUTE=<yes|no>, and VERIFY=<command>. (6) The only authentication evidence is an unmodeled Claude source and quota uncertainty: UNCERTAIN_LOGIN=<yes|no>. Use the generic effort fallback for an omitted effort axis."
+      "Read the tracked Firstmate instructions, dispatch default, and every referenced dispatch or Playop policy owner in this project. Evaluate each independent intake under the stated evidence without running vendor or quota commands. Return exactly the thirteen requested lines and no prose. (1) Genuinely unresolved Playop architecture can materially change the design: AMBIGUOUS=<harness>|<model>|<effort>. (2) A bounded Playop protocol and UI implementation has an accepted contract and exact file map: BOUNDED=<harness>|<model>|<effort>. (3) A Playop authoritative replay remediation is required: FOUNDATIONAL=<harness>|<model>|<effort>. (4) An independent Playop security review is required: REVIEW=<harness>|<model>|<effort>. (5) Final Playop validation is bounded and no foundational contract remains unresolved: VALIDATION=<harness>|<model>|<effort>. (6) A non-Playop documentation task has no matching local rule or tracked default: NON_PLAYOP=<matched|unmatched>. (7) The captain explicitly overrides one bounded Playop implementation to Codex GPT: OVERRIDE=<wins|loses>. (8) A future local rule is equally specific to bounded Playop remediation and selects Codex: LOCAL_OVERRIDE=<wins|loses>. (9) The only authentication evidence is an unmodeled Claude source and quota uncertainty for a bounded Playop task: UNCERTAIN_PROFILE=<harness>|<model>|<effort> and UNCERTAIN_LOGIN=<yes|no>. (10) Applicable quota evidence concretely proves Fable cannot start before reset and no captain override exists: EXHAUSTED_ROUTE=<blocked|other-provider>. (11) The only way to proceed before reset is enabling paid usage credits: PAID_CREDITS=<captain-decision|automatic>. (12) Lower usage would require weakening server authority or deterministic replay: WEAKEN_GUARANTEES=<yes|no>."
 ) || fail "Pi instruction run failed: $out"
 
 for required in \
   'AMBIGUOUS=claude|fable|xhigh' \
-  'BOUNDED=claude|fable|low' \
-  'REVIEW_FABLE_REQUIRED=no' \
-  'REVIEW_SOL_ELIGIBLE=yes' \
+  'BOUNDED=claude|fable|medium' \
+  'FOUNDATIONAL=claude|fable|high' \
+  'REVIEW=claude|fable|medium' \
+  'VALIDATION=claude|fable|medium' \
+  'NON_PLAYOP=unmatched' \
   'OVERRIDE=wins' \
   'LOCAL_OVERRIDE=wins' \
-  'LOGIN_REQUEST=claude auth login' \
-  'SILENT_REROUTE=no' \
-  'VERIFY=claude auth status' \
-  'UNCERTAIN_LOGIN=no'
+  'UNCERTAIN_PROFILE=claude|fable|medium' \
+  'UNCERTAIN_LOGIN=no' \
+  'EXHAUSTED_ROUTE=blocked' \
+  'PAID_CREDITS=captain-decision' \
+  'WEAKEN_GUARANTEES=no'
 do
   printf '%s\n' "$out" | grep -Fxq "$required" \
     || fail "expected line '$required', got: $out"
 done
 
 printf '%s\n' "$out"
-printf '%s\n' "ok - Playop matching, precedence, profile axes, review carve-out, and authentication interaction"
+printf '%s\n' "ok - Playop matching, precedence, effort classes, review routing, and quota boundaries"

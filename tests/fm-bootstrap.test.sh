@@ -1109,8 +1109,12 @@ test_tracked_crew_dispatch_defaults_and_local_precedence() {
     "tracked dispatch default was not selected when local config was absent"
   assert_contains "$out" "-> claude/fable/xhigh" \
     "tracked ambiguous Playop profile lost Claude/Fable xhigh axes"
-  assert_contains "$out" "-> claude/fable" \
-    "tracked bounded Playop profile lost Claude/Fable with generic effort fallback"
+  assert_contains "$out" "The task is an independent Playop domain, security, final-diff, or coverage review. -> claude/fable/medium" \
+    "tracked independent Playop review profile lost Claude/Fable medium axes"
+  assert_contains "$out" "source-side privacy, persistence, authorization, replay, or authoritative undo. -> claude/fable/high" \
+    "tracked foundational Playop profile lost Claude/Fable high axes"
+  assert_contains "$out" "any other Playop implementation, architecture, investigation, remediation, validation, bounded contract, protocol, UI, fixture, documentation, or test work. -> claude/fable/medium" \
+    "tracked bounded Playop profile lost Claude/Fable medium axes"
 
   printf '%s\n' '{"rules":[{"when":"local override","use":{"harness":"codex","model":"gpt-local","effort":"low"}}]}' \
     > "$case_dir/home/config/crew-dispatch.json"
