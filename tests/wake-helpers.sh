@@ -261,7 +261,9 @@ wait_for_exit() {
     sleep 0.1
     i=$((i + 1))
   done
-  kill "$pid" 2>/dev/null || true
+  # The deadline is absolute: a process with a stuck or ignored graceful trap
+  # must not block the serial test lane in an unbounded wait.
+  kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   return 124
 }
