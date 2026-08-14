@@ -1229,7 +1229,9 @@ assert row["result"] == "timeout" and row["exit"] == 124, row
 assert row["began_at"].endswith("Z") and row["duration_ms"] >= 1000, row
 assert any("active_script=tests/fm-watcher-lock.test.sh" in line for line in row["timeout_diagnostics"]), row
 assert any("processes_surviving_kill:" in line for line in row["timeout_diagnostics"]), row
-' "$tmp/timing.json" || fail "incremental timeout artifact lacks actionable evidence"
+if sys.platform == "darwin":
+    assert any("escaped.pid" in line for line in row["timeout_diagnostics"]), row
+' "$tmp/timing.json" || fail "incremental timeout artifact lacks actionable process identity evidence"
   touch "$evidence/release-followup"
   set +e
   wait "$pid"

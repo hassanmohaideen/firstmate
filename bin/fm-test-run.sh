@@ -1937,7 +1937,6 @@ snapshot_process_forest() { # <roots-file>
 process_identity() { # <pid>
   python3 - "$1" <<'PY'
 import ctypes
-import struct
 import sys
 
 pid = int(sys.argv[1])
@@ -1950,12 +1949,43 @@ if sys.platform.startswith("linux"):
         raise SystemExit(1)
     print(f"linux-starttime={value}")
 elif sys.platform == "darwin":
-    buffer = ctypes.create_string_buffer(136)
+    class ProcBSDInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    info = ProcBSDInfo()
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    size = libproc.proc_pidinfo(pid, 3, 0, buffer, len(buffer))
-    if size < 136:
+    libproc.proc_pidinfo.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_void_p, ctypes.c_int,
+    ]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    size = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if size != ctypes.sizeof(info):
         raise SystemExit(1)
-    sec, usec = struct.unpack_from("=QQ", buffer.raw, 120)
+    sec, usec = info.pbi_start_tvsec, info.pbi_start_tvusec
     if sec <= 0 or usec >= 1_000_000:
         raise SystemExit(1)
     print(f"darwin-starttime={sec}.{usec:06d}")
