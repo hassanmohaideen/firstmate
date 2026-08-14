@@ -703,7 +703,7 @@ test_spawn_releases_orca_resources_when_metadata_write_fails() {
     FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 )
   status=$?
-  [ "$status" -ne 0 ] || fail "Orca spawn should fail when metadata cannot be written"
+  [ "$status" -ne 0 ] || fail "Orca spawn should fail when metadata cannot be written; output: $out"
   assert_contains "$out" "Is a directory" "spawn should fail at metadata publication"
   assert_contains "$(cat "$LOG")" $'orca\x1f''terminal'$'\x1f''close'$'\x1f''--terminal'$'\x1f''term-meta-fail'$'\x1f''--json' \
     "Orca spawn should close the recorded terminal when a later abort occurs"

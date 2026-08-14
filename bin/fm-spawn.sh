@@ -2580,6 +2580,7 @@ preserve_relaunch_meta() {
     !($1 in owned)
   ' "$RELAUNCH_META"
 }
+SPAWN_META_WRITE_RC=0
 {
   echo "window=$META_WINDOW"
   echo "endpoint_task_id=$ID"
@@ -2628,7 +2629,10 @@ preserve_relaunch_meta() {
   if [ "$SPAWN_CONTROL_PARENT" = 1 ] && [ -n "${FM_CONTROL_RELAUNCH_TX:-}" ]; then
     echo "control_relaunch_tx=$FM_CONTROL_RELAUNCH_TX"
   fi
-} > "$SPAWN_META_PATH"
+} > "$SPAWN_META_PATH" || SPAWN_META_WRITE_RC=$?
+if [ "$SPAWN_META_WRITE_RC" -ne 0 ]; then
+  die "could not publish task metadata: $SPAWN_META_PATH"
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_META_PUBLISH_STARTED=1
   mv -f "$SPAWN_META_TMP" "$STATE/$ID.meta"

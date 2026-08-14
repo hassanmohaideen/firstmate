@@ -55,6 +55,18 @@ pass() {
   printf 'ok - %s\n' "$1"
 }
 
+# fm_test_wait_for_file <path> [attempts] [sleep-seconds]: bounded readiness
+# wait for a fixture artifact whose creation, rather than elapsed time, is the
+# behavior under test.
+fm_test_wait_for_file() {
+  local path=$1 attempts=${2:-100} interval=${3:-0.05} i=0
+  while [ ! -e "$path" ] && [ "$i" -lt "$attempts" ]; do
+    sleep "$interval"
+    i=$((i + 1))
+  done
+  [ -e "$path" ]
+}
+
 # --- self-cleaning temp root ------------------------------------------------
 #
 # fm_test_tmproot <prefix> echoes a fresh temp dir and registers it for removal

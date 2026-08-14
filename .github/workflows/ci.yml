@@ -13,6 +13,7 @@ jobs:
   lint:
     name: Lint shell scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned ShellCheck
@@ -36,6 +37,7 @@ jobs:
   test-coverage:
     name: Test coverage guard
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Prove complete regression partition
@@ -120,10 +122,9 @@ jobs:
   tests-portable-serial:
     name: Behavior portable serial ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    # Current measured hints total about 37 min of serial work; the balanced
-    # shards are about 3.7 min each. Cap is a hang tripwire with margin, not
-    # the expected healthy end of the lane.
-    timeout-minutes: 30
+    # Balanced shards are about 3.7 min each. The universal ten-minute cap is
+    # a failure ceiling, not the expected healthy end of the lane.
+    timeout-minutes: 10
     strategy:
       # Every shard reports so one failure never hides another shard's result.
       fail-fast: false
@@ -182,10 +183,9 @@ jobs:
   tests-herdr:
     name: Behavior tests (Herdr ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Real Herdr is slower than the portable suite; this is a hang tripwire,
-    # not the expected healthy end of the lane (balanced shards are under
-    # five minutes each).
-    timeout-minutes: 30
+    # Real Herdr is slower than the portable suite, but balanced shards remain
+    # under five minutes. The universal ten-minute cap fails a hung job red.
+    timeout-minutes: 10
     strategy:
       # Every shard reports so one failure never hides another shard's result.
       fail-fast: false
@@ -310,6 +310,7 @@ jobs:
   tests-timing-aggregate:
     name: Behavior timing aggregate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs:
       - tests-portable-parallel-1
       - tests-portable-parallel-2
@@ -398,6 +399,7 @@ jobs:
   invariants:
     name: Repo invariants
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Symlinks must stay intact

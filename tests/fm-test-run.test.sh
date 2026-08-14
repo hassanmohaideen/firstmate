@@ -235,7 +235,7 @@ SH
   [ "$end_n" -eq 1 ] || fail "expected one FM_TEST_END, got $end_n"
   grep -Eq '^FM_TEST_BEGIN .+ family=unclassified expected_gate_skip=none$' "$out" \
     || fail "BEGIN line missing family/expected_gate_skip: $(grep '^FM_TEST_BEGIN' "$out")"
-  grep -Eq '^FM_TEST_END .+ exit=0 duration_ms=[0-9]+ gate_skip=false$' "$out" \
+  grep -Eq '^FM_TEST_END .+ exit=0 duration_ms=[0-9]+ gate_skip=false result=passed$' "$out" \
     || fail "END line missing exit/duration/gate_skip: $(grep '^FM_TEST_END' "$out")"
   summary=$(grep '^FM_TEST_SUMMARY ' "$out" || true)
   assert_contains "$summary" "total=1" "summary total"
@@ -308,7 +308,7 @@ SH
   chmod +x "$skip_f"
   "$RUNNER" --json "$json" "$skip_f" >"$out" 2>"$tmp/err.txt" \
     || fail "gate-skip fixture must exit 0 from the runner"
-  grep -Eq '^FM_TEST_END .+ exit=0 duration_ms=[0-9]+ gate_skip=true$' "$out" \
+  grep -Eq '^FM_TEST_END .+ exit=0 duration_ms=[0-9]+ gate_skip=true result=passed$' "$out" \
     || fail "END must mark gate_skip=true: $(grep '^FM_TEST_END' "$out")"
   grep -q 'FM_TEST_SUMMARY total=1 failed=0 skipped_gate=1' "$out" \
     || fail "summary must count skipped_gate=1: $(grep FM_TEST_SUMMARY "$out")"
@@ -728,7 +728,7 @@ SH
 
   "$runner" --jobs 2 "$d" >"$tmp/out6" 2>"$tmp/err6" \
     || { rm -rf "$tmp"; fail "ordinary parallel stderr gate skip must remain successful"; }
-  grep -Eq '^FM_TEST_END .+ exit=0 duration_ms=[0-9]+ gate_skip=true$' "$tmp/out6" \
+  grep -Eq '^FM_TEST_END .+ exit=0 duration_ms=[0-9]+ gate_skip=true result=passed$' "$tmp/out6" \
     || { rm -rf "$tmp"; fail "parallel stderr gate skip was not recorded"; }
   grep -q 'FM_TEST_SUMMARY total=1 failed=0 skipped_gate=1' "$tmp/out6" \
     || { rm -rf "$tmp"; fail "parallel stderr skip summary wrong: $(grep FM_TEST_SUMMARY "$tmp/out6")"; }
@@ -1166,6 +1166,91 @@ SH
   pass "duration budgets warn locally and enforce every required CI script"
 }
 
+test_watchdog_timeout_cleanup_and_incremental_evidence() {
+  local tmp repo runner evidence pid child rc n
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-watchdog.XXXXXX")
+  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  runner="$repo/bin/fm-test-run.sh"
+  chmod +x "$runner"
+  cat >"$repo/tests/fm-watcher-lock.test.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'run\n' >>"$WATCHDOG_EVIDENCE/watchdog-runs"
+trap '' TERM INT HUP
+bash -c 'trap "" TERM INT HUP; while :; do sleep 1; done' &
+printf '%s\n' "$!" >"$WATCHDOG_EVIDENCE/descendant.pid"
+touch "$WATCHDOG_EVIDENCE/watchdog-started"
+wait
+SH
+  cat >"$repo/tests/fm-new-required.test.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'run\n' >>"$WATCHDOG_EVIDENCE/followup-runs"
+touch "$WATCHDOG_EVIDENCE/followup-started"
+while [ ! -e "$WATCHDOG_EVIDENCE/release-followup" ]; do sleep 0.01; done
+echo 'ok - followup after timeout'
+SH
+  chmod +x "$repo"/tests/*.test.sh
+
+  WATCHDOG_EVIDENCE="$evidence" FM_TEST_WATCHDOG_SECONDS_OVERRIDE=1 \
+    "$runner" --json "$tmp/timing.json" \
+    tests/fm-watcher-lock.test.sh tests/fm-new-required.test.sh >"$tmp/out" 2>"$tmp/err" &
+  pid=$!
+  n=0
+  while [ ! -e "$evidence/followup-started" ] && [ "$n" -lt 500 ]; do
+    sleep 0.01
+    n=$((n + 1))
+  done
+  [ -e "$evidence/followup-started" ] || {
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -rf "$tmp"
+    fail "watchdog did not terminate the hung script and continue"
+  }
+  [ -f "$tmp/timing.json" ] || fail "timeout did not persist incremental timing evidence"
+  python3 -c '
+import json, sys
+row = json.load(open(sys.argv[1]))["scripts"]
+assert len(row) == 1, row
+row = row[0]
+assert row["path"] == "tests/fm-watcher-lock.test.sh", row
+assert row["result"] == "timeout" and row["exit"] == 124, row
+assert row["began_at"].endswith("Z") and row["duration_ms"] >= 1000, row
+assert any("active_script=tests/fm-watcher-lock.test.sh" in line for line in row["timeout_diagnostics"]), row
+assert any("processes_surviving_kill:" in line for line in row["timeout_diagnostics"]), row
+' "$tmp/timing.json" || fail "incremental timeout artifact lacks actionable evidence"
+  touch "$evidence/release-followup"
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "a watchdog timeout must fail the run"
+  [ "$(wc -l <"$evidence/watchdog-runs" | tr -d ' ')" = 1 ] \
+    || fail "timed-out script was silently rerun"
+  [ "$(wc -l <"$evidence/followup-runs" | tr -d ' ')" = 1 ] \
+    || fail "post-timeout coverage did not run exactly once"
+  grep -Eq '^FM_TEST_BEGIN .+ tests/fm-watcher-lock.test.sh ' "$tmp/out" \
+    || fail "timeout output lost FM_TEST_BEGIN"
+  grep -Eq '^FM_TEST_END .+ tests/fm-watcher-lock.test.sh exit=124 duration_ms=[0-9]+ gate_skip=false result=timeout$' "$tmp/out" \
+    || fail "timeout output lost the terminal result"
+  grep -Fq 'FM_TEST_TIMEOUT_DIAGNOSTIC tests/fm-watcher-lock.test.sh active_script=tests/fm-watcher-lock.test.sh' "$tmp/err" \
+    || fail "timeout diagnostics did not name the exact active script"
+  child=$(cat "$evidence/descendant.pid")
+  n=0
+  while kill -0 "$child" 2>/dev/null && [ "$n" -lt 100 ]; do sleep 0.01; n=$((n + 1)); done
+  if kill -0 "$child" 2>/dev/null; then
+    kill -KILL "$child" 2>/dev/null || true
+    fail "watchdog left a test-owned descendant alive"
+  fi
+  python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))["scripts"]
+assert [row["path"] for row in rows] == ["tests/fm-new-required.test.sh", "tests/fm-watcher-lock.test.sh"], rows
+assert [row["result"] for row in rows] == ["passed", "timeout"], rows
+' "$tmp/timing.json" || fail "final artifact did not preserve complete exact-once results"
+  rm -rf "$tmp"
+  pass "watchdog fails hung scripts, cleans descendants, and persists partial evidence"
+}
+
 test_aggregate_json() {
   local tmp a b
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-aggjson.XXXXXX")
@@ -1236,4 +1321,5 @@ test_serial_signal_cleanup
 test_completed_worker_descendant_cleanup
 test_environment_isolation_in_serial_and_parallel_children
 test_duration_budget_warns_and_ci_enforces
+test_watchdog_timeout_cleanup_and_incremental_evidence
 test_aggregate_json

@@ -74,10 +74,7 @@ test_stale_watch_lock_reclaimed() {
   state="$dir/state"
   fakebin="$dir/fakebin"
   out="$dir/watch.out"
-  dead_pid=999999
-  while kill -0 "$dead_pid" 2>/dev/null; do
-    dead_pid=$((dead_pid + 1))
-  done
+  dead_pid=$(dead_pid) || fail "could not select a dead pid fixture"
   mkdir "$state/.watch.lock"
   printf '%s\n' "$dead_pid" > "$state/.watch.lock/pid"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
@@ -646,18 +643,17 @@ test_arm_starts_and_self_heals() {
   # before reporting 'started' - whether the lock is empty (clean start) or held
   # by a dead pid with a fresh-looking leftover beacon (self-heal). It must never
   # report 'healthy' off a dead pid. One row per pre-state, one assertion block.
-  local row dir state fakebin armout armpid i lock_pid dead_pid
+  local row dir state fakebin armout armpid i lock_pid stale_pid
   for row in clean dead-pid; do
     dir=$(make_case "arm-$row")
     state="$dir/state"
     fakebin="$dir/fakebin"
     armout="$dir/arm.out"
-    dead_pid=
+    stale_pid=
     if [ "$row" = dead-pid ]; then
-      dead_pid=999999
-      while kill -0 "$dead_pid" 2>/dev/null; do dead_pid=$((dead_pid + 1)); done
+      stale_pid=$(dead_pid) || fail "could not select a dead pid fixture"
       mkdir "$state/.watch.lock"
-      printf '%s\n' "$dead_pid" > "$state/.watch.lock/pid"
+      printf '%s\n' "$stale_pid" > "$state/.watch.lock/pid"
       printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
       printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
       printf '%s\n' "dead watcher identity" > "$state/.watch.lock/pid-identity"

@@ -287,9 +287,11 @@ hash_text() {
 }
 
 dead_pid() {
-  local p=999999
-  while kill -0 "$p" 2>/dev/null; do
+  local p=999999 attempts=0
+  while kill -0 "$p" 2>/dev/null && [ "$attempts" -lt 1000 ]; do
     p=$((p + 1))
+    attempts=$((attempts + 1))
   done
+  kill -0 "$p" 2>/dev/null && return 1
   printf '%s\n' "$p"
 }

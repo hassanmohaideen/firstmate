@@ -48,12 +48,14 @@
 #   --enforce-duration-budgets
 #                   fail after functional results are reported when a script
 #                   exceeds or lacks a data-driven baseline budget. The default
-#                   warns.
+#                   warns. Every measured script also gets a generous hard
+#                   watchdog derived from that baseline; timeout always fails.
 #   -h, --help      print this header
 #
 # Per-script machine-parseable markers (stdout):
 #   FM_TEST_BEGIN <iso8601> <script> family=<family> expected_gate_skip=<class>
-#   FM_TEST_END <iso8601> <script> exit=<code> duration_ms=<n> gate_skip=<true|false>
+#   FM_TEST_END <iso8601> <script> exit=<code> duration_ms=<n> gate_skip=<true|false> result=<passed|failed|timeout>
+#   FM_TEST_TIMEOUT_DIAGNOSTIC <script> <process diagnostic>
 #
 # After all scripts (stdout):
 #   FM_TEST_SUMMARY total=<n> failed=<n> skipped_gate=<n> duration_ms=<n>
@@ -61,10 +63,11 @@
 #   FM_TEST_SLOWEST rank=<k> script=<path> duration_ms=<n>
 #   FM_TEST_BUDGET_SUMMARY checked=<n> exceeded=<n> missing=<n> mode=warn|enforce
 #
-# Exit status is non-zero if any selected script exits non-zero, a configured
-# --fail-on-gate-skip token appears, or enforced duration budgets are exceeded
-# or missing. Other gate skips (first meaningful line matching ^skip:) remain
-# successful and are counted as skipped_gate.
+# Exit status is non-zero if any selected script exits non-zero or times out, a
+# configured --fail-on-gate-skip token appears, or enforced duration budgets are
+# exceeded or missing. Other gate skips (first meaningful line matching ^skip:)
+# remain successful and are counted as skipped_gate. A timeout is terminal and
+# is never silently retried.
 #
 # Family labels, the changed-file map, and production CI shard composition live
 # in this script only (one owner). The proven-isolated candidate set remains
@@ -347,35 +350,35 @@ EOF
 list_portable_parallel_1() {
   cat <<'EOF'
 tests/fm-x-mode.test.sh
+tests/fm-backend-herdr.test.sh
 tests/fm-cd-pretool-check.test.sh
-tests/fm-decision-hold-lifecycle.test.sh
-tests/fm-test-run.test.sh
+tests/fm-herdr-lab.test.sh
 tests/fm-composer-ghost.test.sh
-tests/fm-grok-harness.test.sh
+tests/fm-pr-merge.test.sh
 tests/fm-lint.test.sh
 tests/fm-pi-primary-types.test.sh
-tests/fm-review-diff.test.sh
-tests/fm-brief.test.sh
+tests/fm-send-settle.test.sh
+tests/fm-send-strict.test.sh
+tests/fm-supervision-instructions.test.sh
 tests/fm-transition-lib.test.sh
+tests/fm-composer-lib.test.sh
 EOF
 }
 
 # Portable parallel shard 2: the complementary LPT half of the proven set.
 list_portable_parallel_2() {
   cat <<'EOF'
-tests/fm-backend-herdr.test.sh
 tests/fm-arm-pretool-check.test.sh
+tests/fm-test-run.test.sh
+tests/fm-decision-hold-lifecycle.test.sh
 tests/fm-crew-state.test.sh
-tests/fm-herdr-lab.test.sh
-tests/fm-pr-merge.test.sh
+tests/fm-grok-harness.test.sh
 tests/fm-send-popup-settle.test.sh
 tests/fm-tmux-submit-busy.test.sh
-tests/fm-send-settle.test.sh
-tests/fm-send-strict.test.sh
+tests/fm-review-diff.test.sh
+tests/fm-brief.test.sh
 tests/fm-spawn-batch.test.sh
-tests/fm-supervision-instructions.test.sh
 tests/fm-ensure-agents-md.test.sh
-tests/fm-composer-lib.test.sh
 EOF
 }
 
@@ -435,24 +438,24 @@ tests/fm-afk-return.test.sh 3773
 tests/fm-ask-user-authority.test.sh 206
 tests/fm-backend-cmux-smoke.test.sh 46
 tests/fm-backend-cmux.test.sh 2268
-tests/fm-backend-orca.test.sh 15544
+tests/fm-backend-orca.test.sh 39125
 tests/fm-backend-tmux-smoke.test.sh 656
 tests/fm-backend-zellij-smoke.test.sh 35
 tests/fm-backend-zellij.test.sh 8436
 tests/fm-backend.test.sh 17423
 tests/fm-backlog-handoff.test.sh 3272
 tests/fm-bearings-snapshot.test.sh 57310
-tests/fm-bootstrap.test.sh 24895
+tests/fm-bootstrap.test.sh 148695
 tests/fm-busy-adapter-wiring.test.sh 14845
 tests/fm-busy-state.test.sh 1482
-tests/fm-calm-pi-extension.test.sh 166
+tests/fm-calm-pi-extension.test.sh 43584
 tests/fm-classify-decision-key.test.sh 560
 tests/fm-claude-stop-autoarm-live-e2e.test.sh 39
 tests/fm-claude-stop-autoarm.test.sh 60609
 tests/fm-cmux-claude-composer-live-e2e.test.sh 49
 tests/fm-codex-continuity-live-e2e.test.sh 24
 tests/fm-composer-matrix-live-e2e.test.sh 38
-tests/fm-control-relaunch.test.sh 29506
+tests/fm-control-relaunch.test.sh 85660
 tests/fm-control.test.sh 34081
 tests/fm-daemon.test.sh 14894
 tests/fm-discord-bot.test.sh 46859
@@ -538,7 +541,7 @@ tests/fm-wake-queue.test.sh 27451
 tests/fm-watch-arm.test.sh 50289
 tests/fm-watch-checkpoint.test.sh 7321
 tests/fm-watch-triage.test.sh 145269
-tests/fm-watcher-lock.test.sh 88221
+tests/fm-watcher-lock.test.sh 90486
 EOF
 }
 
@@ -582,7 +585,7 @@ tests/fm-send-settle.test.sh 2911
 tests/fm-send-strict.test.sh 2747
 tests/fm-spawn-batch.test.sh 855
 tests/fm-supervision-instructions.test.sh 703
-tests/fm-test-run.test.sh 15674
+tests/fm-test-run.test.sh 46194
 tests/fm-tmux-submit-busy.test.sh 4816
 tests/fm-transition-lib.test.sh 248
 tests/fm-x-mode.test.sh 52939
@@ -610,6 +613,25 @@ duration_budget_ms_for() {
   local script=$1 baseline
   baseline=$(script_duration_baseline_ms "$script") || return 1
   printf '%s\t%s\n' "$baseline" "$((baseline * 2 + 10000))"
+}
+
+# The hard watchdog deliberately reuses the measured-baseline owner. It keeps a
+# two-minute floor for loaded-runner variance, scales to five baselines plus 60
+# seconds, and caps at nine minutes so cleanup evidence lands before CI's
+# ten-minute job ceiling. FM_TEST_WATCHDOG_SECONDS_OVERRIDE is a positive-integer
+# regression-test hook; production and CI leave it unset.
+watchdog_seconds_for() {
+  local script=$1 baseline watchdog_ms override=${FM_TEST_WATCHDOG_SECONDS_OVERRIDE:-}
+  baseline=$(script_duration_baseline_ms "$script") || return 1
+  if [ -n "$override" ]; then
+    case "$override" in ''|*[!0-9]*|0) die "FM_TEST_WATCHDOG_SECONDS_OVERRIDE must be a positive integer" ;; esac
+    printf '%s\n' "$override"
+    return 0
+  fi
+  watchdog_ms=$((baseline * 5 + 60000))
+  [ "$watchdog_ms" -ge 120000 ] || watchdog_ms=120000
+  [ "$watchdog_ms" -le 540000 ] || watchdog_ms=540000
+  printf '%s\n' "$(((watchdog_ms + 999) / 1000))"
 }
 
 # Longest-processing-time assignment of one lane listing to <count> bins,
@@ -1383,7 +1405,8 @@ write_json_artifact() {
   fi
 
   python3 - "$out" "$started" "$finished" "$run_id" "$total" "$failed" "$skipped" "$duration" "$selection" "$records_file" "$families_file" <<'PY'
-import json, sys
+import json, os, sys
+from pathlib import Path
 
 out, started, finished, run_id, total, failed, skipped, duration, selection, records_file, families_file = sys.argv[1:]
 
@@ -1393,14 +1416,23 @@ with open(records_file, encoding="utf-8") as fh:
         line = line.rstrip("\n")
         if not line:
             continue
-        path, family, expected, exit_s, dur_s, gate, baseline_s, budget_s, exceeded = line.split("\t")
+        path, family, expected, exit_s, dur_s, gate, baseline_s, budget_s, exceeded, result, began_at, diagnostics_file = line.split("\t")
+        diagnostics = []
+        if diagnostics_file:
+            try:
+                diagnostics = [line.rstrip("\n") for line in open(diagnostics_file, encoding="utf-8") if line.rstrip("\n")]
+            except FileNotFoundError:
+                diagnostics = ["timeout diagnostics were not readable"]
         row = {
             "path": path,
             "family": family,
             "expected_gate_skip": expected,
+            "began_at": began_at,
             "duration_ms": int(dur_s),
             "exit": int(exit_s),
+            "result": result,
             "gate_skip": gate == "true",
+            "timeout_diagnostics": diagnostics,
             "duration_budget_exceeded": exceeded == "true",
             "duration_baseline_measured": bool(baseline_s),
         }
@@ -1441,9 +1473,14 @@ doc = {
     "scripts": scripts,
     "families": families,
 }
-with open(out, "w", encoding="utf-8") as fh:
+out_path = Path(out)
+tmp_path = out_path.with_name(out_path.name + ".tmp")
+with open(tmp_path, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, indent=2, sort_keys=True)
     fh.write("\n")
+    fh.flush()
+    os.fsync(fh.fileno())
+os.replace(tmp_path, out_path)
 PY
 }
 
@@ -1734,6 +1771,7 @@ FAMILIES_TSV="$RUN_TMP/families.tsv"
 : >"$RECORDS"
 WORKER_PIDS=()
 WORKER_GROUP_PIDS=()
+WATCHDOG_PIDS=()
 
 # shellcheck disable=SC2329 # Used by cleanup/signal handlers invoked indirectly by traps.
 worker_group_is_running() {
@@ -1821,8 +1859,23 @@ stop_active_workers() {
   retire_empty_worker_groups
 }
 
+# shellcheck disable=SC2329 # Invoked indirectly by EXIT and signal cleanup.
+stop_active_watchdogs() {
+  local pid
+  for pid in "${WATCHDOG_PIDS[@]+"${WATCHDOG_PIDS[@]}"}"; do
+    [ -n "$pid" ] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "${WATCHDOG_PIDS[@]+"${WATCHDOG_PIDS[@]}"}"; do
+    [ -n "$pid" ] || continue
+    wait "$pid" 2>/dev/null || true
+  done
+  WATCHDOG_PIDS=()
+}
+
 # shellcheck disable=SC2329 # Invoked indirectly by EXIT and signal traps.
 cleanup_run() {
+  stop_active_watchdogs
   stop_active_workers
   rm -rf "$RUN_TMP"
 }
@@ -1850,6 +1903,126 @@ AGG_RC=0
 
 # Family accumulators as TSV lines updated in-memory via temp files.
 # family -> count, duration_ms, failed
+# Print the root plus every recursively owned descendant from one process-table
+# snapshot. This complements process-group signaling for a descendant that
+# deliberately creates another process group or session.
+snapshot_process_tree() { # <root-pid>
+  local root=$1
+  ps -eo pid=,ppid=,pgid=,stat=,etime=,command= 2>/dev/null | awk -v root="$root" '
+    { line[NR]=$0; pid[NR]=$1; ppid[NR]=$2 }
+    END {
+      owned[root]=1
+      changed=1
+      while (changed) {
+        changed=0
+        for (i=1; i<=NR; i++) {
+          if (!owned[pid[i]] && owned[ppid[i]]) { owned[pid[i]]=1; changed=1 }
+        }
+      }
+      for (i=1; i<=NR; i++) if (owned[pid[i]]) print line[i]
+    }
+  '
+}
+
+signal_owned_tree() { # <signal> <pids-file> <group-pid>
+  local signal=$1 pids_file=$2 group_pid=$3 pid
+  kill -"$signal" -- "-$group_pid" 2>/dev/null || true
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    kill -"$signal" "$pid" 2>/dev/null || true
+  done <"$pids_file"
+}
+
+# A watchdog is outside the test worker's process group, so it can diagnose and
+# terminate the complete tree without killing itself. TERM gets a bounded grace
+# before KILL, and both pre-termination and survivor snapshots remain artifact
+# evidence.
+watch_worker_group() { # <seconds> <group-pid> <script> <work>
+  local seconds=$1 group_pid=$2 script=$3 work=$4 n pid
+  sleep "$seconds"
+  worker_group_is_running "$group_pid" || exit 0
+  : >"$work/timeout"
+  snapshot_process_tree "$group_pid" >"$work/processes.before"
+  awk '{print $1}' "$work/processes.before" >"$work/owned-pids"
+  {
+    printf 'active_script=%s watchdog_seconds=%s process_group=%s\n' "$script" "$seconds" "$group_pid"
+    printf 'processes_before_term:\n'
+    if [ -s "$work/processes.before" ]; then
+      cat "$work/processes.before"
+    else
+      printf 'process snapshot unavailable for root %s\n' "$group_pid"
+    fi
+  } >"$work/diagnostics"
+  signal_owned_tree TERM "$work/owned-pids" "$group_pid"
+  sleep 1
+  printf 'processes_surviving_term:\n' >>"$work/diagnostics"
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      ps -o pid=,ppid=,pgid=,stat=,etime=,command= -p "$pid" >>"$work/diagnostics" 2>&1 || true
+    fi
+  done <"$work/owned-pids"
+  signal_owned_tree KILL "$work/owned-pids" "$group_pid"
+  n=0
+  while worker_group_is_running "$group_pid" && [ "$n" -lt 20 ]; do
+    sleep 0.05
+    n=$((n + 1))
+  done
+  printf 'processes_surviving_kill:' >>"$work/diagnostics"
+  n=0
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '\n' >>"$work/diagnostics"
+      ps -o pid=,ppid=,pgid=,stat=,etime=,command= -p "$pid" >>"$work/diagnostics" 2>&1 || true
+      n=$((n + 1))
+    fi
+  done <"$work/owned-pids"
+  [ "$n" -ne 0 ] || printf ' none\n' >>"$work/diagnostics"
+}
+
+start_worker_watchdog() { # <script> <worker-pid> <work>
+  local script=$1 worker_pid=$2 work=$3 seconds watchdog_pid
+  if ! seconds=$(watchdog_seconds_for "$script"); then
+    return 0
+  fi
+  watch_worker_group "$seconds" "$worker_pid" "$script" "$work" &
+  watchdog_pid=$!
+  WATCHDOG_PIDS+=("$watchdog_pid")
+  printf '%s\n' "$watchdog_pid" >"$work/watchdog.pid"
+}
+
+stop_worker_watchdog() { # <work>
+  local work=$1 pid registered
+  local -a retained=()
+  pid=$(cat "$work/watchdog.pid" 2>/dev/null || true)
+  [ -n "$pid" ] || return 0
+  if [ -f "$work/timeout" ]; then
+    wait "$pid" 2>/dev/null || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  for registered in "${WATCHDOG_PIDS[@]+"${WATCHDOG_PIDS[@]}"}"; do
+    [ "$registered" = "$pid" ] || retained+=("$registered")
+  done
+  WATCHDOG_PIDS=("${retained[@]+"${retained[@]}"}")
+}
+
+write_progress_json() {
+  local finished_iso finished_ms duration
+  [ -n "$JSON_PATH" ] || return 0
+  finished_iso=$(now_iso)
+  finished_ms=$(now_ms)
+  duration=$((finished_ms - RUN_STARTED_MS))
+  [ "$duration" -ge 0 ] || duration=0
+  mkdir -p "$(dirname "$JSON_PATH")"
+  write_json_artifact "$JSON_PATH" \
+    "$RUN_STARTED_ISO" "$finished_iso" "$RUN_ID" \
+    "$TOTAL" "$FAILED" "$SKIPPED_GATE" "$duration" \
+    "$SELECTION_DESC" "$RECORDS" "$FAMILIES_TSV"
+}
+
 family_bump() {
   local fam=$1 dur=$2 failed_delta=$3
   local line name count duration failed_count rest
@@ -1880,8 +2053,8 @@ family_bump() {
 }
 
 record_script_result() {
-  local script=$1 rc=$2 duration=$3 out=$4 end_iso=$5
-  local base family expected gate_skip fail_delta budget_row baseline budget exceeded
+  local script=$1 rc=$2 duration=$3 out=$4 end_iso=$5 begin_iso=$6 work=$7
+  local base family expected gate_skip fail_delta budget_row baseline budget exceeded result diagnostics_file
   base=$(basename "$script")
   family=$(family_for_basename "$base")
   expected=$(expected_gate_skip_for_family "$family")
@@ -1891,14 +2064,30 @@ record_script_result() {
     rc=1
   fi
 
+  result=passed
+  diagnostics_file=
+  if [ -f "$work/timeout" ]; then
+    rc=124
+    result=timeout
+    diagnostics_file="$work/diagnostics"
+    log "test watchdog timed out: $script duration_ms=$duration"
+    if [ -s "$diagnostics_file" ]; then
+      while IFS= read -r diagnostic; do
+        printf 'FM_TEST_TIMEOUT_DIAGNOSTIC %s %s\n' "$script" "$diagnostic" >&2
+      done <"$diagnostics_file"
+    fi
+  elif [ "$rc" -ne 0 ]; then
+    result=failed
+  fi
+
   gate_skip=false
   if [ "$rc" -eq 0 ] && detect_gate_skip "$out"; then
     gate_skip=true
     SKIPPED_GATE=$((SKIPPED_GATE + 1))
   fi
 
-  printf 'FM_TEST_END %s %s exit=%s duration_ms=%s gate_skip=%s\n' \
-    "$end_iso" "$script" "$rc" "$duration" "$gate_skip"
+  printf 'FM_TEST_END %s %s exit=%s duration_ms=%s gate_skip=%s result=%s\n' \
+    "$end_iso" "$script" "$rc" "$duration" "$gate_skip" "$result"
 
   fail_delta=0
   if [ "$rc" -ne 0 ]; then
@@ -1930,11 +2119,12 @@ record_script_result() {
     fi
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$script" "$family" "$expected" "$rc" "$duration" "$gate_skip" \
-    "$baseline" "$budget" "$exceeded" >>"$RECORDS"
+    "$baseline" "$budget" "$exceeded" "$result" "$begin_iso" "$diagnostics_file" >>"$RECORDS"
   family_bump "$family" "$duration" "$fail_delta"
   TOTAL=$((TOTAL + 1))
+  write_progress_json
 }
 
 clear_ambient_fleet_environment() {
@@ -1976,11 +2166,13 @@ run_one_serial() {
   set +m
   WORKER_PIDS[0]=$worker_pid
   register_worker_group "$worker_pid"
+  start_worker_watchdog "$script" "$worker_pid" "$work"
   : >"$work/start"
   set +e
   wait "$worker_pid"
   rc=$?
   set -e
+  stop_worker_watchdog "$work"
   unset 'WORKER_PIDS[0]'
   retire_empty_worker_groups
   if [ -f "$work/exit" ]; then
@@ -1994,7 +2186,7 @@ run_one_serial() {
   if [ "$duration" -lt 0 ]; then
     duration=0
   fi
-  record_script_result "$script" "$rc" "$duration" "$out" "$end_iso"
+  record_script_result "$script" "$rc" "$duration" "$out" "$end_iso" "$begin_iso" "$work"
 }
 
 if [ "$JOBS" -eq 1 ]; then
@@ -2027,7 +2219,7 @@ else
   active_workers=0
 
   wait_one_job_worker() {
-    local slot=$1 pid idx work script rc duration mode out end_iso
+    local slot=$1 pid idx work script rc duration mode out end_iso begin_iso
     pid=${WORKER_PIDS[$slot]}
     idx=${WORKER_IDX[$slot]}
     script=${WORKER_SCRIPTS[$slot]}
@@ -2040,9 +2232,18 @@ else
     set -e
     retire_empty_worker_groups
     work="$RUN_TMP/w$idx"
+    stop_worker_watchdog "$work"
     rc=$(cat "$work/exit" 2>/dev/null || echo 1)
-    duration=$(cat "$work/duration_ms" 2>/dev/null || echo 0)
+    if [ -f "$work/duration_ms" ]; then
+      duration=$(cat "$work/duration_ms")
+    else
+      end_ms=$(now_ms)
+      begin_ms=$(cat "$work/began_ms")
+      duration=$((end_ms - begin_ms))
+      [ "$duration" -ge 0 ] || duration=0
+    fi
     out="$work/output"
+    begin_iso=$(cat "$work/began_at")
     end_iso=$(now_iso)
     # Replay captured output after the worker finishes so markers stay ordered.
     if [ -s "$out" ]; then
@@ -2056,7 +2257,7 @@ else
         rc=1
         ;;
     esac
-    record_script_result "$script" "$rc" "$duration" "$out" "$end_iso"
+    record_script_result "$script" "$rc" "$duration" "$out" "$end_iso" "$begin_iso" "$work"
   }
 
   worker_pid_is_running() {
@@ -2096,8 +2297,12 @@ else
     base=$(basename "$script")
     family=$(family_for_basename "$base")
     expected=$(expected_gate_skip_for_family "$family")
+    begin_iso=$(now_iso)
+    begin_ms=$(now_ms)
+    printf '%s\n' "$begin_iso" >"$work/began_at"
+    printf '%s\n' "$begin_ms" >"$work/began_ms"
     printf 'FM_TEST_BEGIN %s %s family=%s expected_gate_skip=%s\n' \
-      "$(now_iso)" "$script" "$family" "$expected"
+      "$begin_iso" "$script" "$family" "$expected"
     set -m
     (
       set +e
@@ -2142,6 +2347,7 @@ else
     WORKER_IDX[worker_n]=$worker_n
     WORKER_SCRIPTS[worker_n]=$script
     active_workers=$((active_workers + 1))
+    start_worker_watchdog "$script" "$worker_pid" "$work"
     : >"$work/start"
   done
   while [ "$active_workers" -gt 0 ]; do
@@ -2175,7 +2381,7 @@ fi
 # Slowest scripts (top 15) from records. Path is the stable tie-breaker.
 if [ -s "$RECORDS" ]; then
   rank=1
-  sort -t$'\t' -k5,5nr -k1,1 "$RECORDS" | head -n 15 | while IFS=$'\t' read -r path _family _expected _rc duration _gate _baseline _budget _exceeded; do
+  sort -t$'\t' -k5,5nr -k1,1 "$RECORDS" | head -n 15 | while IFS=$'\t' read -r path _family _expected _rc duration _gate _baseline _budget _exceeded _result _began _diagnostics; do
     printf 'FM_TEST_SLOWEST rank=%s script=%s duration_ms=%s\n' \
       "$rank" "$path" "$duration"
     rank=$((rank + 1))

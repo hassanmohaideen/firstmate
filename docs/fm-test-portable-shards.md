@@ -5,8 +5,9 @@
 
 ## Verification inputs
 
-The current candidate timings came from the 2026-07-29 concurrent proof recorded in [fm-test-isolation-proof.md](fm-test-isolation-proof.md).
+The candidate set came from the 2026-07-29 concurrent proof recorded in [fm-test-isolation-proof.md](fm-test-isolation-proof.md).
 The proof ran 24 candidates with four workers and no failures.
+The table keeps those proof timings except for newer focused green measurements documented below.
 
 | duration_ms | script |
 |---:|---|
@@ -16,7 +17,7 @@ The proof ran 24 candidates with four workers and no failures.
 | 34207 | `tests/fm-cd-pretool-check.test.sh` |
 | 30771 | `tests/fm-decision-hold-lifecycle.test.sh` |
 | 25365 | `tests/fm-crew-state.test.sh` |
-| 15674 | `tests/fm-test-run.test.sh` |
+| 46194 | `tests/fm-test-run.test.sh` |
 | 15422 | `tests/fm-herdr-lab.test.sh` |
 | 9065 | `tests/fm-composer-ghost.test.sh` |
 | 8564 | `tests/fm-pr-merge.test.sh` |
@@ -41,9 +42,9 @@ The two parallel lanes use longest-processing-time assignment from those measure
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-parallel-1` | 11 | 162436 ms (~162.4 s) |
-| `portable-parallel-2` | 13 | 162754 ms (~162.8 s) |
-| imbalance | | 318 ms |
+| `portable-parallel-1` | 13 | 172276 ms (~172.3 s) |
+| `portable-parallel-2` | 11 | 172364 ms (~172.4 s) |
+| imbalance | | 88 ms |
 
 `bin/fm-test-run.sh` contains the exact ordered memberships in `list_portable_parallel_1` and `list_portable_parallel_2`.
 
@@ -63,26 +64,40 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 `.github/workflows/ci.yml` derives the same `n` from `strategy.job-total` rather than a literal, so changing the shard count in either file without the other fails the lane loudly instead of leaving part of the required suite unrun.
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
-The hints are the complete per-script measurements from the retained per-shard timing artifacts of green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), refreshed through the procedure below.
+The hints start from the complete per-script measurements in the retained per-shard timing artifacts of green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), with newer focused green measurements replacing stale rows through the procedure below.
 A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of10` | 10 | 221044 ms (~221.0 s) |
-| `portable-serial-2of10` | 11 | 221049 ms (~221.0 s) |
-| `portable-serial-3of10` | 7 | 221526 ms (~221.5 s) |
-| `portable-serial-4of10` | 12 | 221048 ms (~221.0 s) |
-| `portable-serial-5of10` | 15 | 221055 ms (~221.1 s) |
-| `portable-serial-6of10` | 8 | 221483 ms (~221.5 s) |
-| `portable-serial-7of10` | 12 | 221056 ms (~221.1 s) |
-| `portable-serial-8of10` | 9 | 221143 ms (~221.1 s) |
-| `portable-serial-9of10` | 12 | 221053 ms (~221.1 s) |
-| `portable-serial-10of10` | 14 | 221053 ms (~221.1 s) |
-| imbalance | | 482 ms |
+| `portable-serial-1of10` | 7 | 252283 ms (~252.3 s) |
+| `portable-serial-2of10` | 8 | 252266 ms (~252.3 s) |
+| `portable-serial-3of10` | 12 | 252206 ms (~252.2 s) |
+| `portable-serial-4of10` | 8 | 252234 ms (~252.2 s) |
+| `portable-serial-5of10` | 12 | 252208 ms (~252.2 s) |
+| `portable-serial-6of10` | 13 | 252217 ms (~252.2 s) |
+| `portable-serial-7of10` | 12 | 252226 ms (~252.2 s) |
+| `portable-serial-8of10` | 13 | 252216 ms (~252.2 s) |
+| `portable-serial-9of10` | 15 | 252219 ms (~252.2 s) |
+| `portable-serial-10of10` | 10 | 252241 ms (~252.2 s) |
+| imbalance | | 77 ms |
 
 The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210119 ms in that run, is the floor for any serial shard count.
 Ten shards sit just above that floor, so more serial runners would stop paying off without first splitting or speeding that script.
+
+The 2026-08-14 focused baseline refresh used the public runner after concrete fixture and compatibility corrections:
+
+```sh
+bin/fm-test-run.sh tests/fm-test-run.test.sh
+bin/fm-test-run.sh tests/fm-watcher-lock.test.sh
+bin/fm-test-run.sh tests/fm-bootstrap.test.sh
+bin/fm-test-run.sh tests/fm-control-relaunch.test.sh
+bin/fm-test-run.sh tests/fm-backend-orca.test.sh
+bin/fm-test-run.sh tests/fm-calm-pi-extension.test.sh
+```
+
+The retained replacement measurements are 46,194 ms, 90,486 ms, 148,695 ms, 85,660 ms, 39,125 ms, and 43,584 ms respectively.
+The watcher value is the slower representative-load focused result; unloaded reruns completed in 69,208 ms and 82,072 ms, while retained green CI run [`31745668914`](https://github.com/hassanmohaideen/firstmate/actions/runs/31745668914) completed it in 87,421 ms.
 
 ## Real-Herdr CI shards
 
@@ -164,13 +179,20 @@ It also verifies that the parallel lanes, portable serial lane, and real-Herdr f
 It separately verifies that the portable serial CI shards are non-empty, disjoint, and together equal the portable serial lane.
 It verifies the real-Herdr CI shards the same way against the real-herdr-gated family.
 
-## Timing artifacts and budgets
+## Timing artifacts, budgets, and watchdogs
 
 Portable shards, each portable serial shard, and each real-Herdr shard upload runner-generated timing JSON.
 `bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
-The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from archived timing artifacts.
+The runner derives a generous per-script duration budget of twice the measured baseline plus ten seconds from the same measured hints used for shard balance and from archived timing artifacts.
+The hard per-script watchdog reuses the same measured-baseline owner instead of introducing a second timing inventory.
+It allows the greater of two minutes or five measured baselines plus 60 seconds, capped at nine minutes so cleanup evidence lands before the universal job ceiling.
+Every retained healthy baseline fits below its watchdog, including `tests/fm-watcher-lock.test.sh` at 87,421 ms in retained green CI run [`31745668914`](https://github.com/hassanmohaideen/firstmate/actions/runs/31745668914) and 90,486 ms under representative local load.
 An unmeasured script has no budget: local execution reports it as missing, enforced execution fails after the functional result, and the coverage guard rejects it from every required lane.
 Budget overruns warn during local runs and are enforced by required CI lanes without replacing or hiding functional failures.
+A watchdog expiry is always a functional failure and is never retried or converted into a partial pass.
+The runner records the active script, begin timestamp, terminal timeout result, elapsed duration, process-tree snapshot, TERM survivors, and KILL survivors in atomically replaced incremental timing JSON before continuing to the next retained script.
+It terminates the complete test-owned process tree with bounded TERM/KILL escalation, including descendants that create another process group, so a hung descendant cannot consume the entire job ceiling or leak into another script.
+Successful final artifacts retain deterministic script, family, and aggregate ordering.
 `.github/workflows/ci.yml` owns the exact artifact names, enforcement wiring, and aggregation wiring.
 
 ## Local entry points
@@ -178,12 +200,10 @@ Budget overruns warn during local runs and are enforced by required CI lanes wit
 [CONTRIBUTING.md](../CONTRIBUTING.md) owns the local test policy and common entry points.
 `bin/fm-test-run.sh --help` owns exact selection flags, lane names, duration enforcement, and bounded scheduling mechanics.
 
-## Timeouts
+## CI completion target and ceiling
 
-| Job | timeout-minutes | Rationale |
-|---|---:|---|
-| portable parallel 1/2 | 10 | The measured shard sums are under two minutes and the timeout is a hang tripwire. |
-| portable serial 1-10 | 30 | Each balanced shard is about 3.7 minutes, leaving a generous hang-tripwire margin. |
-| Herdr 1/2 | 30 | The longest shard is about 4.3 minutes and keeps a generous hang-tripwire margin. |
-
-Timeouts are hang tripwires rather than expected healthy durations.
+Healthy complete CI targets roughly five to eight minutes from job execution start through required aggregation.
+Every CI job has the same explicit ten-minute execution ceiling, including matrix jobs, setup-only guards, lint, invariants, and timing aggregation.
+GitHub queue time is outside `timeout-minutes` and does not consume that execution allowance.
+The ten-minute ceiling is a universal failure boundary rather than a healthy-duration target, and reaching it fails the job red.
+Per-script watchdogs stop one hung behavior script before it can consume the whole ceiling while preserving the complete required inventory, exact-once coverage proof, stateful isolation, real-Herdr coverage, lint, typing, and safety assertions.
