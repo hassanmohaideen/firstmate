@@ -617,21 +617,31 @@ duration_budget_ms_for() {
 
 # The hard watchdog deliberately reuses the measured-baseline owner. It keeps a
 # two-minute floor for loaded-runner variance, scales to five baselines plus 60
-# seconds, and caps at nine minutes so cleanup evidence lands before CI's
-# ten-minute job ceiling. FM_TEST_WATCHDOG_SECONDS_OVERRIDE is a positive-integer
-# regression-test hook; production and CI leave it unset.
+# seconds, and caps at nine minutes. CI also supplies the absolute job deadline;
+# the watchdog reserves the final minute for bounded cleanup, evidence
+# finalization, and artifact upload. FM_TEST_WATCHDOG_SECONDS_OVERRIDE is a
+# positive-integer regression-test hook; production and CI leave it unset.
 watchdog_seconds_for() {
-  local script=$1 baseline watchdog_ms override=${FM_TEST_WATCHDOG_SECONDS_OVERRIDE:-}
+  local script=$1 baseline watchdog_ms seconds override=${FM_TEST_WATCHDOG_SECONDS_OVERRIDE:-}
+  local deadline=${FM_TEST_JOB_DEADLINE_EPOCH:-} now remaining
   baseline=$(script_duration_baseline_ms "$script") || return 1
   if [ -n "$override" ]; then
     case "$override" in ''|*[!0-9]*|0) die "FM_TEST_WATCHDOG_SECONDS_OVERRIDE must be a positive integer" ;; esac
-    printf '%s\n' "$override"
-    return 0
+    seconds=$override
+  else
+    watchdog_ms=$((baseline * 5 + 60000))
+    [ "$watchdog_ms" -ge 120000 ] || watchdog_ms=120000
+    [ "$watchdog_ms" -le 540000 ] || watchdog_ms=540000
+    seconds=$(((watchdog_ms + 999) / 1000))
   fi
-  watchdog_ms=$((baseline * 5 + 60000))
-  [ "$watchdog_ms" -ge 120000 ] || watchdog_ms=120000
-  [ "$watchdog_ms" -le 540000 ] || watchdog_ms=540000
-  printf '%s\n' "$(((watchdog_ms + 999) / 1000))"
+  if [ -n "$deadline" ]; then
+    case "$deadline" in ''|*[!0-9]*|0) die "FM_TEST_JOB_DEADLINE_EPOCH must be a positive integer epoch" ;; esac
+    now=$(date +%s)
+    remaining=$((deadline - now - 60))
+    [ "$remaining" -ge 0 ] || remaining=0
+    [ "$seconds" -le "$remaining" ] || seconds=$remaining
+  fi
+  printf '%s\n' "$seconds"
 }
 
 # Longest-processing-time assignment of one lane listing to <count> bins,
@@ -1906,31 +1916,72 @@ AGG_RC=0
 # Print the root plus every recursively owned descendant from one process-table
 # snapshot. This complements process-group signaling for a descendant that
 # deliberately creates another process group or session.
-snapshot_process_tree() { # <root-pid>
-  local root=$1
-  ps -eo pid=,ppid=,pgid=,stat=,etime=,command= 2>/dev/null | awk -v root="$root" '
-    { line[NR]=$0; pid[NR]=$1; ppid[NR]=$2 }
+snapshot_process_forest() { # <roots-file>
+  local roots_file=$1
+  awk '
+    FNR == NR { owned[$1]=1; next }
+    { line[++n]=$0; pid[n]=$1; ppid[n]=$2 }
     END {
-      owned[root]=1
       changed=1
       while (changed) {
         changed=0
-        for (i=1; i<=NR; i++) {
+        for (i=1; i<=n; i++) {
           if (!owned[pid[i]] && owned[ppid[i]]) { owned[pid[i]]=1; changed=1 }
         }
       }
-      for (i=1; i<=NR; i++) if (owned[pid[i]]) print line[i]
+      for (i=1; i<=n; i++) if (owned[pid[i]]) print line[i]
     }
-  '
+  ' "$roots_file" <(ps -eo pid=,ppid=,pgid=,stat=,etime=,command= 2>/dev/null)
 }
 
-signal_owned_tree() { # <signal> <pids-file> <group-pid>
-  local signal=$1 pids_file=$2 group_pid=$3 pid
-  kill -"$signal" -- "-$group_pid" 2>/dev/null || true
-  while IFS= read -r pid; do
+process_identity() { # <pid>
+  ps -o lstart= -p "$1" 2>/dev/null | awk '{$1=$1; print; exit}'
+}
+
+process_identity_matches() { # <pid> <identity>
+  local current
+  current=$(process_identity "$1")
+  [ -n "$current" ] && [ "$current" = "$2" ]
+}
+
+retain_owned_snapshot() { # <root-pid> <identities-file> <snapshot-file>
+  local root=$1 identities_file=$2 snapshot_file=$3 line pid _ppid pgid _rest identity
+  local roots_file="$snapshot_file.roots"
+  : >"$snapshot_file"
+  printf '%s\n' "$root" >"$roots_file"
+  while IFS=$'\t' read -r pid identity _pgid; do
     [ -n "$pid" ] || continue
+    process_identity_matches "$pid" "$identity" || continue
+    printf '%s\n' "$pid" >>"$roots_file"
+  done <"$identities_file"
+  LC_ALL=C sort -u "$roots_file" -o "$roots_file"
+  snapshot_process_forest "$roots_file" >"$snapshot_file"
+  rm -f "$roots_file"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    read -r pid _ppid pgid _rest <<<"$line"
+    identity=$(process_identity "$pid")
+    [ -n "$identity" ] || continue
+    if ! awk -F '\t' -v pid="$pid" -v identity="$identity" \
+      '$1 == pid && $2 == identity { found=1 } END { exit !found }' "$identities_file"; then
+      printf '%s\t%s\t%s\n' "$pid" "$identity" "$pgid" >>"$identities_file"
+    fi
+  done <"$snapshot_file"
+}
+
+signal_owned_tree() { # <signal> <identities-file>
+  local signal=$1 identities_file=$2 pid identity pgid
+  while IFS=$'\t' read -r pid identity pgid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$pgid" ] || continue
+    process_identity_matches "$pid" "$identity" || continue
+    kill -"$signal" -- "-$pgid" 2>/dev/null || true
+  done <"$identities_file"
+  while IFS=$'\t' read -r pid identity pgid; do
+    [ -n "$pid" ] || continue
+    process_identity_matches "$pid" "$identity" || continue
     kill -"$signal" "$pid" 2>/dev/null || true
-  done <"$pids_file"
+  done <"$identities_file"
 }
 
 # A watchdog is outside the test worker's process group, so it can diagnose and
@@ -1938,12 +1989,12 @@ signal_owned_tree() { # <signal> <pids-file> <group-pid>
 # before KILL, and both pre-termination and survivor snapshots remain artifact
 # evidence.
 watch_worker_group() { # <seconds> <group-pid> <script> <work>
-  local seconds=$1 group_pid=$2 script=$3 work=$4 n pid
+  local seconds=$1 group_pid=$2 script=$3 work=$4 n pid identity
   sleep "$seconds"
   worker_group_is_running "$group_pid" || exit 0
   : >"$work/timeout"
-  snapshot_process_tree "$group_pid" >"$work/processes.before"
-  awk '{print $1}' "$work/processes.before" >"$work/owned-pids"
+  : >"$work/owned-identities"
+  retain_owned_snapshot "$group_pid" "$work/owned-identities" "$work/processes.before"
   {
     printf 'active_script=%s watchdog_seconds=%s process_group=%s\n' "$script" "$seconds" "$group_pid"
     printf 'processes_before_term:\n'
@@ -1953,16 +2004,22 @@ watch_worker_group() { # <seconds> <group-pid> <script> <work>
       printf 'process snapshot unavailable for root %s\n' "$group_pid"
     fi
   } >"$work/diagnostics"
-  signal_owned_tree TERM "$work/owned-pids" "$group_pid"
-  sleep 1
+  signal_owned_tree TERM "$work/owned-identities"
+  n=0
+  while [ "$n" -lt 20 ]; do
+    sleep 0.05
+    retain_owned_snapshot "$group_pid" "$work/owned-identities" "$work/processes.term.$n"
+    signal_owned_tree TERM "$work/owned-identities"
+    n=$((n + 1))
+  done
   printf 'processes_surviving_term:\n' >>"$work/diagnostics"
-  while IFS= read -r pid; do
+  while IFS=$'\t' read -r pid identity _pgid; do
     [ -n "$pid" ] || continue
-    if kill -0 "$pid" 2>/dev/null; then
+    if process_identity_matches "$pid" "$identity"; then
       ps -o pid=,ppid=,pgid=,stat=,etime=,command= -p "$pid" >>"$work/diagnostics" 2>&1 || true
     fi
-  done <"$work/owned-pids"
-  signal_owned_tree KILL "$work/owned-pids" "$group_pid"
+  done <"$work/owned-identities"
+  signal_owned_tree KILL "$work/owned-identities"
   n=0
   while worker_group_is_running "$group_pid" && [ "$n" -lt 20 ]; do
     sleep 0.05
@@ -1970,14 +2027,14 @@ watch_worker_group() { # <seconds> <group-pid> <script> <work>
   done
   printf 'processes_surviving_kill:' >>"$work/diagnostics"
   n=0
-  while IFS= read -r pid; do
+  while IFS=$'\t' read -r pid identity _pgid; do
     [ -n "$pid" ] || continue
-    if kill -0 "$pid" 2>/dev/null; then
+    if process_identity_matches "$pid" "$identity"; then
       printf '\n' >>"$work/diagnostics"
       ps -o pid=,ppid=,pgid=,stat=,etime=,command= -p "$pid" >>"$work/diagnostics" 2>&1 || true
       n=$((n + 1))
     fi
-  done <"$work/owned-pids"
+  done <"$work/owned-identities"
   [ "$n" -ne 0 ] || printf ' none\n' >>"$work/diagnostics"
 }
 

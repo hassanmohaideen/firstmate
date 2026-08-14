@@ -52,6 +52,8 @@ jobs:
     # a hang tripwire with margin, not the expected healthy end of the lane.
     timeout-minutes: 10
     steps:
+      - name: Establish absolute test job deadline
+        run: echo "FM_TEST_JOB_DEADLINE_EPOCH=$(( $(date +%s) + 600 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -85,6 +87,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Establish absolute test job deadline
+        run: echo "FM_TEST_JOB_DEADLINE_EPOCH=$(( $(date +%s) + 600 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -131,6 +135,8 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
+      - name: Establish absolute test job deadline
+        run: echo "FM_TEST_JOB_DEADLINE_EPOCH=$(( $(date +%s) + 600 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -192,6 +198,8 @@ jobs:
       matrix:
         shard: [1, 2]
     steps:
+      - name: Establish absolute test job deadline
+        run: echo "FM_TEST_JOB_DEADLINE_EPOCH=$(( $(date +%s) + 600 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0

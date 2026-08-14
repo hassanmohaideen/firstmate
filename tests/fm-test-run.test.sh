@@ -1176,7 +1176,20 @@ test_watchdog_timeout_cleanup_and_incremental_evidence() {
   cat >"$repo/tests/fm-watcher-lock.test.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'run\n' >>"$WATCHDOG_EVIDENCE/watchdog-runs"
-trap '' TERM INT HUP
+spawn_escaped() {
+  trap '' TERM INT HUP
+  python3 - "$WATCHDOG_EVIDENCE/escaped.pid" <<'PY' &
+import os, signal, sys, time
+os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(sys.argv[1], "w") as handle:
+    handle.write(str(os.getpid()))
+time.sleep(300)
+PY
+  while [ ! -s "$WATCHDOG_EVIDENCE/escaped.pid" ]; do sleep 0.01; done
+  sleep 0.2
+}
+trap spawn_escaped TERM
 bash -c 'trap "" TERM INT HUP; while :; do sleep 1; done' &
 printf '%s\n' "$!" >"$WATCHDOG_EVIDENCE/descendant.pid"
 touch "$WATCHDOG_EVIDENCE/watchdog-started"
@@ -1234,13 +1247,16 @@ assert any("processes_surviving_kill:" in line for line in row["timeout_diagnost
     || fail "timeout output lost the terminal result"
   grep -Fq 'FM_TEST_TIMEOUT_DIAGNOSTIC tests/fm-watcher-lock.test.sh active_script=tests/fm-watcher-lock.test.sh' "$tmp/err" \
     || fail "timeout diagnostics did not name the exact active script"
-  child=$(cat "$evidence/descendant.pid")
-  n=0
-  while kill -0 "$child" 2>/dev/null && [ "$n" -lt 100 ]; do sleep 0.01; n=$((n + 1)); done
-  if kill -0 "$child" 2>/dev/null; then
-    kill -KILL "$child" 2>/dev/null || true
-    fail "watchdog left a test-owned descendant alive"
-  fi
+  for child_file in descendant.pid escaped.pid; do
+    [ -s "$evidence/$child_file" ] || fail "TERM handler did not record $child_file"
+    child=$(cat "$evidence/$child_file")
+    n=0
+    while kill -0 "$child" 2>/dev/null && [ "$n" -lt 100 ]; do sleep 0.01; n=$((n + 1)); done
+    if kill -0 "$child" 2>/dev/null; then
+      kill -KILL "$child" 2>/dev/null || true
+      fail "watchdog left test-owned $child_file alive"
+    fi
+  done
   python3 -c '
 import json, sys
 rows = json.load(open(sys.argv[1]))["scripts"]
@@ -1249,6 +1265,51 @@ assert [row["result"] for row in rows] == ["passed", "timeout"], rows
 ' "$tmp/timing.json" || fail "final artifact did not preserve complete exact-once results"
   rm -rf "$tmp"
   pass "watchdog fails hung scripts, cleans descendants, and persists partial evidence"
+}
+
+test_watchdog_honors_absolute_job_deadline() {
+  local tmp repo runner evidence deadline started finished rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-deadline.XXXXXX")
+  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  runner="$repo/bin/fm-test-run.sh"
+  chmod +x "$runner"
+  cat >"$repo/tests/fm-transition-lib.test.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+echo 'ok - setup consumed the early job budget'
+SH
+  cat >"$repo/tests/fm-watcher-lock.test.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'run\n' >>"$DEADLINE_EVIDENCE/runs"
+trap '' TERM INT HUP
+while :; do sleep 1; done
+SH
+  chmod +x "$repo"/tests/*.test.sh
+
+  deadline=$(( $(date +%s) + 64 ))
+  started=$(date +%s)
+  set +e
+  DEADLINE_EVIDENCE="$evidence" FM_TEST_JOB_DEADLINE_EPOCH="$deadline" \
+    FM_TEST_WATCHDOG_SECONDS_OVERRIDE=30 "$runner" --json "$tmp/timing.json" \
+    tests/fm-transition-lib.test.sh tests/fm-watcher-lock.test.sh >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  finished=$(date +%s)
+  [ "$rc" -ne 0 ] || fail "absolute job deadline timeout passed green"
+  [ "$((finished - started))" -lt 15 ] || fail "late script ignored the absolute job deadline"
+  [ "$(wc -l <"$evidence/runs" | tr -d ' ')" = 1 ] || fail "deadline timeout reran the script"
+  grep -Eq 'active_script=tests/fm-watcher-lock.test.sh watchdog_seconds=[0-3] ' "$tmp/err" \
+    || fail "late script did not use the remaining absolute job budget"
+  python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))["scripts"]
+assert [row["path"] for row in rows] == ["tests/fm-transition-lib.test.sh", "tests/fm-watcher-lock.test.sh"], rows
+assert [row["result"] for row in rows] == ["passed", "timeout"], rows
+assert rows[1]["exit"] == 124 and rows[1]["timeout_diagnostics"], rows
+' "$tmp/timing.json" || fail "deadline timeout lost complete incremental evidence"
+  rm -rf "$tmp"
+  pass "watchdog reserves cleanup time against the absolute job deadline"
 }
 
 test_aggregate_json() {
@@ -1322,4 +1383,5 @@ test_completed_worker_descendant_cleanup
 test_environment_isolation_in_serial_and_parallel_children
 test_duration_budget_warns_and_ci_enforces
 test_watchdog_timeout_cleanup_and_incremental_evidence
+test_watchdog_honors_absolute_job_deadline
 test_aggregate_json

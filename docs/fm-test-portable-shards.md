@@ -185,13 +185,16 @@ Portable shards, each portable serial shard, and each real-Herdr shard upload ru
 `bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
 The runner derives a generous per-script duration budget of twice the measured baseline plus ten seconds from the same measured hints used for shard balance and from archived timing artifacts.
 The hard per-script watchdog reuses the same measured-baseline owner instead of introducing a second timing inventory.
-It allows the greater of two minutes or five measured baselines plus 60 seconds, capped at nine minutes so cleanup evidence lands before the universal job ceiling.
+It allows the greater of two minutes or five measured baselines plus 60 seconds, capped at nine minutes.
+Each behavior job records an absolute deadline in its first executable step, before checkout and setup; CI watchdogs further shorten that per-script allowance when necessary to reserve the final minute for diagnostics, bounded TERM/KILL cleanup, atomic evidence finalization, and artifact upload before the universal job ceiling.
+Local runs without that deadline retain the data-driven per-script allowance.
 Every retained healthy baseline fits below its watchdog, including `tests/fm-watcher-lock.test.sh` at 87,421 ms in retained green CI run [`31745668914`](https://github.com/hassanmohaideen/firstmate/actions/runs/31745668914) and 90,486 ms under representative local load.
 An unmeasured script has no budget: local execution reports it as missing, enforced execution fails after the functional result, and the coverage guard rejects it from every required lane.
 Budget overruns warn during local runs and are enforced by required CI lanes without replacing or hiding functional failures.
 A watchdog expiry is always a functional failure and is never retried or converted into a partial pass.
 The runner records the active script, begin timestamp, terminal timeout result, elapsed duration, process-tree snapshot, TERM survivors, and KILL survivors in atomically replaced incremental timing JSON before continuing to the next retained script.
 It terminates the complete test-owned process tree with bounded TERM/KILL escalation, including descendants that create another process group, so a hung descendant cannot consume the entire job ceiling or leak into another script.
+During the TERM grace it repeatedly re-snapshots and retains process identities, so a TERM handler cannot escape cleanup by spawning a new session and recycled PIDs are not signaled as owned processes.
 Successful final artifacts retain deterministic script, family, and aggregate ordering.
 `.github/workflows/ci.yml` owns the exact artifact names, enforcement wiring, and aggregation wiring.
 
