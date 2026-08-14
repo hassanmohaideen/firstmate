@@ -1208,9 +1208,14 @@ SH
     "$runner" --json "$tmp/timing.json" \
     tests/fm-watcher-lock.test.sh tests/fm-new-required.test.sh >"$tmp/out" 2>"$tmp/err" &
   pid=$!
+  # The watchdog owns bounded diagnostics plus TERM/KILL cleanup before the
+  # runner may continue. Allow its documented 15-second job-cleanup reserve
+  # after the one-second watchdog fires; a five-second fixture poll is too
+  # short on a loaded portable runner. Stop early if the runner itself exits.
   n=0
-  while [ ! -e "$evidence/followup-started" ] && [ "$n" -lt 500 ]; do
-    sleep 0.01
+  while [ ! -e "$evidence/followup-started" ] && [ "$n" -lt 400 ] \
+    && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.05
     n=$((n + 1))
   done
   [ -e "$evidence/followup-started" ] || {
