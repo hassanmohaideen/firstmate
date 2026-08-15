@@ -44,19 +44,12 @@ fm_github_validate_organization() {
 }
 
 fm_github_http_remote_host() {
-  local url=$1 authority userinfo host port normalized_port
+  local url=$1 authority host port normalized_port
   case "$url" in
     https://*/*) authority=${url#*://}; authority=${authority%%/*} ;;
     *) return 1 ;;
   esac
-  case "$authority" in
-    ''|*@*@*) return 1 ;;
-    *@*)
-      userinfo=${authority%%@*}
-      authority=${authority#*@}
-      case "$userinfo" in ''|*[!A-Za-z0-9._~-]*) return 1 ;; esac
-      ;;
-  esac
+  case "$authority" in ''|*@*) return 1 ;; esac
   case "$authority" in
     *:*)
       host=${authority%:*}

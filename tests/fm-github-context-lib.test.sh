@@ -231,14 +231,14 @@ test_gate_trusts_a_matching_verified_tuple_without_probing() {
 test_gate_blocks_unverifiable_transports_before_fast_path() {
   local proj vt url
   vt='github|github.com|repository|owner/repo|push'
-  for url in http://github.com/owner/repo.git https://github.com:8443/owner/repo.git ssh://root@github.com/owner/repo.git ssh://git@github.com:2222/owner/repo.git; do
+  for url in http://github.com/owner/repo.git https://github.com:8443/owner/repo.git https://other-user@github.com/owner/repo.git ssh://root@github.com/owner/repo.git ssh://git@github.com:2222/owner/repo.git; do
     proj=$(make_project gatebadtransport "$url")
     install_fake_gh "$proj"
     run_gate "$proj" github github.com repository owner/repo push '' "$vt"
     [ "$GATE_RC" -eq 2 ] || fail "an unverifiable transport must block indeterminate before the fast path (rc $GATE_RC, URL $url)"
     [ "$GATE_PROBED" -eq 1 ] || fail "an unverifiable transport must block without probing (URL $url)"
   done
-  pass "the gate blocks unverifiable HTTP, HTTPS, and SSH authorities before its fast path"
+  pass "the gate blocks unverifiable HTTP, HTTPS userinfo, ports, and SSH authorities before its fast path"
 }
 
 test_gate_accepts_standard_github_ssh_authorities() {
