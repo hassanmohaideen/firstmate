@@ -46,7 +46,7 @@ fm_github_validate_organization() {
 fm_github_http_remote_host() {
   local url=$1 authority userinfo host port normalized_port
   case "$url" in
-    https://*/*|http://*/*) authority=${url#*://}; authority=${authority%%/*} ;;
+    https://*/*) authority=${url#*://}; authority=${authority%%/*} ;;
     *) return 1 ;;
   esac
   case "$authority" in
@@ -67,6 +67,7 @@ fm_github_http_remote_host() {
       while [ "${normalized_port#0}" != "$normalized_port" ]; do normalized_port=${normalized_port#0}; done
       [ -n "$normalized_port" ] || return 1
       [ "${#normalized_port}" -lt 6 ] && [ "$normalized_port" -le 65535 ] || return 1
+      [ "$normalized_port" = 443 ] || return 1
       ;;
     *) host=$authority ;;
   esac
@@ -75,37 +76,14 @@ fm_github_http_remote_host() {
   printf '%s' "$host"
 }
 
-fm_github_remote_urls_include_host() {
-  local project=$1 capability=$2 expected_host=$3 urls url host
-  case "$capability" in
-    push) urls=$(git -C "$project" remote get-url --push --all origin 2>/dev/null) || return 1 ;;
-    fetch|api-org-membership) urls=$(git -C "$project" remote get-url --all origin 2>/dev/null) || return 1 ;;
-    *) return 1 ;;
-  esac
-  while IFS= read -r url; do
-    case "$url" in
-      https://*/*|http://*/*) host=$(fm_github_http_remote_host "$url") || continue ;;
-      ssh://*/*) host=${url#ssh://}; host=${host#*@}; host=${host%%[:/]*} ;;
-      git@*:*/*) host=${url#git@}; host=${host%%:*} ;;
-      *) continue ;;
-    esac
-    host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
-    fm_github_validate_hostname "$host" || continue
-    [ "$host" = "$expected_host" ] && return 0
-  done <<EOF
-$urls
-EOF
-  return 1
-}
-
 fm_github_remote_destination_host() {
   local project=$1 capability=$2 url host
   url=$(fm_github_remote_destination_url "$project" "$capability") || return $?
   case "$url" in
-    https://*/*|http://*/*) host=$(fm_github_http_remote_host "$url") || return 1 ;;
+    https://*/*) host=$(fm_github_http_remote_host "$url") || return 2 ;;
     ssh://*/*) host=${url#ssh://}; host=${host#*@}; host=${host%%[:/]*} ;;
     git@*:*/*) host=${url#git@}; host=${host%%:*} ;;
-    *) return 1 ;;
+    *) return 2 ;;
   esac
   host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
   fm_github_validate_hostname "$host" || return 1
@@ -295,11 +273,8 @@ fm_github_ctx_intake() {
   obs_host=$(fm_github_remote_destination_host "$project" "$capability" 2>/dev/null)
   st=$?
   if [ "$st" -eq 2 ]; then
-    if [ -n "$asserted" ] || fm_github_remote_urls_include_host "$project" "$capability" github.com; then
-      echo "GH_AUTH_INDETERMINATE: multiple or mixed GitHub destinations cannot establish one authoritative target" >&2
-      return 2
-    fi
-    return 3
+    echo "GH_AUTH_INDETERMINATE: an ambiguous or unverifiable destination cannot establish one authoritative target" >&2
+    return 2
   elif [ "$st" -ne 0 ] || [ -z "$obs_host" ]; then
     if [ -n "$asserted" ]; then
       echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub destination for the asserted host" >&2
@@ -350,7 +325,7 @@ fm_github_ctx_gate() {
   obs_host=$(fm_github_remote_destination_host "$project" "$capability" 2>/dev/null)
   st=$?
   if [ "$st" -eq 2 ]; then
-    echo "GH_AUTH_INDETERMINATE: multiple or mixed GitHub destinations cannot establish one authoritative target" >&2
+    echo "GH_AUTH_INDETERMINATE: an ambiguous or unverifiable destination cannot establish one authoritative target" >&2
     return 2
   elif [ "$st" -ne 0 ] || [ -z "$obs_host" ]; then
     echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub destination" >&2

@@ -150,7 +150,29 @@ test_intake_refuses_mismatch_and_ambiguity() {
   git -C "$proj" remote set-url --add --push origin https://github.enterprise.example/owner/repo.git
   fm_github_ctx_intake "$proj" push '' '' >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 2 ] || fail "mixed destinations including github.com are indeterminate (expected rc 2), got $rc"
-  pass "intake refuses an asserted mismatch, a malformed host, and mixed destinations"
+
+  proj=$(make_project mixednongithub https://gitlab.example/owner/repo.git)
+  git -C "$proj" remote set-url --add --push origin https://github.enterprise.example/owner/repo.git
+  git -C "$proj" remote set-url --add --push origin https://gitlab.example/owner/repo.git
+  fm_github_ctx_intake "$proj" push '' '' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] || fail "multiple destinations without github.com are indeterminate (expected rc 2), got $rc"
+  pass "intake refuses an asserted mismatch, a malformed host, and all multiple destinations"
+}
+
+test_intake_rejects_unverifiable_http_transports() {
+  local proj rc out
+  proj=$(make_project plainhttp http://github.com/owner/repo.git)
+  fm_github_ctx_intake "$proj" push '' '' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] || fail "an HTTP destination must be indeterminate (expected rc 2), got $rc"
+
+  proj=$(make_project customport https://github.com:8443/owner/repo.git)
+  fm_github_ctx_intake "$proj" push '' '' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] || fail "a non-default HTTPS port must be indeterminate (expected rc 2), got $rc"
+
+  proj=$(make_project defaultport https://github.com:443/owner/repo.git)
+  out=$(fm_github_ctx_intake "$proj" push '' '') || fail "an explicit default HTTPS port must remain verifiable"
+  [ "$out" = "$(printf 'github.com\trepository\towner/repo')" ] || fail "an explicit default HTTPS port must resolve the canonical destination"
+  pass "intake rejects unverifiable HTTP transports and accepts explicit HTTPS port 443"
 }
 
 test_intake_resolves_org_membership_selection() {
@@ -199,6 +221,19 @@ test_gate_trusts_a_matching_verified_tuple_without_probing() {
   [ "$GATE_RC" -eq 0 ] || fail "a recorded tuple matching the observed destination must be trusted (rc $GATE_RC)"
   [ "$GATE_PROBED" -eq 1 ] || fail "a matching verified tuple must NOT re-probe"
   pass "the gate trusts a verified tuple that matches the current destination without re-probing"
+}
+
+test_gate_blocks_unverifiable_transports_before_fast_path() {
+  local proj vt url
+  vt='github|github.com|repository|owner/repo|push'
+  for url in http://github.com/owner/repo.git https://github.com:8443/owner/repo.git; do
+    proj=$(make_project gatebadtransport "$url")
+    install_fake_gh "$proj"
+    run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+    [ "$GATE_RC" -eq 2 ] || fail "an unverifiable transport must block indeterminate before the fast path (rc $GATE_RC, URL $url)"
+    [ "$GATE_PROBED" -eq 1 ] || fail "an unverifiable transport must block without probing (URL $url)"
+  done
+  pass "the gate blocks HTTP and non-default-port HTTPS destinations before its fast path"
 }
 
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it() {
@@ -315,9 +350,11 @@ test_recorded_context_state_distinguishes_absent_partial_and_complete_records
 test_dest_tuple_is_a_stable_delimited_join
 test_intake_auto_selects_github_com_but_never_infers_another_host
 test_intake_refuses_mismatch_and_ambiguity
+test_intake_rejects_unverifiable_http_transports
 test_intake_resolves_org_membership_selection
 test_gate_verifies_a_fresh_matching_destination
 test_gate_trusts_a_matching_verified_tuple_without_probing
+test_gate_blocks_unverifiable_transports_before_fast_path
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it
 test_gate_reprobes_when_the_verified_record_is_missing
 test_gate_classifies_auth_and_indeterminate_failures
