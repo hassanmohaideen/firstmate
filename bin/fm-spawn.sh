@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--github-host <canonical-host>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--github-host <canonical-host> --github-auth-required[=<private-repository-read|organization-membership-read>] [--github-organization <organization>]] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+#   GitHub authentication-context gate (bin/fm-github-context-lib.sh owns the
+#   decision). A ship push and an authentication scout verify their exact
+#   destination BEFORE any worktree, window, or endpoint is created, and refuse to
+#   launch until an authoritative probe of the selected destination succeeds.
+#   --github-host is firstmate's intake assertion that the remote is authoritatively
+#   GitHub on that lowercase canonical host, so an arbitrary forge or unresolved SSH
+#   alias cannot become GitHub by inference; github.com is auto-selected without it.
+#   --github-auth-required (scouts only) verifies a private-repository read or, with
+#   --github-organization, an authenticated organization-membership read. A relaunch
+#   reuses the recorded selection and refuses all three flags. The resolved
+#   selection is persisted verbatim (gh_forge, gh_selected_host, gh_target_kind,
+#   gh_target, gh_auth_required, gh_auth_capability, gh_organization) and is never a
+#   function of a probe outcome; gh_verified_dest, the one field a probe transitions,
+#   is written only on a successful verification and its absence re-probes on the
+#   next relaunch (fail-closed). A changed, mixed, missing, or malformed destination
+#   stays indeterminate and cannot launch.
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
@@ -252,6 +268,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-github-context-lib.sh
+. "$SCRIPT_DIR/fm-github-context-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -275,6 +293,14 @@ MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
+# GitHub authentication-context selection. GITHUB_* hold the intake assertion
+# from firstmate; GH_* hold the resolved selection persisted into the task meta
+# and gated by bin/fm-github-context-lib.sh. GITHUB_AUTH_REQUIRED defaults off.
+GITHUB_HOST=
+GITHUB_HOST_SET=0
+GITHUB_AUTH_REQUIRED=0
+GITHUB_AUTH_CAPABILITY=
+GITHUB_ORGANIZATION=
 POS=()
 want_value=
 for a in "$@"; do
@@ -290,6 +316,8 @@ for a in "$@"; do
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
       traceparent) TRACEPARENT_ARG=$a; TRACEPARENT_SET=1 ;;
+      github-host) GITHUB_HOST=$a; GITHUB_HOST_SET=1 ;;
+      github-organization) GITHUB_ORGANIZATION=$a ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -313,6 +341,12 @@ for a in "$@"; do
     --yolo=*) YOLO=${a#--yolo=}; YOLO_SET=1 ;;
     --traceparent) want_value=traceparent ;;
     --traceparent=*) TRACEPARENT_ARG=${a#--traceparent=}; TRACEPARENT_SET=1 ;;
+    --github-host) want_value=github-host ;;
+    --github-host=*) GITHUB_HOST=${a#--github-host=}; GITHUB_HOST_SET=1 ;;
+    --github-auth-required) GITHUB_AUTH_REQUIRED=1; GITHUB_AUTH_CAPABILITY=private-repository-read ;;
+    --github-auth-required=*) GITHUB_AUTH_REQUIRED=1; GITHUB_AUTH_CAPABILITY=${a#--github-auth-required=} ;;
+    --github-organization) want_value=github-organization ;;
+    --github-organization=*) GITHUB_ORGANIZATION=${a#--github-organization=} ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -341,6 +375,25 @@ case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
 esac
+# GitHub authentication-context flags are firstmate's intake-only assertion that
+# the selected remote is authoritatively GitHub. A relaunch reuses the recorded
+# selection and refuses them (below).
+[ "$GITHUB_HOST_SET" -eq 0 ] || [ -n "$GITHUB_HOST" ] || { echo "error: --github-host requires a non-empty value" >&2; exit 1; }
+if [ "$GITHUB_HOST_SET" -eq 1 ]; then
+  fm_github_validate_hostname "$GITHUB_HOST" || { echo "error: --github-host must be a lowercase canonical hostname" >&2; exit 1; }
+fi
+if [ "$GITHUB_AUTH_REQUIRED" -eq 1 ]; then
+  [ "$KIND" = scout ] || { echo "error: --github-auth-required applies only to --scout spawns" >&2; exit 1; }
+  case "$GITHUB_AUTH_CAPABILITY" in
+    private-repository-read|organization-membership-read) ;;
+    *) echo "error: --github-auth-required must be private-repository-read or organization-membership-read" >&2; exit 1 ;;
+  esac
+  [ "$GITHUB_HOST_SET" -eq 1 ] || { echo "error: --github-auth-required requires --github-host naming the canonical destination" >&2; exit 1; }
+fi
+if [ "$GITHUB_AUTH_CAPABILITY" = organization-membership-read ]; then
+  [ -n "$GITHUB_ORGANIZATION" ] || { echo "error: --github-auth-required=organization-membership-read requires --github-organization" >&2; exit 1; }
+fi
+[ -z "$GITHUB_ORGANIZATION" ] || [ "$GITHUB_AUTH_CAPABILITY" = organization-membership-read ] || { echo "error: --github-organization applies only to --github-auth-required=organization-membership-read" >&2; exit 1; }
 
 # --relaunch reuses an existing task's endpoint, worktree, project, and kind,
 # so every axis this block resolves for a fresh spawn instead comes from that
@@ -351,6 +404,9 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$KIND_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded kind; --scout/--secondmate cannot override it" >&2; exit 1; }
   [ "$MODE_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded delivery mode; --mode cannot override it" >&2; exit 1; }
   [ "$YOLO_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded yolo posture; --yolo cannot override it" >&2; exit 1; }
+  [ "$GITHUB_HOST_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded GitHub selection; --github-host cannot override it" >&2; exit 1; }
+  [ "$GITHUB_AUTH_REQUIRED" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded GitHub selection; --github-auth-required cannot override it" >&2; exit 1; }
+  [ -z "$GITHUB_ORGANIZATION" ] || { echo "error: --relaunch reuses the task's recorded GitHub selection; --github-organization cannot override it" >&2; exit 1; }
 else
   # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
   # firstmate's per-task decision, so they are required and closed-set validated
@@ -1006,6 +1062,19 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ -n "$KIND" ] || KIND=ship
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
   YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
+  # The recorded GitHub selection is authoritative and immutable across a
+  # relaunch: it is read here, carried verbatim into the republished meta, and
+  # revalidated by the gate. A relaunch never re-derives or clears it, so the
+  # erase-then-bypass class cannot occur.
+  GITHUB_AUTH_REQUIRED=$(fm_meta_get "$RELAUNCH_META" gh_auth_required)
+  [ -n "$GITHUB_AUTH_REQUIRED" ] || GITHUB_AUTH_REQUIRED=0
+  GITHUB_AUTH_CAPABILITY=$(fm_meta_get "$RELAUNCH_META" gh_auth_capability)
+  GH_REC_FORGE=$(fm_meta_get "$RELAUNCH_META" gh_forge)
+  GH_REC_HOST=$(fm_meta_get "$RELAUNCH_META" gh_selected_host)
+  GH_REC_TARGET_KIND=$(fm_meta_get "$RELAUNCH_META" gh_target_kind)
+  GH_REC_TARGET=$(fm_meta_get "$RELAUNCH_META" gh_target)
+  GH_REC_ORG=$(fm_meta_get "$RELAUNCH_META" gh_organization)
+  GH_REC_VERIFIED=$(fm_meta_get "$RELAUNCH_META" gh_verified_dest)
   RELAUNCH_WT=$(fm_meta_get "$RELAUNCH_META" worktree)
   [ -n "$RELAUNCH_WT" ] && [ -d "$RELAUNCH_WT" ] || {
     echo "error: task $ID's recorded worktree '${RELAUNCH_WT:-none}' is missing; refusing to relaunch without the local copy its work lives in" >&2
@@ -1607,6 +1676,74 @@ else
   BRIEF="$DATA/$ID/brief.md"
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+
+# GitHub authentication-context gate. bin/fm-github-context-lib.sh is the single
+# owner of the decision; this block only resolves the selection (from intake
+# flags, or the recorded selection carried verbatim on a relaunch) and refuses to
+# launch when verification does not succeed. It runs before any worktree, window,
+# or endpoint is created, so a blocked task leaves no orphan and never mutates the
+# recorded meta. A launch that reaches here is either out of scope or verified.
+GH_GATED=0
+GH_FORGE=
+GH_SEL_HOST=
+GH_TARGET_KIND=
+GH_TARGET=
+GH_CAPABILITY=
+GH_ORG=
+GH_VERIFIED_DEST=
+if [ "$KIND" != secondmate ] && fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; then
+  GH_CAPABILITY=$(fm_github_ctx_capability "$KIND" "$GITHUB_AUTH_CAPABILITY") || {
+    echo "error: task $ID has no resolvable GitHub authentication capability" >&2
+    exit 1
+  }
+  if [ "$RELAUNCH" -eq 1 ] && [ -n "${GH_REC_HOST:-}" ]; then
+    GH_FORGE=$GH_REC_FORGE
+    GH_SEL_HOST=$GH_REC_HOST
+    GH_TARGET_KIND=$GH_REC_TARGET_KIND
+    GH_TARGET=$GH_REC_TARGET
+    GH_ORG=$GH_REC_ORG
+    GH_VERIFIED_DEST=$GH_REC_VERIFIED
+    GH_GATED=1
+  # The command substitution is kept in the `if` condition so `set -e` does not
+  # exit on the intended non-zero returns before they are handled.
+  elif GH_INTAKE=$(fm_github_ctx_intake "$PROJ_ABS" "$GH_CAPABILITY" "$GITHUB_HOST" "$GITHUB_ORGANIZATION"); then
+    IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
+$GH_INTAKE
+EOF
+    GH_FORGE=github
+    GH_ORG=$GITHUB_ORGANIZATION
+    GH_GATED=1
+  else
+    GH_INTAKE_RC=$?
+    case "$GH_INTAKE_RC" in
+      3)
+        if [ "$KIND" = scout ]; then
+          echo "error: a GitHub authentication scout requires --github-host naming the canonical destination" >&2
+          exit 1
+        fi
+        GH_GATED=0
+        ;;
+      1) exit 1 ;;
+      *)
+        echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  if [ "$GH_GATED" -eq 1 ]; then
+    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$PROJ_ABS" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST"); then
+      GH_VERIFIED_DEST=$GH_VERIFIED_NEW
+    else
+      GH_GATE_RC=$?
+      if [ "$GH_GATE_RC" -eq 1 ]; then
+        echo "GitHub authentication or access blocks task $ID; worker launch is waiting" >&2
+      else
+        echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+      fi
+      exit 1
+    fi
+  fi
+fi
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
@@ -2574,7 +2711,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo gh_forge gh_selected_host gh_target_kind gh_target gh_auth_required gh_auth_capability gh_organization gh_verified_dest tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2589,6 +2726,21 @@ preserve_relaunch_meta() {
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
+  # GitHub authentication-context selection, written unconditionally from the
+  # immutable resolved selection (never from a probe outcome), so a blocked or
+  # failed relaunch can never erase it. gh_verified_dest, the only field a probe
+  # transitions, is written only when the current destination is verified; its
+  # absence forces a re-probe on the next relaunch (fail-closed migration).
+  if [ "$GH_GATED" -eq 1 ]; then
+    echo "gh_forge=$GH_FORGE"
+    echo "gh_selected_host=$GH_SEL_HOST"
+    echo "gh_target_kind=$GH_TARGET_KIND"
+    [ -z "$GH_TARGET" ] || echo "gh_target=$GH_TARGET"
+    [ "$GITHUB_AUTH_REQUIRED" -eq 0 ] || echo "gh_auth_required=1"
+    [ -z "$GITHUB_AUTH_CAPABILITY" ] || echo "gh_auth_capability=$GITHUB_AUTH_CAPABILITY"
+    [ -z "$GH_ORG" ] || echo "gh_organization=$GH_ORG"
+    [ -z "$GH_VERIFIED_DEST" ] || echo "gh_verified_dest=$GH_VERIFIED_DEST"
+  fi
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"

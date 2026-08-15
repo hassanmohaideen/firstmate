@@ -1299,6 +1299,98 @@ test_spawn_relaunch_refuses_a_pane_outside_the_worktree() {
   pass "fm-spawn --relaunch: refuses to start a replacement outside the copy holding the work"
 }
 
+# A gh stub for the GitHub authentication-context gate. It always succeeds if it
+# is ever consulted, so a blocked launch proves the gate refused WITHOUT probing
+# a stale destination rather than because gh happened to fail.
+make_permissive_gh() {  # <case-dir>
+  cat > "$1/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_DIR/gh.log"
+case "$*" in
+  *"auth status --help"*) printf '  --active, --hostname\n'; exit 0 ;;
+  *"auth status"*) exit 0 ;;
+  *"repos/"*) printf 'true\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$1/fakebin/gh"
+}
+
+# Record an authoritative GitHub push selection on a ship task, verified for the
+# given host, and point the project's origin at it.
+record_github_selection() {  # <case-dir> <id> <host> [verified]
+  local dir=$1 id=$2 host=$3 verified=${4:-}
+  {
+    echo "gh_forge=github"
+    echo "gh_selected_host=$host"
+    echo "gh_target_kind=repository"
+    echo "gh_target=owner/repo"
+    [ -z "$verified" ] || echo "gh_verified_dest=github|$host|repository|owner/repo|push"
+  } >> "$dir/home/state/$id.meta"
+  git -C "$dir/proj" remote set-url origin "https://$host/owner/repo.git"
+}
+
+# The core regression: a changed GitHub destination must block EVERY relaunch and
+# never erase the recorded selection. This is the two-relaunch bypass that a
+# per-driver re-implementation produced (the first blocked relaunch erased the
+# context, the second treated it as unmodeled and launched). It must be
+# impossible here.
+test_a_changed_github_destination_blocks_every_relaunch_without_erasing() {
+  local dir id out rc gh_log
+  id=ghchange
+  dir=$(new_case ghchange "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  gh_log="$dir/fake/gh.log"
+  # the push destination changes out from under the recorded selection
+  git -C "$dir/proj" remote set-url origin https://github.new.example/owner/repo.git
+
+  # relaunch #1: blocks, keeps the selection, launches nothing, never probes B
+  : > "$dir/fake/literal"; rm -f "$gh_log"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "the first changed-host relaunch must not launch"
+  assert_contains "$out" 'waiting' "the first relaunch must report it is waiting on verification"
+  [ "$(meta_field "$dir" "$id" gh_selected_host)" = github.old.example ] \
+    || fail "the first relaunch must NOT erase the recorded GitHub selection"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "the first relaunch must not start the agent"
+  [ ! -e "$gh_log" ] || fail "a changed host must never be probed"
+
+  # relaunch #2: STILL blocks - the erase-then-bypass class cannot recur
+  : > "$dir/fake/literal"; rm -f "$gh_log"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "the SECOND changed-host relaunch must still block (the bypass regression)"
+  assert_contains "$out" 'waiting' "the second relaunch must still report waiting on verification"
+  [ "$(meta_field "$dir" "$id" gh_selected_host)" = github.old.example ] \
+    || fail "the recorded selection must survive repeated relaunches"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "the second relaunch must not start the agent"
+  [ ! -e "$gh_log" ] || fail "the second relaunch must never probe the changed host either"
+  pass "a changed GitHub destination blocks every relaunch and never erases the selection or bypasses"
+}
+
+# The proven path: an unchanged destination re-verifies and launches, and the
+# task recovers once its remote is restored - so the block above is specific to a
+# changed destination, not a blanket refusal.
+test_an_unchanged_github_destination_reverifies_and_launches() {
+  local dir id out rc
+  id=ghsame
+  dir=$(new_case ghsame "$id")
+  add_ship_task "$dir" "$id" claude
+  # recorded selection with NO verified tuple: the gate must re-probe (migration)
+  record_github_selection "$dir" "$id" github.old.example
+  make_permissive_gh "$dir"
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -eq 0 ] || fail "an unchanged destination with good access must launch (got rc $rc: $out)"
+  [ -e "$dir/fake/gh.log" ] || fail "a missing verified record must re-probe before launching"
+  grep -q 'encode launch-brief' "$dir/fake/literal" || fail "the verified relaunch must start the agent"
+  [ "$(meta_field "$dir" "$id" gh_verified_dest)" = 'github|github.old.example|repository|owner/repo|push' ] \
+    || fail "a successful verification must persist the verified destination tuple"
+  pass "an unchanged GitHub destination re-probes, verifies, launches, and records the verified tuple"
+}
+
+test_a_changed_github_destination_blocks_every_relaunch_without_erasing
+test_an_unchanged_github_destination_reverifies_and_launches
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication

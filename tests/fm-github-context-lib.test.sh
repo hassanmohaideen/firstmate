@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# bin/fm-github-context-lib.sh is the single owner of the GitHub launch-verification
+# decision. These tests pin its contract through the public functions:
+#   - scope and capability come from immutable task identity;
+#   - intake resolves an authoritative selection or refuses to infer one;
+#   - the gate keys on an affirmative verified-destination tuple, so a changed,
+#     ambiguous, malformed, or missing destination blocks and a dropped verified
+#     record can only re-probe (fail-closed), never bypass;
+#   - the verified tuple is written only by a successful probe of the selected
+#     destination, and a matching tuple is trusted without re-probing.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=/dev/null
+. "$ROOT/bin/fm-github-context-lib.sh"
+
+TMP_ROOT=$(fm_test_tmproot fm-github-context-lib)
+mkdir -p "$TMP_ROOT"
+TMP_ROOT=$(cd "$TMP_ROOT" && pwd)
+trap 'rm -rf "$TMP_ROOT"' EXIT
+
+# A project whose origin is an HTTPS GitHub remote. Echoes the project dir.
+make_project() {  # <name> <remote-url>
+  local dir="$TMP_ROOT/$1-$RANDOM"
+  git init -q "$dir"
+  git -C "$dir" remote add origin "$2"
+  printf '%s\n' "$dir"
+}
+
+# A fake gh on PATH. Behaviour is read from a per-project config file
+# (<dir>/fakebin/conf, sourced) so it is deterministic and free of env
+# propagation. Keys: active (non-empty advertises --active), auth
+# (ok|notlogged|network), push (true|false|notfound), org (ok|notfound). Every
+# call is logged to $GH_LOG so a test can assert the probe was or was not run.
+install_fake_gh() {  # <dir>
+  local fb="$1/fakebin"
+  mkdir -p "$fb"
+  set_fake_gh "$1" active=1 auth=ok push=true org=ok
+  cat > "$fb/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+active=; auth=ok; push=true; org=ok
+# shellcheck disable=SC1091
+[ -f "$(dirname "$0")/conf" ] && . "$(dirname "$0")/conf"
+case "$*" in
+  *"auth status --help"*)
+    [ -n "$active" ] && printf '  --active, --hostname\n'
+    exit 0 ;;
+  *"auth status"*)
+    case "$auth" in
+      ok) exit 0 ;;
+      network) printf 'error connecting: could not resolve host\n' >&2; exit 1 ;;
+      *) printf 'You are not logged into any GitHub hosts.\n' >&2; exit 1 ;;
+    esac ;;
+  *"user/memberships/orgs/"*)
+    case "$org" in
+      ok) exit 0 ;;
+      *) printf 'HTTP 404: Not Found\n' >&2; exit 1 ;;
+    esac ;;
+  *"repos/"*)
+    case "$push" in
+      true) printf 'true\n'; exit 0 ;;
+      false) printf 'false\n'; exit 0 ;;
+      notfound) printf 'HTTP 404: Not Found\n' >&2; exit 1 ;;
+      *) printf 'true\n'; exit 0 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$fb/gh"
+}
+
+# Configure the fake gh for a project. Keys: active, auth, push, org.
+set_fake_gh() {  # <dir> <key=val>...
+  local fb="$1/fakebin"; shift
+  mkdir -p "$fb"
+  : > "$fb/conf"
+  printf '%s\n' "$@" >> "$fb/conf"
+}
+
+# --- scope and capability ---------------------------------------------------
+
+test_scope_comes_from_immutable_task_identity() {
+  fm_github_ctx_scope ship no-mistakes || fail "a no-mistakes ship push must be gated"
+  fm_github_ctx_scope ship direct-PR || fail "a direct-PR ship push must be gated"
+  ! fm_github_ctx_scope ship local-only || fail "a local-only ship must not be gated"
+  ! fm_github_ctx_scope scout '' '' || fail "a scout with no authentication requirement is not gated"
+  fm_github_ctx_scope scout '' 1 || fail "an authentication scout is gated"
+  ! fm_github_ctx_scope secondmate '' '' || fail "a secondmate is never gated"
+  # a ship with an unknown/empty mode fails closed into scope
+  fm_github_ctx_scope ship '' || fail "a ship with an unresolved mode must fail closed into scope"
+  pass "scope is derived from immutable kind/mode and the recorded scout requirement"
+}
+
+test_capability_maps_kind_and_requirement() {
+  [ "$(fm_github_ctx_capability ship)" = push ] || fail "a ship maps to push"
+  [ "$(fm_github_ctx_capability scout private-repository-read)" = fetch ] || fail "a private-read scout maps to fetch"
+  [ "$(fm_github_ctx_capability scout organization-membership-read)" = api-org-membership ] || fail "an org scout maps to api-org-membership"
+  ! fm_github_ctx_capability scout bogus 2>/dev/null || fail "an unknown scout capability is refused"
+  pass "the probe capability is derived from kind and the authentication requirement"
+}
+
+test_dest_tuple_is_a_stable_delimited_join() {
+  [ "$(fm_github_ctx_dest_tuple github github.com repository owner/repo push)" = 'github|github.com|repository|owner/repo|push' ] \
+    || fail "the destination tuple must be a stable delimited join"
+  pass "the verified-destination tuple is a stable delimited join of the destination fields"
+}
+
+# --- intake -----------------------------------------------------------------
+
+test_intake_auto_selects_github_com_but_never_infers_another_host() {
+  local proj out
+  proj=$(make_project autocom https://github.com/owner/repo.git)
+  out=$(fm_github_ctx_intake "$proj" push '' '') || fail "github.com must auto-select without an assertion"
+  [ "$out" = "$(printf 'github.com\trepository\towner/repo')" ] || fail "github.com auto-select must resolve the exact repository, got '$out'"
+
+  proj=$(make_project enterprise https://github.enterprise.example/owner/repo.git)
+  fm_github_ctx_intake "$proj" push '' '' >/dev/null 2>&1
+  [ "$?" -eq 3 ] || fail "an Enterprise host must not be inferred without --github-host (expected rc 3)"
+
+  out=$(fm_github_ctx_intake "$proj" push github.enterprise.example '') || fail "an asserted Enterprise host that matches the remote must resolve"
+  [ "$out" = "$(printf 'github.enterprise.example\trepository\towner/repo')" ] || fail "asserted Enterprise selection must resolve the repository"
+  pass "intake auto-selects github.com and requires an assertion for any other host"
+}
+
+test_intake_refuses_mismatch_and_ambiguity() {
+  local proj rc
+  proj=$(make_project mismatch https://github.com/owner/repo.git)
+  fm_github_ctx_intake "$proj" push github.enterprise.example '' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] || fail "an asserted host that does not match the remote is a hard error (expected rc 1), got $rc"
+
+  proj=$(make_project malformed https://github.com/owner/repo.git)
+  fm_github_ctx_intake "$proj" push 'Bad_Host' '' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] || fail "a malformed --github-host is refused (expected rc 1), got $rc"
+
+  # two push destinations including github.com cannot establish one target
+  proj=$(make_project mixed https://github.com/owner/repo.git)
+  git -C "$proj" remote set-url --add --push origin https://github.com/owner/repo.git
+  git -C "$proj" remote set-url --add --push origin https://github.enterprise.example/owner/repo.git
+  fm_github_ctx_intake "$proj" push '' '' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] || fail "mixed destinations including github.com are indeterminate (expected rc 2), got $rc"
+  pass "intake refuses an asserted mismatch, a malformed host, and mixed destinations"
+}
+
+test_intake_resolves_org_membership_selection() {
+  local proj out
+  proj=$(make_project org https://github.com/owner/repo.git)
+  out=$(fm_github_ctx_intake "$proj" api-org-membership github.com acme) || fail "an org-membership selection must resolve"
+  [ "$out" = "$(printf 'github.com\torganization\tacme')" ] || fail "org selection must carry the organization as the target, got '$out'"
+  fm_github_ctx_intake "$proj" api-org-membership github.com '' >/dev/null 2>&1
+  [ "$?" -eq 1 ] || fail "org-membership selection without an organization is a hard error"
+  pass "intake resolves an organization-membership selection and requires the organization"
+}
+
+# --- gate -------------------------------------------------------------------
+
+# Run the gate for a project with its configured fake gh, returning its rc;
+# captures stdout in GATE_OUT and whether gh was invoked in GATE_PROBED (0 probed,
+# 1 not).
+run_gate() {  # <proj> <forge> <host> <kind> <target> <cap> <org> <recorded>
+  local proj=$1; shift
+  GH_LOG="$proj/gh.log"; : > "$GH_LOG"
+  GATE_OUT=$(GH_LOG="$GH_LOG" PATH="$proj/fakebin:$PATH" \
+    fm_github_ctx_gate "$proj" "$@" 2>/dev/null)
+  GATE_RC=$?
+  if [ -s "$GH_LOG" ]; then GATE_PROBED=0; else GATE_PROBED=1; fi
+}
+
+test_gate_verifies_a_fresh_matching_destination() {
+  local proj
+  proj=$(make_project gatefresh https://github.com/owner/repo.git)
+  install_fake_gh "$proj"  # default: active, auth ok, push true
+  run_gate "$proj" github github.com repository owner/repo push '' ''
+  [ "$GATE_RC" -eq 0 ] || fail "a fresh matching destination with push access must verify (rc $GATE_RC)"
+  [ "$GATE_OUT" = 'github|github.com|repository|owner/repo|push' ] || fail "the gate must return the verified tuple, got '$GATE_OUT'"
+  [ "$GATE_PROBED" -eq 0 ] || fail "a fresh verification must probe"
+  pass "the gate probes and verifies a fresh matching destination, returning its tuple"
+}
+
+test_gate_trusts_a_matching_verified_tuple_without_probing() {
+  local proj vt
+  proj=$(make_project gatefast https://github.com/owner/repo.git)
+  install_fake_gh "$proj"
+  vt='github|github.com|repository|owner/repo|push'
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 0 ] || fail "a recorded tuple matching the observed destination must be trusted (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a matching verified tuple must NOT re-probe"
+  pass "the gate trusts a verified tuple that matches the current destination without re-probing"
+}
+
+test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it() {
+  local proj vt
+  proj=$(make_project gatechanged https://github.com/owner/repo.git)
+  install_fake_gh "$proj"
+  vt='github|github.com|repository|owner/repo|push'
+  # host changed: selection is github.com, remote is now enterprise
+  git -C "$proj" remote set-url origin https://github.enterprise.example/owner/repo.git
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 2 ] || fail "a changed destination host must block indeterminate (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a changed host must not probe the unselected destination"
+
+  # repository changed under the same host
+  git -C "$proj" remote set-url origin https://github.com/owner/other.git
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 2 ] || fail "a changed repository must block indeterminate (rc $GATE_RC)"
+  pass "the gate blocks a changed host or repository and never adopts the unselected destination"
+}
+
+test_gate_reprobes_when_the_verified_record_is_missing() {
+  local proj
+  proj=$(make_project gatemissing https://github.com/owner/repo.git)
+  install_fake_gh "$proj"
+  # no recorded tuple (legacy/erased): must re-probe, not trust
+  run_gate "$proj" github github.com repository owner/repo push '' ''
+  [ "$GATE_RC" -eq 0 ] || fail "a missing verified record must re-probe and can verify (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 0 ] || fail "a missing verified record must force a probe (fail-closed migration)"
+  pass "a missing verified record forces a re-probe rather than a trusted launch"
+}
+
+test_gate_classifies_auth_and_indeterminate_failures() {
+  local proj
+  proj=$(make_project gateauth https://github.com/owner/repo.git)
+  install_fake_gh "$proj"
+  # not logged in -> needs auth (rc 1)
+  set_fake_gh "$proj" active=1 auth=notlogged
+  run_gate "$proj" github github.com repository owner/repo push '' ''
+  [ "$GATE_RC" -eq 1 ] || fail "a signed-out probe must block as a concrete auth failure (rc $GATE_RC)"
+  # write access denied -> access required (rc 1)
+  set_fake_gh "$proj" active=1 auth=ok push=false
+  run_gate "$proj" github github.com repository owner/repo push '' ''
+  [ "$GATE_RC" -eq 1 ] || fail "denied write access must block (rc $GATE_RC)"
+  # network failure -> indeterminate (rc 2), never a login prompt
+  set_fake_gh "$proj" active=1 auth=network
+  run_gate "$proj" github github.com repository owner/repo push '' ''
+  [ "$GATE_RC" -eq 2 ] || fail "a network failure must be indeterminate, not a login prompt (rc $GATE_RC)"
+  # gh cannot isolate the active account -> indeterminate
+  set_fake_gh "$proj" active= auth=ok
+  run_gate "$proj" github github.com repository owner/repo push '' ''
+  [ "$GATE_RC" -eq 2 ] || fail "an account-isolation gap must be indeterminate (rc $GATE_RC)"
+  pass "the gate classifies signed-out, access-denied, network, and account-isolation failures correctly"
+}
+
+test_gate_keeps_organization_404_indeterminate() {
+  local proj
+  proj=$(make_project gateorg https://github.com/owner/repo.git)
+  install_fake_gh "$proj"
+  set_fake_gh "$proj" active=1 auth=ok org=notfound
+  run_gate "$proj" github github.com organization acme api-org-membership acme ''
+  [ "$GATE_RC" -eq 2 ] || fail "an organization 404 must stay indeterminate, not access-required (rc $GATE_RC)"
+  pass "an organization-membership 404 stays indeterminate rather than a concrete authorization verdict"
+}
+
+test_scope_comes_from_immutable_task_identity
+test_capability_maps_kind_and_requirement
+test_dest_tuple_is_a_stable_delimited_join
+test_intake_auto_selects_github_com_but_never_infers_another_host
+test_intake_refuses_mismatch_and_ambiguity
+test_intake_resolves_org_membership_selection
+test_gate_verifies_a_fresh_matching_destination
+test_gate_trusts_a_matching_verified_tuple_without_probing
+test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it
+test_gate_reprobes_when_the_verified_record_is_missing
+test_gate_classifies_auth_and_indeterminate_failures
+test_gate_keeps_organization_404_indeterminate
