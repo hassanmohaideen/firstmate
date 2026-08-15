@@ -67,8 +67,8 @@ wait_for_value() {
 }
 
 wait_for_minimum_value() {
-  local file=$1 minimum=$2 i=0 value
-  while [ "$i" -lt 200 ]; do
+  local file=$1 minimum=$2 attempts=${3:-200} i=0 value
+  while [ "$i" -lt "$attempts" ]; do
     value=$(cat "$file" 2>/dev/null || true)
     case "$value" in
       ''|*[!0-9]*) ;;
@@ -877,7 +877,11 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
   FM_DISCORD_TEST_RANDOM=0.5 "$CONTROL" run > "$home/second.log" 2>&1 &
 pressure_worker=$!
 WORKER_PIDS+=("$pressure_worker")
-wait_for_minimum_value "$home/gateway/connections" "$next_connection" || fail "restarted Gateway did not reconnect"
+# A loaded portable CI runner can deschedule the restarted Node worker for most
+# of the default 10-second polling window. Give this process-start boundary the
+# same 30-second margin used by the slowest real reconnect cases below.
+wait_for_minimum_value "$home/gateway/connections" "$next_connection" 600 \
+  || fail "restarted Gateway did not reconnect"
 restarted_connection=$(sed -n "${next_connection}p" "$home/gateway/connection-events.jsonl" | jq -r .at)
 [ $((restarted_connection - restarted_at)) -ge 25 ] \
   || fail "process restart discarded reconnect pressure: $((restarted_connection - restarted_at))ms"
