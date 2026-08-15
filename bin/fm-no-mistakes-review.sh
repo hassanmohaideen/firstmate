@@ -79,6 +79,10 @@ CAPTURE_HEAD=
 CAPTURE_PR=
 CAPTURE_OUTCOME=
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=bin/fm-nm-run-lib.sh
+. "$SCRIPT_DIR/fm-nm-run-lib.sh"
+
 usage() {
   awk '
     NR == 1 { next }
@@ -199,8 +203,8 @@ validate_capture_context() {
     || die "cannot resolve public validation head $CAPTURE_HEAD in the local worktree"
   [ "$local_branch" = "$CAPTURE_BRANCH" ] \
     || die "stale-run branch mismatch: local=$local_branch public=$CAPTURE_BRANCH"
-  [ "$local_head" = "$public_head" ] \
-    || die "stale-head mismatch: local=$local_head public=$CAPTURE_HEAD"
+  fm_nm_head_matches_worktree "$PROJECT_ROOT" "$CAPTURE_HEAD" \
+    || die "stale-head mismatch: local=$local_head public=$public_head"
 }
 
 current_ids_json() {
@@ -574,7 +578,7 @@ audit_ready() {
       | grep -E 'CI checks passed|no CI checks reported - still monitoring|no CI checks reported yet|checks failed|issues detected|CI checks running|base branch advanced.*re-arming CI monitor timeout' \
       | tail -1 || true)
     case "$marker" in
-      *"checks passed"*|*"no CI checks reported - still monitoring"*) ;;
+      *"checks passed"*) ;;
       "") die "public CI history has no recognized readiness result" ;;
       *) die "latest public CI result is not green: $marker" ;;
     esac
