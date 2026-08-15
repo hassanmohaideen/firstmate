@@ -31,6 +31,14 @@ fm_github_validate_hostname() {
   done
 }
 
+fm_github_validate_organization() {
+  local organization=$1
+  [ -n "$organization" ] || return 1
+  case "$organization" in
+    -*|*-|*[!A-Za-z0-9-]*) return 1 ;;
+  esac
+}
+
 fm_github_http_remote_host() {
   local url=$1 authority userinfo host port normalized_port
   case "$url" in
@@ -231,15 +239,23 @@ fm_github_ctx_capability() {
 
 # Classify a persisted GitHub context at the lifecycle boundary.
 fm_github_ctx_recorded_state() {
-  local forge=${1:-} selected_host=${2:-} target_kind=${3:-} target=${4:-} organization=${5:-} verified=${6:-}
-  if [ -z "$forge$selected_host$target_kind$target$organization$verified" ]; then
+  local kind=${1:-} forge=${2:-} selected_host=${3:-} target_kind=${4:-} target=${5:-} organization=${6:-}
+  local auth_required=${7:-} auth_capability=${8:-} verified=${9:-}
+  if [ -z "$forge$selected_host$target_kind$target$organization$auth_required$auth_capability$verified" ]; then
     printf 'none'
     return 0
   fi
   if [ "$forge" = github ] && [ -n "$selected_host" ]; then
-    case "$target_kind" in
-      repository) [ -n "$target" ] && { printf 'complete'; return 0; } ;;
-      organization) [ -n "$organization" ] && { printf 'complete'; return 0; } ;;
+    case "$kind:$auth_required:$auth_capability:$target_kind" in
+      ship:::repository)
+        [ -n "$target" ] && [ -z "$organization" ] && { printf 'complete'; return 0; }
+        ;;
+      scout:1:private-repository-read:repository)
+        [ -n "$target" ] && [ -z "$organization" ] && { printf 'complete'; return 0; }
+        ;;
+      scout:1:organization-membership-read:organization)
+        [ -z "$target" ] && [ -n "$organization" ] && { printf 'complete'; return 0; }
+        ;;
     esac
   fi
   printf 'partial'
@@ -294,6 +310,7 @@ fm_github_ctx_intake() {
   fi
   if [ "$capability" = api-org-membership ]; then
     [ -n "$organization" ] || { echo "error: organization-membership selection requires --github-organization" >&2; return 1; }
+    fm_github_validate_organization "$organization" || { echo "error: --github-organization must be a valid GitHub organization login" >&2; return 1; }
     printf '%s\torganization\t%s' "$obs_host" "$organization"
   else
     obs_repo=$(fm_github_remote_destination_repository "$project" "$capability" 2>/dev/null) || {
@@ -348,7 +365,7 @@ fm_github_ctx_gate() {
     obs_target=$obs_repo
     probe_target=$obs_repo
   else
-    [ -n "$organization" ] || { echo "GH_AUTH_INDETERMINATE: no organization is recorded for an organization-membership task" >&2; return 2; }
+    fm_github_validate_organization "$organization" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub organization is malformed" >&2; return 2; }
     obs_target=$organization
     probe_target=$organization
   fi

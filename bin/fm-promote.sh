@@ -132,7 +132,7 @@ grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (ki
 # not gated. A blocked verification refuses the promotion rather than flipping the
 # contract. Any scout-only authentication selection is dropped and re-derived for
 # the ship push.
-PROMOTE_PROJECT=$(awk -F= '$1 == "project" { print substr($0, index($0, "=") + 1); exit }' "$META" 2>/dev/null)
+PROMOTE_WORKTREE=$(awk -F= '$1 == "worktree" { print substr($0, index($0, "=") + 1); exit }' "$META" 2>/dev/null)
 GH_GATED=0
 GH_FORGE=
 GH_SEL_HOST=
@@ -140,12 +140,12 @@ GH_TARGET_KIND=
 GH_TARGET=
 GH_VERIFIED_DEST=
 if [ "$MODE" != local-only ]; then
-  if [ -z "$PROMOTE_PROJECT" ] || [ ! -d "$PROMOTE_PROJECT" ]; then
-    echo "GH_AUTH_INDETERMINATE: the recorded project cannot be resolved for GitHub write-access verification" >&2
+  if [ -z "$PROMOTE_WORKTREE" ] || [ ! -d "$PROMOTE_WORKTREE" ]; then
+    echo "GH_AUTH_INDETERMINATE: the recorded worktree cannot be resolved for GitHub write-access verification" >&2
     echo "error: GitHub write-access verification for task $ID is indeterminate; promotion is waiting" >&2
     exit 1
   fi
-  if GH_INTAKE=$(fm_github_ctx_intake "$PROMOTE_PROJECT" push "$GITHUB_HOST" ""); then
+  if GH_INTAKE=$(fm_github_ctx_intake "$PROMOTE_WORKTREE" push "$GITHUB_HOST" ""); then
     IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
 $GH_INTAKE
 EOF
@@ -163,7 +163,7 @@ EOF
     esac
   fi
   if [ "$GH_GATED" -eq 1 ]; then
-    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$PROMOTE_PROJECT" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" push "" "$GH_VERIFIED_DEST"); then
+    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$PROMOTE_WORKTREE" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" push "" "$GH_VERIFIED_DEST"); then
       GH_VERIFIED_DEST=$GH_VERIFIED_NEW
     else
       GH_GATE_RC=$?

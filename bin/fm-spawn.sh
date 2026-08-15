@@ -1066,7 +1066,6 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # revalidated by the gate. A relaunch never re-derives or clears it, so the
   # erase-then-bypass class cannot occur.
   GITHUB_AUTH_REQUIRED=$(fm_meta_get "$RELAUNCH_META" gh_auth_required)
-  [ -n "$GITHUB_AUTH_REQUIRED" ] || GITHUB_AUTH_REQUIRED=0
   GITHUB_AUTH_CAPABILITY=$(fm_meta_get "$RELAUNCH_META" gh_auth_capability)
   GH_REC_FORGE=$(fm_meta_get "$RELAUNCH_META" gh_forge)
   GH_REC_HOST=$(fm_meta_get "$RELAUNCH_META" gh_selected_host)
@@ -1690,15 +1689,23 @@ GH_TARGET=
 GH_CAPABILITY=
 GH_ORG=
 GH_VERIFIED_DEST=
-if [ "$KIND" != secondmate ] && fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; then
+GH_RECORDED_STATE=none
+GH_GATE_PROJECT=$PROJ_ABS
+if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" != secondmate ]; then
+  GH_GATE_PROJECT=$RELAUNCH_WT
+  GH_RECORDED_STATE=$(fm_github_ctx_recorded_state "$KIND" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
+  if [ "$GH_RECORDED_STATE" = partial ]; then
+    echo "GH_AUTH_INDETERMINATE: task $ID has a partial recorded GitHub context" >&2
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+    exit 1
+  fi
+fi
+if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; }; then
   GH_CAPABILITY=$(fm_github_ctx_capability "$KIND" "$GITHUB_AUTH_CAPABILITY") || {
-    echo "error: task $ID has no resolvable GitHub authentication capability" >&2
+    echo "GH_AUTH_INDETERMINATE: task $ID has no resolvable GitHub authentication capability" >&2
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
     exit 1
   }
-  GH_RECORDED_STATE=none
-  if [ "$RELAUNCH" -eq 1 ]; then
-    GH_RECORDED_STATE=$(fm_github_ctx_recorded_state "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GH_REC_VERIFIED")
-  fi
   if [ "$GH_RECORDED_STATE" = complete ]; then
     GH_FORGE=$GH_REC_FORGE
     GH_SEL_HOST=$GH_REC_HOST
@@ -1707,13 +1714,9 @@ if [ "$KIND" != secondmate ] && fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUT
     GH_ORG=$GH_REC_ORG
     GH_VERIFIED_DEST=$GH_REC_VERIFIED
     GH_GATED=1
-  elif [ "$GH_RECORDED_STATE" = partial ]; then
-    echo "GH_AUTH_INDETERMINATE: task $ID has a partial recorded GitHub context" >&2
-    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
-    exit 1
   # The command substitution is kept in the `if` condition so `set -e` does not
   # exit on the intended non-zero returns before they are handled.
-  elif GH_INTAKE=$(fm_github_ctx_intake "$PROJ_ABS" "$GH_CAPABILITY" "$GITHUB_HOST" "$GITHUB_ORGANIZATION"); then
+  elif GH_INTAKE=$(fm_github_ctx_intake "$GH_GATE_PROJECT" "$GH_CAPABILITY" "$GITHUB_HOST" "$GITHUB_ORGANIZATION"); then
     IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
 $GH_INTAKE
 EOF
@@ -1738,7 +1741,7 @@ EOF
     esac
   fi
   if [ "$GH_GATED" -eq 1 ]; then
-    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$PROJ_ABS" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST"); then
+    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$GH_GATE_PROJECT" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST"); then
       GH_VERIFIED_DEST=$GH_VERIFIED_NEW
     else
       GH_GATE_RC=$?

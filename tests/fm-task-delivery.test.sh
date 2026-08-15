@@ -203,11 +203,13 @@ EOF
 test_promote_requires_and_records_the_delivery_contract() {
   local home meta out status
   home="$TMP_ROOT/promote/home"
-  mkdir -p "$home/state"
+  mkdir -p "$home/state" "$home/wt"
+  git init -q "$home/wt"
+  git -C "$home/wt" remote add origin https://gitlab.example/owner/repo.git
   meta="$home/state/promote-d1.meta"
 
   write_scout_meta() {
-    printf 'window=fm-promote-d1\nkind=scout\nworktree=/tmp/wt\n' > "$meta"
+    printf 'window=fm-promote-d1\nkind=scout\nworktree=%s\n' "$home/wt" > "$meta"
   }
 
   write_scout_meta

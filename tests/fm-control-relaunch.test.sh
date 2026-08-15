@@ -1247,26 +1247,27 @@ test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution() {
   pass "fm-promote: promotion participates in lifecycle serialization"
 }
 
-test_nonlocal_promotion_refuses_an_unresolvable_recorded_project() {
+test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree() {
   local dir id out rc before after
   id=promotemissing
   dir=$(new_case promotemissing "$id")
   {
     echo "window=fmses:fm-$id"
     echo "kind=scout"
-    echo "project=$dir/missing-project"
+    echo "project=$dir/project"
+    echo "worktree=$dir/missing-worktree"
     echo "harness=claude"
   } > "$dir/home/state/$id.meta"
   before=$(cksum < "$dir/home/state/$id.meta")
 
   out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 \
     "$PROMOTE" "$id" --mode direct-PR --yolo off 2>&1); rc=$?
-  expect_code 1 "$rc" "a non-local promotion with an unresolvable project must refuse"
-  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "an unresolvable promotion project must be indeterminate"
-  assert_contains "$out" 'promotion is waiting' "an unresolvable promotion project must leave promotion waiting"
+  expect_code 1 "$rc" "a non-local promotion with an unresolvable worktree must refuse"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "an unresolvable promotion worktree must be indeterminate"
+  assert_contains "$out" 'promotion is waiting' "an unresolvable promotion worktree must leave promotion waiting"
   after=$(cksum < "$dir/home/state/$id.meta")
-  [ "$after" = "$before" ] || fail "an unresolvable project refusal must not mutate promotion metadata"
-  pass "fm-promote refuses a non-local promotion whose recorded project cannot be resolved"
+  [ "$after" = "$before" ] || fail "an unresolvable worktree refusal must not mutate promotion metadata"
+  pass "fm-promote refuses a non-local promotion whose recorded worktree cannot be resolved"
 }
 
 # --- 6. fm-spawn --relaunch's own refusals -----------------------------------
@@ -1420,6 +1421,55 @@ test_a_partial_github_context_blocks_every_relaunch_without_erasing() {
   pass "a partial GitHub context blocks every relaunch without probing or erasing metadata"
 }
 
+test_a_scout_with_a_dropped_authentication_requirement_stays_gated() {
+  local dir id out rc before after
+  id=ghdroppedscope
+  dir=$(new_case ghdroppedscope "$id")
+  add_ship_task "$dir" "$id" claude
+  sed 's/^kind=ship$/kind=scout/' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.scout"
+  mv "$dir/home/state/$id.meta.scout" "$dir/home/state/$id.meta"
+  {
+    echo 'gh_forge=github'
+    echo 'gh_selected_host=github.com'
+    echo 'gh_target_kind=repository'
+    echo 'gh_target=owner/repo'
+    echo 'gh_auth_capability=private-repository-read'
+    echo 'gh_verified_dest=github|github.com|repository|owner/repo|fetch'
+  } >> "$dir/home/state/$id.meta"
+  git -C "$dir/proj" remote set-url origin https://github.com/owner/repo.git
+  make_permissive_gh "$dir"
+  before=$(cksum < "$dir/home/state/$id.meta")
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a scout with dropped gh_auth_required must remain blocked"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a dropped scout scope field must be indeterminate"
+  assert_contains "$out" 'worker launch is waiting' "a dropped scout scope field must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a dropped scout scope field must not launch"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "a dropped scout scope refusal must not mutate metadata"
+  pass "a dropped scout authentication requirement cannot bypass the recorded gate"
+}
+
+test_a_relaunch_gates_the_execution_worktree_destination() {
+  local dir id out rc
+  id=ghworktree
+  dir=$(new_case ghworktree "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  git -C "$dir/proj" config extensions.worktreeConfig true
+  git -C "$dir/wt" config --worktree remote.origin.url https://github.new.example/owner/repo.git
+  : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a relaunch with a divergent worktree destination must block"
+  assert_contains "$out" 'worker launch is waiting' "a divergent worktree destination must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a divergent worktree destination must not launch"
+  [ ! -e "$dir/fake/gh.log" ] || fail "a divergent worktree destination must block before probing"
+  pass "a relaunch gates the execution worktree rather than the primary checkout"
+}
+
 test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate() {
   local dir id out rc
   id=ghscout
@@ -1460,6 +1510,8 @@ test_an_unchanged_github_destination_reverifies_and_launches() {
 
 test_a_changed_github_destination_blocks_every_relaunch_without_erasing
 test_a_partial_github_context_blocks_every_relaunch_without_erasing
+test_a_scout_with_a_dropped_authentication_requirement_stays_gated
+test_a_relaunch_gates_the_execution_worktree_destination
 test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate
 test_an_unchanged_github_destination_reverifies_and_launches
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
@@ -1503,7 +1555,7 @@ test_secondmate_checkpoint_refuses_unreadable_child_state
 test_concurrent_relaunch_is_refused
 test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
-test_nonlocal_promotion_refuses_an_unresolvable_recorded_project
+test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task
