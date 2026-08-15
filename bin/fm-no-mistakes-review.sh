@@ -189,6 +189,20 @@ capture_public_history() {
   ' >/dev/null 2>&1 || die "public review log for run $CAPTURE_RUN_ID contains no complete structured review result or has malformed findings"
 }
 
+validate_capture_context() {
+  local local_branch local_head public_head
+  local_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) \
+    || die "validation requires an attached local branch"
+  local_head=$(git rev-parse --verify HEAD 2>/dev/null) \
+    || die "cannot resolve the local validation head"
+  public_head=$(git rev-parse --verify "${CAPTURE_HEAD}^{commit}" 2>/dev/null) \
+    || die "cannot resolve public validation head $CAPTURE_HEAD in the local worktree"
+  [ "$local_branch" = "$CAPTURE_BRANCH" ] \
+    || die "stale-run branch mismatch: local=$local_branch public=$CAPTURE_BRANCH"
+  [ "$local_head" = "$public_head" ] \
+    || die "stale-head mismatch: local=$local_head public=$CAPTURE_HEAD"
+}
+
 current_ids_json() {
   printf '%s' "$CAPTURE_MODEL" | jq -c '.rounds[-1].result.findings | map(.id)'
 }
@@ -423,10 +437,12 @@ respond() {
   command -v "$NM" >/dev/null 2>&1 || die "no-mistakes command is unavailable"
   command -v jq >/dev/null 2>&1 || die "jq is required"
   capture_public_history
+  validate_capture_context
   validate_selection "$kind" "$raw"
 
   acquire_lock
   capture_public_history
+  validate_capture_context
   validate_selection "$kind" "$raw"
   prepare_work_files
   sync_ledger
@@ -450,6 +466,7 @@ respond() {
 
   if [ "$kind" = fix ]; then
     capture_public_history
+    validate_capture_context
     printf '%s\n' "$CAPTURE_MODEL" > "$MODEL_FILE"
     sync_ledger
     errors=$(jq -r --arg run "$CAPTURE_RUN_ID" --argjson round "$round" '
@@ -466,35 +483,17 @@ respond() {
     "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
 }
 
-head_matches() {
-  local local_head=$1 public_head=$2
-  case "$local_head" in
-    "$public_head"*) return 0 ;;
-  esac
-  case "$public_head" in
-    "$local_head"*) return 0 ;;
-  esac
-  return 1
-}
-
 audit_ready() {
-  local local_branch local_head errors ci_logs marker
+  local errors ci_logs marker
   command -v "$NM" >/dev/null 2>&1 || die "no-mistakes command is unavailable"
   command -v jq >/dev/null 2>&1 || die "jq is required"
   capture_public_history
+  validate_capture_context
   acquire_lock
   capture_public_history
+  validate_capture_context
   prepare_work_files
   sync_ledger
-
-  local_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null) \
-    || die "readiness requires an attached validation branch"
-  local_head=$(git rev-parse HEAD 2>/dev/null) \
-    || die "readiness cannot resolve the local validation head"
-  [ "$local_branch" = "$CAPTURE_BRANCH" ] \
-    || die "stale-run branch mismatch: local=$local_branch public=$CAPTURE_BRANCH"
-  head_matches "$local_head" "$CAPTURE_HEAD" \
-    || die "stale-head mismatch: local=$local_head public=$CAPTURE_HEAD"
 
   errors=$(jq -r --arg run "$CAPTURE_RUN_ID" --arg branch "$CAPTURE_BRANCH" '
     (.runs | map(select(.id == $run))) as $matches

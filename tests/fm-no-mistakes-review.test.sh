@@ -49,6 +49,7 @@ emit_status() {
     pr=$(cat "$state/pr")
   fi
   if [ -f "$state/status-head" ]; then head=$(cat "$state/status-head"); fi
+  if [ -f "$state/status-branch" ]; then branch=$(cat "$state/status-branch"); fi
   cat <<EOF
 run:
   id: "RUN-11"
@@ -313,24 +314,54 @@ test_clean_current_status_cannot_erase_unresolved_history() {
   pass "clean current status cannot erase unresolved historical findings"
 }
 
+test_response_refuses_fallback_branch_and_stale_head_without_state_changes() {
+  local d out f stale
+  d=$(new_case response-context)
+  f=$(finding context ask-user)
+  set_round "$d" "$f"
+
+  printf 'fm/another-validation\n' > "$d/fake-state/status-branch"
+  out=$(run_driver "$d" respond --approve context 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "another branch's fallback status was accepted for response"
+  assert_contains "$out" 'stale-run branch mismatch' "fallback-branch response refusal was not actionable"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "fallback-branch refusal invoked the underlying response"
+  [ ! -e "$(ledger "$d")" ] || fail "fallback-branch refusal changed ledger state"
+
+  rm -f "$d/fake-state/status-branch"
+  git -C "$d" commit --allow-empty -qm 'new local head'
+  stale=$(git -C "$d" rev-parse HEAD^)
+  printf '%s\n' "$stale" > "$d/fake-state/status-head"
+  out=$(run_driver "$d" respond --approve context 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "stale public head was accepted for response"
+  assert_contains "$out" 'stale-head mismatch' "stale-head response refusal was not actionable"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "stale-head refusal invoked the underlying response"
+  [ ! -e "$(ledger "$d")" ] || fail "stale-head refusal changed ledger state"
+  pass "responses reject fallback branches and stale heads before state changes"
+}
+
 test_run_and_head_mismatch_are_refused() {
-  local d out f ledger_path
+  local d out f ledger_path before after stale
   d=$(new_case context-mismatch)
+  git -C "$d" commit --allow-empty -qm 'current validation head'
   f=$(finding context ask-user)
   set_round "$d" "$f"
   run_driver "$d" respond --approve context >/dev/null 2>&1 || fail "context fixture approval failed"
-  printf 'deadbeef\n' > "$d/fake-state/status-head"
+  ledger_path=$(ledger "$d")
+  before=$(shasum -a 256 "$ledger_path" | awk '{print $1}')
+  stale=$(git -C "$d" rev-parse HEAD^)
+  printf '%s\n' "$stale" > "$d/fake-state/status-head"
   out=$(run_driver "$d" audit-ready 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "stale public head was accepted"
   assert_contains "$out" 'stale-head mismatch' "head mismatch refusal was not actionable"
+  after=$(shasum -a 256 "$ledger_path" | awk '{print $1}')
+  [ "$before" = "$after" ] || fail "stale-head audit synchronized or changed the ledger"
   rm -f "$d/fake-state/status-head"
-  ledger_path=$(ledger "$d")
   jq '.runs[0].rounds[0].dispositions[0].run_id = "STALE"' "$ledger_path" > "$ledger_path.tmp"
   mv "$ledger_path.tmp" "$ledger_path"
   out=$(run_driver "$d" audit-ready 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "stale-run disposition was accepted"
   assert_contains "$out" 'stale-run disposition context' "run mismatch refusal was not actionable"
-  pass "run and head mismatches refuse readiness"
+  pass "run and head mismatches refuse readiness before synchronization"
 }
 
 test_duplicate_replay_and_underlying_failure() {
@@ -396,6 +427,7 @@ test_mixed_choices_are_unrepresentable
 test_multiple_fix_rounds_preserve_history
 test_surviving_finding_refuses_readiness
 test_clean_current_status_cannot_erase_unresolved_history
+test_response_refuses_fallback_branch_and_stale_head_without_state_changes
 test_run_and_head_mismatch_are_refused
 test_duplicate_replay_and_underlying_failure
 test_concurrent_writers_are_serial_and_atomic
