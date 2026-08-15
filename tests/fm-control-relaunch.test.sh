@@ -1247,6 +1247,28 @@ test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution() {
   pass "fm-promote: promotion participates in lifecycle serialization"
 }
 
+test_nonlocal_promotion_refuses_an_unresolvable_recorded_project() {
+  local dir id out rc before after
+  id=promotemissing
+  dir=$(new_case promotemissing "$id")
+  {
+    echo "window=fmses:fm-$id"
+    echo "kind=scout"
+    echo "project=$dir/missing-project"
+    echo "harness=claude"
+  } > "$dir/home/state/$id.meta"
+  before=$(cksum < "$dir/home/state/$id.meta")
+
+  out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 \
+    "$PROMOTE" "$id" --mode direct-PR --yolo off 2>&1); rc=$?
+  expect_code 1 "$rc" "a non-local promotion with an unresolvable project must refuse"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "an unresolvable promotion project must be indeterminate"
+  assert_contains "$out" 'promotion is waiting' "an unresolvable promotion project must leave promotion waiting"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "an unresolvable project refusal must not mutate promotion metadata"
+  pass "fm-promote refuses a non-local promotion whose recorded project cannot be resolved"
+}
+
 # --- 6. fm-spawn --relaunch's own refusals -----------------------------------
 
 test_spawn_relaunch_refuses_a_live_agent() {
@@ -1368,6 +1390,53 @@ test_a_changed_github_destination_blocks_every_relaunch_without_erasing() {
   pass "a changed GitHub destination blocks every relaunch and never erases the selection or bypasses"
 }
 
+test_a_partial_github_context_blocks_every_relaunch_without_erasing() {
+  local dir id out rc before after gh_log
+  id=ghpartial
+  dir=$(new_case ghpartial "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  gh_log="$dir/fake/gh.log"
+  grep -v '^gh_selected_host=' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.partial"
+  mv "$dir/home/state/$id.meta.partial" "$dir/home/state/$id.meta"
+  before=$(cksum < "$dir/home/state/$id.meta")
+
+  : > "$dir/fake/literal"; rm -f "$gh_log"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a partial context must block the first relaunch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a partial context must report an indeterminate gate"
+  assert_contains "$out" "GitHub access verification for task $id is indeterminate; worker launch is waiting" "a partial context must report that launch is waiting"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "the first partial-context refusal must not mutate metadata"
+  [ ! -e "$gh_log" ] || fail "a partial context must block before probing"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a partial context must block every repeated relaunch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a repeated partial-context relaunch must remain indeterminate"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "a repeated partial-context refusal must not erase metadata"
+  [ ! -e "$gh_log" ] || fail "a repeated partial context must still block before probing"
+  pass "a partial GitHub context blocks every relaunch without probing or erasing metadata"
+}
+
+test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate() {
+  local dir id out rc
+  id=ghscout
+  dir=$(new_case ghscout "$id")
+  fm_git_init_commit "$dir/proj"
+  git -C "$dir/proj" remote add origin https://github.com/owner/repo.git
+  mkdir -p "$dir/home/data/$id"
+  printf '# Scout brief\n\nInspect the repository.\n' > "$dir/home/data/$id/brief.md"
+  : > "$dir/fake/windows"
+  make_permissive_gh "$dir"
+
+  out=$(run_spawn "$dir" "$id" "$dir/proj" --scout --github-auth-required --harness claude); rc=$?
+  [ -e "$dir/fake/gh.log" ] || fail "a github.com authentication scout without --github-host must reach the authentication gate (rc $rc: $out)"
+  ! printf '%s' "$out" | grep -q -- 'requires --github-host' || fail "github.com auto-selection must not demand --github-host"
+  pass "a github.com authentication scout without a host assertion is accepted and gated"
+}
+
 # The proven path: an unchanged destination re-verifies and launches, and the
 # task recovers once its remote is restored - so the block above is specific to a
 # changed destination, not a blanket refusal.
@@ -1390,6 +1459,8 @@ test_an_unchanged_github_destination_reverifies_and_launches() {
 }
 
 test_a_changed_github_destination_blocks_every_relaunch_without_erasing
+test_a_partial_github_context_blocks_every_relaunch_without_erasing
+test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate
 test_an_unchanged_github_destination_reverifies_and_launches
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
@@ -1432,6 +1503,7 @@ test_secondmate_checkpoint_refuses_unreadable_child_state
 test_concurrent_relaunch_is_refused
 test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
+test_nonlocal_promotion_refuses_an_unresolvable_recorded_project
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task

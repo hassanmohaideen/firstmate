@@ -139,7 +139,12 @@ GH_SEL_HOST=
 GH_TARGET_KIND=
 GH_TARGET=
 GH_VERIFIED_DEST=
-if [ "$MODE" != local-only ] && [ -n "$PROMOTE_PROJECT" ] && [ -d "$PROMOTE_PROJECT" ]; then
+if [ "$MODE" != local-only ]; then
+  if [ -z "$PROMOTE_PROJECT" ] || [ ! -d "$PROMOTE_PROJECT" ]; then
+    echo "GH_AUTH_INDETERMINATE: the recorded project cannot be resolved for GitHub write-access verification" >&2
+    echo "error: GitHub write-access verification for task $ID is indeterminate; promotion is waiting" >&2
+    exit 1
+  fi
   if GH_INTAKE=$(fm_github_ctx_intake "$PROMOTE_PROJECT" push "$GITHUB_HOST" ""); then
     IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
 $GH_INTAKE

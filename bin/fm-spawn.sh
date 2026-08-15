@@ -388,7 +388,6 @@ if [ "$GITHUB_AUTH_REQUIRED" -eq 1 ]; then
     private-repository-read|organization-membership-read) ;;
     *) echo "error: --github-auth-required must be private-repository-read or organization-membership-read" >&2; exit 1 ;;
   esac
-  [ "$GITHUB_HOST_SET" -eq 1 ] || { echo "error: --github-auth-required requires --github-host naming the canonical destination" >&2; exit 1; }
 fi
 if [ "$GITHUB_AUTH_CAPABILITY" = organization-membership-read ]; then
   [ -n "$GITHUB_ORGANIZATION" ] || { echo "error: --github-auth-required=organization-membership-read requires --github-organization" >&2; exit 1; }
@@ -1696,7 +1695,11 @@ if [ "$KIND" != secondmate ] && fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUT
     echo "error: task $ID has no resolvable GitHub authentication capability" >&2
     exit 1
   }
-  if [ "$RELAUNCH" -eq 1 ] && [ -n "${GH_REC_HOST:-}" ]; then
+  GH_RECORDED_STATE=none
+  if [ "$RELAUNCH" -eq 1 ]; then
+    GH_RECORDED_STATE=$(fm_github_ctx_recorded_state "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GH_REC_VERIFIED")
+  fi
+  if [ "$GH_RECORDED_STATE" = complete ]; then
     GH_FORGE=$GH_REC_FORGE
     GH_SEL_HOST=$GH_REC_HOST
     GH_TARGET_KIND=$GH_REC_TARGET_KIND
@@ -1704,6 +1707,10 @@ if [ "$KIND" != secondmate ] && fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUT
     GH_ORG=$GH_REC_ORG
     GH_VERIFIED_DEST=$GH_REC_VERIFIED
     GH_GATED=1
+  elif [ "$GH_RECORDED_STATE" = partial ]; then
+    echo "GH_AUTH_INDETERMINATE: task $ID has a partial recorded GitHub context" >&2
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+    exit 1
   # The command substitution is kept in the `if` condition so `set -e` does not
   # exit on the intended non-zero returns before they are handled.
   elif GH_INTAKE=$(fm_github_ctx_intake "$PROJ_ABS" "$GH_CAPABILITY" "$GITHUB_HOST" "$GITHUB_ORGANIZATION"); then

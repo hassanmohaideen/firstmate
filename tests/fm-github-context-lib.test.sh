@@ -101,6 +101,15 @@ test_capability_maps_kind_and_requirement() {
   pass "the probe capability is derived from kind and the authentication requirement"
 }
 
+test_recorded_context_state_distinguishes_absent_partial_and_complete_records() {
+  [ "$(fm_github_ctx_recorded_state '' '' '' '' '' '')" = none ] || fail "an empty context must be absent"
+  [ "$(fm_github_ctx_recorded_state github '' repository owner/repo '' verified)" = partial ] || fail "a context missing its selected host must be partial"
+  [ "$(fm_github_ctx_recorded_state github github.com repository owner/repo '' '')" = complete ] || fail "a repository context with its required fields must be complete"
+  [ "$(fm_github_ctx_recorded_state github github.com organization '' acme '')" = complete ] || fail "an organization context with its required fields must be complete"
+  [ "$(fm_github_ctx_recorded_state github github.com organization '' '' verified)" = partial ] || fail "an organization context missing its organization must be partial"
+  pass "recorded context state distinguishes absent, partial, and complete records"
+}
+
 test_dest_tuple_is_a_stable_delimited_join() {
   [ "$(fm_github_ctx_dest_tuple github github.com repository owner/repo push)" = 'github|github.com|repository|owner/repo|push' ] \
     || fail "the destination tuple must be a stable delimited join"
@@ -241,6 +250,17 @@ test_gate_classifies_auth_and_indeterminate_failures() {
   pass "the gate classifies signed-out, access-denied, network, and account-isolation failures correctly"
 }
 
+test_gate_blocks_a_capability_target_kind_mismatch_before_fast_path() {
+  local proj vt
+  proj=$(make_project gatemismatch https://github.com/owner/repo.git)
+  install_fake_gh "$proj"
+  vt='github|github.com|organization|acme|fetch'
+  run_gate "$proj" github github.com organization acme fetch acme "$vt"
+  [ "$GATE_RC" -eq 2 ] || fail "a fetch capability with an organization target must block indeterminate (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a malformed capability-target pairing must block before probing"
+  pass "the gate blocks a mismatched capability and target kind before its fast path"
+}
+
 test_gate_keeps_organization_404_indeterminate() {
   local proj
   proj=$(make_project gateorg https://github.com/owner/repo.git)
@@ -253,6 +273,7 @@ test_gate_keeps_organization_404_indeterminate() {
 
 test_scope_comes_from_immutable_task_identity
 test_capability_maps_kind_and_requirement
+test_recorded_context_state_distinguishes_absent_partial_and_complete_records
 test_dest_tuple_is_a_stable_delimited_join
 test_intake_auto_selects_github_com_but_never_infers_another_host
 test_intake_refuses_mismatch_and_ambiguity
@@ -262,4 +283,5 @@ test_gate_trusts_a_matching_verified_tuple_without_probing
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it
 test_gate_reprobes_when_the_verified_record_is_missing
 test_gate_classifies_auth_and_indeterminate_failures
+test_gate_blocks_a_capability_target_kind_mismatch_before_fast_path
 test_gate_keeps_organization_404_indeterminate

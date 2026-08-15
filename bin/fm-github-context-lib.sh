@@ -229,6 +229,22 @@ fm_github_ctx_capability() {
   esac
 }
 
+# Classify a persisted GitHub context at the lifecycle boundary.
+fm_github_ctx_recorded_state() {
+  local forge=${1:-} selected_host=${2:-} target_kind=${3:-} target=${4:-} organization=${5:-} verified=${6:-}
+  if [ -z "$forge$selected_host$target_kind$target$organization$verified" ]; then
+    printf 'none'
+    return 0
+  fi
+  if [ "$forge" = github ] && [ -n "$selected_host" ]; then
+    case "$target_kind" in
+      repository) [ -n "$target" ] && { printf 'complete'; return 0; } ;;
+      organization) [ -n "$organization" ] && { printf 'complete'; return 0; } ;;
+    esac
+  fi
+  printf 'partial'
+}
+
 # The canonical verified-destination tuple. Every field is charset-constrained
 # (forge is a literal, host is a validated lowercase DNS name, target is an
 # owner/repo or an org, capability is an enum), so '|' cannot appear inside a
@@ -303,6 +319,10 @@ fm_github_ctx_gate() {
   local obs_host obs_repo obs_target obs_tuple probe_target probe_out st
   [ "$forge" = github ] || { echo "GH_AUTH_INDETERMINATE: no authoritative GitHub forge is recorded for this task" >&2; return 2; }
   fm_github_validate_hostname "$selected_host" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub host is not a canonical hostname" >&2; return 2; }
+  case "$capability:$target_kind" in
+    push:repository|fetch:repository|api-org-membership:organization) ;;
+    *) echo "GH_AUTH_INDETERMINATE: the recorded GitHub target kind does not match the required capability" >&2; return 2 ;;
+  esac
   obs_host=$(fm_github_remote_destination_host "$project" "$capability" 2>/dev/null)
   st=$?
   if [ "$st" -eq 2 ]; then
