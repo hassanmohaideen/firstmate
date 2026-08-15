@@ -80,6 +80,17 @@ wait_for_minimum_value() {
   return 1
 }
 
+wait_for_jsonl_lines() {
+  local file=$1 minimum=$2 i=0 lines
+  while [ "$i" -lt 200 ]; do
+    lines=$(awk 'END { print NR }' "$file" 2>/dev/null || printf '0')
+    [ "${lines:-0}" -ge "$minimum" ] 2>/dev/null && return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
+}
+
 path_mode() {
   if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi
 }
@@ -882,6 +893,8 @@ WORKER_PIDS+=("$pressure_worker")
 # same 30-second margin used by the slowest real reconnect cases below.
 wait_for_minimum_value "$home/gateway/connections" "$next_connection" 600 \
   || fail "restarted Gateway did not reconnect"
+wait_for_jsonl_lines "$home/gateway/connection-events.jsonl" "$next_connection" \
+  || fail "restarted Gateway did not record its connection event"
 restarted_connection=$(sed -n "${next_connection}p" "$home/gateway/connection-events.jsonl" | jq -r .at)
 [ $((restarted_connection - restarted_at)) -ge 25 ] \
   || fail "process restart discarded reconnect pressure: $((restarted_connection - restarted_at))ms"
@@ -926,6 +939,8 @@ while [ "$i" -lt 50 ] && [ "$(cat "$home/gateway/connections" 2>/dev/null || tru
 done
 [ "$(cat "$home/gateway/connections" 2>/dev/null || true)" = 2 ] \
   || fail "future-dated reconnect attempt caused an excessive wait"
+wait_for_jsonl_lines "$home/gateway/connection-events.jsonl" 2 \
+  || fail "future-dated reconnect did not record its connection event"
 restarted_connection=$(sed -n '2p' "$home/gateway/connection-events.jsonl" | jq -r .at)
 [ $((restarted_connection - restarted_at)) -ge 25 ] \
   || fail "future-dated reconnect attempt bypassed the minimum interval"
@@ -945,8 +960,8 @@ for mode in server-reconnect invalid-session-resumable invalid-session-fresh; do
   directed_worker=$!
   WORKER_PIDS+=("$directed_worker")
   wait_for_value "$home/gateway/connections" 2 || fail "$mode did not reconnect"
-  wait_for_file "$home/gateway/events.jsonl" || fail "$mode did not record Gateway authentication choices"
-  sleep 0.05
+  wait_for_jsonl_lines "$home/gateway/events.jsonl" 2 \
+    || fail "$mode did not record both Gateway authentication choices"
   second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
   case "$mode" in
     server-reconnect|invalid-session-resumable)
@@ -991,6 +1006,8 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 resume_worker=$!
 WORKER_PIDS+=("$resume_worker")
 wait_for_value "$home/gateway/connections" 2 || fail "replacement process did not reconnect"
+wait_for_jsonl_lines "$home/gateway/events.jsonl" 2 \
+  || fail "replacement process did not record its Gateway authentication choice"
 second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
 second_session=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .session)
 second_sequence=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .sequence)
@@ -1034,6 +1051,8 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 resume_worker=$!
 WORKER_PIDS+=("$resume_worker")
 wait_for_value "$home/gateway/connections" 2 || fail "checkpoint replacement process did not reconnect"
+wait_for_jsonl_lines "$home/gateway/events.jsonl" 2 \
+  || fail "checkpoint replacement did not record its Gateway authentication choice"
 second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
 second_sequence=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .sequence)
 [ "$second_op" = resume ] || fail "checkpoint replacement process did not preserve Resume"
@@ -1178,6 +1197,10 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 invalid_worker=$!
 WORKER_PIDS+=("$invalid_worker")
 wait_for_value "$home/gateway/connections" 2 || fail "replacement process did not reconnect after invalid session"
+wait_for_jsonl_lines "$home/gateway/connection-events.jsonl" 2 \
+  || fail "invalid-session replacement did not record its connection event"
+wait_for_jsonl_lines "$home/gateway/events.jsonl" 2 \
+  || fail "invalid-session replacement did not record its authentication choice"
 invalid_reconnect_at=$(sed -n '2p' "$home/gateway/connection-events.jsonl" | jq -r .at)
 [ "$invalid_reconnect_at" -ge "$invalid_not_before" ] \
   || fail "replacement process bypassed the invalid-session wait"
@@ -1265,6 +1288,8 @@ sleep 0.1
 [ "$(cat "$home/gateway/connections")" -eq 1 ] \
   || fail "process restart discarded the durable Identify reservation"
 wait_for_value "$home/gateway/connections" 2 || fail "durable session reservation did not permit Resume"
+wait_for_jsonl_lines "$home/gateway/events.jsonl" 2 \
+  || fail "durable session reservation did not record its Resume choice"
 second_op=$(sed -n '2p' "$home/gateway/events.jsonl" | jq -r .op)
 [ "$second_op" = resume ] || fail "fresh process consumed Identify despite a durable resumable session"
 [ "$(jq -r '.session_start_limit.remaining' "$home/state/.discord-bot-service/reconnect.json")" -eq 0 ] \
@@ -1340,6 +1365,8 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
 wait_for_value "$home/gateway/lookups" 2 || fail "rate-limited Gateway lookup did not retry"
+wait_for_jsonl_lines "$home/gateway/lookup-events.jsonl" 2 \
+  || fail "rate-limited Gateway did not record both lookup events"
 first_lookup=$(sed -n '1p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
 second_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
 [ $((second_lookup - first_lookup)) -ge 160 ] \
@@ -1382,6 +1409,8 @@ FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_DISCORD_TEST_MODE=1 \
 rate_worker=$!
 WORKER_PIDS+=("$rate_worker")
 wait_for_value "$home/gateway/lookups" 2 || fail "restarted rate-limited Gateway lookup did not resume"
+wait_for_jsonl_lines "$home/gateway/lookup-events.jsonl" 2 \
+  || fail "restarted rate-limited Gateway did not record its lookup event"
 second_lookup=$(sed -n '2p' "$home/gateway/lookup-events.jsonl" | jq -r .at)
 [ "$second_lookup" -ge "$server_not_before" ] \
   || fail "process restart bypassed the durable server retry deadline"
