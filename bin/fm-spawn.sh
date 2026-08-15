@@ -301,6 +301,7 @@ GITHUB_HOST_SET=0
 GITHUB_AUTH_REQUIRED=0
 GITHUB_AUTH_CAPABILITY=
 GITHUB_ORGANIZATION=
+GH_GATED=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -663,6 +664,7 @@ spawn_remote_secondmate() {
     echo "kind=secondmate"
     echo "mode=secondmate"
     echo "yolo=off"
+    echo "gh_gated=${GH_GATED:-0}"
     echo "tasktmp="
     echo "model=${model#-}"
     echo "effort=${effort#-}"
@@ -719,6 +721,20 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+
+write_github_context_meta() {
+  echo "gh_gated=${GH_GATED:-0}"
+  if [ "${GH_GATED:-0}" = 1 ]; then
+    echo "gh_forge=${GH_FORGE:-}"
+    echo "gh_selected_host=${GH_SEL_HOST:-}"
+    echo "gh_target_kind=${GH_TARGET_KIND:-}"
+    [ -z "${GH_TARGET:-}" ] || echo "gh_target=$GH_TARGET"
+    [ "${GITHUB_AUTH_REQUIRED:-0}" = 0 ] || echo "gh_auth_required=1"
+    [ -z "${GITHUB_AUTH_CAPABILITY:-}" ] || echo "gh_auth_capability=$GITHUB_AUTH_CAPABILITY"
+    [ -z "${GH_ORG:-}" ] || echo "gh_organization=$GH_ORG"
+    [ -z "${GH_VERIFIED_DEST:-}" ] || echo "gh_verified_dest=$GH_VERIFIED_DEST"
+  fi
+}
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -798,6 +814,7 @@ spawn_abort_cleanup() {
             echo "kind=$KIND"
             [ -z "${MODE:-}" ] || echo "mode=$MODE"
             [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
+            write_github_context_meta
             echo "tasktmp=${TASK_TMP:-}"
             echo "model=${MODEL:-default}"
             echo "effort=${EFFORT:-default}"
@@ -2747,17 +2764,7 @@ preserve_relaunch_meta() {
   # GitHub authentication-context classification and selection are written
   # unconditionally from the resolved decision, so complete selection erasure
   # cannot turn a previously gated record into an ungated relaunch.
-  echo "gh_gated=$GH_GATED"
-  if [ "$GH_GATED" -eq 1 ]; then
-    echo "gh_forge=$GH_FORGE"
-    echo "gh_selected_host=$GH_SEL_HOST"
-    echo "gh_target_kind=$GH_TARGET_KIND"
-    [ -z "$GH_TARGET" ] || echo "gh_target=$GH_TARGET"
-    [ "$GITHUB_AUTH_REQUIRED" -eq 0 ] || echo "gh_auth_required=1"
-    [ -z "$GITHUB_AUTH_CAPABILITY" ] || echo "gh_auth_capability=$GITHUB_AUTH_CAPABILITY"
-    [ -z "$GH_ORG" ] || echo "gh_organization=$GH_ORG"
-    [ -z "$GH_VERIFIED_DEST" ] || echo "gh_verified_dest=$GH_VERIFIED_DEST"
-  fi
+  write_github_context_meta
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"

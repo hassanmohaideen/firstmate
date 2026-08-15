@@ -169,6 +169,8 @@ freeze_parent_session
 remote_env "$ROOT/bin/fm-spawn.sh" ios --secondmate >/dev/null 2>&1 \
   || fail "default-off remote secondmate spawn failed"
 assert_present "$PARENT/state/ios.meta" "default-off remote spawn published no parent metadata"
+[ "$(sed -n 's/^gh_gated=//p' "$PARENT/state/ios.meta")" = 0 ] \
+  || fail "a remote secondmate record must carry the explicit ungated lifecycle marker"
 ! grep -q '^traceparent=' "$PARENT/state/ios.meta" \
   || fail "default-off remote spawn must not record a traceparent= line"
 ! grep -q 'export TRACEPARENT=' "$HERDR_LOG" \

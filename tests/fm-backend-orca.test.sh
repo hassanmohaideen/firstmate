@@ -460,6 +460,7 @@ test_spawn_preserves_orca_metadata_when_pathless_worktree_cleanup_fails() {
   state="$TMP_ROOT/pathless-cleanup-state"
   config="$TMP_ROOT/pathless-cleanup-config"
   fm_git_init_commit "$proj"
+  fm_git_add_origin "$proj" "$proj.origin.git"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
@@ -590,6 +591,7 @@ test_spawn_refuses_orca_nonisolated_worktree() {
   state="$TMP_ROOT/bad-spawn-state"
   config="$TMP_ROOT/bad-spawn-config"
   fm_git_init_commit "$proj"
+  fm_git_add_origin "$proj" "$proj.origin.git"
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
@@ -657,10 +659,20 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   state="$TMP_ROOT/cleanup-fail-state"
   config="$TMP_ROOT/cleanup-fail-config"
   fm_git_worktree "$proj" "$wt" "fm/$id"
+  git -C "$proj" remote set-url origin https://github.com/owner/repo.git
   mkdir -p "$data/$id" "$state" "$config"
   printf 'brief\n' > "$data/$id/brief.md"
   touch "$state/.last-watcher-beat"
   orca_case cleanup-fail
+  cat > "$FB/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"auth status --help"*) printf '  --active, --hostname\n' ;;
+  *"repos/"*) printf 'true\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$FB/gh"
   printf '1\n' > "$RESP/1.exit"
   printf '{"ok":true,"result":{"repo":{"id":"repo-cleanup-fail"}}}\n' > "$RESP/2.out"
   printf '{"ok":true,"result":{"worktree":{"id":"wt-cleanup-fail","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
@@ -679,7 +691,13 @@ test_spawn_preserves_orca_metadata_when_abort_cleanup_fails() {
   assert_grep "backend=orca" "$state/$id.meta" "preserved metadata missing backend=orca"
   assert_grep "orca_worktree_id=wt-cleanup-fail" "$state/$id.meta" "preserved metadata missing Orca worktree id"
   assert_no_grep "terminal=" "$state/$id.meta" "preserved metadata should not invent a terminal handle"
-  pass "fm-spawn.sh --backend orca: preserves metadata when abort cleanup fails"
+  assert_grep "gh_gated=1" "$state/$id.meta" "gated abort recovery metadata lost its lifecycle classification"
+  assert_grep "gh_forge=github" "$state/$id.meta" "gated abort recovery metadata lost its forge selection"
+  assert_grep "gh_selected_host=github.com" "$state/$id.meta" "gated abort recovery metadata lost its selected host"
+  assert_grep "gh_target_kind=repository" "$state/$id.meta" "gated abort recovery metadata lost its target kind"
+  assert_grep "gh_target=owner/repo" "$state/$id.meta" "gated abort recovery metadata lost its repository target"
+  assert_grep "gh_verified_dest=github|github.com|repository|owner/repo|push" "$state/$id.meta" "gated abort recovery metadata lost its verified destination"
+  pass "fm-spawn.sh --backend orca: preserves gated context when abort cleanup fails"
 }
 
 test_spawn_releases_orca_resources_when_metadata_write_fails() {
