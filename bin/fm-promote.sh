@@ -179,12 +179,13 @@ fi
 
 TMP="$STATE/.$ID.meta.promote.${BASHPID:-$$}"
 grep -v -e '^kind=' -e '^mode=' -e '^yolo=' \
-  -e '^gh_forge=' -e '^gh_selected_host=' -e '^gh_target_kind=' -e '^gh_target=' \
+  -e '^gh_gated=' -e '^gh_forge=' -e '^gh_selected_host=' -e '^gh_target_kind=' -e '^gh_target=' \
   -e '^gh_auth_required=' -e '^gh_auth_capability=' -e '^gh_organization=' -e '^gh_verified_dest=' "$META" > "$TMP"
 {
   echo "kind=ship"
   echo "mode=$MODE"
   echo "yolo=$YOLO"
+  echo "gh_gated=$GH_GATED"
   if [ "$GH_GATED" -eq 1 ]; then
     echo "gh_forge=$GH_FORGE"
     echo "gh_selected_host=$GH_SEL_HOST"

@@ -76,17 +76,41 @@ fm_github_http_remote_host() {
   printf '%s' "$host"
 }
 
+fm_github_ssh_remote_host() {
+  local url=$1 authority host port normalized_port
+  case "$url" in
+    ssh://git@*/*)
+      authority=${url#ssh://git@}
+      authority=${authority%%/*}
+      case "$authority" in
+        *:*)
+          host=${authority%:*}
+          port=${authority##*:}
+          case "$host" in ''|*:*) return 1 ;; esac
+          case "$port" in ''|*[!0-9]*) return 1 ;; esac
+          normalized_port=$port
+          while [ "${normalized_port#0}" != "$normalized_port" ]; do normalized_port=${normalized_port#0}; done
+          [ "$normalized_port" = 22 ] || return 1
+          ;;
+        *) host=$authority ;;
+      esac
+      ;;
+    git@*:*/*) host=${url#git@}; host=${host%%:*} ;;
+    *) return 1 ;;
+  esac
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  fm_github_validate_hostname "$host" || return 1
+  printf '%s' "$host"
+}
+
 fm_github_remote_destination_host() {
   local project=$1 capability=$2 url host
   url=$(fm_github_remote_destination_url "$project" "$capability") || return $?
   case "$url" in
     https://*/*) host=$(fm_github_http_remote_host "$url") || return 2 ;;
-    ssh://*/*) host=${url#ssh://}; host=${host#*@}; host=${host%%[:/]*} ;;
-    git@*:*/*) host=${url#git@}; host=${host%%:*} ;;
+    ssh://*/*|git@*:*/*) host=$(fm_github_ssh_remote_host "$url") || return 2 ;;
     *) return 2 ;;
   esac
-  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
-  fm_github_validate_hostname "$host" || return 1
   printf '%s' "$host"
 }
 
@@ -98,8 +122,14 @@ fm_github_remote_destination_repository() {
       fm_github_http_remote_host "$url" >/dev/null || return 1
       path=${url#*://}; path=${path#*/}
       ;;
-    ssh://*/*) path=${url#ssh://}; path=${path#*/} ;;
-    git@*:*/*) path=${url#*:} ;;
+    ssh://*/*)
+      fm_github_ssh_remote_host "$url" >/dev/null || return 1
+      path=${url#ssh://}; path=${path#*/}
+      ;;
+    git@*:*/*)
+      fm_github_ssh_remote_host "$url" >/dev/null || return 1
+      path=${url#*:}
+      ;;
     *) return 1 ;;
   esac
   path=${path%.git}
@@ -171,7 +201,7 @@ fm_github_auth_probe() {
         *) echo "GH_AUTH_INDETERMINATE: GitHub write-access probe for $target returned an invalid response"; return 2 ;;
       esac
       ;;
-    *) return 2 ;;
+    *) echo "GH_AUTH_INDETERMINATE: the requested GitHub probe capability is unsupported"; return 2 ;;
   esac
   return 0
 }
@@ -246,6 +276,20 @@ fm_github_ctx_recorded_state() {
   printf 'partial'
 }
 
+fm_github_ctx_lifecycle_state() {
+  local marker_present=${1:-} marker=${2:-}
+  shift 2
+  if [ "$marker_present" != 1 ]; then
+    printf 'legacy'
+    return 0
+  fi
+  case "$marker:$(fm_github_ctx_recorded_state "$@")" in
+    0:none) printf 'ungated' ;;
+    1:complete) printf 'gated' ;;
+    *) printf 'invalid' ;;
+  esac
+}
+
 # The canonical verified-destination tuple. Every field is charset-constrained
 # (forge is a literal, host is a validated lowercase DNS name, target is an
 # owner/repo or an org, capability is an enum), so '|' cannot appear inside a
@@ -268,7 +312,7 @@ fm_github_ctx_dest_tuple() {
 fm_github_ctx_intake() {
   local project=$1 capability=$2 asserted=$3 organization=${4:-} obs_host obs_repo st
   if [ -n "$asserted" ]; then
-    fm_github_validate_hostname "$asserted" || { echo "error: --github-host must be a canonical lowercase hostname" >&2; return 1; }
+    fm_github_validate_hostname "$asserted" || { echo "GH_AUTH_INDETERMINATE: --github-host must be a canonical lowercase hostname" >&2; return 1; }
   fi
   obs_host=$(fm_github_remote_destination_host "$project" "$capability" 2>/dev/null)
   st=$?
@@ -280,19 +324,21 @@ fm_github_ctx_intake() {
       echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub destination for the asserted host" >&2
       return 2
     fi
+    [ "$capability" = push ] || echo "GH_AUTH_INDETERMINATE: an authentication scout requires an asserted host for this destination" >&2
     return 3
   fi
   if [ -n "$asserted" ]; then
     [ "$obs_host" = "$asserted" ] || {
-      echo "error: --github-host '$asserted' does not match the project's canonical destination host '$obs_host'" >&2
+      echo "GH_AUTH_INDETERMINATE: --github-host '$asserted' does not match the project's canonical destination host '$obs_host'" >&2
       return 1
     }
   elif [ "$obs_host" != github.com ]; then
+    [ "$capability" = push ] || echo "GH_AUTH_INDETERMINATE: an authentication scout requires an asserted host for this destination" >&2
     return 3
   fi
   if [ "$capability" = api-org-membership ]; then
-    [ -n "$organization" ] || { echo "error: organization-membership selection requires --github-organization" >&2; return 1; }
-    fm_github_validate_organization "$organization" || { echo "error: --github-organization must be a valid GitHub organization login" >&2; return 1; }
+    [ -n "$organization" ] || { echo "GH_AUTH_INDETERMINATE: organization-membership selection requires --github-organization" >&2; return 1; }
+    fm_github_validate_organization "$organization" || { echo "GH_AUTH_INDETERMINATE: --github-organization must be a valid GitHub organization login" >&2; return 1; }
     printf '%s\torganization\t%s' "$obs_host" "$organization"
   else
     obs_repo=$(fm_github_remote_destination_repository "$project" "$capability" 2>/dev/null) || {

@@ -140,6 +140,7 @@ add_ship_task() {
   local dir=$1 id=$2 harness=${3:-claude}
   local home="$dir/home" proj="$dir/proj" wt="$dir/wt"
   fm_git_worktree "$proj" "$wt" "task-$id"
+  git -C "$proj" remote set-url origin https://gitlab.example/owner/repo.git
   mkdir -p "$home/data/$id"
   printf '# brief for %s\n\nDo the thing.\n' "$id" > "$home/data/$id/brief.md"
   {
@@ -263,6 +264,7 @@ test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint() {
     || fail "the worktree must be reused, not reallocated"
   [ "$(meta_field "$dir" rl1 kind)" = ship ] || fail "kind must survive the relaunch"
   [ "$(meta_field "$dir" rl1 project)" = "$dir/proj" ] || fail "project must survive the relaunch"
+  [ "$(meta_field "$dir" rl1 gh_gated)" = 0 ] || fail "the relaunch must persist its ungated classification"
   gen_after=$(meta_field "$dir" rl1 busy_gen)
   [ -n "$gen_after" ] && [ "$gen_after" != "$gen_before" ] \
     || fail "a relaunch must arm a fresh busy generation, got '$gen_after'"
@@ -1344,6 +1346,7 @@ SH
 record_github_selection() {  # <case-dir> <id> <host> [verified]
   local dir=$1 id=$2 host=$3 verified=${4:-}
   {
+    echo "gh_gated=1"
     echo "gh_forge=github"
     echo "gh_selected_host=$host"
     echo "gh_target_kind=repository"
@@ -1391,6 +1394,31 @@ test_a_changed_github_destination_blocks_every_relaunch_without_erasing() {
   pass "a changed GitHub destination blocks every relaunch and never erases the selection or bypasses"
 }
 
+test_a_fully_erased_gated_context_blocks_relaunch_without_mutation() {
+  local dir id out rc before after
+  id=gherased
+  dir=$(new_case gherased "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  grep -v '^gh_' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.erased"
+  echo 'gh_gated=1' >> "$dir/home/state/$id.meta.erased"
+  mv "$dir/home/state/$id.meta.erased" "$dir/home/state/$id.meta"
+  git -C "$dir/proj" remote set-url origin https://gitlab.example/owner/repo.git
+  before=$(cksum < "$dir/home/state/$id.meta")
+  : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a gated record whose selection was fully erased must not launch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "an erased gated context must report an indeterminate gate"
+  assert_contains "$out" 'worker launch is waiting' "an erased gated context must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "an erased gated context must not start the agent"
+  [ ! -e "$dir/fake/gh.log" ] || fail "an erased gated context must block before probing"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "an erased gated-context refusal must not mutate metadata"
+  pass "a fully erased gated context blocks relaunch without mutation"
+}
+
 test_a_partial_github_context_blocks_every_relaunch_without_erasing() {
   local dir id out rc before after gh_log
   id=ghpartial
@@ -1429,6 +1457,7 @@ test_a_scout_with_a_dropped_authentication_requirement_stays_gated() {
   sed 's/^kind=ship$/kind=scout/' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.scout"
   mv "$dir/home/state/$id.meta.scout" "$dir/home/state/$id.meta"
   {
+    echo 'gh_gated=1'
     echo 'gh_forge=github'
     echo 'gh_selected_host=github.com'
     echo 'gh_target_kind=repository'
@@ -1509,6 +1538,7 @@ test_an_unchanged_github_destination_reverifies_and_launches() {
 }
 
 test_a_changed_github_destination_blocks_every_relaunch_without_erasing
+test_a_fully_erased_gated_context_blocks_relaunch_without_mutation
 test_a_partial_github_context_blocks_every_relaunch_without_erasing
 test_a_scout_with_a_dropped_authentication_requirement_stays_gated
 test_a_relaunch_gates_the_execution_worktree_destination

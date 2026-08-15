@@ -108,7 +108,12 @@ test_recorded_context_state_distinguishes_absent_partial_and_complete_records() 
   [ "$(fm_github_ctx_recorded_state scout github github.com organization '' acme 1 organization-membership-read '')" = complete ] || fail "an organization scout context with its required fields must be complete"
   [ "$(fm_github_ctx_recorded_state scout github github.com repository owner/repo '' '' private-repository-read verified)" = partial ] || fail "a scout context missing its authentication requirement must be partial"
   [ "$(fm_github_ctx_recorded_state scout github github.com organization '' '' 1 organization-membership-read verified)" = partial ] || fail "an organization context missing its organization must be partial"
-  pass "recorded context state distinguishes absent, partial, and complete records"
+  [ "$(fm_github_ctx_lifecycle_state 0 '' ship github github.com repository owner/repo '' '' '' verified)" = legacy ] || fail "a record without a classification marker must use legacy migration"
+  [ "$(fm_github_ctx_lifecycle_state 1 0 ship '' '' '' '' '' '' '' '')" = ungated ] || fail "an empty explicitly ungated context must re-derive"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 ship github github.com repository owner/repo '' '' '' verified)" = gated ] || fail "a complete explicitly gated context must remain gated"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 ship '' '' '' '' '' '' '' '')" = invalid ] || fail "an erased explicitly gated context must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 1 0 ship github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "an ungated marker with a recorded selection must be invalid"
+  pass "recorded context state distinguishes legacy, ungated, invalid, and complete records"
 }
 
 test_dest_tuple_is_a_stable_delimited_join() {
@@ -226,14 +231,24 @@ test_gate_trusts_a_matching_verified_tuple_without_probing() {
 test_gate_blocks_unverifiable_transports_before_fast_path() {
   local proj vt url
   vt='github|github.com|repository|owner/repo|push'
-  for url in http://github.com/owner/repo.git https://github.com:8443/owner/repo.git; do
+  for url in http://github.com/owner/repo.git https://github.com:8443/owner/repo.git ssh://root@github.com/owner/repo.git ssh://git@github.com:2222/owner/repo.git; do
     proj=$(make_project gatebadtransport "$url")
     install_fake_gh "$proj"
     run_gate "$proj" github github.com repository owner/repo push '' "$vt"
     [ "$GATE_RC" -eq 2 ] || fail "an unverifiable transport must block indeterminate before the fast path (rc $GATE_RC, URL $url)"
     [ "$GATE_PROBED" -eq 1 ] || fail "an unverifiable transport must block without probing (URL $url)"
   done
-  pass "the gate blocks HTTP and non-default-port HTTPS destinations before its fast path"
+  pass "the gate blocks unverifiable HTTP, HTTPS, and SSH authorities before its fast path"
+}
+
+test_gate_accepts_standard_github_ssh_authorities() {
+  local proj out url
+  for url in git@github.com:owner/repo.git ssh://git@github.com/owner/repo.git ssh://git@github.com:22/owner/repo.git; do
+    proj=$(make_project gatessh "$url")
+    out=$(fm_github_ctx_intake "$proj" push '' '') || fail "a standard GitHub SSH authority must resolve (URL $url)"
+    [ "$out" = "$(printf 'github.com\trepository\towner/repo')" ] || fail "a standard GitHub SSH authority resolved incorrectly (URL $url)"
+  done
+  pass "intake accepts standard GitHub SSH authorities"
 }
 
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it() {
@@ -334,6 +349,37 @@ test_gate_reports_when_gh_is_not_installed() {
   pass "the gate reports an indeterminate bootstrap diagnostic when gh is not installed"
 }
 
+test_owner_refusals_emit_bootstrap_diagnostics() {
+  local proj out rc
+  proj=$(make_project diagnostics https://github.com/owner/repo.git)
+
+  out=$(fm_github_ctx_intake "$proj" push Bad_Host '' 2>&1); rc=$?
+  [ "$rc" -eq 1 ] || fail "a malformed asserted host must refuse"
+  case "$out" in *GH_AUTH_INDETERMINATE:*) ;; *) fail "a malformed asserted host must emit a bootstrap diagnostic" ;; esac
+
+  out=$(fm_github_ctx_intake "$proj" push github.enterprise.example '' 2>&1); rc=$?
+  [ "$rc" -eq 1 ] || fail "an asserted host mismatch must refuse"
+  case "$out" in *GH_AUTH_INDETERMINATE:*) ;; *) fail "an asserted host mismatch must emit a bootstrap diagnostic" ;; esac
+
+  out=$(fm_github_ctx_intake "$proj" api-org-membership github.com '' 2>&1); rc=$?
+  [ "$rc" -eq 1 ] || fail "a missing organization must refuse"
+  case "$out" in *GH_AUTH_INDETERMINATE:*) ;; *) fail "a missing organization must emit a bootstrap diagnostic" ;; esac
+
+  out=$(fm_github_ctx_intake "$proj" api-org-membership github.com bad/org 2>&1); rc=$?
+  [ "$rc" -eq 1 ] || fail "a malformed organization must refuse"
+  case "$out" in *GH_AUTH_INDETERMINATE:*) ;; *) fail "a malformed organization must emit a bootstrap diagnostic" ;; esac
+
+  git -C "$proj" remote set-url origin https://gitlab.example/owner/repo.git
+  out=$(fm_github_ctx_intake "$proj" fetch '' '' 2>&1); rc=$?
+  [ "$rc" -eq 3 ] || fail "an authentication scout without an asserted non-GitHub host must refuse selection"
+  case "$out" in *GH_AUTH_INDETERMINATE:*) ;; *) fail "an authentication scout host refusal must emit a bootstrap diagnostic" ;; esac
+
+  out=$(fm_github_ctx_gate "$proj" gitlab gitlab.example repository owner/repo push '' '' 2>&1); rc=$?
+  [ "$rc" -eq 2 ] || fail "an unsupported recorded forge must block"
+  case "$out" in *GH_AUTH_INDETERMINATE:*) ;; *) fail "an unsupported recorded forge must emit a bootstrap diagnostic" ;; esac
+  pass "authentication-context owner refusals emit bootstrap diagnostics"
+}
+
 test_gate_keeps_organization_404_indeterminate() {
   local proj
   proj=$(make_project gateorg https://github.com/owner/repo.git)
@@ -355,6 +401,7 @@ test_intake_resolves_org_membership_selection
 test_gate_verifies_a_fresh_matching_destination
 test_gate_trusts_a_matching_verified_tuple_without_probing
 test_gate_blocks_unverifiable_transports_before_fast_path
+test_gate_accepts_standard_github_ssh_authorities
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it
 test_gate_reprobes_when_the_verified_record_is_missing
 test_gate_classifies_auth_and_indeterminate_failures
@@ -362,4 +409,5 @@ test_gate_blocks_a_capability_target_kind_mismatch_before_fast_path
 test_gate_blocks_a_malformed_organization_before_fast_path
 test_gate_blocks_a_malformed_repository_owner_before_fast_path
 test_gate_reports_when_gh_is_not_installed
+test_owner_refusals_emit_bootstrap_diagnostics
 test_gate_keeps_organization_404_indeterminate

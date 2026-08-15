@@ -1067,6 +1067,9 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # erase-then-bypass class cannot occur.
   GITHUB_AUTH_REQUIRED=$(fm_meta_get "$RELAUNCH_META" gh_auth_required)
   GITHUB_AUTH_CAPABILITY=$(fm_meta_get "$RELAUNCH_META" gh_auth_capability)
+  GH_REC_GATED_PRESENT=0
+  grep -q '^gh_gated=' "$RELAUNCH_META" && GH_REC_GATED_PRESENT=1
+  GH_REC_GATED=$(fm_meta_get "$RELAUNCH_META" gh_gated)
   GH_REC_FORGE=$(fm_meta_get "$RELAUNCH_META" gh_forge)
   GH_REC_HOST=$(fm_meta_get "$RELAUNCH_META" gh_selected_host)
   GH_REC_TARGET_KIND=$(fm_meta_get "$RELAUNCH_META" gh_target_kind)
@@ -1690,15 +1693,20 @@ GH_CAPABILITY=
 GH_ORG=
 GH_VERIFIED_DEST=
 GH_RECORDED_STATE=none
+GH_LIFECYCLE_STATE=legacy
 GH_GATE_PROJECT=$PROJ_ABS
 if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" != secondmate ]; then
   GH_GATE_PROJECT=$RELAUNCH_WT
-  GH_RECORDED_STATE=$(fm_github_ctx_recorded_state "$KIND" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
-  if [ "$GH_RECORDED_STATE" = partial ]; then
-    echo "GH_AUTH_INDETERMINATE: task $ID has a partial recorded GitHub context" >&2
-    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
-    exit 1
-  fi
+  GH_LIFECYCLE_STATE=$(fm_github_ctx_lifecycle_state "$GH_REC_GATED_PRESENT" "$GH_REC_GATED" "$KIND" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
+  case "$GH_LIFECYCLE_STATE" in
+    gated) GH_RECORDED_STATE=complete ;;
+    legacy|ungated) GH_RECORDED_STATE=none ;;
+    *)
+      echo "GH_AUTH_INDETERMINATE: task $ID has an incomplete or inconsistent recorded GitHub context" >&2
+      echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+      exit 1
+      ;;
+  esac
 fi
 if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; }; then
   GH_CAPABILITY=$(fm_github_ctx_capability "$KIND" "$GITHUB_AUTH_CAPABILITY") || {
@@ -1728,7 +1736,7 @@ EOF
     case "$GH_INTAKE_RC" in
       3)
         if [ "$KIND" = scout ]; then
-          echo "error: a GitHub authentication scout requires --github-host naming the canonical destination" >&2
+          echo "GH_AUTH_INDETERMINATE: a GitHub authentication scout requires --github-host naming the canonical destination" >&2
           exit 1
         fi
         GH_GATED=0
@@ -2721,7 +2729,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo gh_forge gh_selected_host gh_target_kind gh_target gh_auth_required gh_auth_capability gh_organization gh_verified_dest tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo gh_gated gh_forge gh_selected_host gh_target_kind gh_target gh_auth_required gh_auth_capability gh_organization gh_verified_dest tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2736,11 +2744,10 @@ preserve_relaunch_meta() {
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
-  # GitHub authentication-context selection, written unconditionally from the
-  # immutable resolved selection (never from a probe outcome), so a blocked or
-  # failed relaunch can never erase it. gh_verified_dest, the only field a probe
-  # transitions, is written only when the current destination is verified; its
-  # absence forces a re-probe on the next relaunch (fail-closed migration).
+  # GitHub authentication-context classification and selection are written
+  # unconditionally from the resolved decision, so complete selection erasure
+  # cannot turn a previously gated record into an ungated relaunch.
+  echo "gh_gated=$GH_GATED"
   if [ "$GH_GATED" -eq 1 ]; then
     echo "gh_forge=$GH_FORGE"
     echo "gh_selected_host=$GH_SEL_HOST"
