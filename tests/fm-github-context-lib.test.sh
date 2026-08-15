@@ -275,6 +275,30 @@ test_gate_blocks_a_malformed_organization_before_fast_path() {
   pass "the gate blocks a malformed organization before its fast path"
 }
 
+test_gate_blocks_a_malformed_repository_owner_before_fast_path() {
+  local proj vt
+  proj=$(make_project gatebadowner https://github.com/bad_owner/repo.git)
+  install_fake_gh "$proj"
+  vt='github|github.com|repository|bad_owner/repo|push'
+  run_gate "$proj" github github.com repository bad_owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 2 ] || fail "a malformed repository owner must block indeterminate (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a malformed repository owner must block before probing or trusting the tuple"
+  pass "the gate blocks a malformed repository owner before its fast path"
+}
+
+test_gate_reports_when_gh_is_not_installed() {
+  local proj err rc
+  proj=$(make_project gatenogh https://github.com/owner/repo.git)
+  err=$(PATH=/usr/bin:/bin fm_github_ctx_gate "$proj" github github.com repository owner/repo push '' '' 2>&1 >/dev/null)
+  rc=$?
+  [ "$rc" -eq 2 ] || fail "a gate without gh must block indeterminate (rc $rc)"
+  case "$err" in
+    *"GH_AUTH_INDETERMINATE: the gh CLI is not installed"*) ;;
+    *) fail "a gate without gh must emit its indeterminate bootstrap diagnostic, got '$err'" ;;
+  esac
+  pass "the gate reports an indeterminate bootstrap diagnostic when gh is not installed"
+}
+
 test_gate_keeps_organization_404_indeterminate() {
   local proj
   proj=$(make_project gateorg https://github.com/owner/repo.git)
@@ -299,4 +323,6 @@ test_gate_reprobes_when_the_verified_record_is_missing
 test_gate_classifies_auth_and_indeterminate_failures
 test_gate_blocks_a_capability_target_kind_mismatch_before_fast_path
 test_gate_blocks_a_malformed_organization_before_fast_path
+test_gate_blocks_a_malformed_repository_owner_before_fast_path
+test_gate_reports_when_gh_is_not_installed
 test_gate_keeps_organization_404_indeterminate

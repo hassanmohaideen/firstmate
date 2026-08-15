@@ -31,12 +31,16 @@ fm_github_validate_hostname() {
   done
 }
 
-fm_github_validate_organization() {
-  local organization=$1
-  [ -n "$organization" ] || return 1
-  case "$organization" in
+fm_github_validate_login() {
+  local login=$1
+  [ -n "$login" ] || return 1
+  case "$login" in
     -*|*-|*[!A-Za-z0-9-]*) return 1 ;;
   esac
+}
+
+fm_github_validate_organization() {
+  fm_github_validate_login "$1"
 }
 
 fm_github_http_remote_host() {
@@ -122,7 +126,7 @@ fm_github_remote_destination_repository() {
   esac
   path=${path%.git}
   case "$path" in */*) owner=${path%%/*}; repository=${path#*/} ;; *) return 1 ;; esac
-  case "$owner" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+  fm_github_validate_login "$owner" || return 1
   case "$repository" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
   printf '%s/%s' "$owner" "$repository"
 }
@@ -153,7 +157,10 @@ fm_github_auth_probe_failure() {
 
 fm_github_auth_probe() {
   local host=$1 capability=$2 target=$3 organization=${4:-} diagnostic result
-  command -v gh >/dev/null 2>&1 || return 2
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "GH_AUTH_INDETERMINATE: the gh CLI is not installed"
+    return 2
+  fi
   if ! gh auth status --help 2>&1 | grep -q -- '--active'; then
     echo "GH_AUTH_INDETERMINATE: installed gh cannot isolate the selected active account"
     return 2
@@ -333,7 +340,7 @@ fm_github_ctx_intake() {
 # re-selected.
 fm_github_ctx_gate() {
   local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} recorded=${8:-}
-  local obs_host obs_repo obs_target obs_tuple probe_target probe_out st
+  local obs_host obs_repo obs_target obs_tuple probe_target probe_out target_owner target_repository st
   [ "$forge" = github ] || { echo "GH_AUTH_INDETERMINATE: no authoritative GitHub forge is recorded for this task" >&2; return 2; }
   fm_github_validate_hostname "$selected_host" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub host is not a canonical hostname" >&2; return 2; }
   case "$capability:$target_kind" in
@@ -354,6 +361,9 @@ fm_github_ctx_gate() {
     return 2
   }
   if [ "$target_kind" = repository ]; then
+    case "$target" in */*) target_owner=${target%%/*}; target_repository=${target#*/} ;; *) target_owner=; target_repository= ;; esac
+    fm_github_validate_login "$target_owner" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub repository owner is malformed" >&2; return 2; }
+    case "$target_repository" in ''|*/*|*[!A-Za-z0-9_.-]*) echo "GH_AUTH_INDETERMINATE: the recorded GitHub repository is malformed" >&2; return 2 ;; esac
     obs_repo=$(fm_github_remote_destination_repository "$project" "$capability" 2>/dev/null) || {
       echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub repository" >&2
       return 2
