@@ -114,7 +114,6 @@ case "$cmd ${1:-}" in
       shift
     done
     if [ "$action" = fix ]; then
-      [ ! -f "$state/respond-sleep" ] || sleep 0.4
       git commit --allow-empty -qm 'fake no-mistakes fix'
       tmp="$state/rounds.tmp.$$"
       jq --slurpfile next "$state/next-result" '. + [$next[0]]' "$state/rounds" > "$tmp"
@@ -165,6 +164,38 @@ ledger() {
 
 calls_count() {
   jq 'length' "$1/fake-state/calls"
+}
+
+owner_file() {
+  printf '%s/.no-mistakes/firstmate-review-ledger.lock/owner.json\n' "$1"
+}
+
+new_ready_case() {
+  local name=$1 d f
+  d=$(new_case "$name")
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  run_driver "$d" respond --approve accepted >/dev/null 2>&1 \
+    || fail "$name ready fixture could not record its review disposition"
+  printf '%s\n' "$d"
+}
+
+seed_abandoned_owner() {
+  local d=$1 rc
+  FM_NM_REVIEW_TEST_CRASH_AT=after-owner-publication \
+    run_driver "$d" audit-ready >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "fixture owner did not die after publishing ownership"
+  [ -f "$(owner_file "$d")" ] || fail "dead fixture owner left no complete owner evidence"
+}
+
+wait_for_marker() {
+  local marker=$1 pid=$2 spins=0
+  while [ ! -s "$marker" ]; do
+    kill -0 "$pid" 2>/dev/null || fail "guarded fixture exited before reaching its deterministic marker"
+    spins=$((spins + 1))
+    [ "$spins" -lt 1000000 ] || fail "guarded fixture did not reach its deterministic marker"
+  done
 }
 
 test_all_findings_fixed_and_audited_ready() {
@@ -477,15 +508,25 @@ test_duplicate_replay_and_underlying_failure() {
 }
 
 test_concurrent_writers_are_serial_and_atomic() {
-  local d f p1 p2 r1 r2 count ledger_path
+  local d f p1 p2 r1 r2 count ledger_path winner_fifo marker spins=0
   d=$(new_case concurrent)
   f=$(finding concurrent auto-fix)
   set_round "$d" "$f"
   set_next "$d"
-  : > "$d/fake-state/respond-sleep"
-  (run_driver "$d" respond --fix concurrent >"$d/out1" 2>&1) & p1=$!
-  sleep 0.05
-  (run_driver "$d" respond --fix concurrent >"$d/out2" 2>&1) & p2=$!
+  winner_fifo="$d/winner-release"
+  marker="$d/winner-acquired"
+  mkfifo "$winner_fifo"
+  (FM_NM_REVIEW_TEST_ACQUIRED="$marker" FM_NM_REVIEW_TEST_HOLD_FIFO="$winner_fifo" \
+    run_driver "$d" respond --fix concurrent >"$d/out1" 2>&1) & p1=$!
+  (FM_NM_REVIEW_TEST_ACQUIRED="$marker" FM_NM_REVIEW_TEST_HOLD_FIFO="$winner_fifo" \
+    run_driver "$d" respond --fix concurrent >"$d/out2" 2>&1) & p2=$!
+  while [ ! -s "$marker" ] || ! grep -q 'live owner' "$d/out1" "$d/out2" 2>/dev/null; do
+    kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null \
+      || fail "both concurrent writers exited before one acquired the ledger"
+    spins=$((spins + 1))
+    [ "$spins" -lt 1000000 ] || fail "concurrent writer election did not converge"
+  done
+  printf 'release\n' > "$winner_fifo"
   wait "$p1"; r1=$?
   wait "$p2"; r2=$?
   if [ "$r1" -eq 0 ]; then
@@ -503,6 +544,171 @@ test_concurrent_writers_are_serial_and_atomic() {
   pass "concurrent guarded writers serialize without corruption or duplicate invocation"
 }
 
+# The initiating trigger in the abandoned-owner regression is an audit process
+# dying after complete owner publication. The persisted owner record exposes the
+# defect, while the visible symptom is a later complete-history audit that cannot
+# establish readiness. A matching live owner is the proven contention path.
+test_matching_live_owner_refuses() {
+  local d p rc acquired release out
+  d=$(new_ready_case live-owner)
+  acquired="$d/live-acquired"
+  release="$d/live-release"
+  mkfifo "$release"
+  (FM_NM_REVIEW_TEST_ACQUIRED="$acquired" FM_NM_REVIEW_TEST_HOLD_FIFO="$release" \
+    run_driver "$d" audit-ready >"$d/live-out" 2>&1) & p=$!
+  wait_for_marker "$acquired" "$p"
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "matching live ledger owner allowed concurrent audit access"
+  assert_contains "$out" 'live owner' "live-owner refusal did not identify active contention"
+  printf 'release\n' > "$release"
+  wait "$p" || fail "original matching live owner did not finish normally"
+  pass "a matching live owner refuses concurrent ledger access"
+}
+
+test_dead_owner_recovers_and_audit_is_idempotent() {
+  local d out
+  d=$(new_ready_case dead-owner)
+  seed_abandoned_owner "$d"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "complete audit did not recover a positively dead owner: $out"
+  assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' \
+    "recovered audit did not establish public readiness"
+  [ ! -e "$(owner_file "$d")" ] || fail "recovered audit left its owner metadata behind"
+  run_driver "$d" audit-ready >/dev/null 2>&1 \
+    || fail "recovered complete audit was not idempotent"
+  pass "a dead owner is recovered and complete readiness remains idempotent"
+}
+
+test_reused_pid_does_not_impersonate_dead_owner() {
+  local d owner unrelated_fifo unrelated out
+  d=$(new_ready_case reused-pid)
+  seed_abandoned_owner "$d"
+  owner=$(owner_file "$d")
+  unrelated_fifo="$d/unrelated-release"
+  mkfifo "$unrelated_fifo"
+  (IFS= read -r _ < "$unrelated_fifo") & unrelated=$!
+  jq --argjson pid "$unrelated" '.pid = $pid | .process.start = "deterministic-dead-incarnation"' \
+    "$owner" > "$owner.tmp"
+  mv "$owner.tmp" "$owner"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "unrelated live process with a reused PID blocked abandoned-owner recovery: $out"
+  printf 'release\n' > "$unrelated_fifo"
+  wait "$unrelated" || fail "unrelated PID fixture did not exit normally"
+  assert_contains "$out" 'ready:' "PID-reuse recovery did not complete the public audit"
+  pass "an unrelated live process cannot impersonate a dead owner through PID reuse"
+}
+
+test_ambiguous_owner_evidence_refuses() {
+  local d owner out rc variant
+  for variant in malformed partial unreadable unsupported foreign missing legacy; do
+    d=$(new_ready_case "owner-$variant")
+    seed_abandoned_owner "$d"
+    owner=$(owner_file "$d")
+    case "$variant" in
+      malformed) printf '%s\n' '{not-json' > "$owner" ;;
+      partial) jq 'del(.process.start)' "$owner" > "$owner.tmp" && mv "$owner.tmp" "$owner" ;;
+      unreadable) chmod 000 "$owner" ;;
+      unsupported) jq '.process.kind = "unsupported-fixture-kind"' "$owner" > "$owner.tmp" && mv "$owner.tmp" "$owner" ;;
+      foreign) jq '.host.boot = "another-host-or-boot"' "$owner" > "$owner.tmp" && mv "$owner.tmp" "$owner" ;;
+      missing) rm -f "$owner" "${owner%/*}/format" ;;
+      legacy) rm -f "$owner"; printf '25299\n' > "${owner%/*}/pid" ;;
+    esac
+    out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "$variant owner evidence was guessed to be abandoned"
+    assert_contains "$out" 'REFUSED:' "$variant owner evidence lacked a red refusal diagnostic"
+    assert_not_contains "$out" 'ready:' "$variant owner evidence visibly authorized readiness"
+    chmod 600 "$owner" 2>/dev/null || true
+  done
+  pass "missing, malformed, partial, unreadable, unsupported, foreign, and legacy owner evidence refuse"
+}
+
+test_two_reclaimers_converge_to_one_owner() {
+  local d release acquired p1 p2 r1 r2 spins=0 owner_count
+  d=$(new_ready_case reclaim-race)
+  seed_abandoned_owner "$d"
+  release="$d/reclaimer-release"
+  acquired="$d/reclaimer-acquired"
+  mkfifo "$release"
+  (FM_NM_REVIEW_TEST_ACQUIRED="$acquired" FM_NM_REVIEW_TEST_HOLD_FIFO="$release" \
+    run_driver "$d" audit-ready >"$d/reclaim1" 2>&1) & p1=$!
+  (FM_NM_REVIEW_TEST_ACQUIRED="$acquired" FM_NM_REVIEW_TEST_HOLD_FIFO="$release" \
+    run_driver "$d" audit-ready >"$d/reclaim2" 2>&1) & p2=$!
+  while [ ! -s "$acquired" ] || ! grep -q 'live owner' "$d/reclaim1" "$d/reclaim2" 2>/dev/null; do
+    kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null \
+      || fail "both reclaimers exited before abandoned-owner election converged"
+    spins=$((spins + 1))
+    [ "$spins" -lt 1000000 ] || fail "simultaneous reclaimers did not converge"
+  done
+  owner_count=$(wc -l < "$acquired" | tr -d '[:space:]')
+  [ "$owner_count" -eq 1 ] || fail "simultaneous reclaimers published split ownership"
+  printf 'release\n' > "$release"
+  wait "$p1"; r1=$?
+  wait "$p2"; r2=$?
+  [ $(( (r1 == 0) + (r2 == 0) )) -eq 1 ] \
+    || fail "simultaneous reclaimers did not produce exactly one winner"
+  run_driver "$d" audit-ready >/dev/null 2>&1 \
+    || fail "safe losing reclaimer could not retry after the winner released"
+  pass "simultaneous reclaimers produce one owner and one safe retry"
+}
+
+test_crash_before_publication_is_recoverable() {
+  local d rc out old_token
+  d=$(new_ready_case prepublication-crash)
+  FM_NM_REVIEW_TEST_CRASH_AT=before-owner-publication \
+    run_driver "$d" audit-ready >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "prepublication crash fixture unexpectedly completed"
+  [ ! -e "$(owner_file "$d")" ] \
+    || fail "prepublication crash exposed partial metadata as a valid owner"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "prepublication crash was not recoverable: $out"
+  assert_contains "$out" 'ready:' "recovered prepublication crash did not complete its audit"
+
+  d=$(new_ready_case reclaimer-publication-crash)
+  seed_abandoned_owner "$d"
+  old_token=$(jq -r '.token' "$(owner_file "$d")")
+  FM_NM_REVIEW_TEST_CRASH_AT=before-owner-publication \
+    run_driver "$d" audit-ready >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "reclaimer publication crash fixture unexpectedly completed"
+  [ "$(jq -r '.token' "$(owner_file "$d")")" = "$old_token" ] \
+    || fail "dying reclaimer destroyed the recoverable prior owner evidence"
+  run_driver "$d" audit-ready >/dev/null 2>&1 \
+    || fail "a reclaimer death during takeover was not recoverable"
+  pass "original and reclaiming crashes before publication preserve recoverable ownership"
+}
+
+test_cleanup_cannot_remove_successor_owner() {
+  local d cleanup_release cleanup_at p1 out rc first_token successor_release successor_at p2 successor_token
+  d=$(new_ready_case cleanup-incarnation)
+  cleanup_release="$d/cleanup-release"
+  cleanup_at="$d/cleanup-at"
+  mkfifo "$cleanup_release"
+  (FM_NM_REVIEW_TEST_CLEANUP_AT="$cleanup_at" FM_NM_REVIEW_TEST_CLEANUP_FIFO="$cleanup_release" \
+    run_driver "$d" audit-ready >"$d/cleanup-owner" 2>&1) & p1=$!
+  wait_for_marker "$cleanup_at" "$p1"
+  first_token=$(jq -r '.token' "$(owner_file "$d")")
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "successor entered while old-owner cleanup still held exclusion"
+  assert_contains "$out" 'live owner' "cleanup overlap did not safely refuse the early successor"
+  printf 'release\n' > "$cleanup_release"
+  wait "$p1" || fail "old owner cleanup did not finish"
+
+  successor_release="$d/successor-release"
+  successor_at="$d/successor-at"
+  mkfifo "$successor_release"
+  (FM_NM_REVIEW_TEST_ACQUIRED="$successor_at" FM_NM_REVIEW_TEST_HOLD_FIFO="$successor_release" \
+    run_driver "$d" audit-ready >"$d/successor" 2>&1) & p2=$!
+  wait_for_marker "$successor_at" "$p2"
+  successor_token=$(jq -r '.token' "$(owner_file "$d")")
+  [ "$successor_token" != "$first_token" ] || fail "successor reused the old owner's incarnation token"
+  [ -f "$(owner_file "$d")" ] || fail "old-owner cleanup removed successor ownership"
+  printf 'release\n' > "$successor_release"
+  wait "$p2" || fail "successor audit did not complete"
+  [ ! -e "$(owner_file "$d")" ] || fail "successor did not release its own owner metadata"
+  pass "old-owner cleanup cannot overlap or remove a successor incarnation"
+}
+
 test_all_findings_fixed_and_audited_ready
 test_all_approved_and_explicit_rejection
 test_pr11_partial_fix_reproduction_and_proven_path
@@ -518,3 +724,10 @@ test_terminal_outcomes_reject_stale_green_ci
 test_run_and_head_mismatch_are_refused
 test_duplicate_replay_and_underlying_failure
 test_concurrent_writers_are_serial_and_atomic
+test_matching_live_owner_refuses
+test_dead_owner_recovers_and_audit_is_idempotent
+test_reused_pid_does_not_impersonate_dead_owner
+test_ambiguous_owner_evidence_refuses
+test_two_reclaimers_converge_to_one_owner
+test_crash_before_publication_is_recoverable
+test_cleanup_cannot_remove_successor_owner
