@@ -42,7 +42,7 @@ append_call() {
 }
 
 emit_status() {
-  local review_status=awaiting_approval status=running pr=''
+  local review_status=awaiting_approval status=running pr='' outcome=''
   if [ "$phase" -gt 0 ]; then
     review_status=completed
     status=ci
@@ -50,11 +50,13 @@ emit_status() {
   fi
   if [ -f "$state/status-head" ]; then head=$(cat "$state/status-head"); fi
   if [ -f "$state/status-branch" ]; then branch=$(cat "$state/status-branch"); fi
+  if [ -f "$state/status-outcome" ]; then outcome=$(cat "$state/status-outcome"); fi
   cat <<EOF
 run:
   id: "RUN-11"
   branch: "$branch"
   status: $status
+  outcome: $outcome
   head: "$head"
   pr: "$pr"
   findings: none
@@ -91,6 +93,7 @@ case "$cmd ${1:-}" in
     case " $* " in
       *" --step review "*) emit_review_logs ;;
       *" --step ci "*)
+        : > "$state/ci-queried"
         if [ -f "$state/ci-red" ]; then
           printf '%s\n' 'CI checks failed - issues detected'
         elif [ -f "$state/ci-no-checks" ]; then
@@ -375,6 +378,27 @@ test_no_ci_checks_refuses_readiness() {
   pass "readiness requires actual public green CI evidence"
 }
 
+test_terminal_outcomes_reject_stale_green_ci() {
+  local d out f outcome
+  for outcome in cancelled failed; do
+    d=$(new_case "terminal-$outcome")
+    f=$(finding accepted ask-user)
+    set_round "$d" "$f"
+    run_driver "$d" respond --approve accepted >/dev/null 2>&1 \
+      || fail "$outcome fixture approval failed"
+    rm -f "$d/fake-state/ci-queried"
+    printf '%s\n' "$outcome" > "$d/fake-state/status-outcome"
+
+    out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "readiness accepted a terminal $outcome run with stale green CI"
+    assert_contains "$out" "outcome is $outcome" "$outcome readiness refusal did not name the terminal outcome"
+    assert_not_contains "$out" 'ready:' "$outcome run was visibly reported ready"
+    [ ! -e "$d/fake-state/ci-queried" ] \
+      || fail "$outcome readiness consulted stale historical CI evidence"
+  done
+  pass "failed and cancelled runs cannot reuse stale green CI evidence"
+}
+
 test_run_and_head_mismatch_are_refused() {
   local d out f ledger_path before after stale
   d=$(new_case context-mismatch)
@@ -466,6 +490,7 @@ test_clean_current_status_cannot_erase_unresolved_history
 test_response_refuses_fallback_branch_and_stale_head_without_state_changes
 test_pipeline_descendant_head_is_accepted
 test_no_ci_checks_refuses_readiness
+test_terminal_outcomes_reject_stale_green_ci
 test_run_and_head_mismatch_are_refused
 test_duplicate_replay_and_underlying_failure
 test_concurrent_writers_are_serial_and_atomic
