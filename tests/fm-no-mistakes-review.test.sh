@@ -349,7 +349,7 @@ test_pipeline_descendant_head_is_accepted() {
   d=$(new_case pipeline-descendant)
   f=$(finding context ask-user)
   set_round "$d" "$f"
-  tree=$(git -C "$d" rev-parse HEAD^{tree})
+  tree=$(git -C "$d" rev-parse 'HEAD^{tree}')
   descendant=$(printf 'pipeline fix\n' | git -C "$d" commit-tree "$tree" -p HEAD)
   printf '%s\n' "$descendant" > "$d/fake-state/status-head"
 
@@ -372,7 +372,7 @@ test_post_review_pipeline_commit_refuses_readiness() {
     || fail "stale-review-head fixture approval failed"
   ledger_path=$(ledger "$d")
   before=$(shasum -a 256 "$ledger_path" | awk '{print $1}')
-  tree=$(git -C "$d" rev-parse HEAD^{tree})
+  tree=$(git -C "$d" rev-parse 'HEAD^{tree}')
   descendant=$(printf 'later pipeline fix\n' | git -C "$d" commit-tree "$tree" -p HEAD)
   printf '%s\n' "$descendant" > "$d/fake-state/status-head"
 
