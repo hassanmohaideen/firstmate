@@ -77,6 +77,7 @@ CAPTURE_RUN_ID=
 CAPTURE_BRANCH=
 CAPTURE_HEAD=
 CAPTURE_PR=
+CAPTURE_STATUS_VALUE=
 CAPTURE_OUTCOME=
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -133,6 +134,7 @@ capture_public_history() {
   CAPTURE_BRANCH=$(status_field branch)
   CAPTURE_HEAD=$(status_field head)
   CAPTURE_PR=$(status_field pr)
+  CAPTURE_STATUS_VALUE=$(status_field status)
   CAPTURE_OUTCOME=$(status_field outcome)
   [ -n "$CAPTURE_RUN_ID" ] || die "axi status omitted the validation run ID"
   [ -n "$CAPTURE_BRANCH" ] || die "axi status omitted the validation branch for run $CAPTURE_RUN_ID"
@@ -570,19 +572,31 @@ audit_ready() {
 
   [ -n "$CAPTURE_PR" ] || die "axi status has no PR URL; readiness is not public"
   case "$CAPTURE_PR" in https://*) ;; *) die "axi status PR is not a full https URL: $CAPTURE_PR" ;; esac
-  if [ "$CAPTURE_OUTCOME" != checks-passed ]; then
-    if ! ci_logs=$("$NM" axi logs --run "$CAPTURE_RUN_ID" --step ci); then
-      die "public CI log is unavailable for run $CAPTURE_RUN_ID"
-    fi
-    marker=$(printf '%s\n' "$ci_logs" \
-      | grep -E 'CI checks passed|no CI checks reported - still monitoring|no CI checks reported yet|checks failed|issues detected|CI checks running|base branch advanced.*re-arming CI monitor timeout' \
-      | tail -1 || true)
-    case "$marker" in
-      *"checks passed"*) ;;
-      "") die "public CI history has no recognized readiness result" ;;
-      *) die "latest public CI result is not green: $marker" ;;
-    esac
-  fi
+  case "$CAPTURE_OUTCOME" in
+    checks-passed) ;;
+    failed|cancelled)
+      die "authoritative validation run outcome is $CAPTURE_OUTCOME; historical CI evidence cannot authorize readiness"
+      ;;
+    passed)
+      die "authoritative validation run outcome is passed; the PR is no longer awaiting readiness"
+      ;;
+    "")
+      [ "$CAPTURE_STATUS_VALUE" = ci ] \
+        || die "authoritative validation run is not in the active CI monitor: ${CAPTURE_STATUS_VALUE:-unknown}"
+      if ! ci_logs=$("$NM" axi logs --run "$CAPTURE_RUN_ID" --step ci); then
+        die "public CI log is unavailable for run $CAPTURE_RUN_ID"
+      fi
+      marker=$(printf '%s\n' "$ci_logs" \
+        | grep -E 'CI checks passed|no CI checks reported - still monitoring|no CI checks reported yet|checks failed|issues detected|CI checks running|base branch advanced.*re-arming CI monitor timeout' \
+        | tail -1 || true)
+      case "$marker" in
+        *"checks passed"*) ;;
+        "") die "public CI history has no recognized readiness result" ;;
+        *) die "latest public CI result is not green: $marker" ;;
+      esac
+      ;;
+    *) die "authoritative validation run has unrecognized outcome: $CAPTURE_OUTCOME" ;;
+  esac
 
   printf 'ready: %s run=%s branch=%s head=%s\n' \
     "$CAPTURE_PR" "$CAPTURE_RUN_ID" "$CAPTURE_BRANCH" "$CAPTURE_HEAD"
