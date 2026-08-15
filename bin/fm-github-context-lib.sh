@@ -102,7 +102,9 @@ fm_github_remote_destination_host() {
   case "$url" in
     https://*/*) host=$(fm_github_http_remote_host "$url") || return 2 ;;
     ssh://*/*|git@*:*/*) host=$(fm_github_ssh_remote_host "$url") || return 2 ;;
-    *) return 2 ;;
+    file://*|/*|./*|../*) return 3 ;;
+    *://*|*:*/*) return 2 ;;
+    *) return 3 ;;
   esac
   printf '%s' "$host"
 }
@@ -309,17 +311,34 @@ fm_github_ctx_intake() {
   fi
   obs_host=$(fm_github_remote_destination_host "$project" "$capability" 2>/dev/null)
   st=$?
-  if [ "$st" -eq 2 ]; then
-    echo "GH_AUTH_INDETERMINATE: an ambiguous or unverifiable destination cannot establish one authoritative target" >&2
-    return 2
-  elif [ "$st" -ne 0 ] || [ -z "$obs_host" ]; then
-    if [ -n "$asserted" ]; then
-      echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub destination for the asserted host" >&2
+  case "$st" in
+    0)
+      [ -n "$obs_host" ] || {
+        echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub destination" >&2
+        return 2
+      }
+      ;;
+    1)
+      echo "GH_AUTH_INDETERMINATE: the selected project has no configured destination" >&2
       return 2
-    fi
-    [ "$capability" = push ] || echo "GH_AUTH_INDETERMINATE: an authentication scout requires an asserted host for this destination" >&2
-    return 3
-  fi
+      ;;
+    2)
+      echo "GH_AUTH_INDETERMINATE: an ambiguous or unverifiable destination cannot establish one authoritative target" >&2
+      return 2
+      ;;
+    3)
+      if [ -n "$asserted" ]; then
+        echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub destination for the asserted host" >&2
+        return 2
+      fi
+      [ "$capability" = push ] || echo "GH_AUTH_INDETERMINATE: an authentication scout requires an asserted host for this destination" >&2
+      return 3
+      ;;
+    *)
+      echo "GH_AUTH_INDETERMINATE: the selected project's destination could not be classified" >&2
+      return 2
+      ;;
+  esac
   if [ -n "$asserted" ]; then
     [ "$obs_host" = "$asserted" ] || {
       echo "GH_AUTH_INDETERMINATE: --github-host '$asserted' does not match the project's canonical destination host '$obs_host'" >&2

@@ -139,6 +139,26 @@ test_intake_auto_selects_github_com_but_never_infers_another_host() {
   pass "intake auto-selects github.com and requires an assertion for any other host"
 }
 
+test_intake_blocks_a_missing_destination_but_leaves_local_origins_ungated() {
+  local proj local_origin out rc
+  proj="$TMP_ROOT/missing-origin-$RANDOM"
+  git init -q "$proj"
+
+  out=$(fm_github_ctx_intake "$proj" push '' '' 2>&1); rc=$?
+  [ "$rc" -eq 2 ] || fail "a project with no origin must be indeterminate (expected rc 2), got $rc"
+  case "$out" in
+    *"GH_AUTH_INDETERMINATE: the selected project has no configured destination"*) ;;
+    *) fail "a missing origin must emit an authentication-context diagnostic, got '$out'" ;;
+  esac
+
+  local_origin="$TMP_ROOT/local-origin-$RANDOM.git"
+  git init -q --bare "$local_origin"
+  git -C "$proj" remote add origin "$local_origin"
+  fm_github_ctx_intake "$proj" push '' '' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 3 ] || fail "a local filesystem origin must remain ungated (expected rc 3), got $rc"
+  pass "intake blocks a missing destination while leaving a local origin ungated"
+}
+
 test_intake_refuses_mismatch_and_ambiguity() {
   local proj rc
   proj=$(make_project mismatch https://github.com/owner/repo.git)
@@ -395,6 +415,7 @@ test_capability_maps_kind_and_requirement
 test_recorded_context_state_distinguishes_absent_partial_and_complete_records
 test_dest_tuple_is_a_stable_delimited_join
 test_intake_auto_selects_github_com_but_never_infers_another_host
+test_intake_blocks_a_missing_destination_but_leaves_local_origins_ungated
 test_intake_refuses_mismatch_and_ambiguity
 test_intake_rejects_unverifiable_http_transports
 test_intake_resolves_org_membership_selection

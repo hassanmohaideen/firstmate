@@ -296,7 +296,8 @@ Write the task-specific brief under section 11 before spawning.
 Spawn only through `bin/fm-spawn.sh` after the profile and backend checks in section 4.
 The spawn must resolve a genuine isolated task worktree distinct from the primary checkout; a failed isolation assertion stops the task.
 A ship push and an authentication scout verify their exact GitHub destination before launch and refuse to start until it succeeds, so when the selected remote is authoritatively GitHub on a non-`github.com` host pass its lowercase canonical host with `--github-host` (and, for a scout that needs authentication, `--github-auth-required` with `--github-organization` for organization-membership reads); `github.com` is auto-verified without it, and an arbitrary or Enterprise host is never inferred without the assertion (`bin/fm-github-context-lib.sh` owns the decision, `fm-spawn.sh`/`fm-promote.sh` headers own the flags and persisted selection).
-A blocked launch prints a `NEEDS_GH_AUTH`, `GITHUB_ACCESS_REQUIRED:`, or `GH_AUTH_INDETERMINATE:` line and is handled through `bootstrap-diagnostics`.
+A well-formed launch blocked by GitHub authentication-context verification prints a `NEEDS_GH_AUTH`, `GITHUB_ACCESS_REQUIRED:`, or `GH_AUTH_INDETERMINATE:` line and is handled through `bootstrap-diagnostics`.
+A malformed flag or other input-validation rejection remains a plain input error distinct from authentication-context indeterminacy.
 After spawning, confirm the worker is processing the brief, handle any trust dialog through `harness-adapters`, and record ship or scout work as under way.
 A persistent secondmate is recorded in the secondmate registry and runtime state, never as a backlog work item.
 

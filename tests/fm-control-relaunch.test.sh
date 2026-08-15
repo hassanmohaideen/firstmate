@@ -1499,6 +1499,31 @@ test_a_relaunch_gates_the_execution_worktree_destination() {
   pass "a relaunch gates the execution worktree rather than the primary checkout"
 }
 
+test_a_nonlocal_ship_without_an_origin_blocks_while_a_local_origin_launches_ungated() {
+  local dir id local_origin out rc
+  id=ghmissingorigin
+  dir=$(new_case ghmissingorigin "$id")
+  add_ship_task "$dir" "$id" claude
+  git -C "$dir/wt" remote remove origin
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a non-local ship with no origin must not launch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE: the selected project has no configured destination' "a missing origin must be auth-context indeterminate"
+  assert_contains "$out" 'worker launch is waiting' "a missing origin must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a ship with no origin must not start the agent"
+
+  local_origin="$dir/local-origin.git"
+  git init -q --bare "$local_origin"
+  git -C "$dir/wt" remote add origin "$local_origin"
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -eq 0 ] || fail "a ship with a local origin must launch ungated (rc $rc: $out)"
+  grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a ship with a local origin must start the agent"
+  [ "$(meta_field "$dir" "$id" gh_gated)" = 0 ] || fail "a local origin launch must persist its ungated classification"
+  pass "a missing origin blocks while a local origin launches ungated"
+}
+
 test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate() {
   local dir id out rc
   id=ghscout
@@ -1542,6 +1567,7 @@ test_a_fully_erased_gated_context_blocks_relaunch_without_mutation
 test_a_partial_github_context_blocks_every_relaunch_without_erasing
 test_a_scout_with_a_dropped_authentication_requirement_stays_gated
 test_a_relaunch_gates_the_execution_worktree_destination
+test_a_nonlocal_ship_without_an_origin_blocks_while_a_local_origin_launches_ungated
 test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate
 test_an_unchanged_github_destination_reverifies_and_launches
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
