@@ -108,11 +108,13 @@ test_recorded_context_state_distinguishes_absent_partial_and_complete_records() 
   [ "$(fm_github_ctx_recorded_state scout github github.com organization '' acme 1 organization-membership-read '')" = complete ] || fail "an organization scout context with its required fields must be complete"
   [ "$(fm_github_ctx_recorded_state scout github github.com repository owner/repo '' '' private-repository-read verified)" = partial ] || fail "a scout context missing its authentication requirement must be partial"
   [ "$(fm_github_ctx_recorded_state scout github github.com organization '' '' 1 organization-membership-read verified)" = partial ] || fail "an organization context missing its organization must be partial"
-  [ "$(fm_github_ctx_lifecycle_state 0 '' ship github github.com repository owner/repo '' '' '' verified)" = legacy ] || fail "a record without a classification marker must use legacy migration"
-  [ "$(fm_github_ctx_lifecycle_state 1 0 ship '' '' '' '' '' '' '' '')" = ungated ] || fail "an empty explicitly ungated context must re-derive"
-  [ "$(fm_github_ctx_lifecycle_state 1 1 ship github github.com repository owner/repo '' '' '' verified)" = gated ] || fail "a complete explicitly gated context must remain gated"
-  [ "$(fm_github_ctx_lifecycle_state 1 1 ship '' '' '' '' '' '' '' '')" = invalid ] || fail "an erased explicitly gated context must be invalid"
-  [ "$(fm_github_ctx_lifecycle_state 1 0 ship github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "an ungated marker with a recorded selection must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 0 '' ship no-mistakes github github.com repository owner/repo '' '' '' verified)" = legacy ] || fail "a record without a classification marker must use legacy migration"
+  [ "$(fm_github_ctx_lifecycle_state 1 0 ship no-mistakes '' '' '' '' '' '' '' '')" = ungated ] || fail "an empty explicitly ungated context must re-derive"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 ship no-mistakes github github.com repository owner/repo '' '' '' verified)" = gated ] || fail "a complete explicitly gated context must remain gated"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 ship no-mistakes '' '' '' '' '' '' '' '')" = invalid ] || fail "an erased explicitly gated context must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 1 0 ship no-mistakes github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "an ungated marker with a recorded selection must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 ship local-only github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "a gated ship whose immutable mode became local-only must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 secondmate secondmate github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "a gated task whose immutable kind became secondmate must be invalid"
   pass "recorded context state distinguishes legacy, ungated, invalid, and complete records"
 }
 

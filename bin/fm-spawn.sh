@@ -302,6 +302,8 @@ GITHUB_AUTH_REQUIRED=0
 GITHUB_AUTH_CAPABILITY=
 GITHUB_ORGANIZATION=
 GH_GATED=0
+GH_RECORDED_STATE=none
+GH_LIFECYCLE_STATE=legacy
 POS=()
 want_value=
 for a in "$@"; do
@@ -721,6 +723,7 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+GH_ALLOCATED_BLOCK_CLEANUP=0
 
 write_github_context_meta() {
   echo "gh_gated=${GH_GATED:-0}"
@@ -796,6 +799,18 @@ spawn_abort_cleanup() {
   if [ "$HERDR_PRESENTATION_ORDER_LOCK_HELD" = 1 ]; then
     HERDR_PRESENTATION_ORDER_LOCK_HELD=0
     fm_lock_release "$HERDR_PRESENTATION_ORDER_LOCK" || true
+  fi
+  if [ "$GH_ALLOCATED_BLOCK_CLEANUP" = 1 ]; then
+    GH_ALLOCATED_BLOCK_CLEANUP=0
+    case "${BACKEND:-}" in
+      zellij) fm_backend_kill "$BACKEND" "${T:-}" "${ZELLIJ_TAB_ID:-}" "${W:-}" 2>/dev/null || true ;;
+      '') ;;
+      *) fm_backend_kill "$BACKEND" "${T:-}" 2>/dev/null || true ;;
+    esac
+    if [ -n "${WT:-}" ]; then
+      ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 \
+        || echo "warning: could not return blocked task $ID's allocated worktree '$WT'" >&2
+    fi
   fi
   if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
     ORCA_ABORT_CLEANUP=0
@@ -1093,6 +1108,16 @@ if [ "$RELAUNCH" -eq 1 ]; then
   GH_REC_TARGET=$(fm_meta_get "$RELAUNCH_META" gh_target)
   GH_REC_ORG=$(fm_meta_get "$RELAUNCH_META" gh_organization)
   GH_REC_VERIFIED=$(fm_meta_get "$RELAUNCH_META" gh_verified_dest)
+  GH_LIFECYCLE_STATE=$(fm_github_ctx_lifecycle_state "$GH_REC_GATED_PRESENT" "$GH_REC_GATED" "$KIND" "$MODE" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
+  case "$GH_LIFECYCLE_STATE" in
+    gated) GH_RECORDED_STATE=complete ;;
+    legacy|ungated) GH_RECORDED_STATE=none ;;
+    *)
+      echo "GH_AUTH_INDETERMINATE: task $ID has an incomplete or inconsistent recorded GitHub context" >&2
+      echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+      exit 1
+      ;;
+  esac
   RELAUNCH_WT=$(fm_meta_get "$RELAUNCH_META" worktree)
   [ -n "$RELAUNCH_WT" ] && [ -d "$RELAUNCH_WT" ] || {
     echo "error: task $ID's recorded worktree '${RELAUNCH_WT:-none}' is missing; refusing to relaunch without the local copy its work lives in" >&2
@@ -1709,21 +1734,9 @@ GH_TARGET=
 GH_CAPABILITY=
 GH_ORG=
 GH_VERIFIED_DEST=
-GH_RECORDED_STATE=none
-GH_LIFECYCLE_STATE=legacy
 GH_GATE_PROJECT=$PROJ_ABS
-if [ "$RELAUNCH" -eq 1 ] && [ "$KIND" != secondmate ]; then
+if [ "$RELAUNCH" -eq 1 ]; then
   GH_GATE_PROJECT=$RELAUNCH_WT
-  GH_LIFECYCLE_STATE=$(fm_github_ctx_lifecycle_state "$GH_REC_GATED_PRESENT" "$GH_REC_GATED" "$KIND" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
-  case "$GH_LIFECYCLE_STATE" in
-    gated) GH_RECORDED_STATE=complete ;;
-    legacy|ungated) GH_RECORDED_STATE=none ;;
-    *)
-      echo "GH_AUTH_INDETERMINATE: task $ID has an incomplete or inconsistent recorded GitHub context" >&2
-      echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
-      exit 1
-      ;;
-  esac
 fi
 if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; }; then
   GH_CAPABILITY=$(fm_github_ctx_capability "$KIND" "$GITHUB_AUTH_CAPABILITY") || {
@@ -1878,6 +1891,7 @@ verify_allocated_worktree_github_destination() {  # <worktree>
   else
     echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
   fi
+  [ "${BACKEND:-}" = orca ] || GH_ALLOCATED_BLOCK_CLEANUP=1
   return 1
 }
 

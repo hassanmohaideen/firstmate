@@ -1480,6 +1480,35 @@ test_a_scout_with_a_dropped_authentication_requirement_stays_gated() {
   pass "a dropped scout authentication requirement cannot bypass the recorded gate"
 }
 
+test_a_gated_relaunch_refuses_corrupted_scope_identity() {
+  local dir id field value out rc before after
+  for field in kind mode; do
+    id="ghscope-$field"
+    dir=$(new_case "ghscope-$field" "$id")
+    add_ship_task "$dir" "$id" claude
+    record_github_selection "$dir" "$id" github.com verified
+    make_permissive_gh "$dir"
+    case "$field" in
+      kind) value=secondmate ;;
+      mode) value=local-only ;;
+    esac
+    sed "s/^$field=.*/$field=$value/" "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.changed"
+    mv "$dir/home/state/$id.meta.changed" "$dir/home/state/$id.meta"
+    before=$(cksum < "$dir/home/state/$id.meta")
+    : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+    out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+    [ "$rc" -ne 0 ] || fail "a gated record whose $field became $value must not launch"
+    assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a corrupted gated $field must be indeterminate"
+    assert_contains "$out" 'worker launch is waiting' "a corrupted gated $field must leave launch waiting"
+    ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a corrupted gated $field must not launch"
+    [ ! -e "$dir/fake/gh.log" ] || fail "a corrupted gated $field must block before probing"
+    after=$(cksum < "$dir/home/state/$id.meta")
+    [ "$after" = "$before" ] || fail "a corrupted gated $field refusal must not mutate metadata"
+  done
+  pass "a gated relaunch cannot be de-gated by corrupted kind or mode identity"
+}
+
 test_a_relaunch_gates_the_execution_worktree_destination() {
   local dir id out rc
   id=ghworktree
@@ -1566,6 +1595,7 @@ test_a_changed_github_destination_blocks_every_relaunch_without_erasing
 test_a_fully_erased_gated_context_blocks_relaunch_without_mutation
 test_a_partial_github_context_blocks_every_relaunch_without_erasing
 test_a_scout_with_a_dropped_authentication_requirement_stays_gated
+test_a_gated_relaunch_refuses_corrupted_scope_identity
 test_a_relaunch_gates_the_execution_worktree_destination
 test_a_nonlocal_ship_without_an_origin_blocks_while_a_local_origin_launches_ungated
 test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate

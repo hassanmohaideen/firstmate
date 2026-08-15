@@ -49,13 +49,20 @@ esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|kill-window) exit 0 ;;
+  has-session|new-session) exit 0 ;;
+  new-window) [ -z "${FM_FAKE_ENDPOINT:-}" ] || : > "$FM_FAKE_ENDPOINT"; exit 0 ;;
+  kill-window) [ -z "${FM_FAKE_ENDPOINT:-}" ] || rm -f "$FM_FAKE_ENDPOINT"; exit 0 ;;
   send-keys) printf '%s\n' "$*" >> "${FM_FAKE_SEND_LOG:-/dev/null}"; exit 0 ;;
 esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
-  fm_fake_exit0 "$fakebin" treehouse
+  cat > "$fakebin/treehouse" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:-/dev/null}"
+exit 0
+SH
+  chmod +x "$fakebin/treehouse"
   printf '%s\n' "$fakebin"
 }
 
@@ -99,6 +106,7 @@ run_settle_spawn() {
     FM_FAKE_PANE_STALE_READS="$STALE_READS" FM_FAKE_PANE_COUNTFILE="$COUNTFILE" \
     FM_REAL_GIT="${FM_REAL_GIT:-}" FM_FAKE_GIT_LOG="${FM_FAKE_GIT_LOG:-}" \
     FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
+    FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
@@ -177,7 +185,7 @@ prepare_github_gate_case() {
 }
 
 test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch() {
-  local rec id out status git_log gh_log send_log
+  local rec id out status git_log gh_log send_log treehouse_log endpoint
   id=allocated-github-divergent-z3
   rec=$(make_settle_case allocated-github-divergent "$id" 0)
   read_settle_record "$rec"
@@ -187,16 +195,20 @@ test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch() {
   git_log="$TMP_ROOT/divergent-git.log"
   gh_log="$TMP_ROOT/divergent-gh.log"
   send_log="$TMP_ROOT/divergent-send.log"
-  : > "$git_log"; : > "$gh_log"; : > "$send_log"
+  treehouse_log="$TMP_ROOT/divergent-treehouse.log"
+  endpoint="$TMP_ROOT/divergent-endpoint"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
 
-  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" run_settle_spawn "$id")
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" run_settle_spawn "$id")
   status=$?
   [ "$status" -ne 0 ] || fail "a divergent allocated worktree destination must block"
   assert_contains "$out" "worker launch is waiting" "a divergent allocated worktree did not report a blocked launch"
   [ ! -s "$git_log" ] || fail "a divergent allocated worktree fetched before destination verification"
   assert_no_grep 'encode launch-brief' "$send_log" "a divergent allocated worktree started the worker"
   [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "a divergent allocated worktree should only probe the selected project destination"
-  pass "a divergent allocated worktree destination blocks before fetch and launch"
+  [ ! -e "$endpoint" ] || fail "a divergent allocated worktree left its task endpoint behind"
+  assert_grep "return --force $WT_DIR" "$treehouse_log" "a divergent allocated worktree was not returned after the block"
+  pass "a divergent allocated worktree destination blocks without leaving an endpoint or lease"
 }
 
 test_matching_allocated_worktree_destination_fast_paths_without_reprobe() {
