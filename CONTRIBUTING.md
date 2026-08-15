@@ -89,7 +89,8 @@ bin/fm-test-isolation-proof.sh --jobs 4 --json /tmp/fm-isolation-proof.json   # 
 tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVERRIDE="$tmp" FM_SIGNAL_GRACE=1 FM_POLL=1 FM_HEARTBEAT=999999 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then an actionable signal)
 ```
 
-`bin/fm-test-run.sh` is the single owner of behavior-suite selection, mixed local portable scheduling, portable CI lane composition, bounded parallelism for the proven-isolated set, per-script timing markers and duration budgets, family totals, the coverage guard, and the optional JSON timing artifact.
+`bin/fm-test-run.sh` owns behavior-suite selection, lane composition, duration inputs, manifest construction, coverage, aggregation, and readable output, while `bin/fm-test-supervisor.py` exclusively owns attempts, required credential-domain containment, deadlines, interruption, cleanup, and schema-v2 evidence.
+Local runs are visibly non-enforcing unless required containment is selected; only required Linux and macOS CI qualification claims hard descendant containment.
 Its header and `--help` own the flags, family labels, lanes, and changed-file map; this section only documents the entry points.
 `bin/fm-test-isolation-proof.sh` remains the single owner of the Phase 2 concurrent isolation proof and the exact proven candidate set; see `docs/fm-test-isolation-proof.md`.
 CI shard balance evidence lives in `docs/fm-test-portable-shards.md`.

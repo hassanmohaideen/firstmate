@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# fm-test-run.sh - single owner of Firstmate's behavior-test runner, lane
-# composition, mixed complete-regression scheduling, timing and duration-budget
-# reporting, and the complete-regression coverage guard.
+# fm-test-run.sh - behavior-test selection, deterministic lane composition,
+# duration inputs, credential-executor manifest construction, readable output,
+# schema-v2 aggregation, and the complete-regression coverage guard.
 #
 # Selection modes (exactly one of: --portable, --all, --family, --changed,
 # --lane, --proven-isolated, or script paths):
@@ -40,7 +40,8 @@
 #                   "skip: <token>" (e.g. --fail-on-gate-skip 'herdr not found').
 #                   Every required Herdr CI shard uses this so a missing pin cannot
 #                   silently pass as a gate skip.
-#   --jobs N        run proven-isolated scripts with up to N concurrent workers.
+#   --jobs N        ask the lane executor to run proven-isolated scripts with
+#                   up to N concurrent credential domains.
 #                   --portable and --all default to 4 and automatically keep
 #                   every other selected script strictly serial. Other modes
 #                   default to 1 and refuse N>1 for mixed/stateful selections.
@@ -49,6 +50,11 @@
 #                   fail after functional results are reported when a script
 #                   exceeds or lacks a data-driven baseline budget. The default
 #                   warns.
+#   --developer-non-enforcing
+#                   run without credential-domain containment for local
+#                   development. This mode is labeled in output and artifacts,
+#                   is never accepted by required CI, and makes no hard
+#                   descendant-cleanup claim.
 #   -h, --help      print this header
 #
 # Per-script machine-parseable markers (stdout):
@@ -105,9 +111,7 @@ JOBS=
 JOBS_EXPLICIT=0
 JOBS_MAX=8
 DURATION_BUDGET_MODE=warn
-DURATION_BUDGET_CHECKED=0
-DURATION_BUDGET_EXCEEDED=0
-DURATION_BUDGET_MISSING=0
+CONTAINMENT_MODE=${FM_TEST_CONTAINMENT:-developer-non-enforcing}
 
 # How many separate-runner shards the portable serial remainder splits into.
 # One owner: CI lane names carry this count and are refused when they disagree.
@@ -139,10 +143,6 @@ die() {
 
 log() {
   printf 'fm-test-run: %s\n' "$*" >&2
-}
-
-now_iso() {
-  date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
 now_ms() {
@@ -925,63 +925,104 @@ aggregate_timing_json() {
   [ "$#" -gt 0 ] || die "--aggregate-json requires at least one input timing JSON"
   command -v python3 >/dev/null 2>&1 || die "--aggregate-json requires python3"
   python3 - "$out" "$@" <<'PY'
-import json, sys
-from pathlib import Path
+import json, os, pathlib, sys, tempfile
 
-out = Path(sys.argv[1])
-inputs = [Path(p) for p in sys.argv[2:]]
-lanes = []
-all_scripts = []
-failed = 0
-skipped = 0
-budget_exceeded = 0
-budget_missing = 0
-total = 0
-wall_ms = 0
-for path in inputs:
-    doc = json.loads(path.read_text(encoding="utf-8"))
-    summary = doc.get("summary") or {}
-    lane = {
-        "path": str(path),
-        "run_id": doc.get("run_id"),
-        "selection": doc.get("selection"),
-        "started_at": doc.get("started_at"),
-        "finished_at": doc.get("finished_at"),
-        "summary": summary,
-    }
-    lanes.append(lane)
-    total += int(summary.get("total") or 0)
-    failed += int(summary.get("failed") or 0)
-    skipped += int(summary.get("skipped_gate") or 0)
-    budget_exceeded += int(summary.get("duration_budget_exceeded") or 0)
-    budget_missing += int(summary.get("duration_budget_missing") or 0)
-    wall_ms = max(wall_ms, int(summary.get("duration_ms") or 0))
-    for s in doc.get("scripts") or []:
-        row = dict(s)
-        row["lane_selection"] = doc.get("selection")
-        row["lane_run_id"] = doc.get("run_id")
-        all_scripts.append(row)
-
+out = pathlib.Path(sys.argv[1])
+lanes, scripts = [], []
+summary = {
+    "lanes": 0, "total": 0, "failed": 0, "skipped_gate": 0,
+    "duration_budget_exceeded": 0, "duration_budget_missing": 0,
+    "critical_path_duration_ms": 0,
+}
+errors = []
+for path_text in sys.argv[2:]:
+    path = pathlib.Path(path_text)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"{path}: invalid JSON: {exc}")
+        continue
+    if doc.get("schema_version") != 2 or doc.get("kind") != "fm-test-lane":
+        errors.append(f"{path}: unknown or mixed artifact schema")
+        continue
+    planned = doc.get("planned")
+    rows = doc.get("scripts")
+    if not isinstance(planned, list) or not isinstance(rows, list):
+        errors.append(f"{path}: missing planned/scripts inventory")
+        continue
+    pkeys = [(row.get("path"), row.get("attempt")) for row in planned]
+    rkeys = [(row.get("path"), row.get("attempt")) for row in rows]
+    if len(set(pkeys)) != len(pkeys) or len(set(rkeys)) != len(rkeys):
+        errors.append(f"{path}: duplicate planned or attempted identity")
+        continue
+    if pkeys != rkeys:
+        errors.append(f"{path}: planned/executed inventory mismatch")
+        continue
+    for row in rows:
+        starts = [item for item in row.get("events", []) if item.get("name") == "started"]
+        terminals = [item for item in row.get("events", []) if item.get("name") == "terminal"]
+        if row.get("attempt_count") != 1 or len(starts) != 1:
+            errors.append(f"{path}: missing or duplicate attempt for {row.get('path')}")
+        if not isinstance(row.get("terminal"), dict) or len(terminals) != 1:
+            errors.append(f"{path}: missing or duplicate terminal for {row.get('path')}")
+    if not doc.get("run", {}).get("complete"):
+        errors.append(f"{path}: incomplete lane")
+    lane_summary = doc.get("summary") or {}
+    lanes.append({
+        "path": str(path), "run_id": doc.get("run_id"),
+        "selection": doc.get("selection"), "started_at": doc.get("started_at"),
+        "finished_at": doc.get("finished_at"), "summary": lane_summary,
+    })
+    summary["lanes"] += 1
+    summary["total"] += int(lane_summary.get("total") or 0)
+    summary["failed"] += int(lane_summary.get("failed") or 0)
+    summary["skipped_gate"] += int(lane_summary.get("skipped_gate") or 0)
+    summary["duration_budget_exceeded"] += int(lane_summary.get("duration_budget_exceeded") or 0)
+    summary["duration_budget_missing"] += int(lane_summary.get("duration_budget_missing") or 0)
+    summary["critical_path_duration_ms"] = max(
+        summary["critical_path_duration_ms"], int(lane_summary.get("duration_ms") or 0)
+    )
+    for row in rows:
+        item = dict(row)
+        item["lane_selection"] = doc.get("selection")
+        item["lane_run_id"] = doc.get("run_id")
+        scripts.append(item)
+if errors:
+    for problem in errors:
+        print(f"fm-test-run: aggregate rejected: {problem}", file=sys.stderr)
+    raise SystemExit(1)
 lanes.sort(key=lambda lane: (lane.get("selection") or "", lane.get("path") or ""))
-all_scripts.sort(key=lambda s: (-int(s.get("duration_ms") or 0), s.get("path") or "", s.get("lane_selection") or ""))
-agg = {
-    "kind": "aggregate",
-    "lanes": lanes,
-    "summary": {
-        "lanes": len(lanes),
-        "total": total,
-        "failed": failed,
-        "skipped_gate": skipped,
-        "duration_budget_exceeded": budget_exceeded,
-        "duration_budget_missing": budget_missing,
-        "critical_path_duration_ms": wall_ms,
-    },
-    "scripts": all_scripts,
-    "slowest": all_scripts[:15],
+scripts.sort(key=lambda row: (-int(row.get("duration_ms") or 0), row.get("path") or "", row.get("lane_selection") or ""))
+aggregate = {
+    "schema_version": 2, "kind": "fm-test-aggregate", "complete": True,
+    "lanes": lanes, "summary": summary, "scripts": scripts, "slowest": scripts[:15],
 }
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text(json.dumps(agg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-print(f"FM_TEST_AGGREGATE lanes={len(lanes)} total={total} failed={failed} skipped_gate={skipped} critical_path_duration_ms={wall_ms}")
+fd, temporary_name = tempfile.mkstemp(prefix=f".{out.name}.tmp.", dir=out.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(aggregate, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary_name, out)
+    directory_fd = os.open(out.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+print(
+    f"FM_TEST_AGGREGATE lanes={summary['lanes']} total={summary['total']} "
+    f"failed={summary['failed']} skipped_gate={summary['skipped_gate']} "
+    f"critical_path_duration_ms={summary['critical_path_duration_ms']}"
+)
+if summary["failed"] or summary["duration_budget_exceeded"] or summary["duration_budget_missing"]:
+    raise SystemExit(1)
 PY
 }
 
@@ -1092,7 +1133,7 @@ families_for_changed_path() {
       # resolution in the caller; emit a marker family of __script__
       printf '%s\n' "__script__:$(basename "$path")"
       ;;
-    bin/fm-test-run.sh|bin/fm-test-isolation-proof.sh)
+    bin/fm-test-run.sh|bin/fm-test-supervisor.py|bin/fm-test-isolation-proof.sh)
       printf '%s\n' pure-contract-unit
       ;;
     bin/backends/herdr*|bin/fm-herdr-lab.sh|tests/herdr-test-safety.sh)
@@ -1331,23 +1372,6 @@ select_changed() {
   fi
 }
 
-detect_gate_skip() {
-  # True when the first non-empty output line is a skip: gate message.
-  local file=$1 first
-  first=$(awk 'NF { print; exit }' "$file" 2>/dev/null || true)
-  case "$first" in
-    skip:*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# True when any output line contains "skip: <token>" (token may contain spaces).
-detect_gate_skip_token() {
-  local file=$1 token=$2
-  [ -n "$token" ] || return 1
-  grep -F -q "skip: $token" "$file" 2>/dev/null
-}
-
 apply_exclude_families() {
   local s fam keep ex
   local -a kept=()
@@ -1365,88 +1389,6 @@ apply_exclude_families() {
     [ "$keep" -eq 1 ] && kept+=("$s")
   done
   SCRIPTS=("${kept[@]+"${kept[@]}"}")
-}
-
-write_json_artifact() {
-  local out=$1
-  local started=$2
-  local finished=$3
-  local run_id=$4
-  local total=$5
-  local failed=$6
-  local skipped=$7
-  local duration=$8
-  local selection=$9
-  local records_file=${10}
-  local families_file=${11}
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    die "--json requires python3 to emit a valid timing artifact"
-  fi
-
-  python3 - "$out" "$started" "$finished" "$run_id" "$total" "$failed" "$skipped" "$duration" "$selection" "$records_file" "$families_file" <<'PY'
-import json, sys
-
-out, started, finished, run_id, total, failed, skipped, duration, selection, records_file, families_file = sys.argv[1:]
-
-scripts = []
-with open(records_file, encoding="utf-8") as fh:
-    for line in fh:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        path, family, expected, exit_s, dur_s, gate, baseline_s, budget_s, exceeded = line.split("\t")
-        row = {
-            "path": path,
-            "family": family,
-            "expected_gate_skip": expected,
-            "duration_ms": int(dur_s),
-            "exit": int(exit_s),
-            "gate_skip": gate == "true",
-            "duration_budget_exceeded": exceeded == "true",
-            "duration_baseline_measured": bool(baseline_s),
-        }
-        if baseline_s:
-            row["duration_baseline_ms"] = int(baseline_s)
-            row["duration_budget_ms"] = int(budget_s)
-        scripts.append(row)
-
-scripts.sort(key=lambda s: s["path"])
-
-families = []
-with open(families_file, encoding="utf-8") as fh:
-    for line in fh:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        name, count_s, dur_s, failed_s = line.split("\t")
-        families.append({
-            "name": name,
-            "count": int(count_s),
-            "duration_ms": int(dur_s),
-            "failed": int(failed_s),
-        })
-
-doc = {
-    "run_id": run_id,
-    "started_at": started,
-    "finished_at": finished,
-    "selection": selection,
-    "summary": {
-        "total": int(total),
-        "failed": int(failed),
-        "skipped_gate": int(skipped),
-        "duration_ms": int(duration),
-        "duration_budget_exceeded": sum(1 for s in scripts if s["duration_budget_exceeded"]),
-        "duration_budget_missing": sum(1 for s in scripts if not s["duration_baseline_measured"]),
-    },
-    "scripts": scripts,
-    "families": families,
-}
-with open(out, "w", encoding="utf-8") as fh:
-    json.dump(doc, fh, indent=2, sort_keys=True)
-    fh.write("\n")
-PY
 }
 
 while [ "$#" -gt 0 ]; do
@@ -1528,6 +1470,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --enforce-duration-budgets)
       DURATION_BUDGET_MODE=enforce
+      shift
+      ;;
+    --developer-non-enforcing)
+      CONTAINMENT_MODE=developer-non-enforcing
       shift
       ;;
     --list)
@@ -1699,29 +1645,14 @@ fi
 
 if [ "${#SCRIPTS[@]}" -eq 0 ]; then
   log "nothing to run"
-  printf 'FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0\n'
-  printf 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=0 mode=%s\n' "$DURATION_BUDGET_MODE"
-  if [ -n "$JSON_PATH" ]; then
-    empty_rec=$(mktemp)
-    empty_fam=$(mktemp)
-    : >"$empty_rec"
-    : >"$empty_fam"
-    started=$(now_iso)
-    mkdir -p "$(dirname "$JSON_PATH")"
-    write_json_artifact "$JSON_PATH" "$started" "$started" "empty" 0 0 0 0 "$SELECTION_DESC" "$empty_rec" "$empty_fam"
-    rm -f "$empty_rec" "$empty_fam"
-  fi
-  exit 0
 fi
 
-# Verify selected scripts exist before starting.
-for s in "${SCRIPTS[@]}"; do
+# Verify selected scripts and concurrency eligibility before constructing the
+# complete immutable manifest.
+for s in "${SCRIPTS[@]+"${SCRIPTS[@]}"}"; do
   [ -f "$s" ] || die "test script not found: $s"
   [ -x "$s" ] || [ -r "$s" ] || die "test script not readable: $s"
 done
-
-# Mixed complete modes parallelize only their proven-isolated subset and keep
-# every other selected script serial. Other modes retain the stricter refusal.
 if [ "$JOBS" -gt 1 ] && [ "$MODE" != portable ] && [ "$MODE" != all ]; then
   for s in "${SCRIPTS[@]}"; do
     if ! is_proven_isolated_script "$s"; then
@@ -1729,477 +1660,196 @@ if [ "$JOBS" -gt 1 ] && [ "$MODE" != portable ] && [ "$MODE" != all ]; then
     fi
   done
 fi
+case "$CONTAINMENT_MODE" in
+  required|developer-non-enforcing) ;;
+  *) die "FM_TEST_CONTAINMENT must be required or developer-non-enforcing" ;;
+esac
 
+command -v python3 >/dev/null 2>&1 || die "execution requires python3"
+SUPERVISOR="$ROOT/bin/fm-test-supervisor.py"
+[ -x "$SUPERVISOR" ] || die "credential-domain executor is missing or not executable: $SUPERVISOR"
 RUN_TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run.XXXXXX")
-RECORDS="$RUN_TMP/records.tsv"
-FAMILIES_TSV="$RUN_TMP/families.tsv"
-: >"$RECORDS"
-WORKER_PIDS=()
-WORKER_GROUP_PIDS=()
+trap 'rm -rf "$RUN_TMP"' EXIT
+MANIFEST="$RUN_TMP/manifest.json"
+ROWS="$RUN_TMP/planned.tsv"
+: >"$ROWS"
 
-# shellcheck disable=SC2329 # Used by cleanup/signal handlers invoked indirectly by traps.
-worker_group_is_running() {
-  kill -0 -- "-$1" 2>/dev/null
-}
-
-register_worker_group() {
-  local pid=$1 registered
-  for registered in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
-    [ "$registered" = "$pid" ] && return
-  done
-  WORKER_GROUP_PIDS+=("$pid")
-}
-
-retire_empty_worker_groups() {
-  local pid
-  local -a retained=()
-  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
-    if worker_group_is_running "$pid"; then
-      retained+=("$pid")
-    fi
-  done
-  WORKER_GROUP_PIDS=("${retained[@]+"${retained[@]}"}")
-}
-
-# shellcheck disable=SC2329 # Invoked indirectly by cleanup/signal traps.
-stop_active_workers() {
-  local pid registered known n running
-  local jobs_file="$RUN_TMP/active-jobs"
-  trap - INT TERM HUP
-  jobs -p >"$jobs_file" 2>/dev/null || true
-  while IFS= read -r pid; do
-    [ -n "$pid" ] || continue
-    known=0
-    for registered in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
-      if [ "$registered" = "$pid" ]; then
-        known=1
-        break
-      fi
-    done
-    [ "$known" -eq 1 ] || WORKER_PIDS+=("$pid")
-    register_worker_group "$pid"
-  done <"$jobs_file"
-  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
-    [ -n "$pid" ] || continue
-    kill -TERM -- "-$pid" 2>/dev/null || true
-  done
-  running=0
-  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
-    [ -n "$pid" ] || continue
-    if worker_group_is_running "$pid"; then
-      running=1
-      break
-    fi
-  done
-  # One sleep preserves the intended TERM grace without paying for 100
-  # external sleep processes (which can exceed the bounded cleanup window on
-  # a loaded macOS host).
-  [ "$running" -eq 0 ] || sleep 1
-  for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
-    [ -n "$pid" ] || continue
-    if worker_group_is_running "$pid"; then
-      kill -KILL -- "-$pid" 2>/dev/null || true
-    fi
-  done
-  for pid in "${WORKER_PIDS[@]+"${WORKER_PIDS[@]}"}"; do
-    [ -n "$pid" ] || continue
-    wait "$pid" 2>/dev/null || true
-  done
-  n=0
-  while [ "$n" -lt 20 ]; do
-    running=0
-    for pid in "${WORKER_GROUP_PIDS[@]+"${WORKER_GROUP_PIDS[@]}"}"; do
-      [ -n "$pid" ] || continue
-      if worker_group_is_running "$pid"; then
-        running=1
-        break
-      fi
-    done
-    [ "$running" -eq 1 ] || break
-    sleep 0.05
-    n=$((n + 1))
-  done
-  WORKER_PIDS=()
-  retire_empty_worker_groups
-}
-
-# shellcheck disable=SC2329 # Invoked indirectly by EXIT and signal traps.
-cleanup_run() {
-  stop_active_workers
-  rm -rf "$RUN_TMP"
-}
-
-# shellcheck disable=SC2329 # Invoked indirectly by signal traps.
-interrupt_run() { # <exit-code>
-  local code=$1
-  cleanup_run
-  trap - EXIT
-  exit "$code"
-}
-
-trap cleanup_run EXIT
-trap 'interrupt_run 130' INT
-trap 'interrupt_run 143' TERM
-trap 'interrupt_run 129' HUP
-
-RUN_STARTED_ISO=$(now_iso)
-RUN_STARTED_MS=$(now_ms)
-RUN_ID="fm-test-run-${RUN_STARTED_MS}-$$"
-TOTAL=0
-FAILED=0
-SKIPPED_GATE=0
-AGG_RC=0
-
-# Family accumulators as TSV lines updated in-memory via temp files.
-# family -> count, duration_ms, failed
-family_bump() {
-  local fam=$1 dur=$2 failed_delta=$3
-  local line name count duration failed_count rest
-  local found=0
-  local tmp="$RUN_TMP/families.new"
-  : >"$tmp"
-  if [ -s "$FAMILIES_TSV" ]; then
-    while IFS= read -r line; do
-      name=${line%%$'\t'*}
-      rest=${line#*$'\t'}
-      count=${rest%%$'\t'*}
-      rest=${rest#*$'\t'}
-      duration=${rest%%$'\t'*}
-      failed_count=${rest#*$'\t'}
-      if [ "$name" = "$fam" ]; then
-        count=$((count + 1))
-        duration=$((duration + dur))
-        failed_count=$((failed_count + failed_delta))
-        found=1
-      fi
-      printf '%s\t%s\t%s\t%s\n' "$name" "$count" "$duration" "$failed_count" >>"$tmp"
-    done <"$FAMILIES_TSV"
-  fi
-  if [ "$found" -eq 0 ]; then
-    printf '%s\t%s\t%s\t%s\n' "$fam" 1 "$dur" "$failed_delta" >>"$tmp"
-  fi
-  mv "$tmp" "$FAMILIES_TSV"
-}
-
-record_script_result() {
-  local script=$1 rc=$2 duration=$3 out=$4 end_iso=$5
-  local base family expected gate_skip fail_delta budget_row baseline budget exceeded
-  base=$(basename "$script")
-  family=$(family_for_basename "$base")
+for s in "${SCRIPTS[@]+"${SCRIPTS[@]}"}"; do
+  family_for_basename_into "${s##*/}"
+  family=$FAMILY_FOR_BASENAME
   expected=$(expected_gate_skip_for_family "$family")
-
-  if [ -n "$FAIL_ON_GATE_SKIP" ] && detect_gate_skip_token "$out" "$FAIL_ON_GATE_SKIP"; then
-    log "required gate skip token seen in $script: skip: $FAIL_ON_GATE_SKIP"
-    rc=1
-  fi
-
-  gate_skip=false
-  if [ "$rc" -eq 0 ] && detect_gate_skip "$out"; then
-    gate_skip=true
-    SKIPPED_GATE=$((SKIPPED_GATE + 1))
-  fi
-
-  printf 'FM_TEST_END %s %s exit=%s duration_ms=%s gate_skip=%s\n' \
-    "$end_iso" "$script" "$rc" "$duration" "$gate_skip"
-
-  fail_delta=0
-  if [ "$rc" -ne 0 ]; then
-    FAILED=$((FAILED + 1))
-    fail_delta=1
-    AGG_RC=1
-  fi
-
   baseline=
   budget=
-  exceeded=false
-  if budget_row=$(duration_budget_ms_for "$script"); then
+  if budget_row=$(duration_budget_ms_for "$s"); then
     baseline=${budget_row%%$'\t'*}
     budget=${budget_row#*$'\t'}
-    DURATION_BUDGET_CHECKED=$((DURATION_BUDGET_CHECKED + 1))
-    if [ "$duration" -gt "$budget" ]; then
-      exceeded=true
-      DURATION_BUDGET_EXCEEDED=$((DURATION_BUDGET_EXCEEDED + 1))
-      log "duration budget exceeded: $script duration_ms=$duration budget_ms=$budget baseline_ms=$baseline mode=$DURATION_BUDGET_MODE"
-      if [ "$DURATION_BUDGET_MODE" = enforce ]; then
-        AGG_RC=1
-      fi
-    fi
-  else
-    DURATION_BUDGET_MISSING=$((DURATION_BUDGET_MISSING + 1))
-    log "duration budget missing: $script mode=$DURATION_BUDGET_MODE"
-    if [ "$DURATION_BUDGET_MODE" = enforce ]; then
-      AGG_RC=1
+  fi
+  phase=serial
+  if [ "$JOBS" -gt 1 ]; then
+    if [ "$MODE" = portable ] || [ "$MODE" = all ]; then
+      is_proven_isolated_script "$s" && phase=parallel
+    else
+      phase=parallel
     fi
   fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$s" "$family" "$expected" "$baseline" "$budget" "$phase" >>"$ROWS"
+done
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$script" "$family" "$expected" "$rc" "$duration" "$gate_skip" \
-    "$baseline" "$budget" "$exceeded" >>"$RECORDS"
-  family_bump "$family" "$duration" "$fail_delta"
-  TOTAL=$((TOTAL + 1))
+REQUESTED_JSON_PATH=$JSON_PATH
+if [ -z "$JSON_PATH" ]; then
+  JSON_PATH="$RUN_TMP/fm-test-timing.json"
+fi
+mkdir -p "$(dirname "$JSON_PATH")"
+JSON_PATH=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$JSON_PATH")
+RUN_STARTED_MS=$(now_ms)
+RUN_ID="fm-test-run-${RUN_STARTED_MS}-$$"
+T0=${FM_TEST_JOB_T0_EPOCH:-$(date +%s)}
+ORDINARY_DEADLINE=${FM_TEST_ORDINARY_DEADLINE_EPOCH:-$((T0 + 430))}
+TERMINAL_DEADLINE=${FM_TEST_TERMINAL_DEADLINE_EPOCH:-$((T0 + 450))}
+CLEANUP_DEADLINE=${FM_TEST_CLEANUP_DEADLINE_EPOCH:-$((T0 + 480))}
+CEILING_DEADLINE=${FM_TEST_CEILING_DEADLINE_EPOCH:-$((T0 + 600))}
+
+python3 - "$MANIFEST" "$ROWS" "$JSON_PATH" "$ROOT" "$RUN_ID" \
+  "$SELECTION_DESC" "$JOBS" "$CONTAINMENT_MODE" "$DURATION_BUDGET_MODE" \
+  "$FAIL_ON_GATE_SKIP" "$T0" "$ORDINARY_DEADLINE" "$TERMINAL_DEADLINE" \
+  "$CLEANUP_DEADLINE" "$CEILING_DEADLINE" "$(command -v bash)" <<'PY'
+import json, os, pathlib, sys
+(
+    manifest_path, rows_path, artifact, root, run_id, selection, jobs,
+    containment, budget_mode, fail_token, t0, ordinary, terminal, cleanup,
+    ceiling, bash_path,
+) = sys.argv[1:]
+secret_parts = ("TOKEN", "SECRET", "PASSWORD", "COOKIE", "CREDENTIAL", "AUTHORIZATION", "PRIVATE_KEY")
+clear = {"FM_TEST_CONTAINMENT"}
+environment = {
+    key: value for key, value in os.environ.items()
+    if key not in clear and not any(part in key.upper() for part in secret_parts)
 }
-
-clear_ambient_fleet_environment() {
-  unset FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE \
-    FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND \
-    TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH HERDR_PANE_ID \
-    CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID \
-    __CFBundleIdentifier 2>/dev/null || true
-  export FM_BACKEND_DISABLE_CMUX_FALLBACK=1
+scripts = []
+for line in pathlib.Path(rows_path).read_text(encoding="utf-8").splitlines():
+    if not line:
+        continue
+    path, family, expected, baseline, budget, phase = line.split("\t")
+    scripts.append({
+        "path": path, "family": family, "expected_gate_skip": expected,
+        "duration_baseline_ms": int(baseline) if baseline else None,
+        "duration_budget_ms": int(budget) if budget else None,
+        "phase": phase,
+    })
+scripts.sort(key=lambda row: 0 if row["phase"] == "parallel" else 1)
+manifest = {
+    "manifest_version": 2, "artifact": artifact, "root": root,
+    "run_id": run_id, "selection": selection, "jobs": int(jobs),
+    "containment": containment, "duration_budget_mode": budget_mode,
+    "fail_on_gate_skip": fail_token, "environment": environment,
+    "bash": bash_path, "scripts": scripts,
+    "deadlines": {
+        "t0_epoch": int(t0), "ordinary_epoch": int(ordinary),
+        "terminal_epoch": int(terminal), "cleanup_epoch": int(cleanup),
+        "ceiling_epoch": int(ceiling),
+    },
 }
+pathlib.Path(manifest_path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 
-run_one_serial() {
-  local script=$1
-  local base family expected out begin_iso begin_ms end_ms end_iso duration rc worker_pid work
-  base=$(basename "$script")
-  family=$(family_for_basename "$base")
-  expected=$(expected_gate_skip_for_family "$family")
-  work="$RUN_TMP/serial.$TOTAL"
-  out="$work/output"
-  mkdir -p "$work"
-  begin_iso=$(now_iso)
-  begin_ms=$(now_ms)
+if [ "$CONTAINMENT_MODE" = required ]; then
+  printf 'FM_TEST_CONTAINMENT mode=required enforcement=credential-domain\n'
+else
+  printf 'FM_TEST_CONTAINMENT mode=developer-non-enforcing enforcement=none\n'
+  log "developer-non-enforcing mode does not provide hard descendant containment"
+fi
 
-  printf 'FM_TEST_BEGIN %s %s family=%s expected_gate_skip=%s\n' \
-    "$begin_iso" "$script" "$family" "$expected"
-
-  set -m
-  (
-    set +e
-    set +m
-    while [ ! -f "$work/start" ]; do
-      sleep 0.01
-    done
-    clear_ambient_fleet_environment
-    bash "$script" 2>&1 | tee "$out"
-    printf '%s\n' "${PIPESTATUS[0]}" >"$work/exit"
-  ) &
-  worker_pid=$!
-  set +m
-  WORKER_PIDS[0]=$worker_pid
-  register_worker_group "$worker_pid"
-  : >"$work/start"
+if [ "$CONTAINMENT_MODE" = required ] && [ "$(id -u)" -ne 0 ] && sudo -n true >/dev/null 2>&1; then
+  EXECUTOR_COMMAND=(sudo -n "$(command -v python3)" "$SUPERVISOR" execute --manifest "$MANIFEST")
+else
+  EXECUTOR_COMMAND=("$(command -v python3)" "$SUPERVISOR" execute --manifest "$MANIFEST")
+fi
+EXECUTOR_PID=
+# shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
+forward_executor_signal() { # <signal> <fallback-exit>
+  local sig=$1 fallback=$2 rc
+  trap - INT TERM HUP
+  [ -z "$EXECUTOR_PID" ] || kill -"$sig" "$EXECUTOR_PID" 2>/dev/null || true
   set +e
-  wait "$worker_pid"
+  [ -z "$EXECUTOR_PID" ] || wait "$EXECUTOR_PID"
   rc=$?
   set -e
-  unset 'WORKER_PIDS[0]'
-  retire_empty_worker_groups
-  if [ -f "$work/exit" ]; then
-    rc=$(cat "$work/exit")
-  fi
-  : "${rc:=1}"
-
-  end_ms=$(now_ms)
-  end_iso=$(now_iso)
-  duration=$((end_ms - begin_ms))
-  if [ "$duration" -lt 0 ]; then
-    duration=0
-  fi
-  record_script_result "$script" "$rc" "$duration" "$out" "$end_iso"
+  [ "$rc" -ne 0 ] || rc=$fallback
+  exit "$rc"
 }
+trap 'forward_executor_signal INT 130' INT
+trap 'forward_executor_signal TERM 143' TERM
+trap 'forward_executor_signal HUP 129' HUP
+set +e
+"${EXECUTOR_COMMAND[@]}" &
+EXECUTOR_PID=$!
+wait "$EXECUTOR_PID"
+EXECUTOR_RC=$?
+set -e
+EXECUTOR_PID=
+trap - INT TERM HUP
 
-if [ "$JOBS" -eq 1 ]; then
-  for script in "${SCRIPTS[@]}"; do
-    run_one_serial "$script"
-  done
-else
-  # Complete modes split the selection exactly once: the proven subset runs in
-  # this bounded phase, then every stateful/unproven script runs serially.
-  # Non-complete modes reached here only after the all-proven validation above.
-  declare -a SERIAL_PHASE_SCRIPTS=()
-  if [ "$MODE" = portable ] || [ "$MODE" = all ]; then
-    parallel_selection=()
-    for script in "${SCRIPTS[@]}"; do
-      if is_proven_isolated_script "$script"; then
-        parallel_selection+=("$script")
-      else
-        SERIAL_PHASE_SCRIPTS+=("$script")
-      fi
-    done
-    SCRIPTS=("${parallel_selection[@]+"${parallel_selection[@]}"}")
-  fi
+[ -f "$JSON_PATH" ] || die "executor did not publish the schema-v2 artifact: $JSON_PATH"
+python3 - "$JSON_PATH" "$DURATION_BUDGET_MODE" <<'PY'
+import json, pathlib, sys
 
-  # Each concurrent worker gets a private mode-0700 TMPDIR so mktemp roots
-  # cannot collide. Retries are never used as a green strategy.
-  WORKER_PIDS=()
-  declare -a WORKER_IDX=()
-  declare -a WORKER_SCRIPTS=()
-  worker_n=0
-  active_workers=0
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for row in doc.get("scripts", []):
+    starts = [item for item in row.get("events", []) if item.get("name") == "started"]
+    if starts:
+        print(
+            f"FM_TEST_BEGIN {starts[0]['at']} {row['path']} "
+            f"family={row['family']} expected_gate_skip={row['expected_gate_skip']}"
+        )
+    log_path = row.get("diagnostic_log")
+    if log_path:
+        try:
+            print(pathlib.Path(log_path).read_text(encoding="utf-8", errors="replace"), end="")
+        except OSError:
+            pass
+    terminal = row.get("terminal")
+    if terminal:
+        print(
+            f"FM_TEST_END {terminal['at']} {row['path']} exit={row.get('exit', 1)} "
+            f"duration_ms={row.get('duration_ms', 0)} gate_skip={'true' if row.get('gate_skip') else 'false'}"
+        )
+summary = doc.get("summary") or {}
+print(
+    f"FM_TEST_SUMMARY total={summary.get('total', 0)} failed={summary.get('failed', 0)} "
+    f"skipped_gate={summary.get('skipped_gate', 0)} duration_ms={summary.get('duration_ms', 0)}"
+)
+for family in doc.get("families", []):
+    print(
+        f"FM_TEST_SUMMARY_FAMILY family={family['name']} count={family['count']} "
+        f"duration_ms={family['duration_ms']} failed={family['failed']}"
+    )
+for rank, row in enumerate(sorted(
+    doc.get("scripts", []), key=lambda item: (-int(item.get("duration_ms") or 0), item.get("path") or "")
+)[:15], 1):
+    print(f"FM_TEST_SLOWEST rank={rank} script={row['path']} duration_ms={row.get('duration_ms', 0)}")
+print(
+    f"FM_TEST_BUDGET_SUMMARY checked={summary.get('total', 0) - summary.get('duration_budget_missing', 0)} "
+    f"exceeded={summary.get('duration_budget_exceeded', 0)} missing={summary.get('duration_budget_missing', 0)} "
+    f"mode={sys.argv[2]}"
+)
+PY
 
-  wait_one_job_worker() {
-    local slot=$1 pid idx work script rc duration mode out end_iso
-    pid=${WORKER_PIDS[$slot]}
-    idx=${WORKER_IDX[$slot]}
-    script=${WORKER_SCRIPTS[$slot]}
-    unset 'WORKER_PIDS[slot]'
-    unset 'WORKER_IDX[slot]'
-    unset 'WORKER_SCRIPTS[slot]'
-    active_workers=$((active_workers - 1))
-    set +e
-    wait "$pid"
-    set -e
-    retire_empty_worker_groups
-    work="$RUN_TMP/w$idx"
-    rc=$(cat "$work/exit" 2>/dev/null || echo 1)
-    duration=$(cat "$work/duration_ms" 2>/dev/null || echo 0)
-    out="$work/output"
-    end_iso=$(now_iso)
-    # Replay captured output after the worker finishes so markers stay ordered.
-    if [ -s "$out" ]; then
-      cat "$out"
-    fi
-    mode=$(stat -c %a "$work" 2>/dev/null || stat -f %Lp "$work" 2>/dev/null || echo unknown)
-    case "$mode" in
-      700|0700) ;;
-      *)
-        log "isolation failure: worker root mode is $mode, expected 0700 ($work)"
-        rc=1
-        ;;
-    esac
-    record_script_result "$script" "$rc" "$duration" "$out" "$end_iso"
-  }
-
-  worker_pid_is_running() {
-    local want=$1 running inventory="$RUN_TMP/running-pids"
-    # Keep `jobs` in this shell. A process substitution runs it in a subshell
-    # without this shell's job table on Bash 3.2/5.x, falsely reporting every
-    # worker complete and making the scheduler wait for the oldest PID.
-    jobs -r -p >"$inventory"
-    while IFS= read -r running; do
-      [ "$running" = "$want" ] && return 0
-    done <"$inventory"
-    return 1
-  }
-
-  wait_one_completed_job_worker() {
-    local slot work
-    while :; do
-      for slot in "${!WORKER_PIDS[@]}"; do
-        work="$RUN_TMP/w${WORKER_IDX[$slot]}"
-        if [ -f "$work/exit" ] || ! worker_pid_is_running "${WORKER_PIDS[$slot]}"; then
-          wait_one_job_worker "$slot"
-          return
-        fi
-      done
-      sleep 0.01
-    done
-  }
-
-  for script in "${SCRIPTS[@]}"; do
-    while [ "$active_workers" -ge "$JOBS" ]; do
-      wait_one_completed_job_worker
-    done
-    worker_n=$((worker_n + 1))
-    work="$RUN_TMP/w$worker_n"
-    mkdir -p "$work/tmp"
-    chmod 0700 "$work" "$work/tmp" || die "could not chmod 0700 worker root $work"
-    base=$(basename "$script")
-    family=$(family_for_basename "$base")
-    expected=$(expected_gate_skip_for_family "$family")
-    printf 'FM_TEST_BEGIN %s %s family=%s expected_gate_skip=%s\n' \
-      "$(now_iso)" "$script" "$family" "$expected"
-    set -m
-    (
-      set +e
-      set +m
-      child_pid=
-      # shellcheck disable=SC2329 # Invoked indirectly by worker signal traps.
-      stop_child() {
-        trap - INT TERM HUP
-        if [ -n "$child_pid" ]; then
-          kill -TERM "$child_pid" 2>/dev/null || true
-          wait "$child_pid" 2>/dev/null || true
-        fi
-        exit 143
-      }
-      trap stop_child INT TERM HUP
-      while [ ! -f "$work/start" ]; do
-        sleep 0.01
-      done
-      export TMPDIR="$work/tmp"
-      export TMP="$work/tmp"
-      clear_ambient_fleet_environment
-      cd "$ROOT" || exit 1
-      begin_ms=$(now_ms)
-      bash "$script" >"$work/output" 2>&1 &
-      child_pid=$!
-      wait "$child_pid"
-      rc=$?
-      child_pid=
-      end_ms=$(now_ms)
-      duration=$((end_ms - begin_ms))
-      if [ "$duration" -lt 0 ]; then
-        duration=0
-      fi
-      printf '%s\n' "$duration" >"$work/duration_ms"
-      printf '%s\n' "$rc" >"$work/exit"
-      exit 0
-    ) &
-    worker_pid=$!
-    set +m
-    WORKER_PIDS[worker_n]=$worker_pid
-    register_worker_group "$worker_pid"
-    WORKER_IDX[worker_n]=$worker_n
-    WORKER_SCRIPTS[worker_n]=$script
-    active_workers=$((active_workers + 1))
-    : >"$work/start"
-  done
-  while [ "$active_workers" -gt 0 ]; do
-    wait_one_completed_job_worker
-  done
-  WORKER_PIDS=()
-
-  for script in "${SERIAL_PHASE_SCRIPTS[@]+"${SERIAL_PHASE_SCRIPTS[@]}"}"; do
-    run_one_serial "$script"
-  done
+if [ -n "$FAIL_ON_GATE_SKIP" ] && python3 - "$JSON_PATH" "$FAIL_ON_GATE_SKIP" <<'PY'
+import json, pathlib, sys
+doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+raise SystemExit(0 if any(
+    row.get("terminal", {}).get("result") == "failed" and f"skip: {sys.argv[2]}" in row.get("output_tail", "")
+    for row in doc.get("scripts", [])
+) else 1)
+PY
+then
+  log "required gate skip token seen: skip: $FAIL_ON_GATE_SKIP"
 fi
 
-RUN_FINISHED_ISO=$(now_iso)
-RUN_FINISHED_MS=$(now_ms)
-RUN_DURATION=$((RUN_FINISHED_MS - RUN_STARTED_MS))
-if [ "$RUN_DURATION" -lt 0 ]; then
-  RUN_DURATION=0
+if [ -n "$REQUESTED_JSON_PATH" ]; then
+  log "wrote schema-v2 timing artifact: $JSON_PATH"
 fi
-
-printf 'FM_TEST_SUMMARY total=%s failed=%s skipped_gate=%s duration_ms=%s\n' \
-  "$TOTAL" "$FAILED" "$SKIPPED_GATE" "$RUN_DURATION"
-
-if [ -s "$FAMILIES_TSV" ]; then
-  # Stable family summary order by name.
-  sort -t$'\t' -k1,1 "$FAMILIES_TSV" | while IFS=$'\t' read -r name count duration failed_count; do
-    printf 'FM_TEST_SUMMARY_FAMILY family=%s count=%s duration_ms=%s failed=%s\n' \
-      "$name" "$count" "$duration" "$failed_count"
-  done
-fi
-
-# Slowest scripts (top 15) from records. Path is the stable tie-breaker.
-if [ -s "$RECORDS" ]; then
-  rank=1
-  sort -t$'\t' -k5,5nr -k1,1 "$RECORDS" | head -n 15 | while IFS=$'\t' read -r path _family _expected _rc duration _gate _baseline _budget _exceeded; do
-    printf 'FM_TEST_SLOWEST rank=%s script=%s duration_ms=%s\n' \
-      "$rank" "$path" "$duration"
-    rank=$((rank + 1))
-  done
-fi
-
-printf 'FM_TEST_BUDGET_SUMMARY checked=%s exceeded=%s missing=%s mode=%s\n' \
-  "$DURATION_BUDGET_CHECKED" "$DURATION_BUDGET_EXCEEDED" "$DURATION_BUDGET_MISSING" "$DURATION_BUDGET_MODE"
-
-if [ -n "$JSON_PATH" ]; then
-  mkdir -p "$(dirname "$JSON_PATH")"
-  # Families file may be unsorted; write_json reads as-is (deterministic sort in python).
-  if [ -s "$FAMILIES_TSV" ]; then
-    sort -t$'\t' -k1,1 "$FAMILIES_TSV" -o "$FAMILIES_TSV"
-  else
-    : >"$FAMILIES_TSV"
-  fi
-  write_json_artifact "$JSON_PATH" \
-    "$RUN_STARTED_ISO" "$RUN_FINISHED_ISO" "$RUN_ID" \
-    "$TOTAL" "$FAILED" "$SKIPPED_GATE" "$RUN_DURATION" \
-    "$SELECTION_DESC" "$RECORDS" "$FAMILIES_TSV"
-  log "wrote timing artifact: $JSON_PATH"
-fi
-
-exit "$AGG_RC"
+trap - EXIT INT TERM HUP
+rm -rf "$RUN_TMP"
+exit "$EXECUTOR_RC"

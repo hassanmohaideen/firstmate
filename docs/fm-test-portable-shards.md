@@ -1,7 +1,31 @@
 # Firstmate test shards
 
-`bin/fm-test-run.sh` owns behavior-test lane composition and execution.
+`bin/fm-test-run.sh` owns behavior-test selection, deterministic lane composition, duration inputs, manifest construction, coverage, aggregation, and human-readable output.
+`bin/fm-test-supervisor.py` is the single owner of manifest scheduling, attempts, credential-domain containment, deadlines, diagnostics, interruption, cleanup, and durable evidence.
 `bin/fm-test-isolation-proof.sh` owns the proven-isolated candidate set.
+
+## Required containment
+
+Required CI leases one otherwise-unused high numeric UID/GID for each selected script after proving that identity absent from account and process credential inventories under a root-owned job-local lock.
+The executor remains outside every test identity, releases a blocked child only after permanent credential drop and verification, and uses an unprivileged helper in that exact identity for every signal and quiescence probe.
+Numeric PIDs, process groups, mutable ancestry, and environment markers are diagnostics at most and are never cleanup authority in required CI.
+The executor is the single owner of the contained child environment and builds it from an explicit default-deny allowlist, so fleet routing, runner secrets, and unknown ambient variables never reach a test and only the sanctioned `FM_TEST_ENV_` channel and a small safe base set pass through.
+The credential boundary remains stable across fork, exec, parent exit, reparenting, `setsid`, signal handlers, and PID reuse.
+An unreadable, ambiguous, or non-quiescent identity is quarantined while later scripts use fresh identities.
+Required Linux and macOS qualification refuses red before tests when noninteractive privilege, credential inspection, permanent drop, signal scope, or platform semantics are unavailable.
+Qualification proves that a live different-UID process is never signaled by its numeric PID during a credential-scoped sweep, and Linux additionally manufactures a true same-numeric-PID reuse in a private PID namespace; macOS relies on the same UID-scoped `kill(-1)` making the numeric PID irrelevant, because deterministic same-number reuse is not available there without exhausting the PID space.
+A dedicated per-platform job runs the executor-behavior subset through the public runner on both `ubuntu-latest` and `macos-latest`, so the credential-domain execute path, timeout, interruption, atomic evidence, environment allowlist, and non-quiescence/ambiguity terminalization are proven on Darwin as well as Linux.
+Local execution is explicitly labeled `developer-non-enforcing`; it does not claim hard descendant containment and required CI never accepts it.
+
+## Schema-v2 evidence
+
+The executor atomically publishes the complete planned manifest before releasing the first script.
+Each attempted script has immutable path, family, and attempt fields, append-preserving events, one historical `started` event, and exactly one terminal object.
+There is no durable active result.
+A started row without a terminal object remains valid JSON but makes the run incomplete and red after uncatchable executor death.
+Every update uses a sibling temporary file, file fsync, atomic replacement, and directory fsync.
+Diagnostics are durable before transient files are removed.
+Aggregation rejects unknown or mixed schemas, incomplete runs, missing or duplicate attempts, missing or duplicate terminals, and planned/executed inventory mismatch.
 
 ## Verification inputs
 
@@ -166,11 +190,12 @@ It verifies the real-Herdr CI shards the same way against the real-herdr-gated f
 
 ## Timing artifacts and budgets
 
-Portable shards, each portable serial shard, and each real-Herdr shard upload runner-generated timing JSON.
-`bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
-The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from archived timing artifacts.
-An unmeasured script has no budget: local execution reports it as missing, enforced execution fails after the functional result, and the coverage guard rejects it from every required lane.
-Budget overruns warn during local runs and are enforced by required CI lanes without replacing or hiding functional failures.
+Portable shards, each portable serial shard, and each real-Herdr shard upload schema-v2 timing JSON with durable per-script diagnostics.
+`bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering and complete-evidence validation.
+The runner derives generous per-script duration budgets from the measured hints used for shard balance and archived timing artifacts.
+An unmeasured script has no budget: local execution reports it as missing, enforced execution fails, and the coverage guard rejects it from every required lane.
+Budget overruns warn during local runs and are enforced by required CI lanes without replacing the test's own exit evidence.
+The tables above remain scheduling inputs until the next green required run publishes exact final-executor measurements; only those schema-v2 artifacts may refresh them.
 `.github/workflows/ci.yml` owns the exact artifact names, enforcement wiring, and aggregation wiring.
 
 ## Local entry points
@@ -178,12 +203,13 @@ Budget overruns warn during local runs and are enforced by required CI lanes wit
 [CONTRIBUTING.md](../CONTRIBUTING.md) owns the local test policy and common entry points.
 `bin/fm-test-run.sh --help` owns exact selection flags, lane names, duration enforcement, and bounded scheduling mechanics.
 
-## Timeouts
+## Deadlines and reserves
 
-| Job | timeout-minutes | Rationale |
-|---|---:|---|
-| portable parallel 1/2 | 10 | The measured shard sums are under two minutes and the timeout is a hang tripwire. |
-| portable serial 1-10 | 30 | Each balanced shard is about 3.7 minutes, leaving a generous hang-tripwire margin. |
-| Herdr 1/2 | 30 | The longest shard is about 4.3 minutes and keeps a generous hang-tripwire margin. |
-
-Timeouts are hang tripwires rather than expected healthy durations.
+Every workflow job has `timeout-minutes: 10`.
+Behavior jobs record T0 as their first executable step, before checkout, so the absolute deadline budget also covers checkout and tool setup rather than starting the clock only once the code is present.
+They then pass one absolute deadline set to the executor.
+Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
+The final 120 seconds remain reserved for artifact upload and platform variance before the 600-second job ceiling.
+The executor reserves startup and cleanup time for every unstarted script and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
+A timed-out attempt is terminal red, and later required scripts still execute exactly once when their reservations allow.
+Healthy complete CI remains targeted at roughly five to eight minutes.
