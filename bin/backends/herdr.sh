@@ -1202,13 +1202,14 @@ fm_backend_herdr_pane_idle_shell_pid() {  # <session> <pane-id>
   done
 }
 
-# fm_backend_herdr_pane_idle_shell_sample: one strict instantaneous
-# observation for fm_backend_herdr_pane_idle_shell_pid, which owns the proof
-# contract and the settle retry.
-fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
-  local session=$1 pane=$2 info shell_pid foreground_pgid count
+# fm_backend_herdr_process_info_idle_shell_pid: validate one already-captured
+# process-info response as the exact pane's lone idle shell.
+# Keeping the operating-system proof here lets lifecycle reconciliation and
+# focus-safe pane removal share the same process-identity boundary without a
+# second API read or a second interpretation of PID ownership.
+fm_backend_herdr_process_info_idle_shell_pid() {  # <process-info-json> <pane-id>
+  local info=$1 pane=$2 shell_pid foreground_pgid count
   local process_pid name argv0 shell_name rows stat ps_bin
-  info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
   printf '%s' "$info" | jq -e --arg pane "$pane" '
     .result.type == "pane_process_info"
     and .result.process_info.pane_id == $pane
@@ -1239,6 +1240,7 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
 
   ps_bin=${FM_HERDR_PS_BIN:-ps}
   command -v "$ps_bin" >/dev/null 2>&1 || return 1
+  fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$shell_pid" || return 1
   rows=$("$ps_bin" -axo pid=,ppid= 2>/dev/null) || return 1
   printf '%s\n' "$rows" | awk -v shell="$shell_pid" '
     $1 == shell { found++ }
@@ -1248,6 +1250,15 @@ fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
   stat=$("$ps_bin" -p "$shell_pid" -o stat= 2>/dev/null | tr -d '[:space:]') || return 1
   case "$stat" in S*|I*) ;; *) return 1 ;; esac
   printf '%s\n' "$shell_pid"
+}
+
+# fm_backend_herdr_pane_idle_shell_sample: one strict instantaneous
+# observation for fm_backend_herdr_pane_idle_shell_pid, which owns the proof
+# contract and the settle retry.
+fm_backend_herdr_pane_idle_shell_sample() {  # <session> <pane-id>
+  local session=$1 pane=$2 info
+  info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) || return 1
+  fm_backend_herdr_process_info_idle_shell_pid "$info" "$pane"
 }
 
 # fm_backend_herdr_projection_order_best_effort: place the exact workspace id
@@ -1921,18 +1932,105 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
   esac
 }
 
-# fm_backend_herdr_agent_state: recovery-grade state for the same session-start
-# sweep as the tmux classifier. It reuses the husk classifier rather than
-# creating a second Herdr state machine: a structurally gone pane is `missing`,
-# a confirmed agent-less pane is `dead`, a registered agent is `alive`, and an
-# unexpected or failed API read is `unreadable`.
+# fm_backend_herdr_registered_process_state: reconcile one exact registered
+# agent against the pane process Herdr currently owns.
+# Prints exited only for the shared strict lone-idle-shell proof, running only
+# for a structurally valid non-shell foreground process group, and unknown for
+# every ambiguous, unreadable, shell-mismatched, or identity-reused shape.
+# A registration carries no process id in Herdr 0.8.0, so its status alone can
+# never prove process ownership after a TUI has exited.
+fm_backend_herdr_registered_process_state() {  # <session> <pane-id>
+  local session=$1 pane=$2 info shell_pid foreground_pgid count process_pid
+  info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  if fm_backend_herdr_process_info_idle_shell_pid "$info" "$pane" >/dev/null 2>&1; then
+    printf 'exited'
+    return 0
+  fi
+  printf '%s' "$info" | jq -e --arg pane "$pane" '
+    .result.type == "pane_process_info"
+    and .result.process_info.pane_id == $pane
+    and (.result.process_info.shell_pid | type) == "number"
+    and .result.process_info.shell_pid > 1
+    and (.result.process_info.foreground_process_group_id | type) == "number"
+    and .result.process_info.foreground_process_group_id > 1
+    and (.result.process_info.foreground_processes | type) == "array"
+    and (.result.process_info.foreground_processes | length) > 0
+    and all(.result.process_info.foreground_processes[];
+      (.pid | type) == "number" and .pid > 1
+      and (.name | type) == "string" and (.name | length) > 0
+      and (((.argv0 // .argv[0]) | type) == "string")
+      and (((.argv0 // .argv[0]) | length) > 0))
+  ' >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  shell_pid=$(printf '%s' "$info" | jq -r '.result.process_info.shell_pid | floor')
+  foreground_pgid=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_process_group_id | floor')
+  count=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_processes | length')
+  process_pid=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_processes[0].pid | floor')
+  if [ "$foreground_pgid" != "$shell_pid" ] \
+     && [ "$count" -ge 1 ] \
+     && [ "$process_pid" = "$foreground_pgid" ]; then
+    printf 'running'
+  else
+    printf 'unknown'
+  fi
+}
+
+# fm_backend_herdr_recovery_agent_state: recovery-grade state for one exact
+# pane. Unlike the restored-husk classifier above, this lifecycle boundary
+# reconciles a registered agent with current process ownership.
+# A positively verified lone idle task shell means the prior TUI exited even
+# if Herdr retained its registration; exact registration/pane identity plus a
+# non-shell foreground process means alive; every mismatch or unreadable
+# process shape refuses recovery as unknown.
+fm_backend_herdr_recovery_agent_state() {  # <session> <pane-id>
+  local session=$1 pane_id=$2 pane_out agent_out code pane_identity agent_identity status process_state
+  pane_out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>&1)
+  code=$(printf '%s' "$pane_out" | jq -r '.error.code // empty' 2>/dev/null)
+  if [ -n "$code" ]; then
+    [ "$code" = pane_not_found ] && printf 'missing' || printf 'unknown'
+    return 0
+  fi
+  pane_identity=$(printf '%s' "$pane_out" | jq -er --arg pane "$pane_id" '
+    .result.pane
+    | select(.pane_id == $pane)
+    | [.pane_id, .tab_id, .workspace_id, .terminal_id]
+    | select(all(.[]; type == "string" and length > 0))
+    | @tsv
+  ' 2>/dev/null) || { printf 'unknown'; return 0; }
+
+  agent_out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>&1)
+  code=$(printf '%s' "$agent_out" | jq -r '.error.code // empty' 2>/dev/null)
+  if [ -n "$code" ]; then
+    [ "$code" = agent_not_found ] && printf 'dead' || printf 'unknown'
+    return 0
+  fi
+  agent_identity=$(printf '%s' "$agent_out" | jq -er '
+    .result.agent
+    | [.pane_id, .tab_id, .workspace_id, .terminal_id]
+    | select(all(.[]; type == "string" and length > 0))
+    | @tsv
+  ' 2>/dev/null) || { printf 'unknown'; return 0; }
+  [ "$agent_identity" = "$pane_identity" ] || { printf 'unknown'; return 0; }
+  status=$(printf '%s' "$agent_out" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+  case "$status" in working|idle|done|blocked) ;; *) printf 'unknown'; return 0 ;; esac
+
+  process_state=$(fm_backend_herdr_registered_process_state "$session" "$pane_id")
+  case "$process_state" in
+    exited) printf 'dead' ;;
+    running) printf 'alive' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# fm_backend_herdr_agent_state: public recovery-grade state for the same
+# session-start and lifecycle callers as the tmux classifier.
 fm_backend_herdr_agent_state() {  # <target>
   local target=$1
   fm_backend_herdr_parse_target "$target" || { printf 'unreadable'; return 0; }
-  case "$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
-    dead) printf 'missing' ;;
-    no-agent) printf 'dead' ;;
-    live) printf 'alive' ;;
+  case "$(fm_backend_herdr_recovery_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
+    missing) printf 'missing' ;;
+    dead) printf 'dead' ;;
+    alive) printf 'alive' ;;
     *) printf 'unreadable' ;;
   esac
 }

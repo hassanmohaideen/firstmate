@@ -2822,6 +2822,136 @@ test_list_live_scoped_to_this_homes_workspace_only() {
   pass "fm_backend_herdr_list_live: scoped to this home's own workspace, never a sibling home's"
 }
 
+# --- recovery agent state: stale registration vs process ownership ---------
+
+recovery_pane_fixture() {  # <pane-id>
+  printf '{"result":{"type":"pane_info","pane":{"pane_id":"%s","tab_id":"w1:t1","workspace_id":"w1","terminal_id":"term-1"}}}\n' "$1"
+}
+
+recovery_agent_fixture() {  # <pane-id> <status> [agent]
+  printf '{"result":{"type":"agent_info","agent":{"pane_id":"%s","tab_id":"w1:t1","workspace_id":"w1","terminal_id":"term-1","agent_status":"%s","agent":"%s"}}}\n' "$1" "$2" "${3:-pi}"
+}
+
+recovery_running_process_fixture() {  # <pane-id>
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":222,"foreground_process_group_id":333,"foreground_processes":[{"pid":333,"name":"node","argv0":"pi"}]}}}\n' "$1"
+}
+
+make_recovery_ps() {  # <dir> <shell-comm>
+  local dir=$1 comm=${2:--zsh}
+  cat > "$dir/ps" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  "-axo pid=,ppid=") printf '1 0\n222 1\n' ;;
+  "-p 222 -o stat=") printf 'Ss+\n' ;;
+  "-p 222 -o comm=") printf '%s\n' '$comm' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$dir/ps"
+}
+
+test_recovery_state_treats_a_stale_registration_over_exact_idle_shell_as_dead() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/recovery-stale-shell"; mkdir -p "$dir/responses"
+  log="$dir/log"; resp="$dir/responses"; : > "$log"
+  recovery_pane_fixture w1:p1 > "$resp/1.out"
+  recovery_agent_fixture w1:p1 idle > "$resp/2.out"
+  death_process_info_fixture w1:p1 222 > "$resp/3.out"
+  make_recovery_ps "$dir" -zsh
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
+  [ "$out" = dead ] || fail "a stale exact registration over the intact idle task shell should be dead, got '$out'"
+  assert_contains "$(cat "$log")" $'agent\x1fget\x1fw1:p1' "recovery did not inspect the registered agent"
+  assert_contains "$(cat "$log")" $'pane\x1fprocess-info\x1f--pane\x1fw1:p1' "recovery did not obtain exact process ownership"
+  pass "herdr recovery state: an exact stale registration over the intact idle task shell is agent-free"
+}
+
+test_recovery_state_keeps_running_idle_done_and_blocked_agents_alive() {
+  local status dir log resp fb out
+  for status in idle done blocked; do
+    dir="$TMP_ROOT/recovery-running-$status"; mkdir -p "$dir/responses"
+    log="$dir/log"; resp="$dir/responses"; : > "$log"
+    recovery_pane_fixture w1:p1 > "$resp/1.out"
+    recovery_agent_fixture w1:p1 "$status" > "$resp/2.out"
+    recovery_running_process_fixture w1:p1 > "$resp/3.out"
+    fb=$(make_herdr_fakebin "$dir")
+    out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
+    [ "$out" = alive ] || fail "a genuinely running $status agent should remain alive, got '$out'"
+  done
+  pass "herdr recovery state: registered idle, done, and blocked values remain alive while their TUI process runs"
+}
+
+test_recovery_state_refuses_mismatched_and_foreign_identity() {
+  local field dir log resp fb out agent
+  for field in pane tab workspace terminal; do
+    dir="$TMP_ROOT/recovery-mismatch-$field"; mkdir -p "$dir/responses"
+    log="$dir/log"; resp="$dir/responses"; : > "$log"
+    recovery_pane_fixture w1:p1 > "$resp/1.out"
+    agent=$(recovery_agent_fixture w1:p1 idle foreign)
+    case "$field" in
+      pane) agent=$(printf '%s' "$agent" | jq '.result.agent.pane_id="w9:p9"') ;;
+      tab) agent=$(printf '%s' "$agent" | jq '.result.agent.tab_id="w9:t9"') ;;
+      workspace) agent=$(printf '%s' "$agent" | jq '.result.agent.workspace_id="w9"') ;;
+      terminal) agent=$(printf '%s' "$agent" | jq '.result.agent.terminal_id="term-foreign"') ;;
+    esac
+    printf '%s\n' "$agent" > "$resp/2.out"
+    fb=$(make_herdr_fakebin "$dir")
+    out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
+    [ "$out" = unreadable ] || fail "a $field-mismatched registration should refuse as unreadable, got '$out'"
+    assert_not_contains "$(cat "$log")" $'pane\x1fprocess-info' "a mismatched registration reached process reconciliation"
+  done
+  pass "herdr recovery state: mismatched or foreign endpoint identity refuses replacement"
+}
+
+test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
+  local mode dir log resp fb out
+  for mode in unreadable malformed reused prompt-helper; do
+    dir="$TMP_ROOT/recovery-process-$mode"; mkdir -p "$dir/responses"
+    log="$dir/log"; resp="$dir/responses"; : > "$log"
+    recovery_pane_fixture w1:p1 > "$resp/1.out"
+    recovery_agent_fixture w1:p1 idle > "$resp/2.out"
+    case "$mode" in
+      unreadable) printf '1\n' > "$resp/3.exit" ;;
+      malformed) printf '%s\n' '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w9:p9"}}}' > "$resp/3.out" ;;
+      reused)
+        death_process_info_fixture w1:p1 222 > "$resp/3.out"
+        make_recovery_ps "$dir" node
+        ;;
+      prompt-helper)
+        printf '%s\n' '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p1","shell_pid":222,"foreground_process_group_id":222,"foreground_processes":[{"pid":222,"name":"zsh","argv0":"zsh"},{"pid":444,"name":"starship","argv0":"starship"}]}}}' > "$resp/3.out"
+        make_recovery_ps "$dir" -zsh
+        ;;
+    esac
+    fb=$(make_herdr_fakebin "$dir")
+    out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="${dir}/ps" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
+    [ "$out" = unreadable ] || fail "a $mode process identity should refuse as unreadable, got '$out'"
+  done
+  pass "herdr recovery state: unreadable, ambiguous, and identity-reused process evidence cannot authorize replacement"
+}
+
+test_recovery_state_preserves_missing_and_unregistered_contracts() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/recovery-missing"; mkdir -p "$dir/responses"
+  log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '%s\n' '{"error":{"code":"pane_not_found"}}' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
+  [ "$out" = missing ] || fail "a missing exact pane should remain missing, got '$out'"
+
+  : > "$log"; rm -f "$resp"/*.out "$resp/.count"
+  recovery_pane_fixture w1:p1 > "$resp/1.out"
+  printf '%s\n' '{"error":{"code":"agent_not_found"}}' > "$resp/2.out"
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
+  [ "$out" = dead ] || fail "an unregistered exact pane should remain dead, got '$out'"
+  pass "herdr recovery state: missing panes and unregistered intact panes retain their established meanings"
+}
+
 # --- target parsing, key normalization ---------------------------------------
 
 test_parse_target() {
@@ -4305,6 +4435,11 @@ test_projection_reclaim_replaces_only_exact_husk_and_advances_binding
 test_projection_recovery_is_read_only_and_refuses_live_duplicate_risk
 test_workspace_find_matches_only_this_homes_own_label
 test_list_live_scoped_to_this_homes_workspace_only
+test_recovery_state_treats_a_stale_registration_over_exact_idle_shell_as_dead
+test_recovery_state_keeps_running_idle_done_and_blocked_agents_alive
+test_recovery_state_refuses_mismatched_and_foreign_identity
+test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity
+test_recovery_state_preserves_missing_and_unregistered_contracts
 test_parse_target
 test_normalize_key
 test_capture_calls_pane_read
