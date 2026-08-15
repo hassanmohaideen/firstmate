@@ -93,6 +93,8 @@ case "$cmd ${1:-}" in
       *" --step ci "*)
         if [ -f "$state/ci-red" ]; then
           printf '%s\n' 'CI checks failed - issues detected'
+        elif [ -f "$state/ci-no-checks" ]; then
+          printf '%s\n' 'no CI checks reported - still monitoring until merged or closed'
         else
           printf '%s\n' 'all CI checks passed - still monitoring until merged or closed'
         fi
@@ -339,6 +341,40 @@ test_response_refuses_fallback_branch_and_stale_head_without_state_changes() {
   pass "responses reject fallback branches and stale heads before state changes"
 }
 
+test_pipeline_descendant_head_is_accepted() {
+  local d out f tree descendant
+  d=$(new_case pipeline-descendant)
+  f=$(finding context ask-user)
+  set_round "$d" "$f"
+  tree=$(git -C "$d" rev-parse HEAD^{tree})
+  descendant=$(printf 'pipeline fix\n' | git -C "$d" commit-tree "$tree" -p HEAD)
+  printf '%s\n' "$descendant" > "$d/fake-state/status-head"
+
+  out=$(run_driver "$d" respond --approve context 2>&1) \
+    || fail "pipeline descendant validation head was refused: $out"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "accepted pipeline descendant did not invoke the response"
+  [ "$(jq -r '.runs[0].rounds[0].head' "$(ledger "$d")")" = "$descendant" ] \
+    || fail "pipeline descendant head was not attached to the disposition"
+  run_driver "$d" audit-ready >/dev/null 2>&1 \
+    || fail "pipeline descendant validation head was refused during audit"
+  pass "pipeline fix commits may advance the run head beyond local HEAD"
+}
+
+test_no_ci_checks_refuses_readiness() {
+  local d out f
+  d=$(new_case no-ci-checks)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  run_driver "$d" respond --approve accepted >/dev/null 2>&1 \
+    || fail "no-CI fixture approval failed"
+  : > "$d/fake-state/ci-no-checks"
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "readiness accepted a run with no public CI checks"
+  assert_contains "$out" 'not green' "no-CI readiness refusal was not actionable"
+  assert_not_contains "$out" 'ready:' "no-CI run was visibly reported ready"
+  pass "readiness requires actual public green CI evidence"
+}
+
 test_run_and_head_mismatch_are_refused() {
   local d out f ledger_path before after stale
   d=$(new_case context-mismatch)
@@ -428,6 +464,8 @@ test_multiple_fix_rounds_preserve_history
 test_surviving_finding_refuses_readiness
 test_clean_current_status_cannot_erase_unresolved_history
 test_response_refuses_fallback_branch_and_stale_head_without_state_changes
+test_pipeline_descendant_head_is_accepted
+test_no_ci_checks_refuses_readiness
 test_run_and_head_mismatch_are_refused
 test_duplicate_replay_and_underlying_failure
 test_concurrent_writers_are_serial_and_atomic
