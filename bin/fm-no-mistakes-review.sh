@@ -9,11 +9,14 @@
 # response and ready-report boundaries instead of restating these mechanics.
 #
 # Usage:
-#   fm-no-mistakes-review.sh respond --fix <id,...> [--instructions <text>]
-#   fm-no-mistakes-review.sh respond --approve <id,...>
-#   fm-no-mistakes-review.sh respond --reject <id,...>
+#   fm-no-mistakes-review.sh respond --fix <id>[,<id>...] [--instructions <text>]
+#   fm-no-mistakes-review.sh respond --approve <id>[,<id>...]
+#   fm-no-mistakes-review.sh respond --reject <id>[,<id>...]
 #   fm-no-mistakes-review.sh audit-ready
 #   fm-no-mistakes-review.sh ledger-path
+# Finding lists are comma-separated current review IDs; whitespace around IDs is
+# ignored, order is preserved, and every current ID must occur exactly once.
+# --instructions passes fix instructions verbatim and is valid only with --fix.
 #
 # Run it from the project worktree whose no-mistakes validation is being driven.
 # It reads only documented public command output:
@@ -30,12 +33,16 @@
 #
 # The ledger is JSON at:
 #   <project-worktree>/.no-mistakes/firstmate-review-ledger.json
-# It has version 1 and an append-preserving runs[] array.
-# Each run records its exact run ID and branch; each observed review round keeps
-# the complete structured review result, the exact run head at which that round
-# was current, the public fix-completion marker that follows it, and one explicit
-# disposition per finding occurrence.
-# Disposition states are requested, approved_as_is, rejected_or_skipped,
+# Its exact version-1 record shape is:
+#   {"version":1,"runs":[{"id":"<run-id>","branch":"<branch>",
+#   "rounds":[{"round":<integer>,"head":"<commit>"|null,
+#   "result":<complete-review-object>,"fix_completed_after":<boolean>,
+#   "dispositions":[{"finding_id":"<id>","finding":<finding-object>,
+#   "kind":"fix"|"approve"|"reject","state":<state>,
+#   "run_id":"<run-id>","branch":"<branch>","head":"<commit>"}]}]}]}
+# runs and rounds are append-preserving, and result/finding retain the complete
+# structured objects emitted by no-mistakes.
+# Disposition <state> is requested, approved_as_is, rejected_or_skipped,
 # fixed_and_confirmed, or survived_unchanged.
 # A successful whole-step approve/skip confirms that explicit disposition.
 # A selected fix remains merely requested until the public review log contains
@@ -59,6 +66,11 @@
 # Historical clean reviews, tests, and CI never imply approval or rejection.
 # If the full structured review history or any required context is absent or
 # unparsable, the command exits nonzero with an actionable diagnostic.
+# Successful respond output is:
+#   recorded: run=<run-id> round=<integer> action=<fix|approve|reject> findings=<id,...>
+# Successful audit-ready output is:
+#   ready: <https-pr-url> run=<run-id> branch=<branch> head=<commit>
+# Refusals exit nonzero and begin "fm-no-mistakes-review.sh: REFUSED:" on stderr.
 #
 # Environment used by hermetic tests only:
 #   FM_NM_REVIEW_STATE_DIR  overrides the ledger directory.
