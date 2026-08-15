@@ -290,6 +290,11 @@ sync_ledger() {
         | select($matches[0].rounds[$i].fix_completed_after == true
         and $m.rounds[$i].fix_completed_after != true)] | length) > 0 then
         "public review history lost a preserved fix-round completion for run \($m.run.id)"
+      elif ($matches | length) == 1
+        and ($matches[0].rounds | length) == ($m.rounds | length)
+        and ($matches[0].rounds | length) > 0
+        and $matches[0].rounds[-1].head != $m.run.head then
+        "stale-head review coverage: latest preserved review head \($matches[0].rounds[-1].head // "unknown") does not cover authoritative head \($m.run.head)"
       else empty end
   ' "$LEDGER") || die "cannot compare the disposition ledger with public review history"
   [ -z "$errors" ] || die "$errors"

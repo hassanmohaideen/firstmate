@@ -363,6 +363,29 @@ test_pipeline_descendant_head_is_accepted() {
   pass "pipeline fix commits may advance the run head beyond local HEAD"
 }
 
+test_post_review_pipeline_commit_refuses_readiness() {
+  local d out f tree descendant ledger_path before after
+  d=$(new_case stale-review-head)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  run_driver "$d" respond --approve accepted >/dev/null 2>&1 \
+    || fail "stale-review-head fixture approval failed"
+  ledger_path=$(ledger "$d")
+  before=$(shasum -a 256 "$ledger_path" | awk '{print $1}')
+  tree=$(git -C "$d" rev-parse HEAD^{tree})
+  descendant=$(printf 'later pipeline fix\n' | git -C "$d" commit-tree "$tree" -p HEAD)
+  printf '%s\n' "$descendant" > "$d/fake-state/status-head"
+
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "readiness accepted a pipeline commit with no subsequent review result"
+  assert_contains "$out" 'stale-head review coverage' "stale review coverage refusal was not actionable"
+  assert_contains "$out" "$descendant" "stale review coverage refusal omitted the authoritative head"
+  assert_not_contains "$out" 'ready:' "unreviewed pipeline commit was visibly reported ready"
+  after=$(shasum -a 256 "$ledger_path" | awk '{print $1}')
+  [ "$before" = "$after" ] || fail "stale review coverage audit rebound or changed the ledger"
+  pass "pipeline commits require a subsequent authoritative review result"
+}
+
 test_no_ci_checks_refuses_readiness() {
   local d out f
   d=$(new_case no-ci-checks)
@@ -489,6 +512,7 @@ test_surviving_finding_refuses_readiness
 test_clean_current_status_cannot_erase_unresolved_history
 test_response_refuses_fallback_branch_and_stale_head_without_state_changes
 test_pipeline_descendant_head_is_accepted
+test_post_review_pipeline_commit_refuses_readiness
 test_no_ci_checks_refuses_readiness
 test_terminal_outcomes_reject_stale_green_ci
 test_run_and_head_mismatch_are_refused
