@@ -18,6 +18,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
+REAL_GIT=$(command -v git)
 TMP_ROOT=$(fm_test_tmproot fm-spawn-worktree-settle)
 
 # make_settle_fakebin <dir> builds a fake tmux whose `#{pane_current_path}`
@@ -49,7 +50,7 @@ case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
   has-session|new-session|new-window|kill-window) exit 0 ;;
-  send-keys) exit 0 ;;
+  send-keys) printf '%s\n' "$*" >> "${FM_FAKE_SEND_LOG:-/dev/null}"; exit 0 ;;
 esac
 exit 0
 SH
@@ -96,6 +97,8 @@ run_settle_spawn() {
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_FAKE_PANE_PATH="$WT_DIR" FM_FAKE_PANE_STALE="$STALE_DIR" \
     FM_FAKE_PANE_STALE_READS="$STALE_READS" FM_FAKE_PANE_COUNTFILE="$COUNTFILE" \
+    FM_REAL_GIT="${FM_REAL_GIT:-}" FM_FAKE_GIT_LOG="${FM_FAKE_GIT_LOG:-}" \
+    FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
@@ -141,7 +144,85 @@ test_already_settled_pane_costs_one_confirm_sleep() {
   pass "an already-settled pane confirms via the existing inter-poll sleep, not an extra full cycle"
 }
 
+install_github_gate_stubs() {  # <fakebin>
+  local fakebin=$1
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_GH_LOG"
+case "$*" in
+  *"auth status --help"*) printf '  --active, --hostname\n' ;;
+  *"repos/"*) printf 'true\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/gh"
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" fetch "*) printf '%s\n' "$*" >> "$FM_FAKE_GIT_LOG"; exit 0 ;;
+  *" remote set-head origin --auto "*) exit 0 ;;
+esac
+exec "$FM_REAL_GIT" "$@"
+SH
+  chmod +x "$fakebin/git"
+}
+
+prepare_github_gate_case() {
+  local default
+  default=$($REAL_GIT -C "$PROJ_DIR" symbolic-ref --short HEAD)
+  $REAL_GIT -C "$WT_DIR" update-ref "refs/remotes/origin/$default" HEAD
+  $REAL_GIT -C "$WT_DIR" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default"
+  $REAL_GIT -C "$PROJ_DIR" remote set-url origin https://github.com/owner/repo.git
+  install_github_gate_stubs "$FAKEBIN_DIR"
+}
+
+test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch() {
+  local rec id out status git_log gh_log send_log
+  id=allocated-github-divergent-z3
+  rec=$(make_settle_case allocated-github-divergent "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
+  $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
+  git_log="$TMP_ROOT/divergent-git.log"
+  gh_log="$TMP_ROOT/divergent-gh.log"
+  send_log="$TMP_ROOT/divergent-send.log"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a divergent allocated worktree destination must block"
+  assert_contains "$out" "worker launch is waiting" "a divergent allocated worktree did not report a blocked launch"
+  [ ! -s "$git_log" ] || fail "a divergent allocated worktree fetched before destination verification"
+  assert_no_grep 'encode launch-brief' "$send_log" "a divergent allocated worktree started the worker"
+  [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "a divergent allocated worktree should only probe the selected project destination"
+  pass "a divergent allocated worktree destination blocks before fetch and launch"
+}
+
+test_matching_allocated_worktree_destination_fast_paths_without_reprobe() {
+  local rec id out status git_log gh_log send_log
+  id=allocated-github-matching-z4
+  rec=$(make_settle_case allocated-github-matching "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  git_log="$TMP_ROOT/matching-git.log"
+  gh_log="$TMP_ROOT/matching-gh.log"
+  send_log="$TMP_ROOT/matching-send.log"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" run_settle_spawn "$id")
+  status=$?
+  expect_code 0 "$status" "a matching allocated worktree should launch"
+  assert_contains "$out" "spawned $id" "a matching allocated worktree did not report success"
+  [ -s "$git_log" ] || fail "the matching allocated worktree did not proceed to refresh its base"
+  assert_grep 'encode launch-brief' "$send_log" "the matching allocated worktree did not start the worker"
+  [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "a matching allocated worktree triggered a second GitHub probe"
+  pass "a matching allocated worktree launches through the verified fast path"
+}
+
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
+test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch
+test_matching_allocated_worktree_destination_fast_paths_without_reprobe
 
 echo "# all fm-spawn-worktree-settle tests passed"

@@ -1864,6 +1864,23 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+verify_allocated_worktree_github_destination() {  # <worktree>
+  local worktree=$1 verified rc
+  [ "$GH_GATED" -eq 1 ] || return 0
+  if verified=$(fm_github_ctx_gate "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST"); then
+    GH_VERIFIED_DEST=$verified
+    return 0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 1 ]; then
+    echo "GitHub authentication or access blocks task $ID; worker launch is waiting" >&2
+  else
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+  fi
+  return 1
+}
+
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
   if ! git -C "$worktree" fetch --quiet origin; then
@@ -2219,6 +2236,7 @@ EOF
       exit 1
     fi
     validate_spawn_worktree "orca worktree create" "$W"
+    verify_allocated_worktree_github_destination "$WT" || exit 1
     if [ -z "$ORCA_TERMINAL" ]; then
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
     fi
@@ -2396,6 +2414,7 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
+  verify_allocated_worktree_github_destination "$WT" || exit 1
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
