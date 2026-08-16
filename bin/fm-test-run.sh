@@ -29,6 +29,9 @@
 #
 # Options:
 #   --json <path>   write a deterministic timing artifact after the run
+#   --duration-baseline-ms N
+#                   measured duration input for one explicitly selected script
+#                   that is not part of the owned suite baseline table
 #   --list          print selected script paths (one per line) and exit 0
 #   --base <ref>    with --changed, compare against this ref (default: origin/main)
 #   --exclude-family <name>
@@ -111,6 +114,7 @@ JOBS=
 JOBS_EXPLICIT=0
 JOBS_MAX=8
 DURATION_BUDGET_MODE=warn
+EXPLICIT_DURATION_BASELINE_MS=
 CONTAINMENT_MODE=${FM_TEST_CONTAINMENT:-developer-non-enforcing}
 
 # How many separate-runner shards the portable serial remainder splits into.
@@ -1477,6 +1481,15 @@ while [ "$#" -gt 0 ]; do
       JOBS_EXPLICIT=1
       shift
       ;;
+    --duration-baseline-ms)
+      [ "$#" -gt 1 ] || die "--duration-baseline-ms requires a positive integer"
+      EXPLICIT_DURATION_BASELINE_MS=$2
+      shift 2
+      ;;
+    --duration-baseline-ms=*)
+      EXPLICIT_DURATION_BASELINE_MS=${1#--duration-baseline-ms=}
+      shift
+      ;;
     --enforce-duration-budgets)
       DURATION_BUDGET_MODE=enforce
       shift
@@ -1673,6 +1686,14 @@ case "$CONTAINMENT_MODE" in
   required|developer-non-enforcing) ;;
   *) die "FM_TEST_CONTAINMENT must be required or developer-non-enforcing" ;;
 esac
+if [ -n "$EXPLICIT_DURATION_BASELINE_MS" ]; then
+  [[ "$EXPLICIT_DURATION_BASELINE_MS" =~ ^[1-9][0-9]*$ ]] \
+    || die "--duration-baseline-ms requires a positive integer"
+  [ "${#SCRIPTS[@]}" -eq 1 ] \
+    || die "--duration-baseline-ms is valid only with one explicitly selected script"
+  [ "$MODE" = scripts ] \
+    || die "--duration-baseline-ms is valid only with one explicitly selected script"
+fi
 
 command -v python3 >/dev/null 2>&1 || die "execution requires python3"
 SUPERVISOR="$ROOT/bin/fm-test-supervisor.py"
@@ -1689,7 +1710,10 @@ for s in "${SCRIPTS[@]+"${SCRIPTS[@]}"}"; do
   expected=$(expected_gate_skip_for_family "$family")
   baseline=
   budget=
-  if budget_row=$(duration_budget_ms_for "$s"); then
+  if [ -n "$EXPLICIT_DURATION_BASELINE_MS" ]; then
+    baseline=$EXPLICIT_DURATION_BASELINE_MS
+    budget=$((baseline * 2 + 10000))
+  elif budget_row=$(duration_budget_ms_for "$s"); then
     baseline=${budget_row%%$'\t'*}
     budget=${budget_row#*$'\t'}
   fi
@@ -1710,7 +1734,10 @@ if [ -z "$JSON_PATH" ]; then
   JSON_PATH="$RUN_TMP/fm-test-timing.json"
 fi
 mkdir -p "$(dirname "$JSON_PATH")"
-JSON_PATH=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$JSON_PATH")
+# Normalize macOS's fixed, root-owned /var compatibility alias before sudo.
+# Other intermediate links and the final component remain unresolved so the
+# privileged executor still rejects caller-controlled symlink paths.
+JSON_PATH=$(python3 -c 'import os,sys; p=os.path.abspath(sys.argv[1]); p="/private"+p if sys.platform=="darwin" and p.startswith("/var/") and os.path.realpath("/var")=="/private/var" else p; print(p)' "$JSON_PATH")
 RUN_STARTED_MS=$(now_ms)
 RUN_ID="fm-test-run-${RUN_STARTED_MS}-$$"
 T0=${FM_TEST_JOB_T0_EPOCH:-$(date +%s)}

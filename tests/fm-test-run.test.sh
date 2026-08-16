@@ -1424,6 +1424,12 @@ make_required_fault_manifest() { # <manifest> <artifact> <root> <fault:budget:pa
   python3 - "$manifest" "$artifact" "$root" "$@" <<'PY'
 import json, os, pathlib, sys, time
 manifest, artifact, root, *specs = sys.argv[1:]
+# The privileged executor accepts only physical, symlink-free output paths.
+# Normalize macOS's fixed /var compatibility alias as the runner does without
+# resolving any caller-controlled intermediate or final symlink.
+artifact = os.path.abspath(artifact)
+if sys.platform == "darwin" and artifact.startswith("/var/") and os.path.realpath("/var") == "/private/var":
+    artifact = "/private" + artifact
 secret = ("TOKEN", "SECRET", "PASSWORD", "COOKIE", "CREDENTIAL", "AUTHORIZATION", "PRIVATE_KEY")
 scripts = []
 for spec in specs:
@@ -1622,7 +1628,8 @@ SH
   chmod 0755 "$tmp/leased.test.sh"
   artifact="$tmp/artifact.json"
   set +e
-  FM_TEST_CONTAINMENT=required "$RUNNER" --json "$artifact" "$tmp/leased.test.sh" >"$tmp/out" 2>"$tmp/err"
+  FM_TEST_CONTAINMENT=required "$RUNNER" --json "$artifact" \
+    --duration-baseline-ms 1000 "$tmp/leased.test.sh" >"$tmp/out" 2>"$tmp/err"
   rc=$?
   set -e
   [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "required public-runner leased-UID run should pass"; }
