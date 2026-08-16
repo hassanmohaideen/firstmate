@@ -405,6 +405,12 @@ def helper_signal(uid: int, gid: int, sig: int) -> tuple[bool, int]:
         code = 0
         try:
             drop_credentials(uid, gid)
+            if sig not in (0, signal.SIGKILL, signal.SIGSTOP):
+                # Darwin includes the sender in kill(-1, signal).  Keep the
+                # dropped helper alive for catchable domain signals so it can
+                # report the kernel operation instead of racing its own death.
+                # The target domain still receives the requested signal.
+                signal.signal(sig, signal.SIG_IGN)
             os.kill(-1, sig)
             if sig == 0:
                 # kill(-1, 0) is allowed to count the caller itself.  Normalize
@@ -1730,11 +1736,19 @@ def qualify(artifact: pathlib.Path) -> int:
         errors: list[str] = []
         for pid, lease in targets:
             try:
-                delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                # Prefer a catchable credential-scoped signal.  In particular,
+                # Darwin's kill(-1, SIGKILL) may kill the dropped sender before
+                # it can durably report completion.  Escalate only domains that
+                # deliberately ignore TERM (the fork-storm fixtures).
+                delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGTERM)
                 if not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
-                    errors.append(f"uid {lease.uid} KILL failed: errno={code}")
-                if not bounded_reap(pid, 1.0):
-                    errors.append(f"uid {lease.uid} target did not exit")
+                    errors.append(f"uid {lease.uid} TERM failed: errno={code}")
+                if not bounded_reap(pid, 0.25):
+                    delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                    if not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
+                        errors.append(f"uid {lease.uid} KILL failed: errno={code}")
+                    if not bounded_reap(pid, 1.0):
+                        errors.append(f"uid {lease.uid} target did not exit")
             except BaseException as exc:
                 errors.append(f"uid {lease.uid} cleanup failed: {exc}")
         for lease in leases:
@@ -1758,8 +1772,8 @@ def qualify(artifact: pathlib.Path) -> int:
         leases.append(owned)
         sentinel = pool.acquire()
         leases.append(sentinel)
-        target = spawn_qualification_target(owned.uid, owned.gid, ignore_term=True, session_escape=True)
-        other = spawn_qualification_target(sentinel.uid, sentinel.gid, ignore_term=True, session_escape=True)
+        target = spawn_qualification_target(owned.uid, owned.gid, session_escape=True)
+        other = spawn_qualification_target(sentinel.uid, sentinel.gid, session_escape=True)
         targets.extend(((target, owned), (other, sentinel)))
         platform.verify_pid(target, owned.uid, owned.gid)
         platform.verify_pid(other, sentinel.uid, sentinel.gid)
@@ -1771,11 +1785,11 @@ def qualify(artifact: pathlib.Path) -> int:
         # identity), then prove the owned domain quiesced while the sentinel is
         # untouched. The sentinel survives because signaling is UID-scoped, never
         # PID-scoped: its live PID was available throughout and never targeted.
-        delivered, code = helper_signal(owned.uid, owned.gid, signal.SIGKILL)
+        delivered, code = helper_signal(owned.uid, owned.gid, signal.SIGTERM)
         if not delivered or code != 0:
-            raise ContainmentError(f"credential-scoped KILL failed: errno={code}")
+            raise ContainmentError(f"credential-scoped TERM failed: errno={code}")
         if not bounded_reap(target, 2.0):
-            raise ContainmentError("owned qualification target did not exit after KILL")
+            raise ContainmentError("owned qualification target did not exit after TERM")
         targets = [(pid, lease) for pid, lease in targets if pid != target]
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:

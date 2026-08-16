@@ -986,25 +986,34 @@ PY
 }
 
 test_interruption_and_atomic_evidence() {
-  local tmp artifact pid rc
+  local tmp artifact pid rc n
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-interrupt.XXXXXX")
   chmod 0711 "$tmp"
+  mkdir "$tmp/ready"
+  chmod 0733 "$tmp/ready"
   cat >"$tmp/hang.sh" <<'SH'
 #!/usr/bin/env bash
+: >"$FM_TEST_ENV_INTERRUPT_READY"
 trap '' TERM
 while :; do sleep 1; done
 SH
   chmod 0755 "$tmp/hang.sh"
   artifact="$tmp/artifact.json"
-  "$RUNNER" --json "$artifact" "$tmp/hang.sh" >"$tmp/out" 2>"$tmp/err" &
+  FM_TEST_ENV_INTERRUPT_READY="$tmp/ready/child-started" \
+    "$RUNNER" --json "$artifact" "$tmp/hang.sh" >"$tmp/out" 2>"$tmp/err" &
   pid=$!
   wait_for_started_artifact "$artifact" \
     || { kill -KILL "$pid" 2>/dev/null || true; fail "interruption fixture never published started evidence"; }
-  # The dedicated concurrent-polling fixture below stresses repeated atomic
-  # replacements.  Interrupt this fixture promptly after its durable started
-  # transition instead of spending an OS-dependent interval launching 100
-  # Python processes, during which a constrained runner can consume the lane's
-  # scheduling allowance and terminalize before the intended signal.
+  # Started evidence is intentionally durable before the blocked child is
+  # released. Wait for an observable action from the test body as well, so the
+  # signal cannot race credential verification or an immediate launch failure.
+  n=0
+  while [ ! -e "$tmp/ready/child-started" ] && kill -0 "$pid" 2>/dev/null && [ "$n" -lt 500 ]; do
+    sleep 0.01
+    n=$((n + 1))
+  done
+  [ -e "$tmp/ready/child-started" ] \
+    || { wait "$pid" 2>/dev/null || true; fail "runner exited before the interruption fixture body became ready"; }
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$artifact" \
     || { kill -KILL "$pid" 2>/dev/null || true; fail "started artifact is invalid JSON"; }
   kill -TERM "$pid" 2>/dev/null \
