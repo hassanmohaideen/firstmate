@@ -723,7 +723,8 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
-GH_ALLOCATED_BLOCK_CLEANUP=0
+GATED_POOL_LEASE_ABORT_RETURN=0
+GATED_POOL_PREALLOCATED=0
 
 write_github_context_meta() {
   echo "gh_gated=${GH_GATED:-0}"
@@ -757,7 +758,7 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? endpoint_kill_status=0 endpoint_state=
+  local status=$?
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -800,55 +801,10 @@ spawn_abort_cleanup() {
     HERDR_PRESENTATION_ORDER_LOCK_HELD=0
     fm_lock_release "$HERDR_PRESENTATION_ORDER_LOCK" || true
   fi
-  if [ "$GH_ALLOCATED_BLOCK_CLEANUP" = 1 ]; then
-    GH_ALLOCATED_BLOCK_CLEANUP=0
-    case "${BACKEND:-}" in
-      zellij)
-        fm_backend_kill "$BACKEND" "${T:-}" "${ZELLIJ_TAB_ID:-}" "${W:-}" 2>/dev/null \
-          || endpoint_kill_status=$?
-        ;;
-      '') ;;
-      *)
-        fm_backend_kill "$BACKEND" "${T:-}" 2>/dev/null \
-          || endpoint_kill_status=$?
-        ;;
-    esac
-    endpoint_state=unreadable
-    if [ -z "${BACKEND:-}" ] || [ -z "${T:-}" ]; then
-      endpoint_state=missing
-    else
-      endpoint_state=$(fm_backend_agent_state "$BACKEND" "$T")
-    fi
-    if [ "$endpoint_state" != missing ]; then
-      mkdir -p "$STATE" 2>/dev/null || true
-      if [ -d "$STATE" ]; then
-        {
-          echo "window=$T"
-          echo "endpoint_task_id=$ID"
-          echo "worktree=${WT:-}"
-          echo "project=$PROJ_ABS"
-          echo "harness=$HARNESS"
-          echo "kind=$KIND"
-          [ -z "${MODE:-}" ] || echo "mode=$MODE"
-          [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
-          write_github_context_meta
-          [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
-          [ -z "${HERDR_SES:-}" ] || echo "herdr_session=$HERDR_SES"
-          [ -z "${HERDR_WORKSPACE_ID:-}" ] || echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
-          [ -z "${HERDR_TAB_ID:-}" ] || echo "herdr_tab_id=$HERDR_TAB_ID"
-          [ -z "${HERDR_PANE_ID:-}" ] || echo "herdr_pane_id=$HERDR_PANE_ID"
-          [ -z "${ZELLIJ_SES:-}" ] || echo "zellij_session=$ZELLIJ_SES"
-          [ -z "${ZELLIJ_TAB_ID:-}" ] || echo "zellij_tab_id=$ZELLIJ_TAB_ID"
-          [ -z "${ZELLIJ_PANE_ID:-}" ] || echo "zellij_pane_id=$ZELLIJ_PANE_ID"
-          [ -z "${CMUX_WORKSPACE_ID:-}" ] || echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
-          [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
-        } > "$STATE/$ID.meta" 2>/dev/null || true
-      fi
-      echo "error: could not confirm removal of blocked task $ID's endpoint '$T' (kill_status=$endpoint_kill_status endpoint_state=$endpoint_state); worktree '${WT:-unknown}' remains leased and requires manual cleanup" >&2
-    elif [ -n "${WT:-}" ]; then
-      ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 \
-        || echo "warning: could not return blocked task $ID's allocated worktree '$WT'" >&2
-    fi
+  if [ "$GATED_POOL_LEASE_ABORT_RETURN" = 1 ] && [ -n "${WT:-}" ]; then
+    GATED_POOL_LEASE_ABORT_RETURN=0
+    ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 \
+      || echo "warning: could not return blocked task $ID's allocated worktree '$WT'" >&2
   fi
   if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
     ORCA_ABORT_CLEANUP=0
@@ -1915,24 +1871,6 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
-verify_allocated_worktree_github_destination() {  # <worktree>
-  local worktree=$1 verified rc
-  [ "$GH_GATED" -eq 1 ] || return 0
-  if verified=$(fm_github_ctx_gate "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST"); then
-    GH_VERIFIED_DEST=$verified
-    return 0
-  else
-    rc=$?
-  fi
-  if [ "$rc" -eq 1 ]; then
-    echo "GitHub authentication or access blocks task $ID; worker launch is waiting" >&2
-  else
-    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
-  fi
-  [ "${BACKEND:-}" = orca ] || GH_ALLOCATED_BLOCK_CLEANUP=1
-  return 1
-}
-
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
   if ! git -C "$worktree" fetch --quiet origin; then
@@ -1981,6 +1919,27 @@ herdr_projection_meta_field_exact() {  # <meta> <key>
   count=$(grep -c "^${key}=" "$meta" 2>/dev/null || true)
   [ "$count" = 1 ] || return 1
   grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-
+}
+
+reset_gated_pool_destination() {  # <worktree> <verified-url>
+  local worktree=$1 verified_url=$2 observed rc
+  if [ "$(git -C "$worktree" config --bool extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
+    if git -C "$worktree" config --worktree --unset-all remote.origin.url 2>/dev/null; then
+      :
+    else
+      rc=$?
+      [ "$rc" -eq 5 ] || return 1
+    fi
+    if git -C "$worktree" config --worktree --unset-all remote.origin.pushurl 2>/dev/null; then
+      :
+    else
+      rc=$?
+      [ "$rc" -eq 5 ] || return 1
+    fi
+  fi
+  git -C "$worktree" remote set-url origin "$verified_url" || return 1
+  observed=$(fm_github_ctx_observe "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG") || return 1
+  [ "$observed" = "$GH_VERIFIED_DEST" ]
 }
 
 # A stale presentation journal never grants launch authority.
@@ -2051,6 +2010,28 @@ herdr_projection_existing_meta_allows_flat() {  # <meta>
   esac
 }
 
+SPAWN_START_DIR=$PROJ_ABS
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$GH_GATED" -eq 1 ]; then
+  GATED_PRIMARY_ORIGIN=$(fm_github_remote_destination_url "$PROJ_ABS" "$GH_CAPABILITY") || {
+    echo "GH_AUTH_INDETERMINATE: the verified primary destination could not be read for pooled allocation" >&2
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+    exit 1
+  }
+  WT=$(cd "$PROJ_ABS" && treehouse get --lease --lease-holder "$ID") || {
+    echo "error: treehouse get --lease failed to allocate a worktree for $ID" >&2
+    exit 1
+  }
+  GATED_POOL_LEASE_ABORT_RETURN=1
+  GATED_POOL_PREALLOCATED=1
+  validate_spawn_worktree "treehouse get --lease" "$ID"
+  if ! reset_gated_pool_destination "$WT" "$GATED_PRIMARY_ORIGIN"; then
+    echo "GH_AUTH_INDETERMINATE: the allocated worktree destination could not be reset to the verified primary destination" >&2
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+    exit 1
+  fi
+  SPAWN_START_DIR=$WT
+fi
+
 W="fm-$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
   # Adopt the recorded endpoint instead of creating one. This is what keeps a
@@ -2074,7 +2055,7 @@ case "$BACKEND" in
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
-    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$SPAWN_START_DIR") || exit 1
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -2180,7 +2161,7 @@ case "$BACKEND" in
             HERDR_PROJECTION_ID=$(fm_backend_herdr_projection_journal_create "$STATE" "$ID") || exit 1
             HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label "$ID" "$HERDR_PROJECTION_ID")
             if ! FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_create_task \
-              "$PROJ_ABS" "$HERDR_PROJECTION_LABEL" "$W"; then
+              "$SPAWN_START_DIR" "$HERDR_PROJECTION_LABEL" "$W"; then
               if [ "${FM_BACKEND_HERDR_PROJECTION_CLEANUP_SAFE:-0}" = 1 ]; then
                 HERDR_PROJECTION_ABORT_CLEANUP=1
                 HERDR_PROJECTION_ABORT_SESSION=$FM_BACKEND_HERDR_PROJECTION_SESSION
@@ -2233,7 +2214,7 @@ case "$BACKEND" in
       HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
       HERDR_SES=${CONTAINER%%:*}
       HERDR_WORKSPACE_ID=${CONTAINER#*:}
-      HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
+      HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$SPAWN_START_DIR" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
       read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
@@ -2246,7 +2227,7 @@ EOF
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_START_DIR") || exit 1
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -2258,7 +2239,7 @@ EOF
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_START_DIR") || exit 1
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF
@@ -2288,7 +2269,6 @@ EOF
       exit 1
     fi
     validate_spawn_worktree "orca worktree create" "$W"
-    verify_allocated_worktree_github_destination "$WT" || exit 1
     if [ -z "$ORCA_TERMINAL" ]; then
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
     fi
@@ -2418,7 +2398,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
-elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$GATED_POOL_PREALLOCATED" -ne 1 ]; then
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -2466,7 +2446,6 @@ elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   fi
 
   validate_spawn_worktree "treehouse get" "$T"
-  verify_allocated_worktree_github_destination "$WT" || exit 1
 fi
 if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
@@ -2893,6 +2872,7 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   fm_lock_release "$SPAWN_TASK_SET_LOCK"
 fi
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+GATED_POOL_LEASE_ABORT_RETURN=0
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

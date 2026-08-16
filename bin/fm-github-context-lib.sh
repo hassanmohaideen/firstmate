@@ -379,9 +379,9 @@ fm_github_ctx_intake() {
 # The gate probes the SELECTED host only; a changed observed host is never
 # adopted, so a repointed remote stays blocked until the destination is
 # re-selected.
-fm_github_ctx_gate() {
-  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} recorded=${8:-}
-  local obs_host obs_repo obs_target obs_tuple probe_target probe_out target_owner target_repository st
+fm_github_ctx_observe() {
+  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-}
+  local obs_host obs_repo obs_target obs_tuple target_owner target_repository st
   [ "$forge" = github ] || { echo "GH_AUTH_INDETERMINATE: no authoritative GitHub forge is recorded for this task" >&2; return 2; }
   fm_github_validate_hostname "$selected_host" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub host is not a canonical hostname" >&2; return 2; }
   case "$capability:$target_kind" in
@@ -414,16 +414,26 @@ fm_github_ctx_gate() {
       return 2
     }
     obs_target=$obs_repo
-    probe_target=$obs_repo
   else
     fm_github_validate_organization "$organization" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub organization is malformed" >&2; return 2; }
     obs_target=$organization
-    probe_target=$organization
   fi
   obs_tuple=$(fm_github_ctx_dest_tuple "$forge" "$obs_host" "$target_kind" "$obs_target" "$capability")
+  printf '%s' "$obs_tuple"
+}
+
+fm_github_ctx_gate() {
+  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} recorded=${8:-}
+  local obs_tuple probe_target probe_out st
+  obs_tuple=$(fm_github_ctx_observe "$project" "$forge" "$selected_host" "$target_kind" "$target" "$capability" "$organization") || return $?
   if [ -n "$recorded" ] && [ "$recorded" = "$obs_tuple" ]; then
     printf '%s' "$obs_tuple"
     return 0
+  fi
+  if [ "$target_kind" = repository ]; then
+    probe_target=$target
+  else
+    probe_target=$organization
   fi
   # `st=$?` must be the FIRST statement of the else branch: after a whole
   # `if cmd; then ...; fi` with no else, `$?` is the if-statement's own status

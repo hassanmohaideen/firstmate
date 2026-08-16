@@ -76,6 +76,9 @@ SH
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:-/dev/null}"
+case "$*" in
+  get*--lease*) printf '%s\n' "${FM_FAKE_PANE_PATH:?FM_FAKE_PANE_PATH unset}" ;;
+esac
 exit 0
 SH
   chmod +x "$fakebin/treehouse"
@@ -124,7 +127,8 @@ run_settle_spawn() {
     FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
     FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
     FM_FAKE_WINDOW="$id" FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
-    FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" PATH="$FAKEBIN_DIR:$PATH" \
+    FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" FM_FAKE_PERSIST_DIVERGENCE="${FM_FAKE_PERSIST_DIVERGENCE:-0}" \
+    PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
 
@@ -185,7 +189,14 @@ SH
 #!/usr/bin/env bash
 case " $* " in
   *" fetch "*) printf '%s\n' "$*" >> "$FM_FAKE_GIT_LOG"; exit 0 ;;
+  *" config --worktree --unset-all remote.origin.url "*)
+    [ "${FM_FAKE_PERSIST_DIVERGENCE:-0}" != 1 ] || exit 1
+    ;;
   *" remote set-head origin --auto "*) exit 0 ;;
+  *" remote set-url origin "*)
+    printf '%s\n' "$*" >> "$FM_FAKE_GIT_LOG"
+    [ "${FM_FAKE_PERSIST_DIVERGENCE:-0}" != 1 ] || exit 0
+    ;;
 esac
 exec "$FM_REAL_GIT" "$@"
 SH
@@ -201,86 +212,60 @@ prepare_github_gate_case() {
   install_github_gate_stubs "$FAKEBIN_DIR"
 }
 
-test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch() {
+test_divergent_allocated_worktree_destination_is_reset_before_launch() {
   local rec id out status git_log gh_log send_log treehouse_log endpoint
-  id=allocated-github-divergent-z3
-  rec=$(make_settle_case allocated-github-divergent "$id" 0)
+  id=allocated-github-reset-z3
+  rec=$(make_settle_case allocated-github-reset "$id" 0)
   read_settle_record "$rec"
   prepare_github_gate_case
   $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
   $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
-  git_log="$TMP_ROOT/divergent-git.log"
-  gh_log="$TMP_ROOT/divergent-gh.log"
-  send_log="$TMP_ROOT/divergent-send.log"
-  treehouse_log="$TMP_ROOT/divergent-treehouse.log"
-  endpoint="$TMP_ROOT/divergent-endpoint"
+  git_log="$TMP_ROOT/reset-git.log"
+  gh_log="$TMP_ROOT/reset-gh.log"
+  send_log="$TMP_ROOT/reset-send.log"
+  treehouse_log="$TMP_ROOT/reset-treehouse.log"
+  endpoint="$TMP_ROOT/reset-endpoint"
   : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
 
   out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" run_settle_spawn "$id")
   status=$?
-  [ "$status" -ne 0 ] || fail "a divergent allocated worktree destination must block"
-  assert_contains "$out" "worker launch is waiting" "a divergent allocated worktree did not report a blocked launch"
-  [ ! -s "$git_log" ] || fail "a divergent allocated worktree fetched before destination verification"
-  assert_no_grep 'encode launch-brief' "$send_log" "a divergent allocated worktree started the worker"
-  [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "a divergent allocated worktree should only probe the selected project destination"
-  [ ! -e "$endpoint" ] || fail "a divergent allocated worktree left its task endpoint behind"
-  assert_grep "return --force $WT_DIR" "$treehouse_log" "a divergent allocated worktree was not returned after the block"
-  pass "a divergent allocated worktree destination blocks without leaving an endpoint or lease"
+  expect_code 0 "$status" "a divergent pooled destination should be reset and launch"
+  assert_contains "$out" "spawned $id" "the reset pooled worktree did not launch"
+  [ "$($REAL_GIT -C "$WT_DIR" remote get-url --push origin)" = https://github.com/owner/repo.git ] || fail "the pooled worktree did not inherit the verified primary destination"
+  assert_grep 'encode launch-brief' "$send_log" "the reset pooled worktree did not start the worker"
+  [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "resetting the pooled destination triggered a second GitHub probe"
+  assert_no_grep 'return --force' "$treehouse_log" "a launched pooled worktree was returned during spawn"
+  pass "a divergent pooled destination is reset before endpoint creation"
 }
 
-test_failed_endpoint_removal_retains_lease_and_recovery_record() {
+test_unverifiable_pool_reset_blocks_before_endpoint_creation() {
   local rec id out status git_log gh_log send_log treehouse_log endpoint
-  id=allocated-github-cleanup-failure-z4
-  rec=$(make_settle_case allocated-github-cleanup-failure "$id" 0)
+  id=allocated-github-reset-failure-z4
+  rec=$(make_settle_case allocated-github-reset-failure "$id" 0)
   read_settle_record "$rec"
   prepare_github_gate_case
   $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
   $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
-  git_log="$TMP_ROOT/cleanup-failure-git.log"
-  gh_log="$TMP_ROOT/cleanup-failure-gh.log"
-  send_log="$TMP_ROOT/cleanup-failure-send.log"
-  treehouse_log="$TMP_ROOT/cleanup-failure-treehouse.log"
-  endpoint="$TMP_ROOT/cleanup-failure-endpoint"
+  git_log="$TMP_ROOT/reset-failure-git.log"
+  gh_log="$TMP_ROOT/reset-failure-gh.log"
+  send_log="$TMP_ROOT/reset-failure-send.log"
+  treehouse_log="$TMP_ROOT/reset-failure-treehouse.log"
+  endpoint="$TMP_ROOT/reset-failure-endpoint"
   : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
 
-  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_KILL_FAIL=1 FM_FAKE_READ_FAIL=1 run_settle_spawn "$id")
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_PERSIST_DIVERGENCE=1 run_settle_spawn "$id")
   status=$?
-  [ "$status" -ne 0 ] || fail "a divergent allocated worktree destination must block when endpoint cleanup fails"
-  assert_contains "$out" "could not confirm removal of blocked task $id's endpoint" "unreadable endpoint cleanup failure was not reported"
-  assert_contains "$out" "endpoint_state=unreadable" "endpoint cleanup did not report its unreadable confirmation"
-  assert_contains "$out" "$WT_DIR" "endpoint cleanup failure did not name the retained worktree"
-  [ -e "$endpoint" ] || fail "the cleanup-failure fixture did not retain the endpoint"
-  assert_no_grep "return --force $WT_DIR" "$treehouse_log" "a worktree was returned while endpoint absence was unreadable"
-  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" "cleanup failure did not retain recoverable worktree metadata"
-  assert_grep 'gh_gated=1' "$HOME_DIR/state/$id.meta" "cleanup failure did not retain the gated classification"
-  pass "failed endpoint removal and unreadable liveness retain the lease and recovery record"
-}
-
-test_matching_allocated_worktree_destination_fast_paths_without_reprobe() {
-  local rec id out status git_log gh_log send_log
-  id=allocated-github-matching-z5
-  rec=$(make_settle_case allocated-github-matching "$id" 0)
-  read_settle_record "$rec"
-  prepare_github_gate_case
-  git_log="$TMP_ROOT/matching-git.log"
-  gh_log="$TMP_ROOT/matching-gh.log"
-  send_log="$TMP_ROOT/matching-send.log"
-  : > "$git_log"; : > "$gh_log"; : > "$send_log"
-
-  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" run_settle_spawn "$id")
-  status=$?
-  expect_code 0 "$status" "a matching allocated worktree should launch"
-  assert_contains "$out" "spawned $id" "a matching allocated worktree did not report success"
-  [ -s "$git_log" ] || fail "the matching allocated worktree did not proceed to refresh its base"
-  assert_grep 'encode launch-brief' "$send_log" "the matching allocated worktree did not start the worker"
-  [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "a matching allocated worktree triggered a second GitHub probe"
-  pass "a matching allocated worktree launches through the verified fast path"
+  [ "$status" -ne 0 ] || fail "an unverifiable pooled destination reset must block"
+  assert_contains "$out" "worker launch is waiting" "the unverifiable pooled reset did not report a blocked launch"
+  [ ! -e "$endpoint" ] || fail "the blocked pooled reset created an endpoint"
+  assert_no_grep 'encode launch-brief' "$send_log" "the blocked pooled reset started the worker"
+  assert_grep "return --force $WT_DIR" "$treehouse_log" "the blocked pre-endpoint allocation was not returned"
+  pass "an unverifiable pooled reset blocks before creating an endpoint"
 }
 
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
-test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch
-test_failed_endpoint_removal_retains_lease_and_recovery_record
-test_matching_allocated_worktree_destination_fast_paths_without_reprobe
+test_divergent_allocated_worktree_destination_is_reset_before_launch
+test_unverifiable_pool_reset_blocks_before_endpoint_creation
 
 echo "# all fm-spawn-worktree-settle tests passed"
