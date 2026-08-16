@@ -5,7 +5,7 @@ fm_github_remote_destination_url() {
   case "$capability" in
     push)
       if [ "$push_branch" = unknown ]; then
-        routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushRemote$' 2>/dev/null || true)
+        routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushremote$' 2>/dev/null || true)
         [ -z "$routes" ] || return 2
       else
         branch=$(git -C "$project" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
@@ -14,7 +14,7 @@ fm_github_remote_destination_url() {
           case "$routes" in *$'\n'*) return 2 ;; esac
           remote=$routes
         else
-          routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushRemote$' 2>/dev/null || true)
+          routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushremote$' 2>/dev/null || true)
           [ -z "$routes" ] || return 2
         fi
       fi

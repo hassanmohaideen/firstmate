@@ -236,6 +236,9 @@ case " $* " in
   *" config --worktree --unset-all remote.origin.url "*)
     [ "${FM_FAKE_PERSIST_DIVERGENCE:-0}" != 1 ] || exit 1
     ;;
+  *" config --worktree --unset-all branch."*)
+    [ "${FM_FAKE_PERSIST_BRANCH_ROUTE:-0}" != 1 ] || exit 1
+    ;;
   *" remote set-head origin --auto "*) exit 0 ;;
 esac
 exec "$FM_REAL_GIT" "$@"
@@ -262,6 +265,9 @@ test_divergent_allocated_worktree_destination_is_reset_before_launch() {
   $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
   $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
   $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.pushurl https://github.example/owner/repo.git
+  $REAL_GIT -C "$WT_DIR" config --worktree remote.pushDefault alternate
+  $REAL_GIT -C "$WT_DIR" config --worktree "branch.fm/$id.pushRemote" alternate
+  $REAL_GIT -C "$WT_DIR" config --worktree "branch.fm/$id.remote" alternate
   git_log="$TMP_ROOT/reset-git.log"
   gh_log="$TMP_ROOT/reset-gh.log"
   send_log="$TMP_ROOT/reset-send.log"
@@ -277,6 +283,9 @@ test_divergent_allocated_worktree_destination_is_reset_before_launch() {
   [ "$($REAL_GIT -C "$WT_DIR" remote get-url --push origin)" = https://github.com/owner/repo.git ] || fail "the pooled worktree did not inherit the verified primary push destination"
   [ "$($REAL_GIT -C "$PROJ_DIR" remote get-url origin)" = https://github.com/upstream/repo.git ] || fail "the pool reset changed the shared primary fetch URL"
   [ "$($REAL_GIT -C "$PROJ_DIR" remote get-url --push origin)" = https://github.com/owner/repo.git ] || fail "the pool reset changed the shared primary push URL"
+  [ -z "$($REAL_GIT -C "$WT_DIR" config --worktree --get remote.pushDefault 2>/dev/null || true)" ] || fail "the pool reset retained a worktree-specific push default"
+  [ -z "$($REAL_GIT -C "$WT_DIR" config --worktree --get "branch.fm/$id.pushRemote" 2>/dev/null || true)" ] || fail "the pool reset retained a future-branch push remote"
+  [ -z "$($REAL_GIT -C "$WT_DIR" config --worktree --get "branch.fm/$id.remote" 2>/dev/null || true)" ] || fail "the pool reset retained a future-branch tracking remote"
   assert_grep 'encode launch-brief' "$send_log" "the reset pooled worktree did not start the worker"
   [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "resetting the pooled destination triggered a second GitHub probe"
   assert_no_grep 'return --force' "$treehouse_log" "a launched pooled worktree was returned during spawn"
@@ -307,6 +316,31 @@ test_unverifiable_pool_reset_blocks_before_endpoint_creation() {
   assert_no_grep 'encode launch-brief' "$send_log" "the blocked pooled reset started the worker"
   assert_grep "return --force $WT_DIR" "$treehouse_log" "the blocked pre-endpoint allocation was not returned"
   pass "an unverifiable pooled reset blocks before creating an endpoint"
+}
+
+test_persistent_future_branch_route_blocks_before_endpoint_creation() {
+  local rec id out status git_log gh_log send_log treehouse_log endpoint
+  id=allocated-github-future-route-z9
+  rec=$(make_settle_case allocated-github-future-route "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
+  $REAL_GIT -C "$WT_DIR" config --worktree "branch.fm/$id.pushRemote" alternate
+  git_log="$TMP_ROOT/future-route-git.log"
+  gh_log="$TMP_ROOT/future-route-gh.log"
+  send_log="$TMP_ROOT/future-route-send.log"
+  treehouse_log="$TMP_ROOT/future-route-treehouse.log"
+  endpoint="$TMP_ROOT/future-route-endpoint"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_PERSIST_BRANCH_ROUTE=1 run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a persistent future-branch push route must block"
+  assert_contains "$out" "worker launch is waiting" "the persistent future-branch route did not report a blocked launch"
+  [ ! -e "$endpoint" ] || fail "the future-branch route block created an endpoint"
+  assert_no_grep 'encode launch-brief' "$send_log" "the future-branch route block started the worker"
+  assert_grep "return --force $WT_DIR" "$treehouse_log" "the blocked future-branch allocation was not returned"
+  pass "a persistent future-branch push route blocks before endpoint creation"
 }
 
 test_failed_pre_endpoint_lease_return_retains_recovery_record() {
@@ -434,6 +468,7 @@ test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
 test_divergent_allocated_worktree_destination_is_reset_before_launch
 test_unverifiable_pool_reset_blocks_before_endpoint_creation
+test_persistent_future_branch_route_blocks_before_endpoint_creation
 test_failed_pre_endpoint_lease_return_retains_recovery_record
 test_failed_endpoint_creation_retains_recoverable_lease
 test_unconfirmed_zellij_partial_endpoint_retains_lease_without_recovery_meta

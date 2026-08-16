@@ -1997,22 +1997,36 @@ herdr_projection_meta_field_exact() {  # <meta> <key>
 }
 
 reset_gated_pool_destination() {  # <worktree>
-  local worktree=$1 observed rc
+  local worktree=$1 observed rc routes key
   if [ "$(git -C "$worktree" config --bool extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
-    if git -C "$worktree" config --worktree --unset-all remote.origin.url 2>/dev/null; then
+    for key in remote.origin.url remote.origin.pushurl; do
+      if git -C "$worktree" config --worktree --unset-all "$key" 2>/dev/null; then
+        :
+      else
+        rc=$?
+        [ "$rc" -eq 5 ] || return 1
+      fi
+    done
+    if routes=$(git -C "$worktree" config --worktree --get-regexp '^(remote\.pushdefault|branch\..*\.(pushremote|remote))$' 2>/dev/null); then
       :
     else
       rc=$?
-      [ "$rc" -eq 5 ] || return 1
+      [ "$rc" -eq 1 ] || return 1
+      routes=
     fi
-    if git -C "$worktree" config --worktree --unset-all remote.origin.pushurl 2>/dev/null; then
-      :
-    else
-      rc=$?
-      [ "$rc" -eq 5 ] || return 1
-    fi
+    while read -r key _; do
+      [ -n "$key" ] || continue
+      if git -C "$worktree" config --worktree --unset-all "$key" 2>/dev/null; then
+        :
+      else
+        rc=$?
+        [ "$rc" -eq 5 ] || return 1
+      fi
+    done <<EOF
+$routes
+EOF
   fi
-  observed=$(fm_github_ctx_observe "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG") || return 1
+  observed=$(fm_github_ctx_observe "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" unknown) || return 1
   [ "$observed" = "$GH_VERIFIED_DEST" ]
 }
 

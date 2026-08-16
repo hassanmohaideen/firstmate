@@ -280,6 +280,12 @@ test_gate_observes_effective_push_routing() {
   local proj vt branch
   vt='github|github.com|repository|owner/repo|push'
 
+  proj=$(make_project gateunknownbranchpush https://github.com/owner/repo.git)
+  git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
+  git -C "$proj" config branch.future.pushRemote alternate
+  fm_github_ctx_intake "$proj" push '' '' unknown >/dev/null 2>&1
+  [ "$?" -eq 2 ] || fail "unknown future-branch intake must reject a branch push remote"
+
   proj=$(make_project gatepushdefault https://github.com/owner/repo.git)
   git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
   git -C "$proj" config remote.pushDefault alternate
