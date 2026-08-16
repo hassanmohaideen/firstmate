@@ -17,6 +17,7 @@ import argparse
 import ctypes
 import datetime as dt
 import errno
+import fcntl
 import grp
 import hashlib
 import json
@@ -222,6 +223,7 @@ class Credentials:
     zombie: bool = False
     exiting: bool = False
     supplementary_gids: tuple[int, ...] = ()
+    identity: str = ""
 
 
 class DarwinProcBSDInfo(ctypes.Structure):
@@ -263,6 +265,9 @@ class CredentialPlatform:
                 if ":" in line:
                     key, value = line.split(":", 1)
                     fields[key] = value.strip()
+            stat_payload = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            stat_fields = stat_payload[stat_payload.rfind(")") + 2:].split()
+            identity = stat_fields[19]
             uids = tuple(int(v) for v in fields["Uid"].split())
             gids = tuple(int(v) for v in fields["Gid"].split())
             supplementary_gids = tuple(int(v) for v in fields["Groups"].split())
@@ -270,6 +275,7 @@ class CredentialPlatform:
             return Credentials(
                 pid, uids, gids, int(fields.get("NoNewPrivs", "0")), caps,
                 fields.get("State", "").startswith("Z"), False, supplementary_gids,
+                identity,
             )
         except (KeyError, ValueError, OSError) as exc:
             raise InventoryError(f"could not inspect /proc/{pid}/status: {exc}") from exc
@@ -350,6 +356,7 @@ class CredentialPlatform:
                 # descendants can escape. Darwin may retain this state briefly
                 # after a credential-scoped KILL and waitpid.
                 exiting=bool(int(info.pbi_flags) & 0x4),
+                identity=f"{int(info.pbi_start_tvsec)}:{int(info.pbi_start_tvusec)}",
             )
         return result
 
@@ -400,6 +407,7 @@ class CredentialPlatform:
                 (int(info.pbi_rgid), int(info.pbi_gid), int(info.pbi_svgid), int(info.pbi_gid)),
                 zombie=int(info.pbi_status) == 5,
                 exiting=bool(int(info.pbi_flags) & 0x4),
+                identity=f"{int(info.pbi_start_tvsec)}:{int(info.pbi_start_tvusec)}",
             )
         return result
 
@@ -527,6 +535,8 @@ class Lease:
     uid: int
     gid: int
     path: pathlib.Path
+    owner_token: str
+    lock_fd: int
     quarantined: bool = False
 
 
@@ -537,6 +547,14 @@ class LeasePool:
         self._ensure_root_directory(self.directory)
         self.offset = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % (UID_MAX - UID_MIN + 1)
         self.allocated: set[int] = set()
+        owner = self.platform.pid_credentials(os.getpid())
+        if not owner.identity:
+            raise ContainmentError("credential lease owner has no stable process identity")
+        self.owner_pid = os.getpid()
+        self.owner_identity = owner.identity
+        self.owner_token = hashlib.sha256(
+            f"{self.owner_pid}:{self.owner_identity}:{seed}".encode()
+        ).hexdigest()
 
     @staticmethod
     def _ensure_root_directory(directory: pathlib.Path) -> None:
@@ -548,6 +566,66 @@ class LeasePool:
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
             raise ContainmentError("credential lease namespace is not root-owned")
         os.chmod(directory, 0o700)
+
+    def _sync_directory(self) -> None:
+        directory_fd = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _read_lock_fd(fd: int) -> dict[str, Any] | None:
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+                return None
+            if metadata.st_size > 4096:
+                return None
+            os.lseek(fd, 0, os.SEEK_SET)
+            value = json.loads(os.read(fd, 4097).decode("ascii"))
+            if not isinstance(value, dict):
+                return None
+            return value
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+
+    def _reclaim_stale_lock(self, path: pathlib.Path, uid: int) -> bool:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            return False
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                return False
+            value = self._read_lock_fd(fd)
+            if value is None or value.get("version") != 1 or value.get("uid") != uid:
+                return False
+            owner_pid = value.get("owner_pid")
+            owner_identity = value.get("owner_identity")
+            if not isinstance(owner_pid, int) or owner_pid <= 0 or not isinstance(owner_identity, str):
+                return False
+            try:
+                inventory = self.platform.inventory(deadline=time.monotonic() + 1.0)
+            except InventoryError:
+                return False
+            owner = inventory.get(owner_pid)
+            if owner is not None and (not owner.identity or owner.identity == owner_identity):
+                return False
+            path_metadata = path.lstat()
+            lock_metadata = os.fstat(fd)
+            if (path_metadata.st_dev, path_metadata.st_ino) != (lock_metadata.st_dev, lock_metadata.st_ino):
+                return False
+            path.unlink()
+            self._sync_directory()
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
 
     def acquire(self) -> Lease:
         width = UID_MAX - UID_MIN + 1
@@ -563,38 +641,56 @@ class LeasePool:
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
-                continue
-            with os.fdopen(fd, "w", encoding="ascii") as stream:
-                stream.write(f"pid={os.getpid()} uid={uid}\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-            # Re-prove after lock acquisition so another process cannot occupy it
-            # between the first inventory and the root-owned lease.
+                if not self._reclaim_stale_lock(path, uid):
+                    continue
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    continue
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            record = {
+                "version": 1,
+                "uid": uid,
+                "owner_pid": self.owner_pid,
+                "owner_identity": self.owner_identity,
+                "owner_token": self.owner_token,
+            }
+            payload = (json.dumps(record, sort_keys=True) + "\n").encode("ascii")
+            os.write(fd, payload)
+            os.fsync(fd)
+            self._sync_directory()
             if not self.platform.credential_absent(uid, uid):
                 path.unlink(missing_ok=True)
+                os.close(fd)
+                self._sync_directory()
                 continue
             self.allocated.add(uid)
-            return Lease(uid, uid, path)
+            return Lease(uid, uid, path, self.owner_token, fd)
         raise ContainmentError("no unused UID/GID is available in the qualified lease range")
 
     def retire(self, lease: Lease, quarantine: bool) -> None:
+        value = self._read_lock_fd(lease.lock_fd)
+        try:
+            path_metadata = lease.path.lstat()
+            lock_metadata = os.fstat(lease.lock_fd)
+        except OSError as exc:
+            raise ContainmentError(f"credential lease disappeared for uid {lease.uid}") from exc
+        if (
+            value is None
+            or value.get("owner_token") != lease.owner_token
+            or (path_metadata.st_dev, path_metadata.st_ino) != (lock_metadata.st_dev, lock_metadata.st_ino)
+        ):
+            raise ContainmentError(f"credential lease ownership changed for uid {lease.uid}")
         if quarantine:
             lease.quarantined = True
             target = lease.path.with_suffix(".quarantine")
             os.replace(lease.path, target)
             lease.path = target
         else:
-            lease.path.unlink(missing_ok=True)
-        directory_fd = os.open(self.directory, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            lease.path.unlink()
+        os.close(lease.lock_fd)
+        lease.lock_fd = -1
+        self._sync_directory()
 
     def finalize(self) -> None:
         pass
@@ -928,10 +1024,9 @@ class LaneExecutor:
             raise ContainmentError("required containment needs noninteractive uid 0 execution")
         self.platform = CredentialPlatform()
         self.platform.inventory()
-        scope = str(self.manifest.get("job_scope") or self.manifest["run_id"])
-        LeasePool._ensure_root_directory(LEASE_DIRECTORY_ROOT)
-        scope_directory = LEASE_DIRECTORY_ROOT / hashlib.sha256(scope.encode()).hexdigest()
-        self.lease_pool = LeasePool(self.platform, self.manifest["run_id"], scope_directory)
+        self.lease_pool = LeasePool(
+            self.platform, self.manifest["run_id"], LEASE_DIRECTORY_ROOT,
+        )
         try:
             self._qualify_host_primitives()
             for row in self.doc["scripts"]:
