@@ -166,7 +166,11 @@ calls_count() {
   jq 'length' "$1/fake-state/calls"
 }
 
-owner_file() {
+guard_file() {
+  printf '%s/.no-mistakes/.firstmate-review-ledger.guard\n' "$1"
+}
+
+legacy_owner_file() {
   printf '%s/.no-mistakes/firstmate-review-ledger.lock/owner.json\n' "$1"
 }
 
@@ -180,13 +184,14 @@ new_ready_case() {
   printf '%s\n' "$d"
 }
 
-seed_abandoned_owner() {
+# Deterministically make a holder acquire the kernel lock and then die, so the
+# kernel releases the lock exactly as an abandoned owner would. No sleeping and
+# no reliance on a naturally reused PID.
+crash_holding_owner() {
   local d=$1 rc
-  FM_NM_REVIEW_TEST_CRASH_AT=after-owner-publication \
-    run_driver "$d" audit-ready >/dev/null 2>&1
+  FM_NM_REVIEW_TEST_CRASH_HOLDING=1 run_driver "$d" audit-ready >/dev/null 2>&1
   rc=$?
-  [ "$rc" -ne 0 ] || fail "fixture owner did not die after publishing ownership"
-  [ -f "$(owner_file "$d")" ] || fail "dead fixture owner left no complete owner evidence"
+  [ "$rc" -ne 0 ] || fail "crash-holding fixture unexpectedly completed instead of dying under the lock"
 }
 
 wait_for_marker() {
@@ -544,10 +549,11 @@ test_concurrent_writers_are_serial_and_atomic() {
   pass "concurrent guarded writers serialize without corruption or duplicate invocation"
 }
 
-# The initiating trigger in the abandoned-owner regression is an audit process
-# dying after complete owner publication. The persisted owner record exposes the
-# defect, while the visible symptom is a later complete-history audit that cannot
-# establish readiness. A matching live owner is the proven contention path.
+# Single-owner exclusion is now proven only by the host kernel's advisory lock,
+# which is non-mintable and released the instant the owner exits. The initiating
+# trigger in the abandoned-owner regression is an owner that dies holding that
+# lock; the visible symptom used to be a later complete-history audit that could
+# never establish readiness. A matching live holder is the proven contention path.
 test_matching_live_owner_refuses() {
   local d p rc acquired release out
   d=$(new_ready_case live-owner)
@@ -558,74 +564,88 @@ test_matching_live_owner_refuses() {
     run_driver "$d" audit-ready >"$d/live-out" 2>&1) & p=$!
   wait_for_marker "$acquired" "$p"
   out=$(run_driver "$d" audit-ready 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "matching live ledger owner allowed concurrent audit access"
+  [ "$rc" -ne 0 ] || fail "a live kernel-lock holder allowed concurrent audit access"
   assert_contains "$out" 'live owner' "live-owner refusal did not identify active contention"
   printf 'release\n' > "$release"
-  wait "$p" || fail "original matching live owner did not finish normally"
-  pass "a matching live owner refuses concurrent ledger access"
+  wait "$p" || fail "original live holder did not finish normally"
+  pass "a live kernel-lock holder refuses concurrent ledger access"
 }
 
 test_dead_owner_recovers_and_audit_is_idempotent() {
   local d out
   d=$(new_ready_case dead-owner)
-  seed_abandoned_owner "$d"
+  crash_holding_owner "$d"
+  [ ! -e "$(legacy_owner_file "$d")" ] \
+    || fail "kernel-lock recovery unexpectedly created a forgeable owner artifact"
   out=$(run_driver "$d" audit-ready 2>&1) \
-    || fail "complete audit did not recover a positively dead owner: $out"
+    || fail "complete audit did not recover after the owner died holding the lock: $out"
   assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' \
     "recovered audit did not establish public readiness"
-  [ ! -e "$(owner_file "$d")" ] || fail "recovered audit left its owner metadata behind"
   run_driver "$d" audit-ready >/dev/null 2>&1 \
     || fail "recovered complete audit was not idempotent"
-  pass "a dead owner is recovered and complete readiness remains idempotent"
+  pass "an owner that died holding the lock is auto-recovered and readiness stays idempotent"
 }
 
-test_reused_pid_does_not_impersonate_dead_owner() {
-  local d owner unrelated_fifo unrelated out
-  d=$(new_ready_case reused-pid)
-  seed_abandoned_owner "$d"
-  owner=$(owner_file "$d")
-  unrelated_fifo="$d/unrelated-release"
-  mkfifo "$unrelated_fifo"
-  (IFS= read -r _ < "$unrelated_fifo") & unrelated=$!
-  jq --argjson pid "$unrelated" '.pid = $pid | .process.start = "deterministic-dead-incarnation"' \
-    "$owner" > "$owner.tmp"
-  mv "$owner.tmp" "$owner"
-  out=$(run_driver "$d" audit-ready 2>&1) \
-    || fail "unrelated live process with a reused PID blocked abandoned-owner recovery: $out"
-  printf 'release\n' > "$unrelated_fifo"
-  wait "$unrelated" || fail "unrelated PID fixture did not exit normally"
-  assert_contains "$out" 'ready:' "PID-reuse recovery did not complete the public audit"
-  pass "an unrelated live process cannot impersonate a dead owner through PID reuse"
+# The kernel lock is the only proof of ownership, so a forged on-disk ownership
+# artifact can neither impersonate a dead owner (PID reuse) nor grant entry past
+# a live holder.
+test_forged_capability_cannot_impersonate_or_grant() {
+  local d owner fifo pid out rc release acquired p
+  d=$(new_ready_case forged-live-pid)
+  crash_holding_owner "$d"
+  owner=$(legacy_owner_file "$d")
+  fifo="$d/unrelated-release"
+  mkfifo "$fifo"
+  (IFS= read -r _ < "$fifo") & pid=$!
+  mkdir -p "${owner%/*}"
+  jq -cn --argjson pid "$pid" \
+    '{version:1,token:"forged-token",pid:$pid,host:{os:"fixture",node:"fixture",boot:"fixture"},process:{kind:"fixture",start:"forged-start"}}' \
+    > "$owner"
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  printf 'release\n' > "$fifo"
+  wait "$pid" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "a forged ownership artifact bearing a live PID blocked recovery: $out"
+  assert_contains "$out" 'ready:' "forged live-PID artifact prevented the public audit"
+
+  d=$(new_ready_case forged-grant)
+  release="$d/holder-release"
+  acquired="$d/holder-acquired"
+  mkfifo "$release"
+  (FM_NM_REVIEW_TEST_ACQUIRED="$acquired" FM_NM_REVIEW_TEST_HOLD_FIFO="$release" \
+    run_driver "$d" audit-ready >"$d/holder-out" 2>&1) & p=$!
+  wait_for_marker "$acquired" "$p"
+  owner=$(legacy_owner_file "$d")
+  mkdir -p "${owner%/*}"
+  printf '%s\n' '{"forged":"released"}' > "$owner"
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a forged artifact granted concurrent entry past a live kernel-lock holder"
+  assert_contains "$out" 'live owner' "forged-grant refusal did not identify the live holder"
+  printf 'release\n' > "$release"
+  wait "$p" || fail "genuine kernel-lock holder did not finish after release"
+  pass "a forged ownership artifact can neither impersonate a dead owner nor grant entry past a live one"
 }
 
-test_ambiguous_owner_evidence_refuses() {
-  local d owner out rc variant
-  for variant in malformed partial unreadable unsupported foreign missing legacy; do
-    d=$(new_ready_case "owner-$variant")
-    seed_abandoned_owner "$d"
-    owner=$(owner_file "$d")
-    case "$variant" in
-      malformed) printf '%s\n' '{not-json' > "$owner" ;;
-      partial) jq 'del(.process.start)' "$owner" > "$owner.tmp" && mv "$owner.tmp" "$owner" ;;
-      unreadable) chmod 000 "$owner" ;;
-      unsupported) jq '.process.kind = "unsupported-fixture-kind"' "$owner" > "$owner.tmp" && mv "$owner.tmp" "$owner" ;;
-      foreign) jq '.host.boot = "another-host-or-boot"' "$owner" > "$owner.tmp" && mv "$owner.tmp" "$owner" ;;
-      missing) rm -f "$owner" "${owner%/*}/format" ;;
-      legacy) rm -f "$owner"; printf '25299\n' > "${owner%/*}/pid" ;;
-    esac
-    out=$(run_driver "$d" audit-ready 2>&1); rc=$?
-    [ "$rc" -ne 0 ] || fail "$variant owner evidence was guessed to be abandoned"
-    assert_contains "$out" 'REFUSED:' "$variant owner evidence lacked a red refusal diagnostic"
-    assert_not_contains "$out" 'ready:' "$variant owner evidence visibly authorized readiness"
-    chmod 600 "$owner" 2>/dev/null || true
-  done
-  pass "missing, malformed, partial, unreadable, unsupported, foreign, and legacy owner evidence refuse"
+test_unsupported_lock_primitive_refuses() {
+  local d out rc f
+  d=$(new_case no-locker)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  out=$(FM_NM_REVIEW_TEST_NO_LOCKER=1 run_driver "$d" respond --approve accepted 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "response proceeded without a kernel lock primitive"
+  assert_contains "$out" 'REFUSED:' "unavailable lock primitive lacked a red refusal diagnostic"
+  assert_contains "$out" 'without single-owner exclusion' "unavailable lock refusal was not actionable"
+  [ ! -e "$(ledger "$d")" ] || fail "unavailable lock primitive still mutated the ledger"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "unavailable lock primitive still invoked no-mistakes"
+  out=$(FM_NM_REVIEW_TEST_NO_LOCKER=1 run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "audit proceeded without a kernel lock primitive"
+  assert_contains "$out" 'without single-owner exclusion' "unavailable lock audit refusal was not actionable"
+  pass "an unavailable or unsupported kernel lock primitive refuses closed without mutation"
 }
 
 test_two_reclaimers_converge_to_one_owner() {
   local d release acquired p1 p2 r1 r2 spins=0 owner_count
   d=$(new_ready_case reclaim-race)
-  seed_abandoned_owner "$d"
+  crash_holding_owner "$d"
   release="$d/reclaimer-release"
   acquired="$d/reclaimer-acquired"
   mkfifo "$release"
@@ -635,12 +655,12 @@ test_two_reclaimers_converge_to_one_owner() {
     run_driver "$d" audit-ready >"$d/reclaim2" 2>&1) & p2=$!
   while [ ! -s "$acquired" ] || ! grep -q 'live owner' "$d/reclaim1" "$d/reclaim2" 2>/dev/null; do
     kill -0 "$p1" 2>/dev/null || kill -0 "$p2" 2>/dev/null \
-      || fail "both reclaimers exited before abandoned-owner election converged"
+      || fail "both reclaimers exited before the kernel-lock election converged"
     spins=$((spins + 1))
     [ "$spins" -lt 1000000 ] || fail "simultaneous reclaimers did not converge"
   done
   owner_count=$(wc -l < "$acquired" | tr -d '[:space:]')
-  [ "$owner_count" -eq 1 ] || fail "simultaneous reclaimers published split ownership"
+  [ "$owner_count" -eq 1 ] || fail "simultaneous reclaimers both entered the guarded section"
   printf 'release\n' > "$release"
   wait "$p1"; r1=$?
   wait "$p2"; r2=$?
@@ -648,65 +668,57 @@ test_two_reclaimers_converge_to_one_owner() {
     || fail "simultaneous reclaimers did not produce exactly one winner"
   run_driver "$d" audit-ready >/dev/null 2>&1 \
     || fail "safe losing reclaimer could not retry after the winner released"
-  pass "simultaneous reclaimers produce one owner and one safe retry"
+  pass "simultaneous reclaimers converge to one kernel-lock owner and one safe retry"
 }
 
-test_crash_before_publication_is_recoverable() {
-  local d rc out old_token
-  d=$(new_ready_case prepublication-crash)
-  FM_NM_REVIEW_TEST_CRASH_AT=before-owner-publication \
-    run_driver "$d" audit-ready >/dev/null 2>&1
-  rc=$?
-  [ "$rc" -ne 0 ] || fail "prepublication crash fixture unexpectedly completed"
-  [ ! -e "$(owner_file "$d")" ] \
-    || fail "prepublication crash exposed partial metadata as a valid owner"
+test_crash_while_holding_leaves_no_owner_and_recovers() {
+  local d out
+  d=$(new_ready_case holding-crash)
+  crash_holding_owner "$d"
+  [ ! -e "$(legacy_owner_file "$d")" ] \
+    || fail "a crash under the lock exposed a partial forgeable ownership artifact"
+  crash_holding_owner "$d"
   out=$(run_driver "$d" audit-ready 2>&1) \
-    || fail "prepublication crash was not recoverable: $out"
-  assert_contains "$out" 'ready:' "recovered prepublication crash did not complete its audit"
-
-  d=$(new_ready_case reclaimer-publication-crash)
-  seed_abandoned_owner "$d"
-  old_token=$(jq -r '.token' "$(owner_file "$d")")
-  FM_NM_REVIEW_TEST_CRASH_AT=before-owner-publication \
-    run_driver "$d" audit-ready >/dev/null 2>&1
-  rc=$?
-  [ "$rc" -ne 0 ] || fail "reclaimer publication crash fixture unexpectedly completed"
-  [ "$(jq -r '.token' "$(owner_file "$d")")" = "$old_token" ] \
-    || fail "dying reclaimer destroyed the recoverable prior owner evidence"
-  run_driver "$d" audit-ready >/dev/null 2>&1 \
-    || fail "a reclaimer death during takeover was not recoverable"
-  pass "original and reclaiming crashes before publication preserve recoverable ownership"
+    || fail "repeated crash-while-holding was not recoverable: $out"
+  assert_contains "$out" 'ready:' "recovered audit after repeated crashes did not complete"
+  pass "a crash while holding the lock leaves no ownership artifact and stays recoverable"
 }
 
-test_cleanup_cannot_remove_successor_owner() {
-  local d cleanup_release cleanup_at p1 out rc first_token successor_release successor_at p2 successor_token
-  d=$(new_ready_case cleanup-incarnation)
-  cleanup_release="$d/cleanup-release"
-  cleanup_at="$d/cleanup-at"
-  mkfifo "$cleanup_release"
-  (FM_NM_REVIEW_TEST_CLEANUP_AT="$cleanup_at" FM_NM_REVIEW_TEST_CLEANUP_FIFO="$cleanup_release" \
-    run_driver "$d" audit-ready >"$d/cleanup-owner" 2>&1) & p1=$!
-  wait_for_marker "$cleanup_at" "$p1"
-  first_token=$(jq -r '.token' "$(owner_file "$d")")
-  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "successor entered while old-owner cleanup still held exclusion"
-  assert_contains "$out" 'live owner' "cleanup overlap did not safely refuse the early successor"
-  printf 'release\n' > "$cleanup_release"
-  wait "$p1" || fail "old owner cleanup did not finish"
+test_old_owner_exit_never_removes_guard_lock() {
+  local d guard sentinel p release acquired
+  d=$(new_ready_case guard-persistence)
+  guard=$(guard_file "$d")
+  run_driver "$d" audit-ready >/dev/null 2>&1 || fail "uncontended audit failed"
+  [ -f "$guard" ] || fail "a normal owner exit removed the shared guard lock file"
+  # Mark the file so an unlink-and-recreate by any exit path is detectable: the
+  # driver only creates the guard when absent and never rewrites its contents.
+  sentinel="old-owner-guard-marker"
+  printf '%s\n' "$sentinel" > "$guard"
+  release="$d/succ-release"
+  acquired="$d/succ-acquired"
+  mkfifo "$release"
+  (FM_NM_REVIEW_TEST_ACQUIRED="$acquired" FM_NM_REVIEW_TEST_HOLD_FIFO="$release" \
+    run_driver "$d" audit-ready >"$d/succ-out" 2>&1) & p=$!
+  wait_for_marker "$acquired" "$p"
+  [ -f "$guard" ] || fail "the guard lock file vanished while a successor held it"
+  grep -q "$sentinel" "$guard" \
+    || fail "the successor locked a recreated guard file, not the prior owner's"
+  printf 'release\n' > "$release"
+  wait "$p" || fail "successor audit did not complete"
+  [ -f "$guard" ] || fail "successor exit removed the shared guard lock file"
+  grep -q "$sentinel" "$guard" || fail "an owner exit unlinked and recreated the guard lock file"
+  pass "no owner exit or cleanup ever removes the shared kernel guard lock"
+}
 
-  successor_release="$d/successor-release"
-  successor_at="$d/successor-at"
-  mkfifo "$successor_release"
-  (FM_NM_REVIEW_TEST_ACQUIRED="$successor_at" FM_NM_REVIEW_TEST_HOLD_FIFO="$successor_release" \
-    run_driver "$d" audit-ready >"$d/successor" 2>&1) & p2=$!
-  wait_for_marker "$successor_at" "$p2"
-  successor_token=$(jq -r '.token' "$(owner_file "$d")")
-  [ "$successor_token" != "$first_token" ] || fail "successor reused the old owner's incarnation token"
-  [ -f "$(owner_file "$d")" ] || fail "old-owner cleanup removed successor ownership"
-  printf 'release\n' > "$successor_release"
-  wait "$p2" || fail "successor audit did not complete"
-  [ ! -e "$(owner_file "$d")" ] || fail "successor did not release its own owner metadata"
-  pass "old-owner cleanup cannot overlap or remove a successor incarnation"
+test_normal_uncontended_acquire_and_release() {
+  local d out
+  d=$(new_ready_case uncontended)
+  out=$(run_driver "$d" audit-ready 2>&1) || fail "uncontended audit failed: $out"
+  assert_contains "$out" 'ready:' "uncontended audit did not report readiness"
+  run_driver "$d" audit-ready >/dev/null 2>&1 \
+    || fail "lock was not released after a normal uncontended audit"
+  [ -f "$(guard_file "$d")" ] || fail "normal release removed the shared guard lock file"
+  pass "normal uncontended acquisition releases the lock for the next owner"
 }
 
 test_all_findings_fixed_and_audited_ready
@@ -726,8 +738,9 @@ test_duplicate_replay_and_underlying_failure
 test_concurrent_writers_are_serial_and_atomic
 test_matching_live_owner_refuses
 test_dead_owner_recovers_and_audit_is_idempotent
-test_reused_pid_does_not_impersonate_dead_owner
-test_ambiguous_owner_evidence_refuses
+test_forged_capability_cannot_impersonate_or_grant
+test_unsupported_lock_primitive_refuses
 test_two_reclaimers_converge_to_one_owner
-test_crash_before_publication_is_recoverable
-test_cleanup_cannot_remove_successor_owner
+test_crash_while_holding_leaves_no_owner_and_recovers
+test_old_owner_exit_never_removes_guard_lock
+test_normal_uncontended_acquire_and_release

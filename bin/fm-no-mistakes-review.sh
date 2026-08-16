@@ -50,17 +50,18 @@
 # it becomes fixed_and_confirmed only when the exact finding object does not
 # survive unchanged into that result.
 #
-# The ledger lock uses the host kernel's nonblocking advisory lock for exact
-# single-owner exclusion and a private sibling owner record for crash recovery.
-# The immutable version-1 owner record binds a random incarnation token, PID,
-# host, boot, process-identity kind, and process start identity. It is published
-# by atomic rename only after it is complete. A later invocation reclaims it
-# only when the same host and boot can positively prove that exact process is
-# gone or that its PID now names a different process. Foreign, missing,
-# malformed, partial, unreadable, or unsupported owner evidence is refused.
-# Kernel lock lifetime prevents takeover and cleanup ABA races; cleanup removes
-# owner metadata only when its exact incarnation token still matches.
-# Every ledger write is a same-directory atomic rename.
+# Single-owner exclusion is proven solely by the host kernel's nonblocking
+# advisory lock (flock on Linux, lockf on macOS/BSD) held for the entire guarded
+# invocation. That proof is non-mintable: a contender cannot forge holding the
+# lock, and the kernel releases it the instant the owning process exits for any
+# reason, so a crashed owner never wedges the ledger. No PID, incarnation token,
+# or on-disk owner record is consulted, so no forgeable ownership capability
+# exists and PID reuse cannot impersonate a past owner. A concurrent invocation
+# that cannot take the lock refuses and retries rather than entering, and if the
+# kernel lock primitive is unavailable or unsupported the command refuses with a
+# red diagnostic instead of proceeding without exclusion.
+# Every ledger write is a same-directory atomic rename, so a crash mid-write
+# leaves the ledger at its prior or next complete state, never a partial one.
 # A repeated or concurrent response never invokes the underlying CLI twice:
 # once a disposition request exists, replay is refused and audit-ready performs
 # any later public-evidence reconciliation.
@@ -82,24 +83,16 @@
 # Refusals exit nonzero and begin "fm-no-mistakes-review.sh: REFUSED:" on stderr.
 #
 # Environment used by hermetic tests only:
-#   FM_NM_REVIEW_STATE_DIR        overrides the ledger directory.
-#   FM_NM_REVIEW_TEST_CRASH_AT    kills the owner before or after publication.
-#   FM_NM_REVIEW_TEST_ACQUIRED    receives a marker after owner publication.
-#   FM_NM_REVIEW_TEST_HOLD_FIFO   blocks a published owner on a fixture FIFO.
-#   FM_NM_REVIEW_TEST_CLEANUP_AT  receives a marker before token-bound cleanup.
-#   FM_NM_REVIEW_TEST_CLEANUP_FIFO blocks cleanup on a fixture FIFO.
+#   FM_NM_REVIEW_STATE_DIR           overrides the ledger directory.
+#   FM_NM_REVIEW_TEST_ACQUIRED       appends this PID once the kernel lock is held.
+#   FM_NM_REVIEW_TEST_HOLD_FIFO      blocks the lock holder on a fixture FIFO.
+#   FM_NM_REVIEW_TEST_CRASH_HOLDING  kills the holder just after it takes the lock.
+#   FM_NM_REVIEW_TEST_NO_LOCKER      simulates an unavailable kernel lock primitive.
 set -eu
 
 SCRIPT_NAME=${0##*/}
 NM=${FM_NO_MISTAKES_BIN:-no-mistakes}
-LOCK_HELD=0
-LOCK_DIR=
 LOCK_GUARD=
-LOCK_OWNER=
-LOCK_FORMAT=
-LOCK_TOKEN=
-OWNER_TMP=
-LOCK_INIT_TMP=
 WORK_FILE=
 MODEL_FILE=
 CAPTURE_STATUS=
@@ -130,33 +123,13 @@ die() {
 }
 
 cleanup() {
-  local cleanup_token=
-  local cleanup_failed=0
-  [ -n "$WORK_FILE" ] && rm -f "$WORK_FILE"
-  [ -n "$MODEL_FILE" ] && rm -f "$MODEL_FILE"
-  [ -n "$OWNER_TMP" ] && rm -f "$OWNER_TMP"
-  [ -n "$LOCK_INIT_TMP" ] && rm -rf "$LOCK_INIT_TMP"
-  if [ "$LOCK_HELD" -eq 1 ] && [ -n "$LOCK_OWNER" ]; then
-    if [ -n "${FM_NM_REVIEW_TEST_CLEANUP_AT:-}" ]; then
-      printf '%s\n' "$$" > "$FM_NM_REVIEW_TEST_CLEANUP_AT"
-    fi
-    if [ -n "${FM_NM_REVIEW_TEST_CLEANUP_FIFO:-}" ]; then
-      IFS= read -r _cleanup_release < "$FM_NM_REVIEW_TEST_CLEANUP_FIFO" || true
-    fi
-    if [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ]; then
-      cleanup_token=$(jq -r 'if .version == 1 and (.token | type) == "string" then .token else empty end' \
-        "$LOCK_OWNER" 2>/dev/null || true)
-    fi
-    if [ "$cleanup_token" = "$LOCK_TOKEN" ]; then
-      rm -f "$LOCK_OWNER" || cleanup_failed=1
-    else
-      printf '%s: REFUSED: owner incarnation changed before cleanup; successor metadata was preserved\n' \
-        "$SCRIPT_NAME" >&2
-      cleanup_failed=1
-    fi
-  fi
-  LOCK_HELD=0
-  return "$cleanup_failed"
+  # The kernel advisory lock is released automatically when this process exits,
+  # so cleanup only removes this invocation's private temporary work files. It
+  # never touches the shared guard file or any ownership artifact, so an exiting
+  # or crashing owner can never remove a successor's lock.
+  [ -z "$WORK_FILE" ] || rm -f "$WORK_FILE"
+  [ -z "$MODEL_FILE" ] || rm -f "$MODEL_FILE"
+  return 0
 }
 
 finish() {
@@ -305,209 +278,20 @@ validate_selection() {
   SELECTED_JSON=$selected
 }
 
-load_system_identity() {
-  local boot_raw boot_sec boot_usec
-  SYSTEM_OS=$(uname -s 2>/dev/null) || die "cannot identify the host operating system for review-ledger ownership"
-  SYSTEM_NODE=$(uname -n 2>/dev/null) || die "cannot identify the host node for review-ledger ownership"
-  [ -n "$SYSTEM_NODE" ] && [ "${#SYSTEM_NODE}" -le 255 ] \
-    || die "host node identity is empty or unreasonably large"
-  case "$SYSTEM_OS" in
-    Linux)
-      [ -r /proc/sys/kernel/random/boot_id ] \
-        || die "Linux boot identity is unavailable; safe review-ledger ownership is unsupported"
-      SYSTEM_BOOT=$(cat /proc/sys/kernel/random/boot_id)
-      printf '%s' "$SYSTEM_BOOT" | grep -Eq '^[0-9A-Fa-f-]{16,64}$' \
-        || die "Linux boot identity is malformed; safe review-ledger ownership is unsupported"
-      SYSTEM_PROCESS_KIND=linux-proc-starttime-v1
-      ;;
-    Darwin)
-      command -v sysctl >/dev/null 2>&1 \
-        || die "sysctl is unavailable; safe macOS review-ledger ownership is unsupported"
-      boot_raw=$(sysctl -n kern.boottime 2>/dev/null) \
-        || die "macOS boot identity is unavailable; safe review-ledger ownership is unsupported"
-      boot_sec=$(printf '%s\n' "$boot_raw" | sed -n 's/.*sec = \([0-9][0-9]*\).*/\1/p')
-      boot_usec=$(printf '%s\n' "$boot_raw" | sed -n 's/.*usec = \([0-9][0-9]*\).*/\1/p')
-      [ -n "$boot_sec" ] && [ -n "$boot_usec" ] \
-        || die "macOS boot identity is malformed; safe review-ledger ownership is unsupported"
-      SYSTEM_BOOT="darwin-$boot_sec-$boot_usec"
-      SYSTEM_PROCESS_KIND=darwin-ps-lstart-v1
-      ;;
-    *) die "safe review-ledger ownership is unsupported on $SYSTEM_OS" ;;
-  esac
-}
-
-snapshot_process() {
-  local pid=$1 stat_line start
-  PROCESS_STATE=ambiguous
-  PROCESS_START=
-  case "$SYSTEM_PROCESS_KIND" in
-    linux-proc-starttime-v1)
-      if [ -r "/proc/$pid/stat" ]; then
-        stat_line=$(cat "/proc/$pid/stat" 2>/dev/null) || return 0
-        start=${stat_line##*) }
-        start=$(printf '%s\n' "$start" | awk '{print $20}')
-        if printf '%s' "$start" | grep -Eq '^[0-9]+$'; then
-          PROCESS_STATE=live
-          PROCESS_START=$start
-        fi
-      elif ! ps -p "$pid" -o pid= 2>/dev/null | grep -Eq '[0-9]'; then
-        PROCESS_STATE=dead
-      fi
-      ;;
-    darwin-ps-lstart-v1)
-      start=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null || true)
-      start=${start#"${start%%[![:space:]]*}"}
-      start=${start%"${start##*[![:space:]]}"}
-      if [ -n "$start" ]; then
-        PROCESS_STATE=live
-        PROCESS_START=$start
-      elif ! ps -p "$pid" -o pid= 2>/dev/null | grep -Eq '[0-9]'; then
-        PROCESS_STATE=dead
-      fi
-      ;;
-    *) PROCESS_STATE=unsupported ;;
-  esac
-}
-
-validate_owner_record() {
-  local bytes owner_version owner_pid owner_os owner_node owner_boot owner_kind owner_start
-  [ -e "$LOCK_OWNER" ] || return 1
-  [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] \
-    || die "review-ledger owner evidence is not a regular private file"
-  [ -r "$LOCK_OWNER" ] || die "review-ledger owner evidence is unreadable"
-  bytes=$(wc -c < "$LOCK_OWNER" | tr -d '[:space:]')
-  case "$bytes" in ''|*[!0-9]*) die "review-ledger owner evidence size is unavailable" ;; esac
-  [ "$bytes" -gt 0 ] && [ "$bytes" -le 4096 ] \
-    || die "review-ledger owner evidence is empty or exceeds 4096 bytes"
-  jq -e '
-    .version == 1
-    and (.token | type) == "string" and (.token | test("^[A-Za-z0-9._-]{1,128}$"))
-    and (.pid | type) == "number" and .pid == (.pid | floor) and .pid > 1
-    and (.host | type) == "object"
-    and (.host.os | type) == "string" and (.host.os | length) > 0 and (.host.os | length) <= 32
-    and (.host.node | type) == "string" and (.host.node | length) > 0 and (.host.node | length) <= 255
-    and (.host.boot | type) == "string" and (.host.boot | length) > 0 and (.host.boot | length) <= 128
-    and (.process | type) == "object"
-    and (.process.kind | type) == "string" and (.process.kind | length) > 0 and (.process.kind | length) <= 64
-    and (.process.start | type) == "string" and (.process.start | length) > 0 and (.process.start | length) <= 256
-    and ((keys | sort) == ["host","pid","process","token","version"])
-    and ((.host | keys | sort) == ["boot","node","os"])
-    and ((.process | keys | sort) == ["kind","start"])
-  ' "$LOCK_OWNER" >/dev/null 2>&1 \
-    || die "review-ledger owner evidence is malformed, partial, or unsupported"
-  owner_version=$(jq -r '.version' "$LOCK_OWNER")
-  owner_pid=$(jq -r '.pid' "$LOCK_OWNER")
-  owner_os=$(jq -r '.host.os' "$LOCK_OWNER")
-  owner_node=$(jq -r '.host.node' "$LOCK_OWNER")
-  owner_boot=$(jq -r '.host.boot' "$LOCK_OWNER")
-  owner_kind=$(jq -r '.process.kind' "$LOCK_OWNER")
-  owner_start=$(jq -r '.process.start' "$LOCK_OWNER")
-  [ "$owner_version" = 1 ] || die "review-ledger owner evidence version is unsupported"
-  if [ "$owner_os" != "$SYSTEM_OS" ] || [ "$owner_node" != "$SYSTEM_NODE" ] \
-    || [ "$owner_boot" != "$SYSTEM_BOOT" ]; then
-    die "review-ledger owner belongs to another host or boot; abandonment cannot be proven locally"
-  fi
-  [ "$owner_kind" = "$SYSTEM_PROCESS_KIND" ] \
-    || die "review-ledger process identity kind is unsupported on this host"
-  snapshot_process "$owner_pid"
-  case "$PROCESS_STATE" in
-    dead) return 0 ;;
-    live)
-      if [ "$PROCESS_START" = "$owner_start" ]; then
-        die "review-ledger owner PID $owner_pid still matches a live process; refusing takeover"
-      fi
-      return 0
-      ;;
-    *) die "review-ledger owner PID $owner_pid cannot be identified unambiguously; refusing takeover" ;;
-  esac
-}
-
-remove_unpublished_owner_files() {
-  local entry base unexpected=0 format_value
-  [ -f "$LOCK_FORMAT" ] && [ ! -L "$LOCK_FORMAT" ] && [ -r "$LOCK_FORMAT" ] \
-    || die "review-ledger lock has missing or unreadable format evidence"
-  format_value=$(cat "$LOCK_FORMAT" 2>/dev/null) \
-    || die "review-ledger lock format evidence is unreadable"
-  [ "$format_value" = 1 ] \
-    || die "review-ledger lock format evidence is malformed or unsupported"
-  for entry in "$LOCK_DIR"/.[!.]* "$LOCK_DIR"/..?* "$LOCK_DIR"/*; do
-    [ -e "$entry" ] || [ -L "$entry" ] || continue
-    base=${entry##*/}
-    case "$base" in
-      .owner-publish.*) rm -f "$entry" || die "cannot remove abandoned unpublished owner metadata" ;;
-      format|owner.json) ;;
-      *) unexpected=1 ;;
-    esac
-  done
-  [ "$unexpected" -eq 0 ] \
-    || die "review-ledger lock contains missing, legacy, or unsupported ownership evidence"
-}
-
-initialize_lock_directory() {
-  local entry
-  if [ -e "$LOCK_DIR" ]; then
-    return
-  fi
-  for entry in "$STATE_DIR"/.firstmate-review-lock-init.*; do
-    [ -e "$entry" ] || [ -L "$entry" ] || continue
-    rm -rf "$entry" || die "cannot remove abandoned lock initialization state"
-  done
-  LOCK_INIT_TMP=$(mktemp -d "$STATE_DIR/.firstmate-review-lock-init.XXXXXXXX") \
-    || die "cannot allocate private review-ledger lock initialization"
-  chmod 700 "$LOCK_INIT_TMP" || die "cannot make lock initialization private"
-  printf '1\n' > "$LOCK_INIT_TMP/format" \
-    || die "cannot publish review-ledger lock format evidence"
-  chmod 600 "$LOCK_INIT_TMP/format" || die "cannot make lock format evidence private"
-  mv "$LOCK_INIT_TMP" "$LOCK_DIR" || die "cannot publish review-ledger lock directory atomically"
-  LOCK_INIT_TMP=
-}
-
-publish_owner_record() {
-  snapshot_process "$$"
-  [ "$PROCESS_STATE" = live ] && [ -n "$PROCESS_START" ] \
-    || die "cannot capture the creating process identity for review-ledger ownership"
-  OWNER_TMP=$(mktemp "$LOCK_DIR/.owner-publish.XXXXXXXX") \
-    || die "cannot allocate private owner metadata"
-  chmod 600 "$OWNER_TMP" || die "cannot make owner metadata private"
-  LOCK_TOKEN="$$-${OWNER_TMP##*.owner-publish.}"
-  jq -n --arg token "$LOCK_TOKEN" --argjson pid "$$" \
-    --arg os "$SYSTEM_OS" --arg node "$SYSTEM_NODE" --arg boot "$SYSTEM_BOOT" \
-    --arg kind "$SYSTEM_PROCESS_KIND" --arg start "$PROCESS_START" \
-    '{version:1,token:$token,pid:$pid,host:{os:$os,node:$node,boot:$boot},process:{kind:$kind,start:$start}}' \
-    > "$OWNER_TMP" || die "cannot write complete owner metadata"
-  if [ "${FM_NM_REVIEW_TEST_CRASH_AT:-}" = before-owner-publication ]; then
-    kill -KILL "$$"
-  fi
-  mv "$OWNER_TMP" "$LOCK_OWNER" || die "cannot publish owner metadata atomically"
-  OWNER_TMP=
-  LOCK_HELD=1
+review_lock_held_hooks() {
+  # Deterministic seams for hermetic concurrency and crash fixtures. They fire
+  # only once the kernel advisory lock is already held by this process, so a test
+  # can observe acquisition, hold the lock open, or kill the holder without any
+  # sleeping or reliance on a naturally reused PID.
   if [ -n "${FM_NM_REVIEW_TEST_ACQUIRED:-}" ]; then
-    printf '%s\n' "$$" > "$FM_NM_REVIEW_TEST_ACQUIRED"
+    printf '%s\n' "$$" >> "$FM_NM_REVIEW_TEST_ACQUIRED"
   fi
-  if [ "${FM_NM_REVIEW_TEST_CRASH_AT:-}" = after-owner-publication ]; then
+  if [ "${FM_NM_REVIEW_TEST_CRASH_HOLDING:-}" = 1 ]; then
     kill -KILL "$$"
   fi
   if [ -n "${FM_NM_REVIEW_TEST_HOLD_FIFO:-}" ]; then
-    IFS= read -r _lock_release < "$FM_NM_REVIEW_TEST_HOLD_FIFO" || true
+    IFS= read -r _held_release < "$FM_NM_REVIEW_TEST_HOLD_FIFO" || true
   fi
-}
-
-acquire_lock() {
-  umask 077
-  mkdir -p "$STATE_DIR"
-  LOCK_DIR="$STATE_DIR/firstmate-review-ledger.lock"
-  [ ! -L "$LOCK_DIR" ] || die "review-ledger lock directory must not be a symlink"
-  initialize_lock_directory
-  [ -d "$LOCK_DIR" ] || die "review-ledger lock path is not a directory"
-  chmod 700 "$LOCK_DIR" || die "cannot make review-ledger lock directory private"
-  LOCK_FORMAT="$LOCK_DIR/format"
-  LOCK_OWNER="$LOCK_DIR/owner.json"
-  load_system_identity
-  remove_unpublished_owner_files
-  if [ -e "$LOCK_OWNER" ]; then
-    validate_owner_record
-  fi
-  publish_owner_record
 }
 
 prepare_guard_file() {
@@ -526,6 +310,9 @@ prepare_guard_file() {
 run_with_kernel_lock() {
   local rc=0
   prepare_guard_file
+  if [ "${FM_NM_REVIEW_TEST_NO_LOCKER:-}" = 1 ]; then
+    die "kernel-backed review-ledger exclusion is unavailable; refusing to proceed without single-owner exclusion"
+  fi
   case "$(uname -s 2>/dev/null || true)" in
     Darwin)
       command -v lockf >/dev/null 2>&1 \
@@ -738,11 +525,6 @@ respond() {
   capture_public_history
   validate_capture_context
   validate_selection "$kind" "$raw"
-
-  acquire_lock
-  capture_public_history
-  validate_capture_context
-  validate_selection "$kind" "$raw"
   prepare_work_files
   sync_ledger
   round=$(current_round_number)
@@ -786,9 +568,6 @@ audit_ready() {
   local errors ci_logs marker
   command -v "$NM" >/dev/null 2>&1 || die "no-mistakes command is unavailable"
   command -v jq >/dev/null 2>&1 || die "jq is required"
-  capture_public_history
-  validate_capture_context
-  acquire_lock
   capture_public_history
   validate_capture_context
   prepare_work_files
@@ -911,6 +690,7 @@ case "${1:-}" in
     ;;
   __fm_review_lock_held)
     shift
+    review_lock_held_hooks
     case "${1:-}" in
       respond) respond "$@" ;;
       audit-ready) [ "$#" -eq 1 ] || die "audit-ready accepts no arguments"; audit_ready ;;
