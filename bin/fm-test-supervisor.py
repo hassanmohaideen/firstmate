@@ -92,29 +92,41 @@ def iso_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+class AtomicJsonError(RuntimeError):
+    def __init__(self, cause: BaseException, published: bool) -> None:
+        super().__init__(str(cause))
+        self.published = published
+
+
 def atomic_json(path: pathlib.Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    counter = getattr(atomic_json, "counter", 0) + 1
-    atomic_json.counter = counter
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{counter}")
-    payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    temporary: pathlib.Path | None = None
+    published = False
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        counter = getattr(atomic_json, "counter", 0) + 1
+        atomic_json.counter = counter
+        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{counter}")
+        payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        published = True
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+    except BaseException as exc:
+        raise AtomicJsonError(exc, published) from exc
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def event(name: str, **values: Any) -> dict[str, Any]:
@@ -551,6 +563,7 @@ class LaneExecutor:
             "kind": "fm-test-lane",
             "run_id": self.manifest["run_id"],
             "selection": self.manifest["selection"],
+            "duration_budget_mode": self.manifest.get("duration_budget_mode", "warn"),
             "started_at": iso_now(),
             "finished_at": None,
             "planned": planned,
@@ -835,6 +848,13 @@ class LaneExecutor:
                 allowance = max(0.0, attempt.deadline_mono - attempt.started_mono)
                 self.append(attempt, "started", allowance_ms=int(allowance * 1000))
                 started_committed = True
+            except AtomicJsonError as exc:
+                started_committed = exc.published
+                if not started_committed:
+                    row.pop("attempt_count", None)
+                    row["events"] = [item for item in row["events"] if item.get("name") != "started"]
+                    self.doc["summary"]["attempted"] -= 1
+                raise
             except BaseException:
                 row.pop("attempt_count", None)
                 row["events"] = [item for item in row["events"] if item.get("name") != "started"]
@@ -1349,6 +1369,9 @@ def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
     if not isinstance(run, dict) or run.get("complete") is not True:
         return False, "lane artifact is incomplete"
     metrics = artifact_terminal_metrics(rows)
+    budget_mode = doc.get("duration_budget_mode")
+    if budget_mode not in {"warn", "enforce"}:
+        return False, "lane duration-budget policy is missing or invalid"
     summary = doc.get("summary")
     if not isinstance(summary, dict):
         return False, "lane summary is inconsistent with terminal evidence"
@@ -1364,8 +1387,10 @@ def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
     ):
         if summary[field] != metrics[field]:
             return False, "lane summary is inconsistent with terminal evidence"
-    policy_failed = metrics["failed"] + metrics["duration_budget_exceeded"] + metrics["duration_budget_missing"]
-    if summary["failed"] not in {metrics["failed"], policy_failed}:
+    policy_failed = metrics["failed"]
+    if budget_mode == "enforce":
+        policy_failed += metrics["duration_budget_exceeded"] + metrics["duration_budget_missing"]
+    if summary["failed"] != policy_failed:
         return False, "lane summary is inconsistent with terminal evidence"
     expected_result = "passed" if summary["failed"] == 0 else "failed"
     if run.get("result") != expected_result:

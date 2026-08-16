@@ -1207,6 +1207,21 @@ SH
   chmod +x "$tmp"/*.test.sh
   "$RUNNER" --json "$tmp/a.json" "$tmp/a.test.sh" >/dev/null 2>"$tmp/a.err" \
     || fail "aggregate passing input fixture failed"
+  "$RUNNER" --aggregate-json "$tmp/warn.json" "$tmp/a.json" >/dev/null \
+    || fail "aggregate enforced a warn-mode missing duration budget"
+  python3 - "$tmp/a.json" "$tmp/enforce.json" <<'PY'
+import json, sys
+lane = json.load(open(sys.argv[1]))
+lane["duration_budget_mode"] = "enforce"
+lane["summary"]["failed"] += lane["summary"]["duration_budget_missing"]
+lane["run"]["result"] = "failed"
+json.dump(lane, open(sys.argv[2], "w"))
+PY
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/enforced.json" "$tmp/enforce.json" >/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate ignored an enforced missing duration budget"
   set +e
   "$RUNNER" --json "$tmp/b.json" "$tmp/b.test.sh" >/dev/null 2>"$tmp/b.err"
   rc=$?

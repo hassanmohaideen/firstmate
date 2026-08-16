@@ -937,6 +937,8 @@ lanes, scripts = [], []
 summary = {
     "lanes": 0, "total": 0, "failed": 0, "skipped_gate": 0,
     "duration_budget_exceeded": 0, "duration_budget_missing": 0,
+    "enforced_duration_budget_exceeded": 0,
+    "enforced_duration_budget_missing": 0,
     "critical_path_duration_ms": 0,
 }
 errors = []
@@ -954,10 +956,12 @@ for path_text in sys.argv[3:]:
     rows = doc["scripts"]
     lane_summary = doc["summary"]
     metrics = supervisor.artifact_terminal_metrics(rows)
+    budget_mode = doc["duration_budget_mode"]
     lanes.append({
         "path": str(path), "run_id": doc.get("run_id"),
         "selection": doc.get("selection"), "started_at": doc.get("started_at"),
         "finished_at": doc.get("finished_at"), "summary": lane_summary,
+        "duration_budget_mode": budget_mode,
     })
     summary["lanes"] += 1
     summary["total"] += metrics["total"]
@@ -965,6 +969,9 @@ for path_text in sys.argv[3:]:
     summary["skipped_gate"] += metrics["skipped_gate"]
     summary["duration_budget_exceeded"] += metrics["duration_budget_exceeded"]
     summary["duration_budget_missing"] += metrics["duration_budget_missing"]
+    if budget_mode == "enforce":
+        summary["enforced_duration_budget_exceeded"] += metrics["duration_budget_exceeded"]
+        summary["enforced_duration_budget_missing"] += metrics["duration_budget_missing"]
     summary["critical_path_duration_ms"] = max(
         summary["critical_path_duration_ms"],
         max((int(row.get("duration_ms") or 0) for row in rows), default=0),
@@ -1008,7 +1015,11 @@ print(
     f"failed={summary['failed']} skipped_gate={summary['skipped_gate']} "
     f"critical_path_duration_ms={summary['critical_path_duration_ms']}"
 )
-if summary["failed"] or summary["duration_budget_exceeded"] or summary["duration_budget_missing"]:
+if (
+    summary["failed"]
+    or summary["enforced_duration_budget_exceeded"]
+    or summary["enforced_duration_budget_missing"]
+):
     raise SystemExit(1)
 PY
 }
