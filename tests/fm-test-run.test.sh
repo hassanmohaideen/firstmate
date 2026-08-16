@@ -1306,7 +1306,8 @@ assert doc["complete"] is True
 assert doc["summary"]["lanes"] == 2 and doc["summary"]["total"] == 2
 assert doc["summary"]["failed"] == 1 and len(doc["scripts"]) == 2
 PY
-  python3 - "$tmp/a.json" "$tmp/b.json" "$tmp/incomplete.json" "$tmp/duplicate.json" "$tmp/dishonest.json" <<'PY'
+  python3 - "$tmp/a.json" "$tmp/b.json" "$tmp/incomplete.json" "$tmp/duplicate.json" \
+    "$tmp/dishonest.json" "$tmp/unattempted.json" "$tmp/green-required-skip.json" <<'PY'
 import json, sys
 passing = json.load(open(sys.argv[1]))
 failing = json.load(open(sys.argv[2]))
@@ -1320,8 +1321,15 @@ dishonest = json.loads(json.dumps(failing))
 dishonest["summary"]["failed"] = 0
 dishonest["run"]["result"] = "passed"
 json.dump(dishonest, open(sys.argv[5], "w"))
+unattempted = json.loads(json.dumps(passing))
+unattempted["scripts"][0]["terminal"]["attempted"] = False
+json.dump(unattempted, open(sys.argv[6], "w"))
+green_required_skip = json.loads(json.dumps(passing))
+green_required_skip["scripts"][0]["required_gate_skip_seen"] = True
+json.dump(green_required_skip, open(sys.argv[7], "w"))
 PY
-  for bad in "$tmp/incomplete.json" "$tmp/duplicate.json" "$tmp/dishonest.json"; do
+  for bad in "$tmp/incomplete.json" "$tmp/duplicate.json" "$tmp/dishonest.json" \
+    "$tmp/unattempted.json" "$tmp/green-required-skip.json"; do
     set +e
     "$RUNNER" --aggregate-json "$tmp/rejected.json" "$bad" >"$tmp/reject.out" 2>"$tmp/reject.err"
     rc=$?

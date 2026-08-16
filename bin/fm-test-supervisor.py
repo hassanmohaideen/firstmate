@@ -1518,8 +1518,6 @@ def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
             return False, f"invalid event inventory for {row.get('path')}"
         starts = [item for item in events if item.get("name") == "started"]
         terminals = [item for item in events if item.get("name") == "terminal"]
-        if row.get("attempt_count") != 1 or len(starts) != 1:
-            return False, f"missing or duplicate attempt for {row.get('path')}"
         terminal = row.get("terminal")
         if (
             not isinstance(terminal, dict)
@@ -1527,9 +1525,20 @@ def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
             or len(terminals) != 1
         ):
             return False, f"missing or duplicate terminal for {row.get('path')}"
+        attempted = row.get("attempt_count") == 1 and len(starts) == 1
+        if terminal.get("attempted") is not attempted:
+            return False, f"terminal attempt state is inconsistent for {row.get('path')}"
+        if not attempted:
+            return False, f"missing or duplicate attempt for {row.get('path')}"
     run = doc.get("run")
     if not isinstance(run, dict) or run.get("complete") is not True:
         return False, "lane artifact is incomplete"
+    if any(
+        row.get("required_gate_skip_seen") is True
+        and (row["terminal"]["result"] == "passed" or run.get("result") != "failed")
+        for row in rows
+    ):
+        return False, "required gate skip is inconsistent with terminal evidence"
     metrics = artifact_terminal_metrics(rows)
     budget_mode = doc.get("duration_budget_mode")
     if budget_mode not in {"warn", "enforce"}:
