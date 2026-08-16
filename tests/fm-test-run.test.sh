@@ -1640,19 +1640,23 @@ test_required_public_runner_leased_uid() {
   chmod 0700 "$tmp/repo/bin/fm-test-supervisor.py"
   printf 'checkout_readable=true\n' >"$tmp/repo/support.sh"
   chmod 0600 "$tmp/repo/support.sh"
-  printf 'runner-secret\n' >"$tmp/repo/.git/config"
-  chmod 0755 "$tmp/repo/.git"
-  chmod 0644 "$tmp/repo/.git/config"
+  printf 'fixture-git-metadata\n' >"$tmp/repo/.git/config"
+  chmod 0700 "$tmp/repo/.git"
+  chmod 0600 "$tmp/repo/.git/config"
+  printf 'runner-secret\n' >"$tmp/runner-secret"
+  chmod 0600 "$tmp/runner-secret"
+  ln -s "$tmp/runner-secret" "$tmp/repo/external-secret"
   fixture_runner="$tmp/repo/bin/fm-test-run.sh"
   cat >"$tmp/leased.test.sh" <<'SH'
 #!/usr/bin/env bash
 . "$PWD/support.sh"
 [ "$checkout_readable" = true ]
-if cat "$PWD/.git/config" >/dev/null 2>&1; then
-  echo "leased identity read checkout Git metadata" >&2
+[ "$(cat "$PWD/.git/config")" = fixture-git-metadata ]
+if cat "$PWD/external-secret" >/dev/null 2>&1; then
+  echo "leased identity read an out-of-checkout symlink target" >&2
   exit 9
 fi
-echo "runuid=$(id -u) git_metadata=unreadable"
+echo "runuid=$(id -u) git_metadata=readable symlink_target=unreadable"
 exit 0
 SH
   chmod 0755 "$tmp/leased.test.sh"
@@ -1673,7 +1677,7 @@ row = doc["scripts"][0]
 assert row["terminal"]["result"] == "passed", row["terminal"]
 match = re.search(r"runuid=(\d+)", row.get("output_tail", ""))
 assert match, row.get("output_tail")
-assert "git_metadata=unreadable" in row.get("output_tail", ""), row.get("output_tail")
+assert "git_metadata=readable symlink_target=unreadable" in row.get("output_tail", ""), row.get("output_tail")
 runuid = int(match.group(1))
 assert runuid != caller, f"script ran as caller uid {runuid}, expected a leased identity"
 assert 61000 <= runuid <= 64999, f"script uid {runuid} outside the leased range 61000-64999"
