@@ -965,7 +965,7 @@ for path_text in sys.argv[3:]:
     })
     summary["lanes"] += 1
     summary["total"] += metrics["total"]
-    summary["failed"] += metrics["failed"]
+    summary["failed"] += supervisor.artifact_failed_script_count(rows, budget_mode)
     summary["skipped_gate"] += metrics["skipped_gate"]
     summary["duration_budget_exceeded"] += metrics["duration_budget_exceeded"]
     summary["duration_budget_missing"] += metrics["duration_budget_missing"]

@@ -1072,7 +1072,8 @@ class LaneExecutor:
             found, status = attempt.pid, 1 << 8
         if found == attempt.pid:
             attempt.wait_status = status
-            attempt.completion_observed_mono = time.monotonic()
+            if attempt.completion_observed_mono is None:
+                attempt.completion_observed_mono = time.monotonic()
             return True
         return False
 
@@ -1090,6 +1091,8 @@ class LaneExecutor:
         if attempt.deadline_expired:
             return
         attempt.deadline_expired = True
+        if attempt.completion_observed_mono is None:
+            attempt.completion_observed_mono = attempt.deadline_mono or time.monotonic()
         attempt.row["events"].append(event("deadline_expired"))
         self._begin_cleanup(attempt, "deadline")
 
@@ -1100,6 +1103,8 @@ class LaneExecutor:
             return
         if attempt.deadline_expired:
             cause = "deadline"
+        if attempt.completion_observed_mono is None:
+            attempt.completion_observed_mono = time.monotonic()
         attempt.cleanup_cause = cause
         if cause == "exit":
             attempt.row["events"].append(event("test_exited", exit=self._exit_code(attempt.wait_status)))
@@ -1171,7 +1176,12 @@ class LaneExecutor:
             )
             attempt.row["exit"] = public_exit
         else:
-            duration_ms = int(max(0.0, time.monotonic() - (attempt.started_mono or time.monotonic())) * 1000)
+            completion_mono = attempt.completion_observed_mono
+            if attempt.deadline_expired and attempt.deadline_mono is not None:
+                completion_mono = attempt.deadline_mono
+            if completion_mono is None:
+                completion_mono = attempt.started_mono or time.monotonic()
+            duration_ms = int(max(0.0, completion_mono - (attempt.started_mono or completion_mono)) * 1000)
             test_exit = self._exit_code(attempt.wait_status)
             required_skip = attempt.required_skip_seen
             budget = attempt.row.get("duration_budget_ms")
@@ -1338,16 +1348,18 @@ class LaneExecutor:
         rows = self.doc["scripts"]
         attempted_rows = [row for row in rows if row.get("attempt_count") == 1]
         terminals = [row for row in rows if row.get("terminal")]
-        failed = sum(1 for row in terminals if row["terminal"]["result"] != "passed")
+        budget_mode = self.manifest.get("duration_budget_mode", "warn")
+        failed = artifact_failed_script_count(rows, budget_mode)
         skipped = sum(1 for row in terminals if row.get("gate_skip"))
         exceeded = sum(1 for row in terminals if row.get("duration_budget_exceeded"))
         missing = sum(1 for row in rows if not row.get("duration_baseline_measured"))
         complete = len(terminals) == len(rows) and len(attempted_rows) == len(rows)
         if self.interrupted is not None:
             complete = False
-        if self.manifest.get("duration_budget_mode") == "enforce":
-            failed += exceeded + missing
-        result = "passed" if complete and failed == 0 else "failed"
+        policy_failed = any(row["terminal"]["result"] != "passed" for row in terminals)
+        if budget_mode == "enforce":
+            policy_failed = policy_failed or exceeded > 0 or missing > 0
+        result = "passed" if complete and not policy_failed else "failed"
         if self.interrupted is not None:
             result = "interrupted"
         families: dict[str, dict[str, Any]] = {}
@@ -1355,7 +1367,13 @@ class LaneExecutor:
             item = families.setdefault(row["family"], {"name": row["family"], "count": 0, "duration_ms": 0, "failed": 0})
             item["count"] += 1
             item["duration_ms"] += row["duration_ms"]
-            item["failed"] += int(row["terminal"]["result"] != "passed")
+            item["failed"] += int(
+                row["terminal"]["result"] != "passed"
+                or (
+                    budget_mode == "enforce"
+                    and (row.get("duration_budget_exceeded") or not row.get("duration_baseline_measured"))
+                )
+            )
         self.doc["families"] = sorted(families.values(), key=lambda item: item["name"])
         self.doc["summary"] = {
             "total": len(rows), "attempted": len(attempted_rows), "failed": failed,
@@ -1452,6 +1470,18 @@ class LaneExecutor:
         return self.finalize()
 
 
+def artifact_failed_script_count(rows: list[dict[str, Any]], budget_mode: str) -> int:
+    return sum(
+        1
+        for row in rows
+        if (isinstance(row.get("terminal"), dict) and row["terminal"].get("result") != "passed")
+        or (
+            budget_mode == "enforce"
+            and (row.get("duration_budget_exceeded") is True or row["duration_baseline_ms"] is None)
+        )
+    )
+
+
 def artifact_terminal_metrics(rows: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "total": len(rows),
@@ -1517,12 +1547,13 @@ def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
     ):
         if summary[field] != metrics[field]:
             return False, "lane summary is inconsistent with terminal evidence"
-    policy_failed = metrics["failed"]
-    if budget_mode == "enforce":
-        policy_failed += metrics["duration_budget_exceeded"] + metrics["duration_budget_missing"]
-    if summary["failed"] != policy_failed:
+    failed_scripts = artifact_failed_script_count(rows, budget_mode)
+    if summary["failed"] != failed_scripts:
         return False, "lane summary is inconsistent with terminal evidence"
-    expected_result = "passed" if summary["failed"] == 0 else "failed"
+    policy_failed = metrics["failed"] > 0
+    if budget_mode == "enforce":
+        policy_failed = policy_failed or metrics["duration_budget_exceeded"] > 0 or metrics["duration_budget_missing"] > 0
+    expected_result = "failed" if policy_failed else "passed"
     if run.get("result") != expected_result:
         return False, "lane result is inconsistent with terminal evidence"
     return True, "ok"

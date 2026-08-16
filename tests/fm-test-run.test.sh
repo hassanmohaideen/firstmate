@@ -949,6 +949,8 @@ import json, pathlib, sys
 artifact = json.load(open(sys.argv[1]))
 assert [row["terminal"]["result"] for row in artifact["scripts"]] == ["timeout", "passed"]
 assert all(row.get("attempt_count") == 1 for row in artifact["scripts"])
+assert artifact["summary"]["failed"] == 1, artifact["summary"]
+assert artifact["summary"]["failed"] <= artifact["summary"]["total"]
 assert pathlib.Path(sys.argv[2]).read_text().splitlines() == ["hang", "after"]
 PY
   rm -rf "$tmp"
@@ -1263,6 +1265,24 @@ PY
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "aggregate failing input fixture passed"
+  python3 - "$tmp/b.json" "$tmp/failing-enforce.json" <<'PY'
+import json, sys
+lane = json.load(open(sys.argv[1]))
+lane["duration_budget_mode"] = "enforce"
+json.dump(lane, open(sys.argv[2], "w"))
+PY
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/failing-enforce-aggregate.json" "$tmp/failing-enforce.json" >/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate ignored an enforced failing lane"
+  python3 - "$tmp/failing-enforce-aggregate.json" <<'PY' \
+    || fail "aggregate double-counted a failed script's budget violation"
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["summary"]["total"] == 1, doc["summary"]
+assert doc["summary"]["failed"] == 1, doc["summary"]
+PY
   set +e
   out=$("$RUNNER" --aggregate-json "$tmp/out.json" "$tmp/a.json" "$tmp/b.json")
   rc=$?
