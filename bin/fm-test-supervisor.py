@@ -1111,35 +1111,46 @@ class LaneExecutor:
         # Checkout credential persistence is disabled for these lanes. Also grant
         # traverse on each ancestor directory so a leased identity can descend to
         # the checkout even when an intermediate directory is not world-executable.
-        # Best-effort: a residual permission problem then surfaces per script as a
-        # captured setup error rather than silently exiting 126.
+        # The in-process walk does not follow symlinks and fails closed on either a
+        # permission error or exhaustion of the terminal-publication budget.
+        deadline = self._cleanup_limit()
+
+        def check_deadline() -> None:
+            if time.monotonic() >= deadline:
+                raise ContainmentError(
+                    "checkout access grant exceeded the terminal deadline budget"
+                )
+
+        def grant(path: str, bits: int) -> None:
+            check_deadline()
+            if os.path.islink(path):
+                return
+            mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+            os.chmod(path, mode | bits, follow_symlinks=False)
+
         root = os.path.realpath(self.manifest["root"])
-        parent = os.path.dirname(root)
-        while parent and parent != os.path.dirname(parent):
-            try:
-                mode = stat.S_IMODE(os.stat(parent).st_mode)
-                os.chmod(parent, mode | 0o001)
-            except OSError:
-                pass
-            parent = os.path.dirname(parent)
-        remaining = self._cleanup_limit() - time.monotonic()
-        if remaining <= 0:
-            raise ContainmentError("checkout access grant cannot fit before the terminal deadline")
         try:
-            subprocess.run(
-                ["find", root, "!", "-type", "l", "-exec", "chmod", "o+rX", "{}", "+"],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=remaining,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ContainmentError(
-                "checkout access grant exceeded the terminal deadline budget"
-            ) from exc
-        except OSError:
-            pass
+            parent = os.path.dirname(root)
+            while parent and parent != os.path.dirname(parent):
+                grant(parent, 0o001)
+                parent = os.path.dirname(parent)
+
+            def raise_walk_error(error: OSError) -> None:
+                raise error
+
+            for current, directories, files in os.walk(
+                root, topdown=True, onerror=raise_walk_error, followlinks=False,
+            ):
+                grant(current, 0o005)
+                for name in directories:
+                    grant(os.path.join(current, name), 0o005)
+                for name in files:
+                    grant(os.path.join(current, name), 0o004)
+            check_deadline()
+        except ContainmentError:
+            raise
+        except OSError as exc:
+            raise ContainmentError(f"checkout access grant failed: {exc}") from exc
 
     def _private_root(self, row: dict[str, Any], lease: Lease | None) -> pathlib.Path:
         root = self.transient / f"attempt-{row['index']}"
