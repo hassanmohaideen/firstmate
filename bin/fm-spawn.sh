@@ -1802,7 +1802,7 @@ GH_CAPABILITY=
 GH_ORG=
 GH_VERIFIED_DEST=
 GH_GATE_PROJECT=$PROJ_ABS
-GH_PUSH_BRANCH=unknown
+GH_PUSH_BRANCH="fm/$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
   GH_GATE_PROJECT=$RELAUNCH_WT
   GH_PUSH_BRANCH=current
@@ -2026,7 +2026,7 @@ reset_gated_pool_destination() {  # <worktree>
 $routes
 EOF
   fi
-  observed=$(fm_github_ctx_observe "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" unknown) || return 1
+  observed=$(fm_github_ctx_observe "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_PUSH_BRANCH") || return 1
   [ "$observed" = "$GH_VERIFIED_DEST" ]
 }
 

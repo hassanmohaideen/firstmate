@@ -4,38 +4,28 @@ fm_github_remote_destination_url() {
   local project=$1 capability=$2 push_branch=${3:-current} urls remote branch routes
   case "$capability" in
     push)
-      if [ "$push_branch" = unknown ]; then
-        routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushremote$' 2>/dev/null || true)
-        [ -z "$routes" ] || return 2
-      else
-        branch=$(git -C "$project" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-        if [ -n "$branch" ]; then
-          routes=$(git -C "$project" config --get-all "branch.$branch.pushRemote" 2>/dev/null || true)
-          case "$routes" in *$'\n'*) return 2 ;; esac
-          remote=$routes
-        else
-          routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushremote$' 2>/dev/null || true)
-          [ -z "$routes" ] || return 2
-        fi
-      fi
+      case "$push_branch" in
+        current)
+          branch=$(git -C "$project" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 2
+          ;;
+        unknown|'') return 2 ;;
+        *) branch=$push_branch ;;
+      esac
+      routes=$(git -C "$project" config --get-all "branch.$branch.pushRemote" 2>/dev/null || true)
+      case "$routes" in *$'\n'*) return 2 ;; esac
+      remote=$routes
       if [ -z "$remote" ]; then
         routes=$(git -C "$project" config --get-all remote.pushDefault 2>/dev/null || true)
         case "$routes" in *$'\n'*) return 2 ;; esac
         remote=$routes
       fi
-      if [ -z "$remote" ] && [ "$push_branch" = unknown ]; then
-        routes=$(git -C "$project" config --get-regexp '^branch\..*\.remote$' 2>/dev/null || true)
-        while IFS=' ' read -r _ route; do
-          [ -z "$route" ] || [ "$route" = origin ] || return 2
-        done <<EOF
-$routes
-EOF
-      elif [ -z "$remote" ] && [ -n "$branch" ]; then
+      if [ -z "$remote" ]; then
         routes=$(git -C "$project" config --get-all "branch.$branch.remote" 2>/dev/null || true)
         case "$routes" in *$'\n'*) return 2 ;; esac
         remote=$routes
       fi
       [ -n "$remote" ] || remote=origin
+      [ "$remote" = origin ] || return 2
       urls=$(git -C "$project" remote get-url --push --all "$remote" 2>/dev/null) || return 1
       ;;
     fetch|api-org-membership) urls=$(git -C "$project" remote get-url --all origin 2>/dev/null) || return 1 ;;
@@ -137,7 +127,7 @@ fm_github_remote_destination_host() {
     https://*/*) host=$(fm_github_http_remote_host "$url") || return 2 ;;
     ssh://*/*|git@*:*/*) host=$(fm_github_ssh_remote_host "$url") || return 2 ;;
     file://*|/*|./*|../*) return 3 ;;
-    *://*|*:*/*) return 2 ;;
+    *::*|*://*|*:*) return 2 ;;
     *) return 3 ;;
   esac
   printf '%s' "$host"

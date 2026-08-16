@@ -190,6 +190,23 @@ test_intake_refuses_mismatch_and_ambiguity() {
   pass "intake refuses an asserted mismatch, a malformed host, and all multiple destinations"
 }
 
+test_intake_blocks_unrecognized_remote_transports() {
+  local proj rc local_path
+  proj=$(make_project remotehelper 'custom::github.com')
+  fm_github_ctx_intake "$proj" push '' '' 'fm/remotehelper' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] || fail "a remote-helper destination must be indeterminate (expected rc 2), got $rc"
+
+  proj=$(make_project unknownscheme 'custom://github.com/owner/repo.git')
+  fm_github_ctx_intake "$proj" push '' '' 'fm/unknownscheme' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] || fail "an unknown remote scheme must be indeterminate (expected rc 2), got $rc"
+
+  local_path="relative/repository.git"
+  proj=$(make_project relativepath "$local_path")
+  fm_github_ctx_intake "$proj" push '' '' 'fm/relativepath' >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 3 ] || fail "a relative filesystem destination must remain ungated (expected rc 3), got $rc"
+  pass "intake blocks remote helpers and unknown schemes while recognizing filesystem destinations"
+}
+
 test_intake_rejects_unverifiable_http_transports() {
   local proj rc out
   proj=$(make_project plainhttp http://github.com/owner/repo.git)
@@ -278,14 +295,20 @@ test_gate_accepts_standard_github_ssh_authorities() {
 }
 
 test_gate_observes_effective_push_routing() {
-  local proj vt branch
+  local proj vt branch out planned
   vt='github|github.com|repository|owner/repo|push'
+  planned='fm/planned-task'
 
-  proj=$(make_project gateunknownbranchpush https://github.com/owner/repo.git)
+  proj=$(make_project gateplannedbranch https://github.com/owner/repo.git)
   git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
-  git -C "$proj" config branch.future.pushRemote alternate
-  fm_github_ctx_intake "$proj" push '' '' unknown >/dev/null 2>&1
-  [ "$?" -eq 2 ] || fail "unknown future-branch intake must reject a branch push remote"
+  git -C "$proj" config branch.historical.pushRemote alternate
+  out=$(fm_github_ctx_intake "$proj" push '' '' "$planned") || fail "an unrelated branch push route must not block the planned branch"
+  [ "$out" = "$(printf 'github.com\trepository\towner/repo')" ] || fail "the planned branch must resolve the verified origin"
+  git -C "$proj" config "branch.$planned.pushRemote" origin
+  fm_github_ctx_intake "$proj" push '' '' "$planned" >/dev/null || fail "a planned branch explicitly routed to origin must remain verifiable"
+  git -C "$proj" config "branch.$planned.pushRemote" alternate
+  fm_github_ctx_intake "$proj" push '' '' "$planned" >/dev/null 2>&1
+  [ "$?" -eq 2 ] || fail "a planned branch routed away from origin must be indeterminate"
 
   proj=$(make_project gatepushdefault https://github.com/owner/repo.git)
   git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
@@ -313,9 +336,7 @@ test_gate_observes_effective_push_routing() {
   [ "$GATE_RC" -eq 2 ] || fail "branch tracking remote must route observation away from origin and block (rc $GATE_RC)"
   [ "$GATE_PROBED" -eq 1 ] || fail "a non-origin branch tracking remote must block before probing the recorded origin"
 
-  fm_github_ctx_intake "$proj" push '' '' unknown >/dev/null 2>&1
-  [ "$?" -eq 2 ] || fail "fresh intake with an unknown future branch must reject alternate branch routing"
-  pass "the gate observes push defaults, push remotes, and tracking remotes instead of trusting origin"
+  pass "the gate resolves only the planned branch push route and blocks routes away from origin"
 }
 
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it() {
@@ -464,6 +485,7 @@ test_dest_tuple_is_a_stable_delimited_join
 test_intake_auto_selects_github_com_but_never_infers_another_host
 test_intake_blocks_a_missing_destination_but_leaves_local_origins_ungated
 test_intake_refuses_mismatch_and_ambiguity
+test_intake_blocks_unrecognized_remote_transports
 test_intake_rejects_unverifiable_http_transports
 test_intake_resolves_org_membership_selection
 test_gate_verifies_a_fresh_matching_destination
