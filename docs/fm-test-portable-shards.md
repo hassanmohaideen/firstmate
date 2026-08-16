@@ -221,6 +221,6 @@ The final 120 seconds remain reserved for artifact upload and platform variance 
 Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards.
 The executor publishes at most one terminal per scheduler iteration and reserves 15 seconds for every concurrently outstanding terminal, so all terminal evidence is published by T0+450.
 Per-attempt deadline enforcement therefore has jitter bounded by one terminal publication's sub-second fsync latency rather than a sub-millisecond guarantee; the required 120-second pre-ceiling margin absorbs that accepted jitter.
-The executor reserves startup and cleanup time for every unstarted script and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
+The executor reserves four seconds of startup (the blocked-child readiness bound plus durable launch evidence) and four seconds of cleanup for every unstarted script, and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
 A timed-out attempt is terminal red, and later required scripts still execute exactly once when their reservations allow.
 Healthy complete CI remains targeted at roughly five to eight minutes.

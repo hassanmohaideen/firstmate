@@ -38,7 +38,11 @@ from typing import Any
 SCHEMA_VERSION = 2
 UID_MIN = 61000
 UID_MAX = 64999
-STARTUP_RESERVE = 15.0
+# A launch has a hard three-second blocked-child readiness bound. Reserve one
+# additional second for its private directory and durable prepared/started
+# publications; charging the terminal-publication reserve again for every
+# unstarted script would reject the duration-balanced CI lanes before launch.
+STARTUP_RESERVE = 4.0
 CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
 LEASE_DIRECTORY_ROOT = pathlib.Path("/tmp/fm-test-credential-leases")

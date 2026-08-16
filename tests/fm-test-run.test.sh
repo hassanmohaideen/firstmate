@@ -1639,8 +1639,10 @@ test_required_public_runner_leased_uid() {
   # when no root and no noninteractive sudo (the runner cannot self-escalate),
   # like the other privileged fixtures; the executor-behavior CI job runs it with
   # real privilege on both platforms. Unlike the interruption/env-isolation
-  # fixtures, this one is designed for required mode: its fixture root and script
-  # are world-traversable/readable so the leased UID can reach them.
+  # fixtures, this one is designed for required mode: its fixture root is
+  # traversable, while its checkout scripts begin runner-readable only and prove
+  # the executor's leased-identity read grant. Five attempts under a bounded
+  # window also prove the lane reserves launches without double-counting them.
   if [ "$(id -u)" -ne 0 ] && ! sudo -n true >/dev/null 2>&1; then
     printf 'skip: privileged executor unavailable; no required public-runner claim\n'
     return 0
@@ -1672,7 +1674,9 @@ test_required_public_runner_leased_uid() {
   chmod 0600 "$tmp/runner-secret"
   ln -s "$tmp/runner-secret" "$tmp/repo/external-secret"
   fixture_runner="$tmp/repo/bin/fm-test-run.sh"
-  cat >"$tmp/leased.test.sh" <<'SH'
+  mkdir -p "$tmp/repo/tests"
+  for name in fm-classify-decision-key fm-brief fm-composer-lib fm-supervision-instructions fm-transition-lib; do
+    cat >"$tmp/repo/tests/$name.test.sh" <<'SH'
 #!/usr/bin/env bash
 . "$PWD/support.sh"
 [ "$checkout_readable" = true ]
@@ -1684,28 +1688,39 @@ fi
 echo "runuid=$(id -u) git_metadata=readable symlink_target=unreadable"
 exit 0
 SH
-  chmod 0755 "$tmp/leased.test.sh"
+    chmod 0600 "$tmp/repo/tests/$name.test.sh"
+  done
   artifact="$tmp/artifact.json"
+  t0=$(date +%s)
   set +e
-  FM_TEST_CONTAINMENT=required "$fixture_runner" --json "$artifact" \
-    --duration-baseline-ms 1000 "$tmp/leased.test.sh" >"$tmp/out" 2>"$tmp/err"
+  FM_TEST_CONTAINMENT=required \
+    FM_TEST_JOB_T0_EPOCH="$t0" \
+    FM_TEST_ORDINARY_DEADLINE_EPOCH="$((t0 + 80))" \
+    FM_TEST_TERMINAL_DEADLINE_EPOCH="$((t0 + 100))" \
+    FM_TEST_CLEANUP_DEADLINE_EPOCH="$((t0 + 130))" \
+    FM_TEST_CEILING_DEADLINE_EPOCH="$((t0 + 160))" \
+    "$fixture_runner" --json "$artifact" \
+    tests/fm-classify-decision-key.test.sh tests/fm-brief.test.sh \
+    tests/fm-composer-lib.test.sh tests/fm-supervision-instructions.test.sh \
+    tests/fm-transition-lib.test.sh >"$tmp/out" 2>"$tmp/err"
   rc=$?
   set -e
-  [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "required public-runner leased-UID run should pass"; }
+  [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "required public-runner leased-UID lane should fit and pass"; }
   python3 - "$artifact" "$(id -u)" <<'PY' || { cat "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "required public-runner leased-UID evidence is wrong"; }
 import json, re, sys
 doc = json.load(open(sys.argv[1]))
 caller = int(sys.argv[2])
 assert doc["containment"]["mode"] == "required" and doc["containment"]["enforcing"] is True, doc["containment"]
 assert doc["run"]["complete"] is True, doc["run"]
-row = doc["scripts"][0]
-assert row["terminal"]["result"] == "passed", row["terminal"]
-match = re.search(r"runuid=(\d+)", row.get("output_tail", ""))
-assert match, row.get("output_tail")
-assert "git_metadata=readable symlink_target=unreadable" in row.get("output_tail", ""), row.get("output_tail")
-runuid = int(match.group(1))
-assert runuid != caller, f"script ran as caller uid {runuid}, expected a leased identity"
-assert 61000 <= runuid <= 64999, f"script uid {runuid} outside the leased range 61000-64999"
+assert len(doc["scripts"]) == 5, doc["scripts"]
+for row in doc["scripts"]:
+    assert row["terminal"]["result"] == "passed", row["terminal"]
+    match = re.search(r"runuid=(\d+)", row.get("output_tail", ""))
+    assert match, row.get("output_tail")
+    assert "git_metadata=readable symlink_target=unreadable" in row.get("output_tail", ""), row.get("output_tail")
+    runuid = int(match.group(1))
+    assert runuid != caller, f"script ran as caller uid {runuid}, expected a leased identity"
+    assert 61000 <= runuid <= 64999, f"script uid {runuid} outside the leased range 61000-64999"
 PY
   remove_privileged_fixture_tree "$tmp"
   pass "required public-runner path runs a test as a leased high UID with passed terminal"
