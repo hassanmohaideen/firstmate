@@ -373,6 +373,13 @@ def drop_credentials(uid: int, gid: int) -> None:
         raise OSError(errno.ENOTSUP, "unsupported credential platform")
 
 
+EMPTY_DOMAIN_PROBE_ERRNOS = (errno.ESRCH, errno.EPERM)
+
+
+def domain_probe_empty(present: bool, code: int) -> bool:
+    return not present and code in EMPTY_DOMAIN_PROBE_ERRNOS
+
+
 def helper_signal(uid: int, gid: int, sig: int) -> tuple[bool, int]:
     """Signal/probe exactly one credential domain through a dropped helper."""
     read_fd, write_fd = os.pipe()
@@ -1071,9 +1078,9 @@ class LaneExecutor:
             self._drain(attempt)
             self._poll_wait(attempt)
             present, last_code = checked_helper(0)
-            if last_code not in (0, errno.ESRCH):
+            if last_code not in (0, *EMPTY_DOMAIN_PROBE_ERRNOS):
                 ambiguous = True
-            if not present and last_code == errno.ESRCH:
+            if domain_probe_empty(present, last_code):
                 break
             time.sleep(0.05)
         limit = min(self.terminal_deadline, time.monotonic() + QUIESCE_GRACE)
@@ -1086,9 +1093,9 @@ class LaneExecutor:
             self._drain(attempt)
             self._poll_wait(attempt)
             present, last_code = checked_helper(0)
-            if last_code not in (0, errno.ESRCH):
+            if last_code not in (0, *EMPTY_DOMAIN_PROBE_ERRNOS):
                 ambiguous = True
-            if not present and last_code == errno.ESRCH:
+            if domain_probe_empty(present, last_code):
                 break
             time.sleep(0.05)
         fault = attempt.row.get("test_fault")
@@ -1103,7 +1110,7 @@ class LaneExecutor:
         if fault == "nonquiescent":
             attempt.row["events"].append(event("nonquiescence_injected"))
             ambiguous = True
-        quiet = not ambiguous and not present and last_code == errno.ESRCH and not survivors
+        quiet = not ambiguous and domain_probe_empty(present, last_code) and not survivors
         attempt.row["events"].append(event("quiescence", proved=quiet, survivors=survivors, probe_errno=last_code))
         if attempt.wait_status is None and attempt.pid is not None:
             try:
@@ -1500,7 +1507,7 @@ def prove_domain_quiescent(uid: int, gid: int, timeout: float = 3.0) -> bool:
     while time.monotonic() < deadline:
         helper_signal(uid, gid, signal.SIGKILL)
         present, code = helper_signal(uid, gid, 0)
-        if not present and code == errno.ESRCH:
+        if domain_probe_empty(present, code):
             return True
         time.sleep(0.02)
     return False
@@ -1565,7 +1572,7 @@ def qualify(artifact: pathlib.Path) -> int:
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             present, probe_code = helper_signal(owned.uid, owned.gid, 0)
-            if not present and probe_code == errno.ESRCH:
+            if domain_probe_empty(present, probe_code):
                 break
             time.sleep(0.02)
         else:
