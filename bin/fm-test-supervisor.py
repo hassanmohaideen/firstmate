@@ -405,7 +405,11 @@ def helper_signal(uid: int, gid: int, sig: int) -> tuple[bool, int]:
                 # helper by inspecting the same credential domain and excluding
                 # only this helper.  PIDs remain inventory diagnostics; signals
                 # are still issued solely through the kernel's UID scope.
-                members = CredentialPlatform().domain_members(uid)
+                # A zombie has no executable context and cannot create descendants.
+                # Darwin can expose a just-killed helper/target as a zombie briefly
+                # even after waitpid has completed, so counting zombies here makes
+                # an empty credential domain spuriously non-quiescent on macOS.
+                members = CredentialPlatform().domain_members(uid, live_only=True)
                 code = 0 if any(member != os.getpid() for member in members) else errno.ESRCH
         except OSError as exc:
             code = exc.errno or errno.EIO

@@ -986,7 +986,7 @@ PY
 }
 
 test_interruption_and_atomic_evidence() {
-  local tmp artifact pid rc n
+  local tmp artifact pid rc
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-interrupt.XXXXXX")
   chmod 0711 "$tmp"
   cat >"$tmp/hang.sh" <<'SH'
@@ -1000,13 +1000,15 @@ SH
   pid=$!
   wait_for_started_artifact "$artifact" \
     || { kill -KILL "$pid" 2>/dev/null || true; fail "interruption fixture never published started evidence"; }
-  n=0
-  while [ "$n" -lt 100 ]; do
-    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$artifact" \
-      || { kill -KILL "$pid" 2>/dev/null || true; fail "atomic artifact polling observed invalid JSON"; }
-    n=$((n + 1))
-  done
-  kill -TERM "$pid"
+  # The dedicated concurrent-polling fixture below stresses repeated atomic
+  # replacements.  Interrupt this fixture promptly after its durable started
+  # transition instead of spending an OS-dependent interval launching 100
+  # Python processes, during which a constrained runner can consume the lane's
+  # scheduling allowance and terminalize before the intended signal.
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$artifact" \
+    || { kill -KILL "$pid" 2>/dev/null || true; fail "started artifact is invalid JSON"; }
+  kill -TERM "$pid" 2>/dev/null \
+    || { wait "$pid" 2>/dev/null || true; fail "runner exited before catchable interruption"; }
   set +e
   wait "$pid"
   rc=$?
