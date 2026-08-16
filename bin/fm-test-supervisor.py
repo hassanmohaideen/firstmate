@@ -9,7 +9,7 @@ Public interface:
 The execute command is the sole owner of test attempts, deadlines, credentials,
 the child-environment allowlist, signaling, cleanup, and schema-v2 evidence.
 Required containment needs uid 0. The explicitly labeled developer mode is
-non-enforcing and never qualifies CI.
+non-enforcing and never qualifies credential-contained CI.
 """
 from __future__ import annotations
 

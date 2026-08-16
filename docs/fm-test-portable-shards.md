@@ -6,17 +6,17 @@
 
 ## Required containment
 
-Required CI leases one otherwise-unused high numeric UID/GID for each selected script after proving that identity absent from account and process credential inventories under a root-owned job-local lock.
+Required containment mode leases one otherwise-unused high numeric UID/GID for each selected script after proving that identity absent from account and process credential inventories under a root-owned job-local lock.
 The executor remains outside every test identity, releases a blocked child only after permanent credential drop and verification, and uses an unprivileged helper in that exact identity for every signal and quiescence probe.
 Numeric PIDs, process groups, mutable ancestry, and environment markers are diagnostics at most and are never cleanup authority in required CI.
 The executor is the single owner of the contained child environment and builds it from an explicit default-deny allowlist, so fleet routing, runner secrets, and unknown ambient variables never reach a test and only the sanctioned `FM_TEST_ENV_` channel and a small safe base set pass through.
 `bin/fm-test-run.sh` imports that same allowlist when it constructs the manifest, so secrets such as `GITHUB_TOKEN`, `DATABASE_URL`, or `SSH_AUTH_SOCK` are never written to the on-disk manifest that passes through `sudo` to the executor.
 The credential boundary remains stable across fork, exec, parent exit, reparenting, `setsid`, signal handlers, and PID reuse.
 An unreadable, ambiguous, or non-quiescent identity is quarantined while later scripts use fresh identities.
-Required Linux and macOS qualification refuses red before tests when noninteractive privilege, credential inspection, permanent drop, signal scope, or platform semantics are unavailable.
+Required Linux and macOS qualification fails closed before tests execute when noninteractive privilege, credential inspection, permanent drop, signal scope, or platform semantics are unavailable.
 Qualification proves that a live different-UID process is never signaled by its numeric PID during a credential-scoped sweep, and Linux additionally manufactures a true same-numeric-PID reuse in a private PID namespace; macOS relies on the same UID-scoped `kill(-1)` making the numeric PID irrelevant, because deterministic same-number reuse is not available there without exhausting the PID space.
 A dedicated per-platform job runs the executor-behavior subset through the public runner on both `ubuntu-latest` and `macos-latest`, so the credential-domain execute path, timeout, interruption, atomic evidence, environment allowlist, and non-quiescence/ambiguity terminalization are proven on Darwin as well as Linux.
-Local execution is explicitly labeled `developer-non-enforcing`; it does not claim hard descendant containment and required CI never accepts it.
+Local execution is explicitly labeled `developer-non-enforcing`; it does not claim hard descendant containment, and credential-contained CI lanes never accept it.
 
 ## Schema-v2 evidence
 
@@ -211,7 +211,9 @@ Behavior jobs record T0 as their first executable step, before checkout, so the 
 They then pass one absolute deadline set to the executor.
 Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
 The final 120 seconds remain reserved for artifact upload and platform variance before the 600-second job ceiling.
-Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards. The executor publishes at most one terminal per scheduler iteration and reserves 15 seconds for every concurrently outstanding terminal, so all terminal evidence is published by T0+450. Per-attempt deadline enforcement therefore has jitter bounded by one terminal publication's sub-second fsync latency rather than a sub-millisecond guarantee; the required 120-second pre-ceiling margin absorbs that accepted jitter.
+Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards.
+The executor publishes at most one terminal per scheduler iteration and reserves 15 seconds for every concurrently outstanding terminal, so all terminal evidence is published by T0+450.
+Per-attempt deadline enforcement therefore has jitter bounded by one terminal publication's sub-second fsync latency rather than a sub-millisecond guarantee; the required 120-second pre-ceiling margin absorbs that accepted jitter.
 The executor reserves startup and cleanup time for every unstarted script and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
 A timed-out attempt is terminal red, and later required scripts still execute exactly once when their reservations allow.
 Healthy complete CI remains targeted at roughly five to eight minutes.

@@ -53,8 +53,8 @@
 #   --developer-non-enforcing
 #                   run without credential-domain containment for local
 #                   development. This mode is labeled in output and artifacts,
-#                   is never accepted by required CI, and makes no hard
-#                   descendant-cleanup claim.
+#                   is never accepted by credential-contained CI, and makes no
+#                   hard descendant-cleanup claim.
 #   -h, --help      print this header
 #
 # Per-script machine-parseable markers (stdout):
