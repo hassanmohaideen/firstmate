@@ -1132,19 +1132,40 @@ test_privileged_artifact_rejects_intermediate_symlink() {
 }
 
 test_required_platform_qualification() {
-  local tmp rc
+  local tmp rc qualification_pid lease guard observed
+  local -a inspect=()
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-qualification.XXXXXX")
+  mkdir "$tmp/private"
   if [ "$(id -u)" -eq 0 ]; then
-    python3 "$SUPERVISOR" qualify --artifact "$tmp/qualification.json"
-    rc=$?
+    TMPDIR="$tmp/private" python3 "$SUPERVISOR" qualify --artifact "$tmp/qualification.json" &
+    qualification_pid=$!
   elif sudo -n true >/dev/null 2>&1; then
-    sudo -n "$(command -v python3)" "$SUPERVISOR" qualify --artifact "$tmp/qualification.json"
-    rc=$?
+    inspect=(sudo -n)
+    sudo -n env TMPDIR="$tmp/private" "$(command -v python3)" "$SUPERVISOR" qualify --artifact "$tmp/qualification.json" &
+    qualification_pid=$!
   else
     printf 'skip: privileged platform qualification unavailable; no containment pass claimed\n'
     rm -rf "$tmp"
     return 0
   fi
+  observed=false
+  for _ in $(seq 1 500); do
+    lease=$("${inspect[@]}" find "$tmp/private" -name 'uid-*.lease' -type f -print -quit 2>/dev/null || true)
+    if [ -n "$lease" ]; then
+      guard="/tmp/fm-test-credential-leases/$(basename "$lease")"
+      if "${inspect[@]}" test -f "$guard"; then
+        observed=true
+        break
+      fi
+    fi
+    kill -0 "$qualification_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  set +e
+  wait "$qualification_pid"
+  rc=$?
+  set -e
+  [ "$observed" = true ] || { rm -rf "$tmp"; fail "qualification lease was not job-local with host-wide exclusion"; }
   [ "$rc" -eq 0 ] || { rm -rf "$tmp"; fail "required platform qualification failed"; }
   python3 - "$tmp/qualification.json" <<'PY' || fail "qualification artifact is not a complete pass"
 import json, sys

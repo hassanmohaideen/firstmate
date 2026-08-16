@@ -550,6 +550,7 @@ class Lease:
     uid: int
     gid: int
     path: pathlib.Path
+    guard_path: pathlib.Path
     owner_token: str
     lock_fd: int
     guard_fd: int
@@ -559,11 +560,11 @@ class Lease:
 class LeasePool:
     def __init__(self, platform: CredentialPlatform, seed: str, directory: pathlib.Path) -> None:
         self.platform = platform
-        self.metadata_directory = directory
-        self._ensure_root_directory(self.metadata_directory)
-        self.directory = LEASE_DIRECTORY_ROOT
-        if self.directory != self.metadata_directory:
-            self._ensure_root_directory(self.directory)
+        self.directory = directory
+        self._ensure_root_directory(self.directory)
+        self.guard_directory = LEASE_DIRECTORY_ROOT
+        if self.guard_directory != self.directory:
+            self._ensure_root_directory(self.guard_directory)
         self.offset = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % (UID_MAX - UID_MIN + 1)
         self.allocated: set[int] = set()
         owner = self.platform.pid_credentials(os.getpid())
@@ -586,8 +587,9 @@ class LeasePool:
             raise ContainmentError("credential lease namespace is not root-owned")
         os.chmod(directory, 0o700)
 
-    def _sync_directory(self) -> None:
-        directory_fd = os.open(self.directory, os.O_RDONLY)
+    @staticmethod
+    def _sync_directory(directory: pathlib.Path) -> None:
+        directory_fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
@@ -639,7 +641,7 @@ class LeasePool:
             if (path_metadata.st_dev, path_metadata.st_ino) != (lock_metadata.st_dev, lock_metadata.st_ino):
                 return False
             path.unlink()
-            self._sync_directory()
+            self._sync_directory(path.parent)
             return True
         except OSError:
             return False
@@ -654,43 +656,17 @@ class LeasePool:
                 continue
             if not self.platform.credential_absent(uid, uid):
                 continue
-            guard_path = self.directory / f"uid-{uid}.lock"
-            guard_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            guard_fd = os.open(guard_path, guard_flags, 0o600)
-            guard_metadata = os.fstat(guard_fd)
-            if (
-                not stat.S_ISREG(guard_metadata.st_mode)
-                or guard_metadata.st_uid != 0
-                or guard_metadata.st_gid != 0
-            ):
-                os.close(guard_fd)
-                raise ContainmentError(f"invalid credential lease guard for uid {uid}")
+            guard_path = self.guard_directory / f"uid-{uid}.lease"
+            guard_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
             try:
-                fcntl.flock(guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (BlockingIOError, OSError):
-                os.close(guard_fd)
-                continue
-            path = self.directory / f"uid-{uid}.lease"
-            quarantine_path = path.with_suffix(".quarantine")
-            try:
-                quarantine_path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                os.close(guard_fd)
-                continue
-            try:
-                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                guard_fd = os.open(guard_path, guard_flags, 0o600)
             except FileExistsError:
-                if not self._reclaim_stale_lock(path, uid):
-                    os.close(guard_fd)
+                if not self._reclaim_stale_lock(guard_path, uid):
                     continue
                 try:
-                    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                    guard_fd = os.open(guard_path, guard_flags, 0o600)
                 except FileExistsError:
-                    os.close(guard_fd)
                     continue
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             record = {
                 "version": 1,
                 "uid": uid,
@@ -699,17 +675,34 @@ class LeasePool:
                 "owner_token": self.owner_token,
             }
             payload = (json.dumps(record, sort_keys=True) + "\n").encode("ascii")
+            os.write(guard_fd, payload)
+            os.fsync(guard_fd)
+            self._sync_directory(self.guard_directory)
+            path = self.directory / f"uid-{uid}.lease"
+            try:
+                fd = os.open(
+                    path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except BaseException:
+                guard_path.unlink(missing_ok=True)
+                os.close(guard_fd)
+                self._sync_directory(self.guard_directory)
+                raise
             os.write(fd, payload)
             os.fsync(fd)
-            self._sync_directory()
+            self._sync_directory(self.directory)
             if not self.platform.credential_absent(uid, uid):
                 path.unlink(missing_ok=True)
+                guard_path.unlink(missing_ok=True)
                 os.close(fd)
                 os.close(guard_fd)
-                self._sync_directory()
+                self._sync_directory(self.directory)
+                self._sync_directory(self.guard_directory)
                 continue
             self.allocated.add(uid)
-            return Lease(uid, uid, path, self.owner_token, fd, guard_fd)
+            return Lease(uid, uid, path, guard_path, self.owner_token, fd, guard_fd)
         raise ContainmentError("no unused UID/GID is available in the qualified lease range")
 
     def retire(self, lease: Lease, quarantine: bool) -> None:
@@ -732,7 +725,10 @@ class LeasePool:
             lease.path = target
         else:
             lease.path.unlink()
-        self._sync_directory()
+        self._sync_directory(self.directory)
+        if not quarantine:
+            lease.guard_path.unlink()
+            self._sync_directory(self.guard_directory)
         os.close(lease.lock_fd)
         lease.lock_fd = -1
         os.close(lease.guard_fd)
@@ -1087,8 +1083,9 @@ class LaneExecutor:
             raise ContainmentError("required containment needs noninteractive uid 0 execution")
         self.platform = CredentialPlatform()
         self.platform.inventory()
+        lease_directory = self.transient / "leases"
         self.lease_pool = LeasePool(
-            self.platform, self.manifest["run_id"], LEASE_DIRECTORY_ROOT,
+            self.platform, self.manifest["run_id"], lease_directory,
         )
         try:
             self._qualify_host_primitives()
@@ -1125,6 +1122,9 @@ class LaneExecutor:
             except OSError:
                 pass
             parent = os.path.dirname(parent)
+        remaining = self._cleanup_limit() - time.monotonic()
+        if remaining <= 0:
+            raise ContainmentError("checkout access grant cannot fit before the terminal deadline")
         try:
             subprocess.run(
                 ["find", root, "!", "-type", "l", "-exec", "chmod", "o+rX", "{}", "+"],
@@ -1132,9 +1132,13 @@ class LaneExecutor:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=120,
+                timeout=remaining,
             )
-        except (OSError, subprocess.SubprocessError):
+        except subprocess.TimeoutExpired as exc:
+            raise ContainmentError(
+                "checkout access grant exceeded the terminal deadline budget"
+            ) from exc
+        except OSError:
             pass
 
     def _private_root(self, row: dict[str, Any], lease: Lease | None) -> pathlib.Path:
@@ -1793,7 +1797,9 @@ class LaneExecutor:
             self.preflight()
         except BaseException as exc:
             self._release_preacquired_leases()
-            return self.unsupported(str(exc))
+            result = self.unsupported(str(exc))
+            shutil.rmtree(self.transient, ignore_errors=True)
+            return result
         pending = list(self.doc["scripts"])
         interruption_broadcast = False
         while pending or self.active or self.residual_cleanup_attempts or self.terminal_publications:
