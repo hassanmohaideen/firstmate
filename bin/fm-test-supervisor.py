@@ -639,12 +639,12 @@ class LeasePool:
             if path.with_suffix(".quarantine").exists():
                 continue
             try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
                 if not self._reclaim_stale_lock(path, uid):
                     continue
                 try:
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
                 except FileExistsError:
                     continue
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
