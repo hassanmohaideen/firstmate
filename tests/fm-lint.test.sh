@@ -609,7 +609,7 @@ test_seeded_module_boundary_parity() {
     return
   fi
   local tmp rel adapter dispatcher dep owner test_root out rc
-  tmp=$(mktemp -d "$ROOT/.fm-lint-parity.XXXXXX")
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-lint-parity.XXXXXX")
   if [ "${#FM_TEST_CLEANUP_DIRS[@]}" -eq 0 ]; then
     trap fm_test_cleanup EXIT
   fi

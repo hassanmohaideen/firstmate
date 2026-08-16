@@ -803,7 +803,20 @@ class LaneExecutor:
         self.ordinary_deadline = self._to_monotonic(float(manifest["deadlines"]["ordinary_epoch"]))
         self.terminal_deadline = self._to_monotonic(float(manifest["deadlines"]["terminal_epoch"]))
         self.cleanup_deadline = self._to_monotonic(float(manifest["deadlines"]["cleanup_epoch"]))
-        self.transient = pathlib.Path(tempfile.mkdtemp(prefix="fm-test-executor."))
+        # Keep the transient base short and canonical. Short: each child's HOME is
+        # rooted here, and a test that binds a Unix-domain socket under HOME (the
+        # herdr named-session control socket at ~/.config/herdr/sessions/<name>/
+        # herdr.sock) must not exceed the ~108-byte sun_path limit; the default
+        # base under RUNNER_TEMP is long enough to overflow it. Canonical: in-process
+        # SSH fixtures reject a remote home whose physical path differs from its
+        # normalized path, so .resolve() strips any symlink component (for example a
+        # macOS /tmp -> /private/tmp symlink). Fall back to the default base only if
+        # a short base is unavailable, which loses socket headroom but never breaks.
+        try:
+            base = tempfile.mkdtemp(prefix="fmt.", dir="/tmp")
+        except OSError:
+            base = tempfile.mkdtemp(prefix="fmt.")
+        self.transient = pathlib.Path(base).resolve()
         os.chmod(self.transient, 0o711)
         self.diagnostics = self.artifact_path.parent / f"{self.artifact_path.stem}.diagnostics"
         if self.output_directory_fd is None:
@@ -1173,9 +1186,12 @@ class LaneExecutor:
             raise ContainmentError(f"checkout access grant failed: {exc}") from exc
 
     def _private_root(self, row: dict[str, Any], lease: Lease | None) -> pathlib.Path:
-        root = self.transient / f"attempt-{row['index']}"
-        home = root / "home"
-        temp = root / "tmp"
+        # Single-letter components keep each child's HOME short enough that a
+        # Unix-domain socket bound under it (see the sun_path note on self.transient)
+        # stays within the sockaddr_un limit.
+        root = self.transient / f"a{row['index']}"
+        home = root / "h"
+        temp = root / "t"
         home.mkdir(parents=True)
         temp.mkdir()
         os.chmod(root, 0o700)
@@ -1206,11 +1222,16 @@ class LaneExecutor:
         source = self.manifest.get("environment", {})
         env = {key: value for key, value in source.items() if self._allowed_env_key(key)}
         env["FM_BACKEND_DISABLE_CMUX_FALLBACK"] = "1"
-        env["HOME"] = str(private / "home")
-        env["TMPDIR"] = str(private / "tmp")
-        env["TMP"] = str(private / "tmp")
-        env["TEMP"] = str(private / "tmp")
-        env["GIT_CONFIG_GLOBAL"] = str(private / "home" / ".gitconfig")
+        env["HOME"] = str(private / "h")
+        env["TMPDIR"] = str(private / "t")
+        env["TMP"] = str(private / "t")
+        env["TEMP"] = str(private / "t")
+        # Override, not forward: the runner-owned RUNNER_TEMP is unwritable by a
+        # leased identity, and installers such as bin/fm-install-shellcheck.sh
+        # prefer it for scratch. Point it at the leased-owned private tmp so that
+        # scratch lands where the child can write.
+        env["RUNNER_TEMP"] = str(private / "t")
+        env["GIT_CONFIG_GLOBAL"] = str(private / "h" / ".gitconfig")
         env["FM_TEST_CONTAINMENT_MODE"] = "required" if self.required else "developer-non-enforcing"
         return env
 

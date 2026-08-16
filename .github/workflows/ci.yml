@@ -407,6 +407,14 @@ jobs:
           bin/fm-herdr-ci-cleanup.sh snapshot "$RUNNER_TEMP/fm-herdr/sessions-before.json"
       - name: Run real-Herdr shard ${{ matrix.shard }} (serial)
         env:
+          # Real Herdr is a GUI-backend integration lane that is intentionally not
+          # credential-contained. The shard runs a shared herdr server as the
+          # runner and reaches it over a Unix socket under the runner's home; a
+          # per-UID leased identity could not share that socket, so this lane runs
+          # developer-non-enforcing (as the runner) rather than required. Set it
+          # explicitly so a future default change cannot silently push real Herdr
+          # into credential containment, where it would fail.
+          FM_TEST_CONTAINMENT: developer-non-enforcing
           # job-total rather than a literal, so shrinking or growing the matrix
           # without matching bin/fm-test-run.sh is refused instead of quietly
           # leaving a shard of the required lane unrun.

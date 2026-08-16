@@ -17,9 +17,12 @@ TMP_ROOT=$(fm_test_tmproot fm-spawn-batch)
 export FM_BACKEND=tmux
 
 # Clear ambient firstmate overrides so the behavior test owns its environment.
+# A leased test identity cannot write the checkout that an empty FM_HOME would
+# resolve to, so point FM_HOME at the test's own writable temp root; batch
+# dispatch behavior is independent of the home location.
 run_spawn() {
   FM_ROOT_OVERRIDE='' \
-    FM_HOME='' \
+    FM_HOME="$TMP_ROOT" \
     FM_STATE_OVERRIDE='' \
     FM_DATA_OVERRIDE='' \
     FM_PROJECTS_OVERRIDE='' \
