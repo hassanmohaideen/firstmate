@@ -1121,18 +1121,32 @@ class LaneExecutor:
                     "checkout access grant exceeded the terminal deadline budget"
                 )
 
-        def grant(path: str, bits: int) -> None:
+        def grant(path: str, bits: int, directory: bool) -> None:
             check_deadline()
             if os.path.islink(path):
                 return
-            mode = stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
-            os.chmod(path, mode | bits, follow_symlinks=False)
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if directory:
+                flags |= os.O_DIRECTORY
+            try:
+                fd = os.open(path, flags)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    return
+                raise
+            try:
+                info = os.fstat(fd)
+                if stat.S_ISDIR(info.st_mode) != directory:
+                    raise OSError(errno.ENOTDIR, "checkout entry type changed", path)
+                os.fchmod(fd, stat.S_IMODE(info.st_mode) | bits)
+            finally:
+                os.close(fd)
 
         root = os.path.realpath(self.manifest["root"])
         try:
             parent = os.path.dirname(root)
             while parent and parent != os.path.dirname(parent):
-                grant(parent, 0o001)
+                grant(parent, 0o001, True)
                 parent = os.path.dirname(parent)
 
             def raise_walk_error(error: OSError) -> None:
@@ -1141,11 +1155,11 @@ class LaneExecutor:
             for current, directories, files in os.walk(
                 root, topdown=True, onerror=raise_walk_error, followlinks=False,
             ):
-                grant(current, 0o005)
+                grant(current, 0o005, True)
                 for name in directories:
-                    grant(os.path.join(current, name), 0o005)
+                    grant(os.path.join(current, name), 0o005, True)
                 for name in files:
-                    grant(os.path.join(current, name), 0o004)
+                    grant(os.path.join(current, name), 0o004, False)
             check_deadline()
         except ContainmentError:
             raise
