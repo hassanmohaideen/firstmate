@@ -537,6 +537,7 @@ class Lease:
     path: pathlib.Path
     owner_token: str
     lock_fd: int
+    guard_fd: int
     quarantined: bool = False
 
 
@@ -638,17 +639,41 @@ class LeasePool:
                 continue
             if not self.platform.credential_absent(uid, uid):
                 continue
+            guard_path = self.directory / f"uid-{uid}.lock"
+            guard_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            guard_fd = os.open(guard_path, guard_flags, 0o600)
+            guard_metadata = os.fstat(guard_fd)
+            if (
+                not stat.S_ISREG(guard_metadata.st_mode)
+                or guard_metadata.st_uid != 0
+                or guard_metadata.st_gid != 0
+            ):
+                os.close(guard_fd)
+                raise ContainmentError(f"invalid credential lease guard for uid {uid}")
+            try:
+                fcntl.flock(guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                os.close(guard_fd)
+                continue
             path = self.directory / f"uid-{uid}.lease"
-            if path.with_suffix(".quarantine").exists():
+            quarantine_path = path.with_suffix(".quarantine")
+            try:
+                quarantine_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                os.close(guard_fd)
                 continue
             try:
                 fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
                 if not self._reclaim_stale_lock(path, uid):
+                    os.close(guard_fd)
                     continue
                 try:
                     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
                 except FileExistsError:
+                    os.close(guard_fd)
                     continue
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             record = {
@@ -665,10 +690,11 @@ class LeasePool:
             if not self.platform.credential_absent(uid, uid):
                 path.unlink(missing_ok=True)
                 os.close(fd)
+                os.close(guard_fd)
                 self._sync_directory()
                 continue
             self.allocated.add(uid)
-            return Lease(uid, uid, path, self.owner_token, fd)
+            return Lease(uid, uid, path, self.owner_token, fd, guard_fd)
         raise ContainmentError("no unused UID/GID is available in the qualified lease range")
 
     def retire(self, lease: Lease, quarantine: bool) -> None:
@@ -691,9 +717,11 @@ class LeasePool:
             lease.path = target
         else:
             lease.path.unlink()
+        self._sync_directory()
         os.close(lease.lock_fd)
         lease.lock_fd = -1
-        self._sync_directory()
+        os.close(lease.guard_fd)
+        lease.guard_fd = -1
 
     def finalize(self) -> None:
         pass
@@ -931,6 +959,14 @@ class LaneExecutor:
         return projected, launches
 
     def _validate_schedule_window(self, start: float) -> None:
+        missing_baseline = next(
+            (row for row in self.doc["scripts"] if row["duration_baseline_ms"] is None),
+            None,
+        )
+        if missing_baseline is not None:
+            raise ContainmentError(
+                f"required manifest lacks a measured duration baseline for {missing_baseline['path']}"
+            )
         execution_deadline = self._execution_deadline()
         completion, launches = self._schedule(self.schedule_waves, start)
         if completion <= execution_deadline:
@@ -938,10 +974,7 @@ class LaneExecutor:
         for row, baseline_start, wave_completion in launches:
             if wave_completion <= execution_deadline:
                 continue
-            baseline_ms = row["duration_baseline_ms"]
-            if baseline_ms is None:
-                continue
-            baseline_seconds = float(baseline_ms) / 1000.0
+            baseline_seconds = float(row["duration_baseline_ms"]) / 1000.0
             tail_reserve = wave_completion - (baseline_start + baseline_seconds)
             allowance = execution_deadline - baseline_start - tail_reserve
             raise ContainmentError(
@@ -949,6 +982,7 @@ class LaneExecutor:
                 f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
                 "before the ordinary deadline"
             )
+        raise ContainmentError("manifest schedule cannot fit before the ordinary deadline")
 
     def _release_preacquired_leases(self) -> None:
         if self.lease_pool is None:
@@ -2055,13 +2089,13 @@ def qualify(artifact: pathlib.Path) -> int:
             cleanup_ambiguities.setdefault(owned.uid, "owned qualification target did not exit after TERM")
             raise ContainmentError("owned qualification target did not exit after TERM")
         targets = [(pid, lease) for pid, lease in targets if pid != target]
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            present, probe_code = helper_signal(owned.uid, owned.gid, 0)
-            if domain_probe_empty(present, probe_code):
-                break
-            time.sleep(0.02)
-        else:
+        quiet, ambiguous = prove_domain_quiescent(owned.uid, owned.gid, timeout=2.0)
+        if ambiguous:
+            cleanup_ambiguities.setdefault(
+                owned.uid, "owned qualification domain cleanup was ambiguous"
+            )
+            raise ContainmentError("owned qualification domain cleanup was ambiguous")
+        if not quiet:
             cleanup_ambiguities.setdefault(owned.uid, "owned qualification domain did not quiesce")
             raise ContainmentError("owned qualification domain did not quiesce")
         # The sentinel must still be exactly the same live different-UID process:
