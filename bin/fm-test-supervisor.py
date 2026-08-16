@@ -997,7 +997,10 @@ class LaneExecutor:
                 raise ContainmentError(f"lane-host credential-scoped KILL failed: errno={code}")
             if not bounded_reap(target, 2.0):
                 raise ContainmentError("lane-host qualification target did not exit after KILL")
-            quiet = prove_domain_quiescent(lease.uid, lease.gid, timeout=2.0)
+            quiet, ambiguous = prove_domain_quiescent(lease.uid, lease.gid, timeout=2.0)
+            cleanup_ambiguous |= ambiguous
+            if ambiguous:
+                raise ContainmentError("lane-host qualification domain cleanup was ambiguous")
             if not quiet:
                 raise ContainmentError("lane-host qualification domain did not quiesce")
         except BaseException as exc:
@@ -1014,7 +1017,8 @@ class LaneExecutor:
                 if target is not None and not bounded_reap(target, 1.0):
                     cleanup_ambiguous = True
                 try:
-                    quiet = prove_domain_quiescent(lease.uid, lease.gid, timeout=1.0)
+                    quiet, ambiguous = prove_domain_quiescent(lease.uid, lease.gid, timeout=1.0)
+                    cleanup_ambiguous |= ambiguous
                 except BaseException:
                     quiet = False
                     cleanup_ambiguous = True
@@ -1925,15 +1929,20 @@ def bounded_reap(pid: int, timeout: float) -> bool:
     return False
 
 
-def prove_domain_quiescent(uid: int, gid: int, timeout: float = 3.0) -> bool:
+def prove_domain_quiescent(uid: int, gid: int, timeout: float = 3.0) -> tuple[bool, bool]:
     deadline = time.monotonic() + timeout
+    ambiguous = False
     while time.monotonic() < deadline:
-        helper_signal(uid, gid, signal.SIGKILL)
+        delivered, code = helper_signal(uid, gid, signal.SIGKILL)
+        if not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
+            ambiguous = True
         present, code = helper_signal(uid, gid, 0)
         if domain_probe_empty(present, code):
-            return True
+            return True, ambiguous
+        if not present or code != 0:
+            ambiguous = True
         time.sleep(0.02)
-    return False
+    return False, ambiguous
 
 
 def qualify(artifact: pathlib.Path) -> int:
@@ -1982,10 +1991,12 @@ def qualify(artifact: pathlib.Path) -> int:
                 ambiguous(lease, f"uid {lease.uid} cleanup failed: {exc}")
         for lease in leases:
             try:
-                quiet = prove_domain_quiescent(lease.uid, lease.gid)
+                quiet, probe_ambiguous = prove_domain_quiescent(lease.uid, lease.gid)
             except BaseException as exc:
                 ambiguous(lease, f"uid {lease.uid} quiescence probe failed: {exc}")
                 continue
+            if probe_ambiguous:
+                ambiguous(lease, f"uid {lease.uid} quiescence cleanup was ambiguous")
             if not quiet:
                 # Bounded Darwin non-quiescence diagnostics so a post-billing CI
                 # run can distinguish zombie-reaping (pbi_status) from kill(-1)
@@ -2066,7 +2077,13 @@ def qualify(artifact: pathlib.Path) -> int:
         reparented = spawn_reparented_target(reparented_lease.uid, reparented_lease.gid)
         targets.append((reparented, reparented_lease))
         platform.verify_pid(reparented, reparented_lease.uid, reparented_lease.gid)
-        if not prove_domain_quiescent(reparented_lease.uid, reparented_lease.gid):
+        quiet, ambiguous = prove_domain_quiescent(reparented_lease.uid, reparented_lease.gid)
+        if ambiguous:
+            cleanup_ambiguities.setdefault(
+                reparented_lease.uid, "reparented setsid qualification cleanup was ambiguous"
+            )
+            raise ContainmentError("reparented setsid qualification cleanup was ambiguous")
+        if not quiet:
             cleanup_ambiguities.setdefault(
                 reparented_lease.uid, "reparented setsid qualification domain did not quiesce"
             )
@@ -2094,7 +2111,11 @@ def qualify(artifact: pathlib.Path) -> int:
         if not bounded_reap(storm, 2.0):
             cleanup_ambiguities.setdefault(storm_lease.uid, "fork-storm target did not exit after KILL")
             raise ContainmentError("fork-storm target did not exit after KILL")
-        if not prove_domain_quiescent(storm_lease.uid, storm_lease.gid):
+        quiet, ambiguous = prove_domain_quiescent(storm_lease.uid, storm_lease.gid)
+        if ambiguous:
+            cleanup_ambiguities.setdefault(storm_lease.uid, "TERM-handler fork-storm cleanup was ambiguous")
+            raise ContainmentError("TERM-handler fork-storm cleanup was ambiguous")
+        if not quiet:
             cleanup_ambiguities.setdefault(storm_lease.uid, "TERM-handler fork-storm domain did not quiesce")
             raise ContainmentError("TERM-handler fork-storm domain did not quiesce")
         result["checks"].append({"name": "term-handler-fork-storm-quiescence", "passed": True})
@@ -2190,9 +2211,12 @@ def pid_reuse_fixture() -> int:
         return 1
     finally:
         for lease in leases:
-            quiet = prove_domain_quiescent(lease.uid, lease.gid)
+            try:
+                quiet, ambiguous = prove_domain_quiescent(lease.uid, lease.gid)
+            except BaseException:
+                quiet, ambiguous = False, True
             if lease.path.exists() and not lease.quarantined:
-                pool.retire(lease, quarantine=not quiet)
+                pool.retire(lease, quarantine=ambiguous or not quiet)
         shutil.rmtree(lease_directory, ignore_errors=True)
 
 
