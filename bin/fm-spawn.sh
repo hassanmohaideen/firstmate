@@ -725,6 +725,7 @@ CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
 GATED_POOL_LEASE_ABORT_RETURN=0
 GATED_POOL_PREALLOCATED=0
+GATED_POOL_ENDPOINT_CREATION_STARTED=0
 
 write_github_context_meta() {
   echo "gh_gated=${GH_GATED:-0}"
@@ -757,8 +758,34 @@ parse_orca_worktree_result() {
   fi
 }
 
+persist_gated_pool_recovery() {
+  local recovery_tmp
+  mkdir -p "$STATE" 2>/dev/null || return 1
+  recovery_tmp="$STATE/.$ID.meta.lease-recovery.${BASHPID:-$$}"
+  {
+    echo "window=${T:-${W:-}}"
+    echo "endpoint_task_id=$ID"
+    echo "worktree=$WT"
+    echo "project=$PROJ_ABS"
+    echo "harness=$HARNESS"
+    echo "kind=$KIND"
+    [ -z "${MODE:-}" ] || echo "mode=$MODE"
+    [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
+    write_github_context_meta
+    echo "tasktmp=${TASK_TMP:-}"
+    echo "model=${MODEL:-default}"
+    echo "effort=${EFFORT:-default}"
+    echo "backend=$BACKEND"
+  } > "$recovery_tmp" 2>/dev/null \
+    && mv -f "$recovery_tmp" "$STATE/$ID.meta" \
+    && printf 'failed: allocated worktree lease requires recovery after pre-endpoint launch failure\n' > "$STATE/$ID.status" \
+    && return 0
+  rm -f "$recovery_tmp" 2>/dev/null || true
+  return 1
+}
+
 spawn_abort_cleanup() {
-  local status=$? recovery_tmp recovery_retained
+  local status=$? recovery_retained
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -803,32 +830,16 @@ spawn_abort_cleanup() {
   fi
   if [ "$GATED_POOL_LEASE_ABORT_RETURN" = 1 ] && [ -n "${WT:-}" ]; then
     GATED_POOL_LEASE_ABORT_RETURN=0
-    if ! ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1; then
-      recovery_retained=0
-      mkdir -p "$STATE" 2>/dev/null || true
-      if [ -d "$STATE" ]; then
-        recovery_tmp="$STATE/.$ID.meta.lease-recovery.${BASHPID:-$$}"
-        if {
-          echo "window="
-          echo "worktree=$WT"
-          echo "project=$PROJ_ABS"
-          echo "harness=$HARNESS"
-          echo "kind=$KIND"
-          [ -z "${MODE:-}" ] || echo "mode=$MODE"
-          [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
-          write_github_context_meta
-          echo "tasktmp=${TASK_TMP:-}"
-          echo "model=${MODEL:-default}"
-          echo "effort=${EFFORT:-default}"
-          echo "backend=$BACKEND"
-        } > "$recovery_tmp" 2>/dev/null \
-          && mv -f "$recovery_tmp" "$STATE/$ID.meta" \
-          && printf 'failed: allocated worktree lease requires recovery after pre-endpoint launch failure\n' > "$STATE/$ID.status"; then
-          recovery_retained=1
-        else
-          rm -f "$recovery_tmp" 2>/dev/null || true
-        fi
+    recovery_retained=0
+    if [ "$GATED_POOL_ENDPOINT_CREATION_STARTED" = 1 ]; then
+      persist_gated_pool_recovery && recovery_retained=1
+      if [ "$recovery_retained" = 1 ]; then
+        echo "error: task $ID's endpoint creation was not confirmed; the allocated worktree lease and recovery metadata were retained" >&2
+      else
+        echo "error: task $ID's endpoint creation was not confirmed and recovery metadata could not be persisted; manual endpoint and lease recovery is required" >&2
       fi
+    elif ! ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1; then
+      persist_gated_pool_recovery && recovery_retained=1
       if [ "$recovery_retained" = 1 ]; then
         echo "error: could not return blocked task $ID's allocated worktree '$WT'; the lease and recovery metadata were retained" >&2
       else
@@ -2079,8 +2090,11 @@ case "$BACKEND" in
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
-    GATED_POOL_LEASE_ABORT_RETURN=0
+    GATED_POOL_ENDPOINT_CREATION_STARTED=1
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$SPAWN_START_DIR") || exit 1
+    [ -n "$WID" ] || { echo "error: tmux did not return a window id for $W" >&2; exit 1; }
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -2129,7 +2143,7 @@ case "$BACKEND" in
           "$HERDR_SES" "$HERDR_PRESENTATION_JOURNAL" "$ID" || exit 1
         if [ "${HERDR_RECOVERY_BACKEND:-}" = herdr ]; then
           set +e
-          GATED_POOL_LEASE_ABORT_RETURN=0
+          GATED_POOL_ENDPOINT_CREATION_STARTED=1
           FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_reclaim_task \
             "$HERDR_SES" "$HERDR_PRESENTATION_JOURNAL" "$ID" "$HERDR_LABEL_HOME" \
             "$HERDR_RECOVERY_WORKSPACE_ID" "$HERDR_RECOVERY_TAB_ID" "$HERDR_RECOVERY_PANE_ID" \
@@ -2147,8 +2161,11 @@ case "$BACKEND" in
               HERDR_PROJECTION_ABORT_SESSION=$HERDR_SES
               HERDR_PROJECTION_ABORT_TASK_PANE=$HERDR_PANE_ID
               HERDR_PROJECTION_ABORT_SEEDED_PANE=""
+              GATED_POOL_ENDPOINT_CREATION_STARTED=0
+              GATED_POOL_LEASE_ABORT_RETURN=0
               ;;
             2)
+              GATED_POOL_ENDPOINT_CREATION_STARTED=0
               spawn_herdr_presentation_order_lock_release
               ;;
             *) exit 1 ;;
@@ -2186,7 +2203,7 @@ case "$BACKEND" in
           else
             HERDR_PROJECTION_ID=$(fm_backend_herdr_projection_journal_create "$STATE" "$ID") || exit 1
             HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label "$ID" "$HERDR_PROJECTION_ID")
-            GATED_POOL_LEASE_ABORT_RETURN=0
+            GATED_POOL_ENDPOINT_CREATION_STARTED=1
             if ! FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_create_task \
               "$SPAWN_START_DIR" "$HERDR_PROJECTION_LABEL" "$W"; then
               if [ "${FM_BACKEND_HERDR_PROJECTION_CLEANUP_SAFE:-0}" = 1 ]; then
@@ -2207,6 +2224,8 @@ case "$BACKEND" in
             HERDR_PROJECTION_ABORT_SESSION=$HERDR_SES
             HERDR_PROJECTION_ABORT_TASK_PANE=$HERDR_PANE_ID
             HERDR_PROJECTION_ABORT_SEEDED_PANE=$FM_BACKEND_HERDR_PROJECTION_SEEDED_PANE_ID
+            GATED_POOL_ENDPOINT_CREATION_STARTED=0
+            GATED_POOL_LEASE_ABORT_RETURN=0
             fm_backend_herdr_projection_order_best_effort \
               "$HERDR_SES" "$HERDR_WORKSPACE_ID" "$HERDR_PARENT_LABEL" "$HERDR_PARENT_WORKSPACE_ID"
             HERDR_HOME_ID=$(fm_backend_herdr_projection_home_identity "$HERDR_LABEL_HOME" 2>/dev/null || true)
@@ -2241,7 +2260,7 @@ case "$BACKEND" in
       HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
       HERDR_SES=${CONTAINER%%:*}
       HERDR_WORKSPACE_ID=${CONTAINER#*:}
-      GATED_POOL_LEASE_ABORT_RETURN=0
+      GATED_POOL_ENDPOINT_CREATION_STARTED=1
       HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$SPAWN_START_DIR" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
       read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
@@ -2251,11 +2270,13 @@ EOF
       echo "error: herdr did not return a tab/pane id for $W" >&2
       exit 1
     fi
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     T="$HERDR_SES:$HERDR_PANE_ID"
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    GATED_POOL_LEASE_ABORT_RETURN=0
+    GATED_POOL_ENDPOINT_CREATION_STARTED=1
     ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_START_DIR") || exit 1
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
@@ -2264,11 +2285,13 @@ EOF
       echo "error: zellij did not return a tab/pane id for $W" >&2
       exit 1
     fi
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     T="$ZELLIJ_SES:$ZELLIJ_PANE_ID"
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    GATED_POOL_LEASE_ABORT_RETURN=0
+    GATED_POOL_ENDPOINT_CREATION_STARTED=1
     CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_START_DIR") || exit 1
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
@@ -2277,6 +2300,8 @@ EOF
       echo "error: cmux did not return a workspace/surface id for $W" >&2
       exit 1
     fi
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
     ;;
   orca)

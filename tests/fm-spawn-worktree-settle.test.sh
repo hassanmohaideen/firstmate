@@ -62,7 +62,12 @@ case "${1:-}" in
     exit 0
     ;;
   has-session|new-session) exit 0 ;;
-  new-window) [ -z "${FM_FAKE_ENDPOINT:-}" ] || : > "$FM_FAKE_ENDPOINT"; exit 0 ;;
+  new-window)
+    [ "${FM_FAKE_CREATE_FAIL:-0}" != 1 ] || exit 1
+    [ -z "${FM_FAKE_ENDPOINT:-}" ] || : > "$FM_FAKE_ENDPOINT"
+    printf '@1\n'
+    exit 0
+    ;;
   kill-window)
     [ "${FM_FAKE_KILL_FAIL:-0}" != 1 ] || exit 1
     [ -z "${FM_FAKE_ENDPOINT:-}" ] || rm -f "$FM_FAKE_ENDPOINT"
@@ -128,7 +133,8 @@ run_settle_spawn() {
     FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
     FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
     FM_FAKE_WINDOW="$id" FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
-    FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" FM_FAKE_PERSIST_DIVERGENCE="${FM_FAKE_PERSIST_DIVERGENCE:-0}" \
+    FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" FM_FAKE_CREATE_FAIL="${FM_FAKE_CREATE_FAIL:-0}" \
+    FM_FAKE_PERSIST_DIVERGENCE="${FM_FAKE_PERSIST_DIVERGENCE:-0}" \
     FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" FM_FAKE_FETCH_FAIL="${FM_FAKE_FETCH_FAIL:-0}" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
@@ -292,9 +298,32 @@ test_failed_pre_endpoint_lease_return_retains_recovery_record() {
   pass "a failed pre-endpoint lease return retains recovery metadata"
 }
 
+test_failed_endpoint_creation_retains_recoverable_lease() {
+  local rec id out status git_log gh_log send_log treehouse_log endpoint
+  id=allocated-github-create-failure-z6
+  rec=$(make_settle_case allocated-github-create-failure "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  git_log="$TMP_ROOT/create-failure-git.log"
+  gh_log="$TMP_ROOT/create-failure-gh.log"
+  send_log="$TMP_ROOT/create-failure-send.log"
+  treehouse_log="$TMP_ROOT/create-failure-treehouse.log"
+  endpoint="$TMP_ROOT/create-failure-endpoint"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_CREATE_FAIL=1 run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a failed endpoint creation must fail the spawn"
+  assert_contains "$out" "endpoint creation was not confirmed" "the unconfirmed endpoint creation was not reported"
+  assert_no_grep 'return --force' "$treehouse_log" "an unconfirmed endpoint creation returned its worktree lease"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" "the endpoint creation failure did not retain recoverable lease metadata"
+  assert_grep "endpoint_task_id=$id" "$HOME_DIR/state/$id.meta" "the endpoint creation failure did not retain endpoint recovery identity"
+  pass "a failed endpoint creation retains endpoint and lease recovery metadata"
+}
+
 test_post_endpoint_failure_does_not_force_return_lease() {
   local rec id out status git_log gh_log send_log treehouse_log endpoint
-  id=allocated-github-post-endpoint-failure-z6
+  id=allocated-github-post-endpoint-failure-z7
   rec=$(make_settle_case allocated-github-post-endpoint-failure "$id" 0)
   read_settle_record "$rec"
   prepare_github_gate_case
@@ -318,6 +347,7 @@ test_already_settled_pane_costs_one_confirm_sleep
 test_divergent_allocated_worktree_destination_is_reset_before_launch
 test_unverifiable_pool_reset_blocks_before_endpoint_creation
 test_failed_pre_endpoint_lease_return_retains_recovery_record
+test_failed_endpoint_creation_retains_recoverable_lease
 test_post_endpoint_failure_does_not_force_return_lease
 
 echo "# all fm-spawn-worktree-settle tests passed"
