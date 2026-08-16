@@ -41,7 +41,7 @@ CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
 LEASE_DIRECTORY_ROOT = pathlib.Path("/tmp/fm-test-credential-leases")
 QUIESCE_GRACE = 3.0
-TERMINAL_PUBLISH_RESERVE = 15.0
+TERMINAL_PUBLISH_RESERVE_PER_ATTEMPT = 15.0
 OUTPUT_TAIL_BYTES = 32768
 IMMUTABLE_PLANNED_FIELDS = (
     "index",
@@ -505,6 +505,7 @@ class Attempt:
     started_mono: float | None = None
     deadline_mono: float | None = None
     wait_status: int | None = None
+    completion_observed_mono: float | None = None
     deadline_expired: bool = False
     deadline_term_mono: float | None = None
     deadline_kill_sent: bool = False
@@ -539,6 +540,7 @@ class LaneExecutor:
         self.selector = selectors.DefaultSelector()
         self.interrupted: int | None = None
         self.active: dict[int, Attempt] = {}
+        self.terminal_publications: list[Attempt] = []
         self.max_active_seen = 1
         self.run_start_mono = time.monotonic()
         self.run_start_wall = time.time()
@@ -562,8 +564,20 @@ class LaneExecutor:
     def _to_monotonic(self, epoch: float) -> float:
         return self.run_start_mono + (epoch - self.run_start_wall)
 
+    def _publication_reserve(self) -> float:
+        if not self.required:
+            return TERMINAL_PUBLISH_RESERVE_PER_ATTEMPT
+        concurrent = min(
+            max(1, int(self.manifest["jobs"])),
+            max(1, len(self.doc["scripts"])),
+        )
+        return TERMINAL_PUBLISH_RESERVE_PER_ATTEMPT * (concurrent + 1)
+
     def _cleanup_limit(self) -> float:
-        return min(self.terminal_deadline - TERMINAL_PUBLISH_RESERVE, self.cleanup_deadline)
+        return min(self.terminal_deadline - self._publication_reserve(), self.cleanup_deadline)
+
+    def _execution_deadline(self) -> float:
+        return min(self.ordinary_deadline, self._cleanup_limit())
 
     def _initial_document(self) -> dict[str, Any]:
         scripts = []
@@ -685,18 +699,19 @@ class LaneExecutor:
         return projected, launches
 
     def _validate_schedule_window(self, start: float) -> None:
+        execution_deadline = self._execution_deadline()
         completion, launches = self._schedule(self.schedule_waves, start)
-        if completion <= self.ordinary_deadline:
+        if completion <= execution_deadline:
             return
         for row, baseline_start, wave_completion in launches:
-            if wave_completion <= self.ordinary_deadline:
+            if wave_completion <= execution_deadline:
                 continue
             baseline_ms = row["duration_baseline_ms"]
             if baseline_ms is None:
                 continue
             baseline_seconds = float(baseline_ms) / 1000.0
             tail_reserve = wave_completion - (baseline_start + baseline_seconds)
-            allowance = self.ordinary_deadline - baseline_start - tail_reserve
+            allowance = execution_deadline - baseline_start - tail_reserve
             raise ContainmentError(
                 f"manifest schedule cannot fit {row['path']}: "
                 f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
@@ -879,9 +894,10 @@ class LaneExecutor:
             self.max_active_seen = max(self.max_active_seen, len(self.active))
             attempt.started_mono = time.monotonic()
             reserved = self._remaining_schedule_reserve(row) if self.required else 0.0
+            scheduling_deadline = self._execution_deadline() if self.required else self.ordinary_deadline
             attempt.deadline_mono = min(
                 attempt.started_mono + float(budget_ms) / 1000.0,
-                self.ordinary_deadline - reserved,
+                scheduling_deadline - reserved,
             )
             if self.required and baseline_ms is not None and attempt.deadline_mono - attempt.started_mono < baseline_seconds:
                 raise ContainmentError(f"startup exceeded the reserved window for {row['path']}")
@@ -1007,6 +1023,7 @@ class LaneExecutor:
             found, status = attempt.pid, 1 << 8
         if found == attempt.pid:
             attempt.wait_status = status
+            attempt.completion_observed_mono = time.monotonic()
             return True
         return False
 
@@ -1056,6 +1073,18 @@ class LaneExecutor:
         if sig != 0 and not delivered:
             attempt.cleanup_ambiguous = True
         return delivered, code
+
+    def _queue_terminalization(self, attempt: Attempt) -> None:
+        if attempt.cleanup_state == "publication_queued":
+            return
+        attempt.cleanup_state = "publication_queued"
+        self.terminal_publications.append(attempt)
+
+    def _publish_one_terminal(self) -> None:
+        if not self.terminal_publications:
+            return
+        attempt = self.terminal_publications.pop(0)
+        self._terminalize_attempt(attempt)
 
     def _terminalize_attempt(self, attempt: Attempt) -> None:
         cause = "deadline" if attempt.deadline_expired else str(attempt.cleanup_cause)
@@ -1133,7 +1162,7 @@ class LaneExecutor:
 
     def _advance_cleanup(self, attempt: Attempt, now: float) -> None:
         state = attempt.cleanup_state
-        if state is None or state == "done" or now < attempt.cleanup_next_mono:
+        if state is None or state in {"done", "publication_queued"} or now < attempt.cleanup_next_mono:
             return
         if state == "developer_term":
             if attempt.pid is not None:
@@ -1154,7 +1183,7 @@ class LaneExecutor:
             attempt.cleanup_state = "terminalize"
             return
         if state == "terminalize":
-            self._terminalize_attempt(attempt)
+            self._queue_terminalization(attempt)
             return
         if not self.required or attempt.lease is None:
             attempt.cleanup_quiet = True
@@ -1298,17 +1327,18 @@ class LaneExecutor:
         for key, _mask in self.selector.select(timeout=timeout):
             self._drain(key.data)
         active = list(self.active.values())
-        now = time.monotonic()
         for attempt in active:
             self._drain(attempt)
             root_exited = self._poll_wait(attempt)
-            if (
-                attempt.cleanup_state is None
-                and not attempt.deadline_expired
-                and attempt.deadline_mono is not None
-                and now >= attempt.deadline_mono
-                and not root_exited
-            ):
+            observed = attempt.completion_observed_mono
+            deadline_elapsed = (
+                attempt.deadline_mono is not None
+                and (
+                    (observed is not None and observed >= attempt.deadline_mono)
+                    or (not root_exited and time.monotonic() >= attempt.deadline_mono)
+                )
+            )
+            if attempt.cleanup_state is None and not attempt.deadline_expired and deadline_elapsed:
                 self._expire_attempt(attempt)
             elif attempt.cleanup_state is None and root_exited:
                 self._begin_cleanup(attempt, "exit")
@@ -1319,6 +1349,7 @@ class LaneExecutor:
             self._advance_cleanup(attempt, time.monotonic())
             if attempt.cleanup_state == "done":
                 self.residual_cleanup_attempts.remove(attempt)
+        self._publish_one_terminal()
 
     def _broadcast_interruption(self) -> None:
         now = time.monotonic()
@@ -1344,7 +1375,7 @@ class LaneExecutor:
             return self.unsupported(str(exc))
         pending = list(self.doc["scripts"])
         interruption_broadcast = False
-        while pending or self.active or self.residual_cleanup_attempts:
+        while pending or self.active or self.residual_cleanup_attempts or self.terminal_publications:
             if self.interrupted is not None:
                 pending.clear()
                 if not interruption_broadcast:
