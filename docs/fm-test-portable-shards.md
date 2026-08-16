@@ -15,7 +15,10 @@ The credential boundary remains stable across fork, exec, parent exit, reparenti
 An unreadable, ambiguous, or non-quiescent identity is quarantined while later scripts use fresh identities.
 Required Linux and macOS qualification fails closed before tests execute when noninteractive privilege, credential inspection, permanent drop, signal scope, or platform semantics are unavailable.
 Qualification proves that a live different-UID process is never signaled by its numeric PID during a credential-scoped sweep, and Linux additionally manufactures a true same-numeric-PID reuse in a private PID namespace; macOS relies on the same UID-scoped `kill(-1)` making the numeric PID irrelevant, because deterministic same-number reuse is not available there without exhausting the PID space.
-A dedicated per-platform job runs the executor-behavior subset through the public runner on both `ubuntu-latest` and `macos-latest`, so the credential-domain execute path, timeout, interruption, atomic evidence, environment allowlist, and non-quiescence/ambiguity terminalization are proven on Darwin as well as Linux.
+A dedicated per-platform job runs the executor-behavior subset through the public runner on both `ubuntu-latest` and `macos-latest`.
+The required public-runner and non-quiescence/ambiguity fixtures self-escalate into credential domains, while timeout, interruption, atomic-evidence, environment-isolation, and scheduling fixtures exercise the same public interfaces in `developer-non-enforcing` mode because their runner-owned scratch is intentionally inaccessible to a leased identity.
+Linux currently qualifies the full boundary, including true same-number PID reuse.
+Darwin runs the required execute path but its current non-quiescence qualification remains red with bounded survivor-credential, zombie, and probe-errno diagnostics, so it does not yet publish passing containment evidence and is not classified as unsupported.
 Local execution is explicitly labeled `developer-non-enforcing`; it does not claim hard descendant containment, and credential-contained CI lanes never accept it.
 
 ## Schema-v2 evidence
@@ -80,7 +83,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 147-script inventory leaves 110 scripts in the portable serial remainder.
+The current 149-script inventory leaves 112 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 
@@ -88,23 +91,23 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 `.github/workflows/ci.yml` derives the same `n` from `strategy.job-total` rather than a literal, so changing the shard count in either file without the other fails the lane loudly instead of leaving part of the required suite unrun.
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
-The hints are the complete per-script measurements from the retained per-shard timing artifacts of green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), refreshed through the procedure below.
-A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
+The retained per-script measurements come from green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13) and are refreshed through the procedure below.
+A script added since that run or otherwise lacking a hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of10` | 10 | 221044 ms (~221.0 s) |
-| `portable-serial-2of10` | 11 | 221049 ms (~221.0 s) |
-| `portable-serial-3of10` | 7 | 221526 ms (~221.5 s) |
-| `portable-serial-4of10` | 12 | 221048 ms (~221.0 s) |
-| `portable-serial-5of10` | 15 | 221055 ms (~221.1 s) |
-| `portable-serial-6of10` | 8 | 221483 ms (~221.5 s) |
-| `portable-serial-7of10` | 12 | 221056 ms (~221.1 s) |
-| `portable-serial-8of10` | 9 | 221143 ms (~221.1 s) |
-| `portable-serial-9of10` | 12 | 221053 ms (~221.1 s) |
-| `portable-serial-10of10` | 14 | 221053 ms (~221.1 s) |
-| imbalance | | 482 ms |
+| `portable-serial-1of10` | 9 | 227794 ms (~227.8 s) |
+| `portable-serial-2of10` | 10 | 227784 ms (~227.8 s) |
+| `portable-serial-3of10` | 11 | 227787 ms (~227.8 s) |
+| `portable-serial-4of10` | 10 | 227792 ms (~227.8 s) |
+| `portable-serial-5of10` | 11 | 227777 ms (~227.8 s) |
+| `portable-serial-6of10` | 13 | 227795 ms (~227.8 s) |
+| `portable-serial-7of10` | 14 | 227796 ms (~227.8 s) |
+| `portable-serial-8of10` | 11 | 227789 ms (~227.8 s) |
+| `portable-serial-9of10` | 12 | 227774 ms (~227.8 s) |
+| `portable-serial-10of10` | 11 | 227840 ms (~227.8 s) |
+| imbalance | | 66 ms |
 
 The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210119 ms in that run, is the floor for any serial shard count.
 Ten shards sit just above that floor, so more serial runners would stop paying off without first splitting or speeding that script.
@@ -168,7 +171,7 @@ Its failures were pre-existing failures unrelated to the scheduling and slow-tes
 
 Green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13) completed in 10 minutes 48 seconds of wall-clock at four serial shards.
 Its critical path was portable serial shard 2's test step at 10 minutes 18 seconds, with shards 1 and 4 near 9 minutes 35 seconds, the single Herdr lane at 6 minutes 25 seconds, and the full-set lint job at 6 minutes 54 seconds under two bounded workers.
-The 2026-08-13 recomposition answers each of those: ten balanced serial shards near 221 seconds of hinted work each, two real-Herdr shards, and four lint workers over eight stable shards.
+The current composition answers each of those: ten balanced serial shards near 228 seconds of hinted work each, two real-Herdr shards, and four lint workers over eight stable shards.
 A local full-set lint measurement on an arm64 host fell from 209.7 seconds at two workers to 126.4 seconds at four workers with byte-identical diagnostics.
 The per-lane timing artifacts and aggregate of the next green CI run are the after measurement for this recomposition.
 The aggregate now finds nested timing JSON recursively; the prior top-level-only glob silently dropped the Herdr lane from the aggregate artifact.
@@ -208,7 +211,7 @@ The tables above remain scheduling inputs until the next green required run publ
 
 Every workflow job has `timeout-minutes: 10`.
 Behavior jobs record T0 as their first executable step, before checkout, so the absolute deadline budget also covers checkout and tool setup rather than starting the clock only once the code is present.
-They then pass one absolute deadline set to the executor.
+Every behavior lane that invokes the executor passes that one absolute deadline set through the public runner.
 Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
 The final 120 seconds remain reserved for artifact upload and platform variance before the 600-second job ceiling.
 Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards.

@@ -219,8 +219,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FM_TEST_CONTAINMENT: required
-    # Current measured hints total about 37 min of serial work; the balanced
-    # shards are about 3.7 min each. Cap is a hang tripwire with margin, not
+    # Current measured hints total about 38 min of serial work; the balanced
+    # shards are about 3.8 min each. Cap is a hang tripwire with margin, not
     # the expected healthy end of the lane.
     timeout-minutes: 10
     strategy:
