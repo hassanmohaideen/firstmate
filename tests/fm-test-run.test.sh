@@ -1317,7 +1317,7 @@ PY
 }
 
 test_concurrent_atomic_polling_across_parallel_transitions() {
-  local tmp manifest artifact pid rc n i
+  local tmp manifest artifact poll_pid rc i reads invalid
   local -a specs=()
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-poll.XXXXXX")
   i=1
@@ -1335,21 +1335,45 @@ SH
   done
   manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
   make_parallel_dev_manifest "$manifest" "$artifact" "$tmp" 4 "${specs[@]}"
-  python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err" &
-  pid=$!
-  n=0
-  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 600 ]; do
-    if [ -f "$artifact" ]; then
-      python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$artifact" \
-        || { kill -KILL "$pid" 2>/dev/null || true; rm -rf "$tmp"; fail "polling observed invalid JSON during parallel transitions"; }
-    fi
-    n=$((n + 1))
-  done
+  # A tight in-process poller races the executor's atomic artifact replacements:
+  # it reads the file as fast as it can for the whole run and records any
+  # observation that is missing mid-write, truncated, or not valid JSON. Because
+  # every publish uses os.replace, a racing reader must always see a complete
+  # prior or next version, never a partial one.
+  cat >"$tmp/poll.py" <<'PY'
+import json, os, sys
+artifact, stop_flag, result = sys.argv[1], sys.argv[2], sys.argv[3]
+reads = invalid = 0
+def read_once():
+    global reads, invalid
+    try:
+        with open(artifact, encoding="utf-8") as handle:
+            json.load(handle)
+        reads += 1
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, ValueError):
+        invalid += 1
+while not os.path.exists(stop_flag):
+    read_once()
+for _ in range(500):  # keep racing the final replacements after the run stops
+    read_once()
+with open(result, "w", encoding="utf-8") as handle:
+    handle.write(f"{reads} {invalid}")
+PY
+  python3 "$tmp/poll.py" "$artifact" "$tmp/stop" "$tmp/poll.result" &
+  poll_pid=$!
   set +e
-  wait "$pid"
+  python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err"
   rc=$?
   set -e
+  : >"$tmp/stop"
+  wait "$poll_pid" 2>/dev/null || true
   [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "parallel developer run should pass"; }
+  reads=$(cut -d' ' -f1 "$tmp/poll.result"); invalid=$(cut -d' ' -f2 "$tmp/poll.result")
+  [ "$invalid" -eq 0 ] \
+    || { rm -rf "$tmp"; fail "poller saw $invalid truncated/invalid JSON reads while artifact replacements were in flight"; }
+  [ "${reads:-0}" -ge 1 ] || { rm -rf "$tmp"; fail "poller never observed the artifact during the run"; }
   python3 - "$artifact" <<'PY' || { rm -rf "$tmp"; fail "final artifact wrong after parallel transitions"; }
 import json, pathlib, sys
 doc = json.load(open(sys.argv[1]))
@@ -1364,7 +1388,7 @@ for row in doc["scripts"]:
     assert log_path and pathlib.Path(log_path).exists(), log_path
 PY
   rm -rf "$tmp"
-  pass "concurrent JSON polling stays valid across rapid parallel transitions"
+  pass "concurrent JSON polling stays valid while artifact replacements are in flight"
 }
 
 test_required_containment_ambiguity_terminalizes() {

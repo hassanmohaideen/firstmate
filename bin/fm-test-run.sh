@@ -1713,19 +1713,27 @@ CEILING_DEADLINE=${FM_TEST_CEILING_DEADLINE_EPOCH:-$((T0 + 600))}
 python3 - "$MANIFEST" "$ROWS" "$JSON_PATH" "$ROOT" "$RUN_ID" \
   "$SELECTION_DESC" "$JOBS" "$CONTAINMENT_MODE" "$DURATION_BUDGET_MODE" \
   "$FAIL_ON_GATE_SKIP" "$T0" "$ORDINARY_DEADLINE" "$TERMINAL_DEADLINE" \
-  "$CLEANUP_DEADLINE" "$CEILING_DEADLINE" "$(command -v bash)" <<'PY'
-import json, os, pathlib, sys
+  "$CLEANUP_DEADLINE" "$CEILING_DEADLINE" "$(command -v bash)" "$SUPERVISOR" <<'PY'
+import importlib.util, json, os, pathlib, sys
 (
     manifest_path, rows_path, artifact, root, run_id, selection, jobs,
     containment, budget_mode, fail_token, t0, ordinary, terminal, cleanup,
-    ceiling, bash_path,
+    ceiling, bash_path, supervisor_path,
 ) = sys.argv[1:]
-secret_parts = ("TOKEN", "SECRET", "PASSWORD", "COOKIE", "CREDENTIAL", "AUTHORIZATION", "PRIVATE_KEY")
-clear = {"FM_TEST_CONTAINMENT"}
-environment = {
-    key: value for key, value in os.environ.items()
-    if key not in clear and not any(part in key.upper() for part in secret_parts)
-}
+# The executor owns the environment allowlist; import it so the manifest that
+# passes through sudo carries only allowlisted variables and never writes a
+# runner secret (GITHUB_TOKEN, DATABASE_URL, SSH_AUTH_SOCK, ...) to disk. This is
+# default-deny at the disk boundary; the executor re-applies the same allowlist
+# at the child-exec boundary (bin/fm-test-supervisor.py is the single owner).
+_spec = importlib.util.spec_from_file_location("fm_test_supervisor", supervisor_path)
+_supervisor = importlib.util.module_from_spec(_spec)
+sys.modules["fm_test_supervisor"] = _supervisor
+_spec.loader.exec_module(_supervisor)
+def _allowed(key):
+    if any(part in key.upper() for part in _supervisor.SECRET_SUBSTRINGS):
+        return False
+    return key in _supervisor.ALLOWED_ENV_NAMES or key.startswith(_supervisor.ALLOWED_ENV_PREFIXES)
+environment = {key: value for key, value in os.environ.items() if _allowed(key)}
 scripts = []
 for line in pathlib.Path(rows_path).read_text(encoding="utf-8").splitlines():
     if not line:

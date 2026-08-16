@@ -1121,6 +1121,7 @@ def qualify(artifact: pathlib.Path) -> int:
     }
     atomic_json(artifact, result)
     targets: list[tuple[int, Lease]] = []
+    leases: list[Lease] = []
     # Qualification leases live in a private temp directory, never beside the
     # uploaded artifact, and are removed whole on exit. This keeps identity lock
     # bytes (including any .quarantine files) out of the evidence upload and
@@ -1132,6 +1133,7 @@ def qualify(artifact: pathlib.Path) -> int:
         platform = CredentialPlatform()
         pool = LeasePool(platform, lease_root / "leases", f"qualification-{os.getpid()}")
         owned, sentinel = pool.acquire(), pool.acquire()
+        leases.extend((owned, sentinel))
         target = spawn_qualification_target(owned.uid, owned.gid, ignore_term=True, session_escape=True)
         other = spawn_qualification_target(sentinel.uid, sentinel.gid, ignore_term=True, session_escape=True)
         targets.extend(((target, owned), (other, sentinel)))
@@ -1168,6 +1170,7 @@ def qualify(artifact: pathlib.Path) -> int:
         })
 
         reparented_lease = pool.acquire()
+        leases.append(reparented_lease)
         reparented = spawn_reparented_target(reparented_lease.uid, reparented_lease.gid)
         platform.verify_pid(reparented, reparented_lease.uid, reparented_lease.gid)
         if not prove_domain_quiescent(reparented_lease.uid, reparented_lease.gid):
@@ -1175,6 +1178,7 @@ def qualify(artifact: pathlib.Path) -> int:
         result["checks"].append({"name": "parent-exit-reparenting-setsid", "passed": True, "diagnostic_pid": reparented})
 
         storm_lease = pool.acquire()
+        leases.append(storm_lease)
         storm = spawn_fork_storm_target(storm_lease.uid, storm_lease.gid)
         platform.verify_pid(storm, storm_lease.uid, storm_lease.gid)
         helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGTERM)
@@ -1194,6 +1198,24 @@ def qualify(artifact: pathlib.Path) -> int:
             if child != 0:
                 raise ContainmentError(f"true same-PID namespace qualification failed with exit {child}")
             result["checks"].append({"name": "true-same-numeric-pid-reuse", "passed": True})
+        # Complete cleanup and prove every leased identity quiescent and retired
+        # BEFORE publishing a passing result. A surviving, unreadable, or
+        # non-quiescent domain must make qualification red here, never a pass
+        # printed ahead of a best-effort finally that could swallow the failure.
+        for pid, lease in targets:
+            try:
+                helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (OSError, ChildProcessError):
+                pass
+        targets.clear()
+        for lease in leases:
+            if not prove_domain_quiescent(lease.uid, lease.gid):
+                raise ContainmentError(
+                    f"qualification lease uid {lease.uid} did not quiesce before publication"
+                )
+        shutil.rmtree(lease_root, ignore_errors=True)
+        result["checks"].append({"name": "all-domains-quiescent-before-publish", "passed": True})
         result.update({"complete": True, "passed": True, "finished_at": iso_now()})
         atomic_json(artifact, result)
         print(f"FM_TEST_QUALIFICATION platform={sys.platform} passed=true")

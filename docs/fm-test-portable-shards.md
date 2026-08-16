@@ -10,6 +10,7 @@ Required CI leases one otherwise-unused high numeric UID/GID for each selected s
 The executor remains outside every test identity, releases a blocked child only after permanent credential drop and verification, and uses an unprivileged helper in that exact identity for every signal and quiescence probe.
 Numeric PIDs, process groups, mutable ancestry, and environment markers are diagnostics at most and are never cleanup authority in required CI.
 The executor is the single owner of the contained child environment and builds it from an explicit default-deny allowlist, so fleet routing, runner secrets, and unknown ambient variables never reach a test and only the sanctioned `FM_TEST_ENV_` channel and a small safe base set pass through.
+`bin/fm-test-run.sh` imports that same allowlist when it constructs the manifest, so secrets such as `GITHUB_TOKEN`, `DATABASE_URL`, or `SSH_AUTH_SOCK` are never written to the on-disk manifest that passes through `sudo` to the executor.
 The credential boundary remains stable across fork, exec, parent exit, reparenting, `setsid`, signal handlers, and PID reuse.
 An unreadable, ambiguous, or non-quiescent identity is quarantined while later scripts use fresh identities.
 Required Linux and macOS qualification refuses red before tests when noninteractive privilege, credential inspection, permanent drop, signal scope, or platform semantics are unavailable.
