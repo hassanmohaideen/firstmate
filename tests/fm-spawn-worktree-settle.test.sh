@@ -78,6 +78,33 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  cat > "$fakebin/zellij" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_FAKE_ZELLIJ_LOG:-/dev/null}"
+case " $* " in
+  *" --version "*) printf 'zellij 0.44.0\n'; exit 0 ;;
+  *" list-sessions "*) printf 'firstmate\n'; exit 0 ;;
+  *" action new-tab "*)
+    [ -z "${FM_FAKE_ENDPOINT:-}" ] || : > "$FM_FAKE_ENDPOINT"
+    printf '9\n'
+    exit 0
+    ;;
+  *" action list-panes "*) printf '[]\n'; exit 0 ;;
+  *" action close-tab-by-id "*) exit 1 ;;
+  *" action list-tabs "*)
+    countfile="${FM_FAKE_ZELLIJ_LIST_COUNT:?FM_FAKE_ZELLIJ_LIST_COUNT unset}"
+    n=0
+    [ -f "$countfile" ] && n=$(cat "$countfile")
+    n=$((n + 1))
+    printf '%s\n' "$n" > "$countfile"
+    [ "$n" -eq 1 ] && { printf '[]\n'; exit 0; }
+    exit 1
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/zellij"
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:-/dev/null}"
@@ -123,6 +150,9 @@ EOF
 
 run_settle_spawn() {
   local id=$1
+  local -a spawn_args
+  spawn_args=("$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
+  [ -z "${FM_FAKE_BACKEND:-}" ] || spawn_args+=(--backend "$FM_FAKE_BACKEND")
   FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
@@ -132,12 +162,13 @@ run_settle_spawn() {
     FM_REAL_GIT="${FM_REAL_GIT:-}" FM_FAKE_GIT_LOG="${FM_FAKE_GIT_LOG:-}" \
     FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
     FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
+    FM_FAKE_ZELLIJ_LOG="${FM_FAKE_ZELLIJ_LOG:-}" FM_FAKE_ZELLIJ_LIST_COUNT="${FM_FAKE_ZELLIJ_LIST_COUNT:-}" \
     FM_FAKE_WINDOW="$id" FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
     FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" FM_FAKE_CREATE_FAIL="${FM_FAKE_CREATE_FAIL:-0}" \
     FM_FAKE_PERSIST_DIVERGENCE="${FM_FAKE_PERSIST_DIVERGENCE:-0}" \
     FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" FM_FAKE_FETCH_FAIL="${FM_FAKE_FETCH_FAIL:-0}" \
     PATH="$FAKEBIN_DIR:$PATH" \
-    "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
+    "$SPAWN" "${spawn_args[@]}" 2>&1
 }
 
 # A single stale first read (the exact incident) must not be accepted: the
@@ -321,6 +352,32 @@ test_failed_endpoint_creation_retains_recoverable_lease() {
   pass "a failed endpoint creation retains endpoint and lease recovery metadata"
 }
 
+test_unconfirmed_zellij_partial_endpoint_retains_lease_without_recovery_meta() {
+  local rec id out status git_log gh_log send_log treehouse_log endpoint zellij_log list_count
+  id=allocated-github-zellij-partial-z7
+  rec=$(make_settle_case allocated-github-zellij-partial "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  git_log="$TMP_ROOT/zellij-partial-git.log"
+  gh_log="$TMP_ROOT/zellij-partial-gh.log"
+  send_log="$TMP_ROOT/zellij-partial-send.log"
+  treehouse_log="$TMP_ROOT/zellij-partial-treehouse.log"
+  endpoint="$TMP_ROOT/zellij-partial-endpoint"
+  zellij_log="$TMP_ROOT/zellij-partial-cli.log"
+  list_count="$TMP_ROOT/zellij-partial-list-count"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"; : > "$zellij_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_BACKEND=zellij FM_FAKE_ZELLIJ_LOG="$zellij_log" FM_FAKE_ZELLIJ_LIST_COUNT="$list_count" run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "an unconfirmed Zellij partial endpoint must fail the spawn"
+  assert_contains "$out" "zellij may have left partial tab 9" "the possible Zellij orphan was not named"
+  assert_contains "$out" "retained pooled-worktree lease '$WT_DIR' needs manual attention" "the retained pooled lease was not reported"
+  assert_grep 'close-tab-by-id 9' "$zellij_log" "the partial Zellij endpoint was not cleaned up best-effort"
+  assert_no_grep 'return --force' "$treehouse_log" "the possible orphan's pooled-worktree lease was returned"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "an unusable partial-endpoint recovery record was persisted"
+  pass "an unconfirmed Zellij partial endpoint fails loudly without persisting unusable recovery metadata"
+}
+
 test_post_endpoint_failure_does_not_force_return_lease() {
   local rec id out status git_log gh_log send_log treehouse_log endpoint
   id=allocated-github-post-endpoint-failure-z7
@@ -348,6 +405,7 @@ test_divergent_allocated_worktree_destination_is_reset_before_launch
 test_unverifiable_pool_reset_blocks_before_endpoint_creation
 test_failed_pre_endpoint_lease_return_retains_recovery_record
 test_failed_endpoint_creation_retains_recoverable_lease
+test_unconfirmed_zellij_partial_endpoint_retains_lease_without_recovery_meta
 test_post_endpoint_failure_does_not_force_return_lease
 
 echo "# all fm-spawn-worktree-settle tests passed"

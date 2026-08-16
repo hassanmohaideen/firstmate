@@ -2277,7 +2277,26 @@ EOF
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
     GATED_POOL_ENDPOINT_CREATION_STARTED=1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_START_DIR") || exit 1
+    set +e
+    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_START_DIR")
+    ZELLIJ_CREATE_STATUS=$?
+    set -e
+    case "$ZELLIJ_CREATE_STATUS" in
+      0) ;;
+      2)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        exit 1
+        ;;
+      3)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        if [ "$GATED_POOL_LEASE_ABORT_RETURN" = 1 ]; then
+          echo "error: zellij partial-endpoint cleanup was not confirmed; retained pooled-worktree lease '$WT' needs manual attention" >&2
+          GATED_POOL_LEASE_ABORT_RETURN=0
+        fi
+        exit 1
+        ;;
+      *) exit 1 ;;
+    esac
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -2292,7 +2311,26 @@ EOF
   cmux)
     fm_backend_cmux_container_ensure || exit 1
     GATED_POOL_ENDPOINT_CREATION_STARTED=1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_START_DIR") || exit 1
+    set +e
+    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_START_DIR")
+    CMUX_CREATE_STATUS=$?
+    set -e
+    case "$CMUX_CREATE_STATUS" in
+      0) ;;
+      2)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        exit 1
+        ;;
+      3)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        if [ "$GATED_POOL_LEASE_ABORT_RETURN" = 1 ]; then
+          echo "error: cmux partial-endpoint cleanup was not confirmed; retained pooled-worktree lease '$WT' needs manual attention" >&2
+          GATED_POOL_LEASE_ABORT_RETURN=0
+        fi
+        exit 1
+        ;;
+      *) exit 1 ;;
+    esac
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF

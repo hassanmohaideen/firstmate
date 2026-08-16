@@ -350,8 +350,15 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   esac
   pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
   if [ -z "$pane_id" ]; then
-    echo "error: could not find a terminal pane for zellij tab $tab_id (session '$session')" >&2
-    return 1
+    # Exact partial-endpoint recovery for Zellij is deferred to the backend-integration follow-up.
+    fm_backend_zellij_cli "$session" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
+    if tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) \
+      && printf '%s' "$tabs" | jq -e --arg id "$tab_id" '[.[]? | select((.tab_id | tostring) == $id)] | length == 0' >/dev/null 2>&1; then
+      echo "error: could not find a terminal pane for zellij tab $tab_id (session '$session'); the partial tab was removed" >&2
+      return 2
+    fi
+    echo "error: zellij may have left partial tab $tab_id in session '$session'; cleanup could not be confirmed and worktree '$cwd' needs manual attention" >&2
+    return 3
   fi
   if [ -n "$prev_active" ] && [ "$prev_active" != "$tab_id" ]; then
     fm_backend_zellij_cli "$session" action go-to-tab-by-id "$prev_active" >/dev/null 2>&1 || true
