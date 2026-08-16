@@ -36,7 +36,7 @@ from typing import Any
 SCHEMA_VERSION = 2
 UID_MIN = 61000
 UID_MAX = 64999
-READINESS_RESERVE = 5.0
+STARTUP_RESERVE = 15.0
 CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
 LEASE_DIRECTORY_ROOT = pathlib.Path("/tmp/fm-test-credential-leases")
@@ -370,11 +370,7 @@ def helper_signal(uid: int, gid: int, sig: int) -> tuple[bool, int]:
         code = 0
         try:
             drop_credentials(uid, gid)
-            if sig == 0:
-                members = CredentialPlatform().domain_members(uid, live_only=True)
-                code = 0 if any(member != os.getpid() for member in members) else errno.ESRCH
-            else:
-                os.kill(-1, sig)
+            os.kill(-1, sig)
         except OSError as exc:
             code = exc.errno or errno.EIO
         except BaseException:
@@ -481,6 +477,7 @@ class Attempt:
     started_mono: float | None = None
     deadline_mono: float | None = None
     wait_status: int | None = None
+    cleanup_ambiguous: bool = False
     tail: bytearray = field(default_factory=bytearray)
 
 
@@ -624,7 +621,7 @@ class LaneExecutor:
         for wave in waves:
             executions: list[tuple[dict[str, Any], float, float]] = []
             for row in wave:
-                projected += READINESS_RESERVE
+                projected += STARTUP_RESERVE
                 baseline_ms = row["duration_baseline_ms"]
                 baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
                 executions.append((row, projected, projected + baseline_seconds))
@@ -928,6 +925,28 @@ class LaneExecutor:
             return 128 + os.WTERMSIG(status)
         return 1
 
+    def _enforce_other_deadlines(self, current: Attempt) -> None:
+        now = time.monotonic()
+        for other in list(self.active.values()):
+            if other is current or other.deadline_mono is None or now < other.deadline_mono:
+                continue
+            if any(item.get("name") == "deadline_expired" for item in other.row["events"]):
+                continue
+            self.append(other, "deadline_expired")
+            if self.required and other.lease is not None:
+                try:
+                    delivered, code = helper_signal(other.lease.uid, other.lease.gid, signal.SIGTERM)
+                except BaseException:
+                    delivered, code = False, errno.EIO
+                if not delivered:
+                    other.cleanup_ambiguous = True
+                other.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
+            elif other.pid is not None:
+                try:
+                    os.killpg(other.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+
     def _cleanup_domain(self, attempt: Attempt, reason: str) -> tuple[bool, list[int]]:
         if not self.required:
             # Explicitly non-enforcing developer behavior. This is never used by
@@ -950,7 +969,7 @@ class LaneExecutor:
         assert attempt.lease is not None and self.platform is not None and self.lease_pool is not None
         lease = attempt.lease
         diagnostics: list[int] = []
-        ambiguous = False
+        ambiguous = attempt.cleanup_ambiguous
 
         def checked_helper(sig: int) -> tuple[bool, int]:
             nonlocal ambiguous
@@ -975,6 +994,7 @@ class LaneExecutor:
         present = bool(diagnostics)
         last_code = 0
         while time.monotonic() < grace:
+            self._enforce_other_deadlines(attempt)
             self._drain(attempt)
             self._poll_wait(attempt)
             present, last_code = checked_helper(0)
@@ -985,6 +1005,7 @@ class LaneExecutor:
             time.sleep(0.05)
         limit = min(self.terminal_deadline, time.monotonic() + QUIESCE_GRACE)
         while present and time.monotonic() < limit:
+            self._enforce_other_deadlines(attempt)
             delivered, code = checked_helper(signal.SIGKILL)
             if not delivered:
                 ambiguous = True
@@ -1024,7 +1045,8 @@ class LaneExecutor:
         self._drain(attempt)
         root_exited = self._poll_wait(attempt)
         if cause == "deadline":
-            self.append(attempt, "deadline_expired")
+            if not any(item.get("name") == "deadline_expired" for item in attempt.row["events"]):
+                self.append(attempt, "deadline_expired")
         elif root_exited:
             self.append(attempt, "test_exited", exit=self._exit_code(attempt.wait_status))
         elif cause == "interrupted":
@@ -1152,11 +1174,36 @@ class LaneExecutor:
     def _service_active(self, timeout: float = 0.0) -> None:
         for key, _mask in self.selector.select(timeout=timeout):
             self._drain(key.data)
-        for attempt in list(self.active.values()):
-            if self._poll_wait(attempt):
-                self.finish(attempt, "exit")
-            elif attempt.deadline_mono is not None and time.monotonic() >= attempt.deadline_mono:
+        active = list(self.active.values())
+        now = time.monotonic()
+        expired = [
+            attempt for attempt in active
+            if attempt.deadline_mono is not None and now >= attempt.deadline_mono
+            and not self._poll_wait(attempt)
+        ]
+        for attempt in expired:
+            if not any(item.get("name") == "deadline_expired" for item in attempt.row["events"]):
+                self.append(attempt, "deadline_expired")
+            if self.required and attempt.lease is not None:
+                try:
+                    delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGTERM)
+                except BaseException:
+                    delivered, code = False, errno.EIO
+                if not delivered:
+                    attempt.cleanup_ambiguous = True
+                attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
+            elif attempt.pid is not None:
+                try:
+                    os.killpg(attempt.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        for attempt in active:
+            if attempt.pid not in self.active:
+                continue
+            if attempt in expired:
                 self.finish(attempt, "deadline")
+            elif self._poll_wait(attempt):
+                self.finish(attempt, "exit")
 
     def run(self) -> int:
         self.publish()  # Complete planned manifest exists before any preflight/launch.

@@ -281,9 +281,12 @@ jobs:
           path: ${{ runner.temp }}/fm-test/
           if-no-files-found: warn
 
-  # Required real-Herdr lane: pinned install, serial real-herdr-gated shards,
-  # hard-fail on "skip: herdr not found". Each shard is strictly serial on its
-  # own runner with its own default session, snapshot, and cleanup; shard
+  # Real Herdr is a GUI-backend integration lane incompatible with per-UID home
+  # isolation, so it runs without hard descendant containment. Portable behavior
+  # lanes retain required credential-domain containment. Pinned install, serial
+  # real-herdr-gated shards, and hard-fail on "skip: herdr not found" remain.
+  # Each shard is strictly serial on its own runner with its own default session,
+  # snapshot, and cleanup; shard
   # membership and the shard count belong to bin/fm-test-run.sh, which refuses
   # a lane whose "ofN" disagrees with it. Starts on Linux x86_64; if a genuine
   # platform invariant fails (focus, cleanup, default-session tripwire), keep
@@ -292,8 +295,6 @@ jobs:
     name: Behavior tests (Herdr ${{ matrix.shard }})
     needs: test-containment-qualification
     runs-on: ubuntu-latest
-    env:
-      FM_TEST_CONTAINMENT: required
     # Real Herdr is slower than the portable suite; this is a hang tripwire,
     # not the expected healthy end of the lane (balanced shards are under
     # five minutes each).
@@ -395,7 +396,7 @@ jobs:
           set -eu
           mkdir -p "$RUNNER_TEMP/fm-herdr"
           bin/fm-herdr-ci-cleanup.sh snapshot "$RUNNER_TEMP/fm-herdr/sessions-before.json"
-      - name: Run real-Herdr shard ${{ matrix.shard }} (serial, required)
+      - name: Run real-Herdr shard ${{ matrix.shard }} (serial)
         env:
           # job-total rather than a literal, so shrinking or growing the matrix
           # without matching bin/fm-test-run.sh is refused instead of quietly
