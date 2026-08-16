@@ -138,7 +138,7 @@ Both recorded runtime identities now classify the exact `pi-launcher` foreground
 
 Backend applicability was reviewed across every spawn adapter.
 Tmux needs the exact `pi-launcher`, `pi-signed`, `pi`, and `Pi` process identities for recovery-grade liveness.
-Herdr reconciles its native registered-agent state against the process it owns, because a 0.8.0 registration carries no process id and so cannot by itself prove a worker's TUI still runs; an exited TUI over an idle task shell reads `dead` even while the registration lingers.
+Herdr needs no harness-specific process-name branch; its process-reconciled registration contract is owned by [Restart and liveness behavior](../herdr-backend.md#restart-and-liveness-behavior).
 Zellij has no verified recovery-grade agent process probe, while Orca and cmux do not support secondmate spawns, so those three retain their existing generic ordinary-launch semantics without a new liveness matcher.
 
 The current classifier matrix and its refresh guard are recorded in [Composer classification matrix](#composer-classification-matrix), with portable shape coverage in `tests/fm-composer-lib.test.sh` and `tests/fm-composer-ghost.test.sh`.

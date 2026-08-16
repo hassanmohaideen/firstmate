@@ -2851,6 +2851,7 @@ make_running_recovery_ps() {  # <dir> <comm> [present] [foreground-parent]
 case "\$*" in
   "-axo pid=,ppid=") printf '$rows' ;;
   "-p 333 -o comm=") printf '%s\n' '$comm' ;;
+  "-p 333 -o pgid=") printf '333\n' ;;
   *) exit 1 ;;
 esac
 SH
@@ -2930,7 +2931,7 @@ test_recovery_state_refuses_mismatched_and_foreign_identity() {
 
 test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
   local mode dir log resp fb out
-  for mode in unreadable malformed reused prompt-helper nested-shell absent-running reused-running foreign-running; do
+  for mode in unreadable malformed reused prompt-helper nested-shell absent-running reused-running foreign-running foreign-member; do
     dir="$TMP_ROOT/recovery-process-$mode"; mkdir -p "$dir/responses"
     log="$dir/log"; resp="$dir/responses"; : > "$log"
     recovery_pane_fixture w1:p1 > "$resp/1.out"
@@ -2961,6 +2962,19 @@ test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
       foreign-running)
         recovery_running_process_fixture w1:p1 > "$resp/3.out"
         make_running_recovery_ps "$dir" node yes 999
+        ;;
+      foreign-member)
+        printf '%s\n' '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p1","shell_pid":222,"foreground_process_group_id":333,"foreground_processes":[{"pid":333,"name":"node","argv0":"pi"},{"pid":999,"name":"python","argv0":"foreign"}]}}}' > "$resp/3.out"
+        cat > "$dir/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  "-axo pid=,ppid=") printf '1 0\n222 1\n333 222\n999 1\n' ;;
+  "-p 333 -o comm=") printf 'node\n' ;;
+  "-p 333 -o pgid=") printf '333\n' ;;
+  *) exit 1 ;;
+esac
+SH
+        chmod +x "$dir/ps"
         ;;
     esac
     fb=$(make_herdr_fakebin "$dir")

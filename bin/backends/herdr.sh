@@ -1941,7 +1941,7 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
 # never prove process ownership after a TUI has exited.
 fm_backend_herdr_registered_process_state() {  # <session> <pane-id>
   local session=$1 pane=$2 info shell_pid foreground_pgid count process_pid
-  local name argv0 process_name comm ps_bin rows
+  local name argv0 process_name comm ps_bin rows process_records process_record member_pid member_name member_argv member_pgid
   info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) \
     || { printf 'unknown'; return 0; }
   if fm_backend_herdr_process_info_idle_shell_pid "$info" "$pane" >/dev/null 2>&1; then
@@ -2001,15 +2001,52 @@ fm_backend_herdr_registered_process_state() {  # <session> <pane-id>
       exit 1
     }
   ' || { printf 'unknown'; return 0; }
-  fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$process_pid" \
-    && { printf 'unknown'; return 0; }
-  comm=$("$ps_bin" -p "$process_pid" -o comm= 2>/dev/null) \
+  process_records=$(printf '%s' "$info" | jq -er \
+    '.result.process_info.foreground_processes[] | @base64' 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  comm=$(printf '%s' "$comm" | tr -d '[:space:]')
-  comm=${comm#-}
-  comm=${comm##*/}
-  [ -n "$comm" ] && [ "$comm" = "$process_name" ] \
-    || { printf 'unknown'; return 0; }
+  for process_record in $process_records; do
+    member_pid=$(printf '%s' "$process_record" | jq -Rer '@base64d | fromjson | .pid | floor' 2>/dev/null) \
+      || { printf 'unknown'; return 0; }
+    member_name=$(printf '%s' "$process_record" | jq -Rer '@base64d | fromjson | .name' 2>/dev/null) \
+      || { printf 'unknown'; return 0; }
+    member_argv=$(printf '%s' "$process_record" | jq -Rer '@base64d | fromjson | .argv0 // .argv[0]' 2>/dev/null) \
+      || { printf 'unknown'; return 0; }
+    member_name=${member_name##*/}
+    member_argv=${member_argv#-}
+    member_argv=${member_argv##*/}
+    case "$member_name:$member_argv" in
+      sh:*|bash:*|zsh:*|dash:*|ksh:*|fish:*|*:sh|*:bash|*:zsh|*:dash|*:ksh|*:fish)
+        printf 'unknown'; return 0
+        ;;
+    esac
+    printf '%s\n' "$rows" | awk -v pid="$member_pid" -v shell="$shell_pid" '
+      $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+        count[$1]++
+        parent[$1] = $2
+      }
+      END {
+        if (count[pid] != 1 || count[shell] != 1) exit 1
+        current = pid
+        for (steps = 0; steps < 256; steps++) {
+          if (current == shell) exit 0
+          if (current <= 1 || count[current] != 1 || seen[current]++) exit 1
+          current = parent[current]
+        }
+        exit 1
+      }
+    ' || { printf 'unknown'; return 0; }
+    comm=$("$ps_bin" -p "$member_pid" -o comm= 2>/dev/null) \
+      || { printf 'unknown'; return 0; }
+    comm=$(printf '%s' "$comm" | tr -d '[:space:]')
+    comm=${comm#-}
+    comm=${comm##*/}
+    [ -n "$comm" ] && [ "$comm" = "$member_name" ] \
+      || { printf 'unknown'; return 0; }
+    member_pgid=$("$ps_bin" -p "$member_pid" -o pgid= 2>/dev/null | tr -d '[:space:]') \
+      || { printf 'unknown'; return 0; }
+    [ "$member_pgid" = "$foreground_pgid" ] \
+      || { printf 'unknown'; return 0; }
+  done
   printf 'running'
 }
 

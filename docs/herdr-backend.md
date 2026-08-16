@@ -253,10 +253,12 @@ A restored same-labeled tab with a missing pane or no registered agent is a husk
 Create replaces only a confidently dead or no-agent husk, creates the replacement before closing the old tab, and refuses live or unknown states.
 This prevents closing the workspace's last tab before a replacement exists.
 
-The generic Herdr agent-liveness probe does not trust the registration alone.
+The public recovery-grade Herdr agent-liveness probe does not trust the registration alone; the create and projection-reclaim paths retain the separate restored-husk classifier described above.
 A Herdr 0.8.0 registration carries no process id, so a registration retained after a worker's TUI exits to its task shell cannot prove the agent still runs.
-The probe therefore reconciles the registration against the process Herdr actually owns: a structurally gone pane becomes `missing`, a confirmed lone idle task shell becomes `dead` even when a stale registration remains, a registration backed by a genuine non-shell foreground process group becomes `alive`, and every ambiguous, unreadable, shell-mismatched, or identity-reused shape becomes `unreadable`.
-This is what lets a task whose TUI exited be idempotently stopped and relaunched in the same isolated copy instead of refusing forever, while a genuinely running, ambiguous, unreadable, mismatched, or identity-reused agent is never misread as gone and so is never torn down without proof it stopped.
+The probe therefore requires exact pane and registration identity and reconciles Herdr's process information with the operating-system process table.
+A structurally gone pane becomes `missing`, and a pane that passes the shared strict lone-idle-shell proof becomes `dead` even when a stale registration remains.
+A registered non-shell foreground process group becomes `alive` only when every reported member has matching operating-system name and group identity and descends from the pane's shell; every ambiguous, unreadable, shell-mismatched, foreign, or PID-reused shape becomes `unreadable`.
+This is what lets a task whose TUI exited be idempotently stopped and relaunched in the same isolated copy instead of refusing forever, without mistaking an unproved agent for one that stopped.
 `done` and `blocked` registrations are not treated as absent: they can name a still-registered resumable worker, so they read `alive` while their process runs.
 
 The session-start sweep uses this probe.
@@ -327,6 +329,8 @@ tests/fm-backend-herdr-workspace-per-home-e2e.test.sh
 tests/fm-backend-herdr-launcher-workspace-e2e.test.sh
 tests/fm-backend-herdr-presentation-e2e.test.sh
 tests/fm-backend-herdr-eventwait-smoke.test.sh
+tests/fm-control-herdr-smoke.test.sh
+tests/fm-control-relaunch.test.sh
 tests/fm-herdr-session-cleanup.test.sh
 tests/fm-herdr-session-cleanup-e2e.test.sh
 tests/fm-afk-inject-herdr-e2e.test.sh
