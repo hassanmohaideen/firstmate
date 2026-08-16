@@ -2869,7 +2869,7 @@ test_recovery_state_treats_a_stale_registration_over_exact_idle_shell_as_dead() 
 
 test_recovery_state_keeps_running_idle_done_and_blocked_agents_alive() {
   local status dir log resp fb out
-  for status in idle done blocked; do
+  for status in idle 'done' blocked; do
     dir="$TMP_ROOT/recovery-running-$status"; mkdir -p "$dir/responses"
     log="$dir/log"; resp="$dir/responses"; : > "$log"
     recovery_pane_fixture w1:p1 > "$resp/1.out"

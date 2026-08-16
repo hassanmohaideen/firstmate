@@ -430,6 +430,42 @@ test_harness_switch_moves_the_record_and_clears_prior_wiring() {
   pass "fm-control relaunch: switching harness is one ordinary relaunch, and the old wiring goes with the old agent"
 }
 
+test_relaunch_of_an_already_exited_agent_is_idempotent_and_keeps_identity() {
+  local dir out rc
+  dir=$(new_case resumed rl40)
+  add_ship_task "$dir" rl40 pi
+  # The reported defect scenario: the old agent's TUI already exited to its task
+  # shell, so its endpoint classifies dead BEFORE any exit command is sent. The
+  # reference tmux stub models that already-stopped precondition by reporting the
+  # shell as the pane's current command; the herdr classifier reaches the same
+  # dead verdict by reconciling a retained registration against the idle shell
+  # (tests/fm-control-herdr-smoke.test.sh, tests/fm-backend-herdr.test.sh).
+  printf 'zsh' > "$dir/fake/command"
+  printf 'claude' > "$dir/fake/becomes"
+  out=$(run_control "$dir" rl40 relaunch --harness claude --note "resume the authentication investigation"); rc=$?
+  expect_code 0 "$rc" "relaunching an already-exited agent should succeed"$'\n'"$out"
+  assert_contains "$out" "harness=claude from=pi" "the outcome should name the Pi->Claude switch"
+  [ "$(meta_field "$dir" rl40 window)" = "fmses:fm-rl40" ] \
+    || fail "the exact endpoint must be reused, not recreated"
+  [ "$(meta_field "$dir" rl40 worktree)" = "$dir/wt" ] \
+    || fail "the exact local copy must be retained"
+  [ "$(meta_field "$dir" rl40 kind)" = ship ] || fail "task kind must survive the relaunch"
+  [ "$(meta_field "$dir" rl40 harness)" = claude ] || fail "the record should follow the switch to claude"
+  # The proof the defect is fixed: an already-exited agent is stopped
+  # idempotently, so no exit command is ever typed into the task shell.
+  [ "$(journal_field "$dir" rl40 exit_result)" = already-stopped ] \
+    || fail "an already-exited agent must be stopped idempotently, got exit_result '$(journal_field "$dir" rl40 exit_result)'"
+  # Whole-line match: the exit command is typed as its own literal line, so a
+  # substring check would false-positive on the launch command's file paths.
+  ! grep -Fxq -- '/quit' "$dir/fake/literal" \
+    || fail "no exit command may be typed into an already-exited agent's shell"
+  ! grep -Fxq -- '/exit' "$dir/fake/literal" \
+    || fail "no exit command may be typed into an already-exited agent's shell"
+  assert_grep "encode launch-brief" "$dir/fake/literal" "the replacement agent should still be launched"
+  [ "$(journal_field "$dir" rl40 phase)" = complete ] || fail "the transaction journal should end complete"
+  pass "fm-control relaunch: an already-exited agent relaunches idempotently onto a new harness, keeping endpoint, local copy, and identity"
+}
+
 test_harness_switch_does_not_carry_the_old_profile_axes() {
   local dir out rc
   dir=$(new_case profile rl5)
@@ -1306,6 +1342,7 @@ test_disabled_relaunch_clears_prior_trace_context
 test_relaunch_appends_the_progress_note_to_the_instructions
 test_relaunch_requires_a_note_for_a_ship_task
 test_harness_switch_moves_the_record_and_clears_prior_wiring
+test_relaunch_of_an_already_exited_agent_is_idempotent_and_keeps_identity
 test_harness_switch_does_not_carry_the_old_profile_axes
 test_harness_switch_resolves_a_prefixed_recorded_harness
 test_prefixed_recorded_harness_requires_explicit_replacement

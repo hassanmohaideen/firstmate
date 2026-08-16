@@ -138,7 +138,7 @@ Both recorded runtime identities now classify the exact `pi-launcher` foreground
 
 Backend applicability was reviewed across every spawn adapter.
 Tmux needs the exact `pi-launcher`, `pi-signed`, `pi`, and `Pi` process identities for recovery-grade liveness.
-Herdr uses native registered-agent state and needs no process-name branch.
+Herdr reconciles its native registered-agent state against the process it owns, because a 0.8.0 registration carries no process id and so cannot by itself prove a worker's TUI still runs; an exited TUI over an idle task shell reads `dead` even while the registration lingers.
 Zellij has no verified recovery-grade agent process probe, while Orca and cmux do not support secondmate spawns, so those three retain their existing generic ordinary-launch semantics without a new liveness matcher.
 
 The current classifier matrix and its refresh guard are recorded in [Composer classification matrix](#composer-classification-matrix), with portable shape coverage in `tests/fm-composer-lib.test.sh` and `tests/fm-composer-ghost.test.sh`.
@@ -556,7 +556,7 @@ Polling remained active and is covered as the fallback for capability, connect, 
 
 ### Agent lifecycle control
 
-Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)), so its lifecycle gating is measured against the real binary; reverified 2026-08-08 on Herdr 0.8.0, and first measured 2026-08-02 on Herdr 0.7.5 with identical results:
+Herdr is one of the two backends whose recovery-grade agent-state classifier the control plane may trust ([agent-control.md](../agent-control.md)), so its lifecycle gating is measured against the real binary; reverified 2026-08-15 on Herdr 0.8.0 after the exited-TUI reconciliation change, first measured 2026-08-02 on Herdr 0.7.5:
 
 ```sh
 tests/fm-control-herdr-smoke.test.sh
@@ -567,12 +567,17 @@ Observed output:
 ```text
 ok - real herdr: exit on a pane with no registered agent is idempotent success
 ok - real herdr: interrupt refuses when herdr's own agent registry reports no agent
-ok - real herdr: interrupt delivers the harness's key and proves the agent survived it
+ok - real herdr: a stale registration over an exited TUI classifies dead, not alive
+ok - real herdr: exit on an exited-TUI pane is idempotent and never types /quit into the shell
+ok - real herdr: a stale registration cannot authorize interrupt on an exited-TUI pane
+ok - real herdr: the same registration over a running process classifies alive (process ownership decides)
+ok - real herdr: interrupt delivers the harness's key and proves the running agent survived it
 ok - real herdr: no control verb removed the endpoint or the task's local copy
-ok - real herdr: an agent that does not stop fails closed instead of being reported as stopped
+ok - real herdr: a running agent that does not stop fails closed instead of being reported as stopped
 ```
 
-The registry read through `herdr pane report-agent` is the same source `fm_backend_herdr_agent_state` classifies, so registering and not registering an agent on a plain shell pane exercises exactly the gate every lifecycle verb depends on, with no real agent launched.
+A `herdr pane report-agent` registration is the retained-registration half of the reported defect, and a foreground `sleep` is the running-process half, so the test drives them apart against the real binary: the same registration reads `dead` over an idle task shell and `alive` over a genuine non-shell process group, proving the classifier reconciles registration against process ownership rather than trusting the registration alone.
+No real agent is launched.
 That command is the guard that refreshes this record; run it after every Herdr upgrade rather than trusting the version above.
 
 ### Away-mode transport

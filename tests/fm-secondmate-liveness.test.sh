@@ -16,8 +16,10 @@
 #     dead, missing, ambiguous, unreadable, and unverified.
 #   - The tmux classifier returns missing only after a readable session
 #     inventory omits the exact window, regardless of display-message fallback.
-#   - The Herdr classifier preserves the proven husk mapping while separating a
-#     missing pane from an existing agent-less pane.
+#   - The Herdr liveness classifier reconciles a registered agent against the
+#     process Herdr actually owns, so a TUI that exited to its task shell reads
+#     dead rather than alive, while a missing pane stays distinct from an
+#     existing agent-less pane.
 #   - fm_backend_agent_alive preserves the older three-state compatibility view.
 #   - bin/fm-bootstrap.sh's secondmate_liveness_sweep recovers only dead or
 #     missing endpoints, keeps successful recovery and already-live results
@@ -159,23 +161,32 @@ SH
 
 # --- unit level: fm_backend_herdr_agent_state -------------------------------
 
-test_herdr_agent_state_preserves_husk_classifier() {
-  local pane_state expected out
+test_herdr_agent_state_maps_the_recovery_classifier() {
+  local recovery expected out row
 
-  for row in 'dead missing' 'no-agent dead' 'live alive' 'unknown unreadable'; do
-    pane_state=${row%% *}
+  # fm_backend_herdr_agent_state no longer trusts the husk classifier for
+  # liveness. It derives from fm_backend_herdr_recovery_agent_state, which
+  # reconciles a registered agent against the process Herdr actually owns so a
+  # TUI that exited to its task shell is not misread as alive. This pins only
+  # the public state mapping; the recovery classifier's own process-identity
+  # logic is proven against real process-info fixtures in
+  # tests/fm-backend-herdr.test.sh.
+  for row in 'missing missing' 'dead dead' 'alive alive' 'unknown unreadable'; do
+    recovery=${row%% *}
     expected=${row#* }
-    out=$(FM_TEST_PANE_STATE="$pane_state" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "%s" "$FM_TEST_PANE_STATE"; }; fm_backend_herdr_agent_state "sess:p1"' "$ROOT")
-    [ "$out" = "$expected" ] || fail "Herdr pane state $pane_state should map to $expected, got '$out'"
+    out=$(FM_TEST_RECOVERY_STATE="$recovery" bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_recovery_agent_state() { printf "%s" "$FM_TEST_RECOVERY_STATE"; }; fm_backend_herdr_agent_state "sess:p1"' "$ROOT")
+    [ "$out" = "$expected" ] || fail "Herdr recovery state $recovery should map to $expected, got '$out'"
   done
 
   out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state "no-colon-target"' "$ROOT")
   [ "$out" = unreadable ] || fail "an unparseable Herdr target should classify as unreadable, got '$out'"
 
-  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "no-agent"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
-  [ "$out" = dead ] || fail "the Herdr compatibility view should keep a no-agent husk dead, got '$out'"
+  # The compatibility view folds the reconciled states into the older three-way
+  # answer: a reconciled-dead pane (the exited-TUI case) stays dead.
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_recovery_agent_state() { printf "dead"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
+  [ "$out" = dead ] || fail "the Herdr compatibility view should fold a reconciled-dead pane to dead, got '$out'"
 
-  pass "fm_backend_herdr_agent_state: preserves missing/no-agent/live/unknown husk behavior"
+  pass "fm_backend_herdr_agent_state: maps the recovery classifier's missing/dead/alive/unknown to the public state contract"
 }
 
 # --- unit level: the generic dispatchers ------------------------------------
@@ -187,7 +198,7 @@ test_agent_state_dispatcher_and_compatibility() {
   out=$(PATH="$fb:$BASE_PATH" bash -c '. "$0/bin/fm-backend.sh"; fm_backend_agent_state tmux sess:win' "$ROOT")
   [ "$out" = alive ] || fail "detailed dispatcher should route tmux, got '$out'"
 
-  out=$(bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source herdr; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_agent_state herdr sess:p1' "$ROOT")
+  out=$(bash -c '. "$0/bin/fm-backend.sh"; fm_backend_source herdr; fm_backend_herdr_recovery_agent_state() { printf "alive"; }; fm_backend_agent_state herdr sess:p1' "$ROOT")
   [ "$out" = alive ] || fail "detailed dispatcher should route Herdr, got '$out'"
 
   out=$(bash -c '. "$0/bin/fm-backend.sh"; fm_backend_agent_state zellij sess:7' "$ROOT")
@@ -542,7 +553,7 @@ test_sweep_noop_with_no_secondmate_meta() {
 
 test_tmux_agent_state_classifies
 test_tmux_agent_state_rejects_malformed_targets_before_probe
-test_herdr_agent_state_preserves_husk_classifier
+test_herdr_agent_state_maps_the_recovery_classifier
 test_agent_state_dispatcher_and_compatibility
 test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_leaves_alive_secondmate_untouched
