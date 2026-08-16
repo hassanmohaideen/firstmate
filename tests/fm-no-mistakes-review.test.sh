@@ -721,6 +721,52 @@ test_normal_uncontended_acquire_and_release() {
   pass "normal uncontended acquisition releases the lock for the next owner"
 }
 
+# The internal lock-held entry point is publicly invokable, so it must prove it
+# actually holds the kernel guard rather than trusting a caller-mintable
+# credential. A direct call with a free guard - even with forged capability files
+# and environment variables planted - is refused before any ledger mutation.
+test_direct_internal_reentry_without_lock_is_refused() {
+  local d out rc f forged
+  d=$(new_case direct-reentry)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  # Plant the forgeable artifacts an attacker could mint: a legacy capability
+  # file and matching environment variables. They must not grant entry.
+  forged="$d/.no-mistakes/.firstmate-review-kernel-capability.forged"
+  mkdir -p "$d/.no-mistakes"
+  printf 'forged-token\n' > "$forged"
+  out=$(FM_NM_REVIEW_KERNEL_CAPABILITY=forged-token FM_NM_REVIEW_KERNEL_TOKEN=forged-token \
+    run_driver "$d" __fm_review_lock_held respond --approve accepted 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "direct internal reentry ran without holding the kernel guard"
+  assert_contains "$out" 'direct reentry is refused' "direct-reentry refusal was not actionable"
+  [ ! -e "$(ledger "$d")" ] || fail "direct internal reentry mutated the ledger"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "direct internal reentry invoked no-mistakes"
+  pass "direct internal reentry with a free guard and forged credentials is refused"
+}
+
+# Two simultaneous direct reentries with a free guard cannot both bypass the
+# probe: its own acquire is exclusive, so at most one un-launched caller can slip
+# through, and the underlying response is therefore invoked at most once.
+test_concurrent_direct_reentry_cannot_both_bypass() {
+  local d f p1 p2 calls ledger_path
+  d=$(new_case concurrent-reentry)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  (run_driver "$d" __fm_review_lock_held respond --approve accepted >"$d/re1" 2>&1) & p1=$!
+  (run_driver "$d" __fm_review_lock_held respond --approve accepted >"$d/re2" 2>&1) & p2=$!
+  wait "$p1" || true
+  wait "$p2" || true
+  calls=$(calls_count "$d")
+  [ "$calls" -le 1 ] \
+    || fail "concurrent direct reentry bypassed exclusion and invoked no-mistakes $calls times"
+  ledger_path=$(ledger "$d")
+  if [ -e "$ledger_path" ]; then
+    jq -e '.version == 1 and (.runs | type) == "array"' "$ledger_path" >/dev/null 2>&1 \
+      || fail "concurrent direct reentry corrupted the ledger"
+  fi
+  pass "concurrent direct internal reentry cannot both bypass the kernel guard"
+}
+
 test_all_findings_fixed_and_audited_ready
 test_all_approved_and_explicit_rejection
 test_pr11_partial_fix_reproduction_and_proven_path
@@ -744,3 +790,5 @@ test_two_reclaimers_converge_to_one_owner
 test_crash_while_holding_leaves_no_owner_and_recovers
 test_old_owner_exit_never_removes_guard_lock
 test_normal_uncontended_acquire_and_release
+test_direct_internal_reentry_without_lock_is_refused
+test_concurrent_direct_reentry_cannot_both_bypass

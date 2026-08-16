@@ -60,6 +60,12 @@
 # that cannot take the lock refuses and retries rather than entering, and if the
 # kernel lock primitive is unavailable or unsupported the command refuses with a
 # red diagnostic instead of proceeding without exclusion.
+# The internal lock-held entry point re-proves that the guard is actively locked
+# before touching the ledger by attempting a fresh non-blocking acquire: a failed
+# acquire proves an ancestor still holds the lock, while a successful acquire
+# proves the guard was free, so a caller that invoked the internal path directly
+# without the kernel lock is refused. That evidence is the live kernel-lock state
+# itself, which a direct caller cannot mint.
 # Every ledger write is a same-directory atomic rename, so a crash mid-write
 # leaves the ledger at its prior or next complete state, never a partial one.
 # A repeated or concurrent response never invokes the underlying CLI twice:
@@ -292,6 +298,37 @@ review_lock_held_hooks() {
   if [ -n "${FM_NM_REVIEW_TEST_HOLD_FIFO:-}" ]; then
     IFS= read -r _held_release < "$FM_NM_REVIEW_TEST_HOLD_FIFO" || true
   fi
+}
+
+verify_guard_actively_locked() {
+  # Non-mintable reentry proof for the internal lock-held entry point. It is
+  # legitimate only when an ancestor run_with_kernel_lock already holds the guard
+  # lock, so probe with a fresh non-blocking acquire: a failed acquire proves the
+  # guard is actively held (proceed), while a successful acquire proves it was
+  # free, meaning this process was invoked directly without the kernel lock
+  # (refuse). A direct caller cannot forge a held lock, so the credential cannot
+  # be minted. The probe keeps the guard file (-k) and never blocks (-t 0 / -n).
+  local guard="$STATE_DIR/.firstmate-review-ledger.guard" probe_rc=0
+  [ -e "$guard" ] \
+    || die "review-ledger internal entry was invoked without the kernel guard; direct reentry is refused"
+  [ -f "$guard" ] && [ ! -L "$guard" ] \
+    || die "review-ledger kernel guard is not a regular private file"
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin)
+      command -v lockf >/dev/null 2>&1 \
+        || die "lockf is required to verify crash-safe review-ledger exclusion on macOS"
+      lockf -k -s -t 0 "$guard" true >/dev/null 2>&1 || probe_rc=$?
+      ;;
+    Linux)
+      command -v flock >/dev/null 2>&1 \
+        || die "flock is required to verify crash-safe review-ledger exclusion on Linux"
+      flock -n "$guard" -c true >/dev/null 2>&1 || probe_rc=$?
+      ;;
+    *) die "kernel-backed review-ledger exclusion is unsupported on this operating system" ;;
+  esac
+  [ "$probe_rc" -ne 0 ] \
+    || die "review-ledger internal entry was invoked without holding the kernel guard; direct reentry is refused"
+  LOCK_GUARD="$guard"
 }
 
 prepare_guard_file() {
@@ -690,6 +727,7 @@ case "${1:-}" in
     ;;
   __fm_review_lock_held)
     shift
+    verify_guard_actively_locked
     review_lock_held_hooks
     case "${1:-}" in
       respond) respond "$@" ;;
