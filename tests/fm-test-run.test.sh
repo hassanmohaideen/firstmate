@@ -1215,6 +1215,19 @@ done
 # be present so the child can still find its tools.
 [ "${FM_TEST_ENV_ALLOWED_PROBE-}" = "carried" ] || exit 11
 [ -n "${PATH-}" ] || exit 12
+# Installer scratch must follow the leased-writable temp, and the executor's
+# private HOME must leave room for a 39-character Herdr session name on Darwin
+# (sun_path includes a trailing NUL, so a 104-byte pathname is already too long).
+[ "$RUNNER_TEMP" = "$TMPDIR" ] || exit 13
+touch "$RUNNER_TEMP/installer-scratch" || exit 14
+socket_dir="$HOME/.config/herdr/sessions/firstmate-real-herdr-regression-session"
+mkdir -p "$socket_dir" || exit 15
+python3 - "$socket_dir/herdr.sock" <<'PY' || exit 16
+import socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
 root=$(cd "$(dirname "$0")/.." && pwd)
 . "$root/bin/fm-backend.sh"
 if PATH="$FM_TEST_ENV_FAKEBIN:$PATH" fm_backend_detect >/dev/null; then

@@ -813,9 +813,9 @@ class LaneExecutor:
         # macOS /tmp -> /private/tmp symlink). Fall back to the default base only if
         # a short base is unavailable, which loses socket headroom but never breaks.
         try:
-            base = tempfile.mkdtemp(prefix="fmt.", dir="/tmp")
+            base = tempfile.mkdtemp(prefix="f.", dir="/tmp")
         except OSError:
-            base = tempfile.mkdtemp(prefix="fmt.")
+            base = tempfile.mkdtemp(prefix="f.")
         self.transient = pathlib.Path(base).resolve()
         os.chmod(self.transient, 0o711)
         self.diagnostics = self.artifact_path.parent / f"{self.artifact_path.stem}.diagnostics"

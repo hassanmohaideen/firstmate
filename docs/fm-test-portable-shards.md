@@ -26,7 +26,7 @@ A dedicated per-platform job runs the executor-behavior subset through the publi
 The required public-runner and non-quiescence/ambiguity fixtures self-escalate into credential domains, while timeout, interruption, atomic-evidence, environment-isolation, and scheduling fixtures exercise the same public interfaces in `developer-non-enforcing` mode because their runner-owned scratch is intentionally inaccessible to a leased identity.
 Linux currently qualifies the full boundary, including true same-number PID reuse.
 The credential-domain qualification jobs currently pass on both `ubuntu-latest` and `macos-latest`, qualifying the boundary through the required execute path and quiescence/non-quiescence proofs, so on that CI evidence macOS is a passing, supported containment platform.
-Local execution is explicitly labeled `developer-non-enforcing`; it does not claim hard descendant containment, and credential-contained CI lanes never accept it.
+Local execution defaults to the explicitly labeled `developer-non-enforcing` mode unless required containment is selected; that default makes no hard descendant-containment claim, and credential-contained CI lanes never accept it.
 
 ## Schema-v2 evidence
 
@@ -123,6 +123,7 @@ Ten shards sit just above that floor, so more serial runners would stop paying o
 
 `real-herdr-gated-<k>of<n>` splits the required real-Herdr family across `n` separate CI runners under the same contract as the serial shards.
 Each shard is strictly serial in itself, and each runner provisions its own pinned Herdr, default session, pre-suite snapshot, and cleanup, so the split needs no concurrency isolation proof and every default-session tripwire stays job-local.
+These GUI-backend integration shards explicitly use `developer-non-enforcing` mode because their runner-owned Herdr server is reached through a Unix socket under the runner's home that a leased identity cannot share; the required portable lanes and qualification jobs retain the hard containment claim.
 `bin/fm-test-run.sh` owns this `n` with the same `of<n>` refusal, `.github/workflows/ci.yml` derives it from `strategy.job-total`, and every shard keeps `--fail-on-gate-skip 'herdr not found'` so a missing pin can never pass as a gate skip.
 Assignment reuses the longest-processing-time packing over `real_herdr_duration_hints`.
 

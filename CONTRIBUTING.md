@@ -90,7 +90,7 @@ tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVE
 ```
 
 `bin/fm-test-run.sh` owns behavior-suite selection, lane composition, duration inputs, manifest construction, coverage, aggregation, and readable output, while `bin/fm-test-supervisor.py` exclusively owns attempts, required credential-domain containment, deadlines, interruption, cleanup, and schema-v2 evidence.
-Local runs are visibly non-enforcing unless required containment is selected; only CI lanes gated by required Linux and macOS qualification claim hard descendant containment.
+Containment claims and the explicitly non-enforcing real-Herdr exception are documented in [`docs/fm-test-portable-shards.md`](docs/fm-test-portable-shards.md).
 Its header and `--help` own the flags, family labels, lanes, and changed-file map; this section only documents the entry points.
 `bin/fm-test-isolation-proof.sh` remains the single owner of the Phase 2 concurrent isolation proof and the exact proven candidate set; see `docs/fm-test-isolation-proof.md`.
 CI shard balance evidence lives in `docs/fm-test-portable-shards.md`.
