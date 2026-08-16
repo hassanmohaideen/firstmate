@@ -1948,9 +1948,14 @@ def qualify(artifact: pathlib.Path) -> int:
     atomic_json(artifact, result, directory_fd=output_directory_fd)
     targets: list[tuple[int, Lease]] = []
     leases: list[Lease] = []
+    cleanup_ambiguities: dict[int, str] = {}
 
     def cleanup_domains() -> list[str]:
         errors: list[str] = []
+
+        def ambiguous(lease: Lease, message: str) -> None:
+            cleanup_ambiguities.setdefault(lease.uid, message)
+            errors.append(message)
         for pid, lease in targets:
             try:
                 # Prefer a catchable credential-scoped signal.  In particular,
@@ -1959,20 +1964,20 @@ def qualify(artifact: pathlib.Path) -> int:
                 # deliberately ignore TERM (the fork-storm fixtures).
                 delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGTERM)
                 if not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
-                    errors.append(f"uid {lease.uid} TERM failed: errno={code}")
+                    ambiguous(lease, f"uid {lease.uid} TERM failed: errno={code}")
                 if not bounded_reap(pid, 0.25):
                     delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGKILL)
                     if not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
-                        errors.append(f"uid {lease.uid} KILL failed: errno={code}")
+                        ambiguous(lease, f"uid {lease.uid} KILL failed: errno={code}")
                     if not bounded_reap(pid, 1.0):
-                        errors.append(f"uid {lease.uid} target did not exit")
+                        ambiguous(lease, f"uid {lease.uid} target did not exit")
             except BaseException as exc:
-                errors.append(f"uid {lease.uid} cleanup failed: {exc}")
+                ambiguous(lease, f"uid {lease.uid} cleanup failed: {exc}")
         for lease in leases:
             try:
                 quiet = prove_domain_quiescent(lease.uid, lease.gid)
             except BaseException as exc:
-                errors.append(f"uid {lease.uid} quiescence probe failed: {exc}")
+                ambiguous(lease, f"uid {lease.uid} quiescence probe failed: {exc}")
                 continue
             if not quiet:
                 # Bounded Darwin non-quiescence diagnostics so a post-billing CI
@@ -1993,9 +1998,10 @@ def qualify(artifact: pathlib.Path) -> int:
                     ]
                 except InventoryError as exc:
                     members = f"inventory unreadable: {exc}"
-                errors.append(
+                ambiguous(
+                    lease,
                     f"uid {lease.uid} remained non-quiescent "
-                    f"(probe present={present} errno={probe_errno} members={members})"
+                    f"(probe present={present} errno={probe_errno} members={members})",
                 )
         return errors
 
@@ -2025,8 +2031,10 @@ def qualify(artifact: pathlib.Path) -> int:
         # PID-scoped: its live PID was available throughout and never targeted.
         delivered, code = helper_signal(owned.uid, owned.gid, signal.SIGTERM)
         if not delivered or code != 0:
+            cleanup_ambiguities.setdefault(owned.uid, f"credential-scoped TERM failed: errno={code}")
             raise ContainmentError(f"credential-scoped TERM failed: errno={code}")
         if not bounded_reap(target, 2.0):
+            cleanup_ambiguities.setdefault(owned.uid, "owned qualification target did not exit after TERM")
             raise ContainmentError("owned qualification target did not exit after TERM")
         targets = [(pid, lease) for pid, lease in targets if pid != target]
         deadline = time.monotonic() + 2
@@ -2036,6 +2044,7 @@ def qualify(artifact: pathlib.Path) -> int:
                 break
             time.sleep(0.02)
         else:
+            cleanup_ambiguities.setdefault(owned.uid, "owned qualification domain did not quiesce")
             raise ContainmentError("owned qualification domain did not quiesce")
         # The sentinel must still be exactly the same live different-UID process:
         # same numeric PID, unchanged credential tuple, not signaled.
@@ -2051,6 +2060,9 @@ def qualify(artifact: pathlib.Path) -> int:
         targets.append((reparented, reparented_lease))
         platform.verify_pid(reparented, reparented_lease.uid, reparented_lease.gid)
         if not prove_domain_quiescent(reparented_lease.uid, reparented_lease.gid):
+            cleanup_ambiguities.setdefault(
+                reparented_lease.uid, "reparented setsid qualification domain did not quiesce"
+            )
             raise ContainmentError("reparented setsid qualification domain did not quiesce")
         result["checks"].append({"name": "parent-exit-reparenting-setsid", "passed": True, "diagnostic_pid": reparented})
 
@@ -2061,14 +2073,22 @@ def qualify(artifact: pathlib.Path) -> int:
         platform.verify_pid(storm, storm_lease.uid, storm_lease.gid)
         term_delivered, term_code = helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGTERM)
         if not term_delivered or term_code != 0:
+            cleanup_ambiguities.setdefault(
+                storm_lease.uid, f"fork-storm credential-scoped TERM failed: errno={term_code}"
+            )
             raise ContainmentError(f"fork-storm credential-scoped TERM failed: errno={term_code}")
         time.sleep(0.1)
         kill_delivered, kill_code = helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGKILL)
         if not kill_delivered or kill_code != 0:
+            cleanup_ambiguities.setdefault(
+                storm_lease.uid, f"fork-storm credential-scoped KILL failed: errno={kill_code}"
+            )
             raise ContainmentError(f"fork-storm credential-scoped KILL failed: errno={kill_code}")
         if not bounded_reap(storm, 2.0):
+            cleanup_ambiguities.setdefault(storm_lease.uid, "fork-storm target did not exit after KILL")
             raise ContainmentError("fork-storm target did not exit after KILL")
         if not prove_domain_quiescent(storm_lease.uid, storm_lease.gid):
+            cleanup_ambiguities.setdefault(storm_lease.uid, "TERM-handler fork-storm domain did not quiesce")
             raise ContainmentError("TERM-handler fork-storm domain did not quiesce")
         result["checks"].append({"name": "term-handler-fork-storm-quiescence", "passed": True})
 
@@ -2113,7 +2133,7 @@ def qualify(artifact: pathlib.Path) -> int:
         if "pool" in locals():
             for lease in leases:
                 if lease.path.exists() and not lease.quarantined:
-                    pool.retire(lease, quarantine=bool(cleanup_errors))
+                    pool.retire(lease, quarantine=lease.uid in cleanup_ambiguities)
         if "qualification_leases" in locals():
             shutil.rmtree(qualification_leases, ignore_errors=True)
         os.close(output_directory_fd)
