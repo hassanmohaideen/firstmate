@@ -41,7 +41,7 @@ CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
 LEASE_DIRECTORY_ROOT = pathlib.Path("/tmp/fm-test-credential-leases")
 QUIESCE_GRACE = 3.0
-TERMINAL_PUBLISH_RESERVE = 1.0
+TERMINAL_PUBLISH_RESERVE = 15.0
 OUTPUT_TAIL_BYTES = 32768
 IMMUTABLE_PLANNED_FIELDS = (
     "index",
@@ -526,6 +526,7 @@ class LaneExecutor:
         self.platform: CredentialPlatform | None = None
         self.lease_pool: LeasePool | None = None
         self.preacquired_leases: dict[int, Lease] = {}
+        self.residual_cleanup_leases: list[Lease] = []
         self.selector = selectors.DefaultSelector()
         self.interrupted: int | None = None
         self.active: dict[int, Attempt] = {}
@@ -553,8 +554,7 @@ class LaneExecutor:
         return self.run_start_mono + (epoch - self.run_start_wall)
 
     def _cleanup_limit(self) -> float:
-        publication_reserve = TERMINAL_PUBLISH_RESERVE * (self.max_active_seen + 1)
-        return min(self.terminal_deadline - publication_reserve, self.cleanup_deadline)
+        return min(self.terminal_deadline - TERMINAL_PUBLISH_RESERVE, self.cleanup_deadline)
 
     def _initial_document(self) -> dict[str, Any]:
         scripts = []
@@ -703,11 +703,12 @@ class LaneExecutor:
         self.preacquired_leases.clear()
 
     def _remaining_schedule_reserve(self, row: dict[str, Any]) -> float:
-        unfinished = [
-            candidate for candidate in self.doc["scripts"]
-            if candidate.get("terminal") is None
+        unfinished_waves = [
+            unfinished
+            for wave in self.schedule_waves
+            if (unfinished := [candidate for candidate in wave if candidate.get("terminal") is None])
         ]
-        completion, launches = self._schedule(self._build_schedule_waves(unfinished), 0.0)
+        completion, launches = self._schedule(unfinished_waves, 0.0)
         for candidate, baseline_start, _wave_completion in launches:
             if candidate is row:
                 baseline_ms = candidate["duration_baseline_ms"]
@@ -932,7 +933,7 @@ class LaneExecutor:
             row["exit"] = 126
             self.publish()
             if lease is not None and self.lease_pool is not None:
-                self.lease_pool.retire(lease, quarantine=not quiet)
+                self._retire_attempt_lease(lease, quiet)
             return None
 
     def _scan_output(self, attempt: Attempt, chunk: bytes, *, eof: bool = False) -> None:
@@ -1179,6 +1180,39 @@ class LaneExecutor:
             self.doc["containment"]["quarantined_uids"].append(lease.uid)
         return quiet, survivors
 
+    def _retire_attempt_lease(self, lease: Lease, quiet: bool) -> None:
+        assert self.lease_pool is not None
+        self.lease_pool.retire(lease, quarantine=not quiet)
+        if quiet:
+            return
+        try:
+            helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+        except BaseException:
+            pass
+        if all(item.uid != lease.uid for item in self.residual_cleanup_leases):
+            self.residual_cleanup_leases.append(lease)
+
+    def _cleanup_residual_domains(self) -> None:
+        pending = [lease for lease in self.residual_cleanup_leases if lease.path.exists()]
+        while pending and time.monotonic() < self.cleanup_deadline:
+            remaining: list[Lease] = []
+            for lease in pending:
+                try:
+                    present, code = helper_signal(lease.uid, lease.gid, 0)
+                except BaseException:
+                    present, code = False, errno.EIO
+                if domain_probe_empty(present, code):
+                    continue
+                try:
+                    helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                except BaseException:
+                    pass
+                remaining.append(lease)
+            pending = remaining
+            if pending:
+                time.sleep(min(0.05, max(0.0, self.cleanup_deadline - time.monotonic())))
+        self.residual_cleanup_leases.clear()
+
     def finish(self, attempt: Attempt, cause: str) -> None:
         if attempt.deadline_expired:
             cause = "deadline"
@@ -1242,7 +1276,7 @@ class LaneExecutor:
         attempt.row["events"].append(event("terminal", result=result, exit=public_exit))
         self.publish()  # Terminal evidence precedes lease/transient finalization.
         if attempt.lease is not None and self.lease_pool is not None:
-            self.lease_pool.retire(attempt.lease, quarantine=not quiet)
+            self._retire_attempt_lease(attempt.lease, quiet)
         if attempt.pid is not None:
             self.active.pop(attempt.pid, None)
 
@@ -1302,6 +1336,7 @@ class LaneExecutor:
         }
         self.publish()
         if self.lease_pool is not None:
+            self._cleanup_residual_domains()
             self._release_preacquired_leases()
             self.lease_pool.finalize()
         shutil.rmtree(self.transient, ignore_errors=True)
