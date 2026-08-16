@@ -1664,6 +1664,10 @@ test_required_public_runner_leased_uid() {
   printf 'fixture-git-metadata\n' >"$tmp/repo/.git/config"
   chmod 0700 "$tmp/repo/.git"
   chmod 0600 "$tmp/repo/.git/config"
+  # An untracked FIFO must not block the deadline-bounded checkout grant.
+  # Exercise this through the public required runner, not the implementation.
+  mkfifo "$tmp/repo/untracked-pipe"
+  chmod 0600 "$tmp/repo/untracked-pipe"
   printf 'runner-secret\n' >"$tmp/runner-secret"
   chmod 0600 "$tmp/runner-secret"
   ln -s "$tmp/runner-secret" "$tmp/repo/external-secret"

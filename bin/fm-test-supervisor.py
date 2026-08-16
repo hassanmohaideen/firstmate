@@ -1125,7 +1125,9 @@ class LaneExecutor:
             check_deadline()
             if os.path.islink(path):
                 return
-            flags = os.O_RDONLY | os.O_NOFOLLOW
+            # A checkout can contain an untracked FIFO. Opening one read-only
+            # without O_NONBLOCK would stall preflight beyond its deadline.
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
             if directory:
                 flags |= os.O_DIRECTORY
             try:

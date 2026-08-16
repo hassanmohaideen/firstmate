@@ -11,7 +11,9 @@ The executor remains outside every test identity, releases a blocked child only 
 Numeric PIDs, process groups, mutable ancestry, and environment markers are diagnostics at most and are never cleanup authority in required CI.
 The executor is the single owner of the contained child environment and builds it from an explicit default-deny allowlist, so fleet routing, runner secrets, and unknown ambient variables never reach a test and only the sanctioned `FM_TEST_ENV_` channel and a small safe base set pass through.
 `bin/fm-test-run.sh` imports that same allowlist when it constructs the manifest, so secrets such as `GITHUB_TOKEN`, `DATABASE_URL`, or `SSH_AUTH_SOCK` are never written to the on-disk manifest that passes through `sudo` to the executor.
-Because each leased identity runs its script with the runner-owned checkout as the working directory, the executor uses a deadline-bounded, in-process walk to grant world read and traverse on non-symlink checkout entries, including `.git` for required read-only Git commands, so any leased identity can read the selected script and the files it sources while the tree stays unwritable by tests. The grant never follows symlinks and fails containment preflight on any permission error. Checkout credential persistence is disabled in every leased-test job, so the runner token is never written into the checkout the leased identities can read.
+Because each leased identity runs its script with the runner-owned checkout as the working directory, the executor uses a deadline-bounded, in-process walk to grant world read and traverse on non-symlink checkout entries, including `.git` for required read-only Git commands, so any leased identity can read the selected script and the files it sources without granting tests write permission.
+The grant never follows symlinks and fails containment preflight on any permission error.
+Checkout credential persistence is disabled in every leased-test job, so the runner token is never written into the checkout the leased identities can read.
 A released child that cannot start its script, for example because of a residual checkout permission problem, reports the exact failing operation on its captured output rather than exiting silently, so the durable per-lane log explains the outcome.
 The credential boundary remains stable across fork, exec, parent exit, reparenting, `setsid`, signal handlers, and PID reuse.
 An unreadable, ambiguous, or non-quiescent identity is quarantined while later scripts use fresh identities.
@@ -183,7 +185,7 @@ Refresh the hints by downloading the per-shard timing artifacts from a green CI 
 
 ```sh
 gh run download <run-id> -R hassanmohaideen/firstmate --pattern 'fm-test-timing-portable-serial-*' -D /tmp/fm-serial
-jq -r '.scripts[] | [.path, .duration_ms] | @tsv' /tmp/fm-serial/*.json | LC_ALL=C sort
+find /tmp/fm-serial -type f -name 'fm-test-timing-portable-serial-*.json' -exec jq -r '.scripts[] | [.path, .duration_ms] | @tsv' {} \; | LC_ALL=C sort
 bin/fm-test-run.sh --check-coverage
 ```
 
@@ -211,7 +213,7 @@ The tables above remain scheduling inputs until the next green required run publ
 
 ## Deadlines and reserves
 
-Every workflow job has `timeout-minutes: 10`.
+Every job in `.github/workflows/ci.yml` has `timeout-minutes: 10`.
 Behavior jobs record T0 as their first executable step, before checkout, so the absolute deadline budget also covers checkout and tool setup rather than starting the clock only once the code is present.
 Every behavior lane that invokes the executor passes that one absolute deadline set through the public runner.
 Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
