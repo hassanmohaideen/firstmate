@@ -41,6 +41,16 @@ CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
 QUIESCE_GRACE = 3.0
 OUTPUT_TAIL_BYTES = 32768
+IMMUTABLE_PLANNED_FIELDS = (
+    "index",
+    "path",
+    "family",
+    "attempt",
+    "expected_gate_skip",
+    "duration_baseline_ms",
+    "duration_budget_ms",
+    "phase",
+)
 
 # Explicit child-environment allowlist. This executor is the single owner of the
 # test credential domain, including which ambient variables a contained test may
@@ -525,7 +535,41 @@ class LaneExecutor:
         print(f"fm-test-supervisor: containment refused before test execution: {reason}", file=sys.stderr)
         return 2
 
+    def _validate_schedule_window(self) -> None:
+        jobs = max(1, int(self.manifest["jobs"]))
+        pending = list(self.doc["scripts"])
+        active: list[tuple[float, int, str]] = []
+        elapsed = 0.0
+        available = self.ordinary_deadline - time.monotonic()
+
+        while pending or active:
+            launched = False
+            while pending and len(active) < jobs:
+                row = pending[0]
+                if row.get("phase") == "serial" and active:
+                    break
+                if any(phase == "serial" for _, _, phase in active):
+                    break
+                pending.pop(0)
+                baseline_ms = row.get("duration_baseline_ms")
+                required = START_RESERVE + CLEANUP_RESERVE
+                if baseline_ms is not None:
+                    required += float(baseline_ms) / 1000.0
+                completion = elapsed + required
+                if completion >= available:
+                    raise ContainmentError(
+                        f"manifest schedule cannot fit {row['path']}: "
+                        f"requires {completion:.1f}s, available {max(0.0, available):.1f}s "
+                        "before the ordinary deadline"
+                    )
+                active.append((completion, int(row["index"]), row.get("phase", "serial")))
+                launched = True
+            if active and (not launched or len(active) >= jobs or not pending):
+                elapsed = min(completion for completion, _, _ in active)
+                active = [entry for entry in active if entry[0] > elapsed]
+
     def preflight(self) -> None:
+        self._validate_schedule_window()
         if not self.required:
             self.doc["containment"]["qualified"] = False
             self.doc["containment"]["blocker"] = "developer mode does not enforce descendant containment"
@@ -537,12 +581,6 @@ class LaneExecutor:
         self.platform.inventory()
         lease_dir = self.artifact_path.parent / f".{self.manifest['run_id']}.uid-leases"
         self.lease_pool = LeasePool(self.platform, lease_dir, self.manifest["run_id"])
-        remaining = len(self.doc["scripts"])
-        minimum = math.ceil(remaining / max(1, int(self.manifest["jobs"]))) * (START_RESERVE + CLEANUP_RESERVE)
-        if time.monotonic() + minimum >= self.ordinary_deadline:
-            raise ContainmentError(
-                f"manifest reservations need {minimum:.1f}s before the ordinary deadline"
-            )
         self.doc["containment"]["qualified"] = True
         self.publish()
 
@@ -984,21 +1022,18 @@ class LaneExecutor:
         return self.finalize()
 
 
-def validate_artifact(path: pathlib.Path) -> tuple[bool, str]:
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return False, f"invalid JSON: {exc}"
+def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
     if doc.get("schema_version") != SCHEMA_VERSION or doc.get("kind") != "fm-test-lane":
         return False, "unknown or mixed artifact schema"
     planned = doc.get("planned")
     rows = doc.get("scripts")
     if not isinstance(planned, list) or not isinstance(rows, list):
         return False, "planned/scripts inventories are missing"
-    keys = lambda values: [(v.get("path"), v.get("attempt")) for v in values]
-    if len(set(keys(planned))) != len(planned) or len(set(keys(rows))) != len(rows):
+    identities = lambda values: [(v.get("path"), v.get("attempt")) for v in values]
+    if len(set(identities(planned))) != len(planned) or len(set(identities(rows))) != len(rows):
         return False, "duplicate planned or attempted identity"
-    if keys(planned) != keys(rows):
+    inventory = lambda values: [tuple(v.get(field) for field in IMMUTABLE_PLANNED_FIELDS) for v in values]
+    if inventory(planned) != inventory(rows):
         return False, "planned/executed inventory mismatch"
     for row in rows:
         starts = [item for item in row.get("events", []) if item.get("name") == "started"]
@@ -1010,6 +1045,14 @@ def validate_artifact(path: pathlib.Path) -> tuple[bool, str]:
     if not doc.get("run", {}).get("complete"):
         return False, "lane artifact is incomplete"
     return True, "ok"
+
+
+def validate_artifact(path: pathlib.Path) -> tuple[bool, str]:
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"invalid JSON: {exc}"
+    return validate_artifact_document(doc)
 
 
 def qualification_target(uid: int, gid: int, ready_fd: int, ignore_term: bool, session_escape: bool) -> None:

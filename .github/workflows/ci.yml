@@ -80,6 +80,8 @@ jobs:
           sudo -n "$(command -v python3)" bin/fm-test-supervisor.py qualify \
             --artifact "$RUNNER_TEMP/fm-test/fm-test-containment-qualification.json"
       - name: Prove executor behavior on this platform
+        env:
+          FM_TEST_CONTAINMENT: required
         run: |
           set -eu
           # Run the executor-behavior subset through the public runner/executor

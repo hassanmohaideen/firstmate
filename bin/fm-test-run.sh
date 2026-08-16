@@ -924,10 +924,15 @@ aggregate_timing_json() {
   shift
   [ "$#" -gt 0 ] || die "--aggregate-json requires at least one input timing JSON"
   command -v python3 >/dev/null 2>&1 || die "--aggregate-json requires python3"
-  python3 - "$out" "$@" <<'PY'
-import json, os, pathlib, sys, tempfile
+  python3 - "$out" "$ROOT/bin/fm-test-supervisor.py" "$@" <<'PY'
+import importlib.util, json, os, pathlib, sys, tempfile
 
 out = pathlib.Path(sys.argv[1])
+supervisor_path = pathlib.Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("fm_test_supervisor", supervisor_path)
+supervisor = importlib.util.module_from_spec(spec)
+sys.modules["fm_test_supervisor"] = supervisor
+spec.loader.exec_module(supervisor)
 lanes, scripts = [], []
 summary = {
     "lanes": 0, "total": 0, "failed": 0, "skipped_gate": 0,
@@ -935,38 +940,18 @@ summary = {
     "critical_path_duration_ms": 0,
 }
 errors = []
-for path_text in sys.argv[2:]:
+for path_text in sys.argv[3:]:
     path = pathlib.Path(path_text)
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         errors.append(f"{path}: invalid JSON: {exc}")
         continue
-    if doc.get("schema_version") != 2 or doc.get("kind") != "fm-test-lane":
-        errors.append(f"{path}: unknown or mixed artifact schema")
+    valid, reason = supervisor.validate_artifact_document(doc)
+    if not valid:
+        errors.append(f"{path}: {reason}")
         continue
-    planned = doc.get("planned")
-    rows = doc.get("scripts")
-    if not isinstance(planned, list) or not isinstance(rows, list):
-        errors.append(f"{path}: missing planned/scripts inventory")
-        continue
-    pkeys = [(row.get("path"), row.get("attempt")) for row in planned]
-    rkeys = [(row.get("path"), row.get("attempt")) for row in rows]
-    if len(set(pkeys)) != len(pkeys) or len(set(rkeys)) != len(rkeys):
-        errors.append(f"{path}: duplicate planned or attempted identity")
-        continue
-    if pkeys != rkeys:
-        errors.append(f"{path}: planned/executed inventory mismatch")
-        continue
-    for row in rows:
-        starts = [item for item in row.get("events", []) if item.get("name") == "started"]
-        terminals = [item for item in row.get("events", []) if item.get("name") == "terminal"]
-        if row.get("attempt_count") != 1 or len(starts) != 1:
-            errors.append(f"{path}: missing or duplicate attempt for {row.get('path')}")
-        if not isinstance(row.get("terminal"), dict) or len(terminals) != 1:
-            errors.append(f"{path}: missing or duplicate terminal for {row.get('path')}")
-    if not doc.get("run", {}).get("complete"):
-        errors.append(f"{path}: incomplete lane")
+    rows = doc["scripts"]
     lane_summary = doc.get("summary") or {}
     lanes.append({
         "path": str(path), "run_id": doc.get("run_id"),
