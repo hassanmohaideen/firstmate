@@ -273,6 +273,32 @@ test_gate_accepts_standard_github_ssh_authorities() {
   pass "intake accepts standard GitHub SSH authorities"
 }
 
+test_gate_observes_effective_push_routing() {
+  local proj vt branch
+  vt='github|github.com|repository|owner/repo|push'
+
+  proj=$(make_project gatepushdefault https://github.com/owner/repo.git)
+  git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
+  git -C "$proj" config remote.pushDefault alternate
+  install_fake_gh "$proj"
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 2 ] || fail "remote.pushDefault must route observation away from origin and block (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a non-origin push default must block before probing the recorded origin"
+
+  proj=$(make_project gatebranchpush https://github.com/owner/repo.git)
+  git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
+  branch=$(git -C "$proj" symbolic-ref --short HEAD)
+  git -C "$proj" config "branch.$branch.pushRemote" alternate
+  install_fake_gh "$proj"
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 2 ] || fail "branch pushRemote must route observation away from origin and block (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a non-origin branch push remote must block before probing the recorded origin"
+
+  fm_github_ctx_intake "$proj" push '' '' unknown >/dev/null 2>&1
+  [ "$?" -eq 2 ] || fail "fresh intake with an unknown future branch must reject branch-specific push routing"
+  pass "the gate observes remote.pushDefault and branch pushRemote instead of trusting origin"
+}
+
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it() {
   local proj vt
   proj=$(make_project gatechanged https://github.com/owner/repo.git)
@@ -425,6 +451,7 @@ test_gate_verifies_a_fresh_matching_destination
 test_gate_trusts_a_matching_verified_tuple_without_probing
 test_gate_blocks_unverifiable_transports_before_fast_path
 test_gate_accepts_standard_github_ssh_authorities
+test_gate_observes_effective_push_routing
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it
 test_gate_reprobes_when_the_verified_record_is_missing
 test_gate_classifies_auth_and_indeterminate_failures

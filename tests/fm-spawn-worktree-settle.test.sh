@@ -87,7 +87,11 @@ case " $* " in
   *" list-sessions "*) printf 'firstmate\n'; exit 0 ;;
   *" action new-tab "*)
     [ -z "${FM_FAKE_ENDPOINT:-}" ] || : > "$FM_FAKE_ENDPOINT"
-    printf '9\n'
+    if [ "${FM_FAKE_ZELLIJ_BAD_TAB_ID:-0}" = 1 ]; then
+      printf 'unresolved\n'
+    else
+      printf '9\n'
+    fi
     exit 0
     ;;
   *" action list-panes "*) printf '[]\n'; exit 0 ;;
@@ -163,6 +167,7 @@ run_settle_spawn() {
     FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
     FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
     FM_FAKE_ZELLIJ_LOG="${FM_FAKE_ZELLIJ_LOG:-}" FM_FAKE_ZELLIJ_LIST_COUNT="${FM_FAKE_ZELLIJ_LIST_COUNT:-}" \
+    FM_FAKE_ZELLIJ_BAD_TAB_ID="${FM_FAKE_ZELLIJ_BAD_TAB_ID:-0}" \
     FM_FAKE_WINDOW="$id" FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
     FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" FM_FAKE_CREATE_FAIL="${FM_FAKE_CREATE_FAIL:-0}" \
     FM_FAKE_PERSIST_DIVERGENCE="${FM_FAKE_PERSIST_DIVERGENCE:-0}" \
@@ -378,6 +383,32 @@ test_unconfirmed_zellij_partial_endpoint_retains_lease_without_recovery_meta() {
   pass "an unconfirmed Zellij partial endpoint fails loudly without persisting unusable recovery metadata"
 }
 
+test_unresolved_endpoint_identity_never_persists_unusable_recovery() {
+  local rec id out status git_log gh_log send_log treehouse_log endpoint zellij_log list_count
+  id=allocated-github-zellij-unresolved-z8
+  rec=$(make_settle_case allocated-github-zellij-unresolved "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  git_log="$TMP_ROOT/zellij-unresolved-git.log"
+  gh_log="$TMP_ROOT/zellij-unresolved-gh.log"
+  send_log="$TMP_ROOT/zellij-unresolved-send.log"
+  treehouse_log="$TMP_ROOT/zellij-unresolved-treehouse.log"
+  endpoint="$TMP_ROOT/zellij-unresolved-endpoint"
+  zellij_log="$TMP_ROOT/zellij-unresolved-cli.log"
+  list_count="$TMP_ROOT/zellij-unresolved-list-count"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"; : > "$zellij_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_BACKEND=zellij FM_FAKE_ZELLIJ_LOG="$zellij_log" FM_FAKE_ZELLIJ_LIST_COUNT="$list_count" FM_FAKE_ZELLIJ_BAD_TAB_ID=1 run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "an unresolved Zellij endpoint identity must fail the spawn"
+  assert_contains "$out" "without recoverable exact identity" "the unresolved endpoint identity was not reported loudly"
+  assert_contains "$out" "retained pooled-worktree lease '$WT_DIR' needs manual attention" "the retained lease was not named"
+  assert_grep 'action list-tabs --json' "$zellij_log" "the unresolved partial endpoint did not receive best-effort cleanup discovery"
+  assert_no_grep 'return --force' "$treehouse_log" "an unresolved endpoint's pooled lease was returned"
+  [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "an unusable unresolved-endpoint recovery record was persisted"
+  pass "an unresolved endpoint identity fails loudly without unusable recovery metadata"
+}
+
 test_post_endpoint_failure_does_not_force_return_lease() {
   local rec id out status git_log gh_log send_log treehouse_log endpoint
   id=allocated-github-post-endpoint-failure-z7
@@ -406,6 +437,7 @@ test_unverifiable_pool_reset_blocks_before_endpoint_creation
 test_failed_pre_endpoint_lease_return_retains_recovery_record
 test_failed_endpoint_creation_retains_recoverable_lease
 test_unconfirmed_zellij_partial_endpoint_retains_lease_without_recovery_meta
+test_unresolved_endpoint_identity_never_persists_unusable_recovery
 test_post_endpoint_failure_does_not_force_return_lease
 
 echo "# all fm-spawn-worktree-settle tests passed"

@@ -1,9 +1,31 @@
 #!/usr/bin/env bash
 
 fm_github_remote_destination_url() {
-  local project=$1 capability=$2 urls
+  local project=$1 capability=$2 push_branch=${3:-current} urls remote branch routes
   case "$capability" in
-    push) urls=$(git -C "$project" remote get-url --push --all origin 2>/dev/null) || return 1 ;;
+    push)
+      if [ "$push_branch" = unknown ]; then
+        routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushRemote$' 2>/dev/null || true)
+        [ -z "$routes" ] || return 2
+      else
+        branch=$(git -C "$project" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+        if [ -n "$branch" ]; then
+          routes=$(git -C "$project" config --get-all "branch.$branch.pushRemote" 2>/dev/null || true)
+          case "$routes" in *$'\n'*) return 2 ;; esac
+          remote=$routes
+        else
+          routes=$(git -C "$project" config --get-regexp '^branch\..*\.pushRemote$' 2>/dev/null || true)
+          [ -z "$routes" ] || return 2
+        fi
+      fi
+      if [ -z "$remote" ]; then
+        routes=$(git -C "$project" config --get-all remote.pushDefault 2>/dev/null || true)
+        case "$routes" in *$'\n'*) return 2 ;; esac
+        remote=$routes
+      fi
+      [ -n "$remote" ] || remote=origin
+      urls=$(git -C "$project" remote get-url --push --all "$remote" 2>/dev/null) || return 1
+      ;;
     fetch|api-org-membership) urls=$(git -C "$project" remote get-url --all origin 2>/dev/null) || return 1 ;;
     *) return 1 ;;
   esac
@@ -97,8 +119,8 @@ fm_github_ssh_remote_host() {
 }
 
 fm_github_remote_destination_host() {
-  local project=$1 capability=$2 url host
-  url=$(fm_github_remote_destination_url "$project" "$capability") || return $?
+  local project=$1 capability=$2 push_branch=${3:-current} url host
+  url=$(fm_github_remote_destination_url "$project" "$capability" "$push_branch") || return $?
   case "$url" in
     https://*/*) host=$(fm_github_http_remote_host "$url") || return 2 ;;
     ssh://*/*|git@*:*/*) host=$(fm_github_ssh_remote_host "$url") || return 2 ;;
@@ -110,8 +132,8 @@ fm_github_remote_destination_host() {
 }
 
 fm_github_remote_destination_repository() {
-  local project=$1 capability=$2 url path owner repository
-  url=$(fm_github_remote_destination_url "$project" "$capability") || return $?
+  local project=$1 capability=$2 push_branch=${3:-current} url path owner repository
+  url=$(fm_github_remote_destination_url "$project" "$capability" "$push_branch") || return $?
   case "$url" in
     https://*/*|http://*/*)
       fm_github_http_remote_host "$url" >/dev/null || return 1
@@ -313,11 +335,11 @@ fm_github_ctx_dest_tuple() {
 # github.com is GitHub's own canonical host, so it is auto-selected without an
 # assertion; an arbitrary or Enterprise host is never inferred without one.
 fm_github_ctx_intake() {
-  local project=$1 capability=$2 asserted=$3 organization=${4:-} obs_host obs_repo st
+  local project=$1 capability=$2 asserted=$3 organization=${4:-} push_branch=${5:-current} obs_host obs_repo st
   if [ -n "$asserted" ]; then
     fm_github_validate_hostname "$asserted" || { echo "GH_AUTH_INDETERMINATE: --github-host must be a canonical lowercase hostname" >&2; return 1; }
   fi
-  obs_host=$(fm_github_remote_destination_host "$project" "$capability" 2>/dev/null)
+  obs_host=$(fm_github_remote_destination_host "$project" "$capability" "$push_branch" 2>/dev/null)
   st=$?
   case "$st" in
     0)
@@ -361,7 +383,7 @@ fm_github_ctx_intake() {
     fm_github_validate_organization "$organization" || { echo "GH_AUTH_INDETERMINATE: --github-organization must be a valid GitHub organization login" >&2; return 1; }
     printf '%s\torganization\t%s' "$obs_host" "$organization"
   else
-    obs_repo=$(fm_github_remote_destination_repository "$project" "$capability" 2>/dev/null) || {
+    obs_repo=$(fm_github_remote_destination_repository "$project" "$capability" "$push_branch" 2>/dev/null) || {
       echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub repository" >&2
       return 2
     }
@@ -380,7 +402,7 @@ fm_github_ctx_intake() {
 # adopted, so a repointed remote stays blocked until the destination is
 # re-selected.
 fm_github_ctx_observe() {
-  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-}
+  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} push_branch=${8:-current}
   local obs_host obs_repo obs_target obs_tuple target_owner target_repository st
   [ "$forge" = github ] || { echo "GH_AUTH_INDETERMINATE: no authoritative GitHub forge is recorded for this task" >&2; return 2; }
   fm_github_validate_hostname "$selected_host" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub host is not a canonical hostname" >&2; return 2; }
@@ -388,7 +410,7 @@ fm_github_ctx_observe() {
     push:repository|fetch:repository|api-org-membership:organization) ;;
     *) echo "GH_AUTH_INDETERMINATE: the recorded GitHub target kind does not match the required capability" >&2; return 2 ;;
   esac
-  obs_host=$(fm_github_remote_destination_host "$project" "$capability" 2>/dev/null)
+  obs_host=$(fm_github_remote_destination_host "$project" "$capability" "$push_branch" 2>/dev/null)
   st=$?
   if [ "$st" -eq 2 ]; then
     echo "GH_AUTH_INDETERMINATE: an ambiguous or unverifiable destination cannot establish one authoritative target" >&2
@@ -405,7 +427,7 @@ fm_github_ctx_observe() {
     case "$target" in */*) target_owner=${target%%/*}; target_repository=${target#*/} ;; *) target_owner=; target_repository= ;; esac
     fm_github_validate_login "$target_owner" || { echo "GH_AUTH_INDETERMINATE: the recorded GitHub repository owner is malformed" >&2; return 2; }
     case "$target_repository" in ''|*/*|*[!A-Za-z0-9_.-]*) echo "GH_AUTH_INDETERMINATE: the recorded GitHub repository is malformed" >&2; return 2 ;; esac
-    obs_repo=$(fm_github_remote_destination_repository "$project" "$capability" 2>/dev/null) || {
+    obs_repo=$(fm_github_remote_destination_repository "$project" "$capability" "$push_branch" 2>/dev/null) || {
       echo "GH_AUTH_INDETERMINATE: the selected project has no unambiguous GitHub repository" >&2
       return 2
     }
@@ -423,9 +445,9 @@ fm_github_ctx_observe() {
 }
 
 fm_github_ctx_gate() {
-  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} recorded=${8:-}
+  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} recorded=${8:-} push_branch=${9:-current}
   local obs_tuple probe_target probe_out st
-  obs_tuple=$(fm_github_ctx_observe "$project" "$forge" "$selected_host" "$target_kind" "$target" "$capability" "$organization") || return $?
+  obs_tuple=$(fm_github_ctx_observe "$project" "$forge" "$selected_host" "$target_kind" "$target" "$capability" "$organization" "$push_branch") || return $?
   if [ -n "$recorded" ] && [ "$recorded" = "$obs_tuple" ]; then
     printf '%s' "$obs_tuple"
     return 0

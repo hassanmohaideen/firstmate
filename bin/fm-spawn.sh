@@ -758,11 +758,31 @@ parse_orca_worktree_result() {
   fi
 }
 
+cleanup_unidentified_gated_pool_endpoint() {
+  local tabs title tab_id workspace_id
+  case "$BACKEND" in
+    zellij)
+      title=$(fm_backend_zellij_scoped_title "$W")
+      tabs=$(fm_backend_zellij_cli "${ZELLIJ_SES:-}" action list-tabs --json 2>/dev/null || true)
+      tab_id=$(printf '%s' "$tabs" | jq -r --arg want "$title" '[.[]? | select(.name == $want) | .tab_id] | if length == 1 then .[0] else empty end' 2>/dev/null)
+      case "$tab_id" in ''|*[!0-9]*) return 1 ;; esac
+      fm_backend_zellij_cli "$ZELLIJ_SES" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
+      ;;
+    cmux)
+      title=$(fm_backend_cmux_scoped_title "$W")
+      workspace_id=$(fm_backend_cmux_workspace_id_for_label "$title" 2>/dev/null || true)
+      [ -n "$workspace_id" ] || return 1
+      fm_backend_cmux_kill "$workspace_id:partial" >/dev/null 2>&1 || true
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 persist_gated_pool_recovery() {
   local recovery_tmp
   mkdir -p "$STATE" 2>/dev/null || return 1
   recovery_tmp="$STATE/.$ID.meta.lease-recovery.${BASHPID:-$$}"
-  {
+  if ! {
     echo "window=${T:-${W:-}}"
     echo "endpoint_task_id=$ID"
     echo "worktree=$WT"
@@ -776,10 +796,21 @@ persist_gated_pool_recovery() {
     echo "model=${MODEL:-default}"
     echo "effort=${EFFORT:-default}"
     echo "backend=$BACKEND"
-  } > "$recovery_tmp" 2>/dev/null \
-    && mv -f "$recovery_tmp" "$STATE/$ID.meta" \
-    && printf 'failed: allocated worktree lease requires recovery after pre-endpoint launch failure\n' > "$STATE/$ID.status" \
-    && return 0
+  } > "$recovery_tmp" 2>/dev/null; then
+    rm -f "$recovery_tmp" 2>/dev/null || true
+    return 1
+  fi
+  if [ "$GATED_POOL_ENDPOINT_CREATION_STARTED" = 1 ] \
+    && ! fm_backend_validate_task_endpoint "$recovery_tmp" "$ID" >/dev/null 2>&1; then
+    rm -f "$recovery_tmp" 2>/dev/null || true
+    cleanup_unidentified_gated_pool_endpoint || true
+    echo "error: $BACKEND may have left a partial endpoint for task $ID without recoverable exact identity; retained pooled-worktree lease '$WT' needs manual attention" >&2
+    return 1
+  fi
+  if mv -f "$recovery_tmp" "$STATE/$ID.meta" \
+    && printf 'failed: allocated worktree lease requires recovery after pre-endpoint launch failure\n' > "$STATE/$ID.status"; then
+    return 0
+  fi
   rm -f "$recovery_tmp" 2>/dev/null || true
   return 1
 }
@@ -1770,8 +1801,10 @@ GH_CAPABILITY=
 GH_ORG=
 GH_VERIFIED_DEST=
 GH_GATE_PROJECT=$PROJ_ABS
+GH_PUSH_BRANCH=unknown
 if [ "$RELAUNCH" -eq 1 ]; then
   GH_GATE_PROJECT=$RELAUNCH_WT
+  GH_PUSH_BRANCH=current
 fi
 if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; }; then
   GH_CAPABILITY=$(fm_github_ctx_capability "$KIND" "$GITHUB_AUTH_CAPABILITY") || {
@@ -1789,7 +1822,7 @@ if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_gith
     GH_GATED=1
   # The command substitution is kept in the `if` condition so `set -e` does not
   # exit on the intended non-zero returns before they are handled.
-  elif GH_INTAKE=$(fm_github_ctx_intake "$GH_GATE_PROJECT" "$GH_CAPABILITY" "$GITHUB_HOST" "$GITHUB_ORGANIZATION"); then
+  elif GH_INTAKE=$(fm_github_ctx_intake "$GH_GATE_PROJECT" "$GH_CAPABILITY" "$GITHUB_HOST" "$GITHUB_ORGANIZATION" "$GH_PUSH_BRANCH"); then
     IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
 $GH_INTAKE
 EOF
@@ -1814,7 +1847,7 @@ EOF
     esac
   fi
   if [ "$GH_GATED" -eq 1 ]; then
-    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$GH_GATE_PROJECT" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST"); then
+    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$GH_GATE_PROJECT" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST" "$GH_PUSH_BRANCH"); then
       GH_VERIFIED_DEST=$GH_VERIFIED_NEW
     else
       GH_GATE_RC=$?
