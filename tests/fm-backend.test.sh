@@ -782,6 +782,7 @@ case "\${1:-}" in
     for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$wt"; exit 0 ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
   list-windows) exit 0 ;;
+  new-window) printf '@spawn-window\\n'; exit 0 ;;
 esac
 exit 0
 SH
@@ -852,6 +853,7 @@ case "\${1:-}" in
     ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
   list-windows) exit 0 ;;
+  new-window) printf '@symlink-window\\n'; exit 0 ;;
 esac
 exit 0
 SH

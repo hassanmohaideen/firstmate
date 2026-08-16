@@ -365,7 +365,17 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
   wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
   [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; return 1; }
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
-  [ -n "$sfid" ] || { echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid)" >&2; return 1; }
+  if [ -z "$sfid" ]; then
+    # Exact partial-endpoint recovery for cmux is deferred to the backend-integration follow-up.
+    fm_backend_cmux_kill "$wsid:partial" >/dev/null 2>&1 || true
+    if out=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) \
+      && printf '%s' "$out" | jq -e --arg id "$wsid" '[.workspaces[]? | select(.id == $id)] | length == 0' >/dev/null 2>&1; then
+      echo "error: could not resolve the default surface for cmux workspace '$title' ($wsid); the partial workspace was removed" >&2
+      return 2
+    fi
+    echo "error: cmux may have left partial workspace '$title' ($wsid); cleanup could not be confirmed and worktree '$cwd' needs manual attention" >&2
+    return 3
+  fi
   printf '%s %s' "$wsid" "$sfid"
 }
 

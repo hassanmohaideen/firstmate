@@ -503,6 +503,47 @@ test_create_task_restores_previously_active_tab() {
   pass "fm_backend_zellij_create_task: restores focus to the previously-active tab after the steal-focus new-tab call"
 }
 
+test_create_task_cleans_partial_tab_when_pane_discovery_fails() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-partial-cleanup"; mkdir -p "$dir/responses" "$dir/home"
+  fb=$(make_zellij_fakebin "$dir")
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '8\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/3.out"
+  printf '[]\n' > "$dir/responses/5.out"
+
+  out=$(FM_HOME="$dir/home" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate PATH="$fb:$PATH" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-partial /tmp/pooled-lease' "$ROOT" 2>&1)
+  status=$?
+
+  expect_code 2 "$status" "a confirmed partial-tab cleanup should return the dedicated cleaned status"
+  assert_contains "$out" "partial tab was removed" "partial-tab cleanup was not reported"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''8' "partial-tab cleanup did not close the exact created tab"
+  assert_not_contains "$out" "needs manual attention" "confirmed cleanup incorrectly reported an orphan"
+  pass "fm_backend_zellij_create_task: removes a partial tab after pane discovery fails"
+}
+
+test_create_task_reports_unconfirmed_partial_tab_without_recovery_identity() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-partial-unconfirmed"; mkdir -p "$dir/responses" "$dir/home"
+  fb=$(make_zellij_fakebin "$dir")
+  printf '[]\n' > "$dir/responses/1.out"
+  printf '9\n' > "$dir/responses/2.out"
+  printf '[]\n' > "$dir/responses/3.out"
+  printf '1\n' > "$dir/responses/5.exit"
+
+  out=$(FM_HOME="$dir/home" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate PATH="$fb:$PATH" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-partial /tmp/pooled-lease' "$ROOT" 2>&1)
+  status=$?
+
+  expect_code 3 "$status" "an unconfirmed partial-tab cleanup should return the retained-lease status"
+  assert_contains "$out" "zellij may have left partial tab 9" "the possible orphan was not named"
+  assert_contains "$out" "worktree '/tmp/pooled-lease' needs manual attention" "the affected worktree was not reported"
+  pass "fm_backend_zellij_create_task: reports an unconfirmed partial endpoint without inventing recovery identity"
+}
+
 test_create_task_no_restore_when_new_tab_was_already_active() {
   local dir fb out
   dir="$TMP_ROOT/focus-noop"; mkdir -p "$dir/responses"
@@ -1320,6 +1361,8 @@ test_dispatch_busy_state_unknown_for_zellij
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
 test_create_task_restores_previously_active_tab
+test_create_task_cleans_partial_tab_when_pane_discovery_fails
+test_create_task_reports_unconfirmed_partial_tab_without_recovery_identity
 test_create_task_no_restore_when_new_tab_was_already_active
 test_capture_small_reads_use_viewport_and_trim
 test_capture_large_reads_use_full_scrollback_and_trim

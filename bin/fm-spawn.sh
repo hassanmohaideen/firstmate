@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--github-host <canonical-host>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--github-host <canonical-host>] [--github-auth-required[=<private-repository-read|organization-membership-read>]] [--github-organization <organization>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+#   GitHub authentication-context gate (bin/fm-github-context-lib.sh owns the
+#   decision). A ship push and an authentication scout verify their exact
+#   destination BEFORE any worktree, window, or endpoint is created, and refuse to
+#   launch until an authoritative probe of the selected destination succeeds.
+#   --github-host is firstmate's intake assertion that the remote is authoritatively
+#   GitHub on that lowercase canonical host, so an arbitrary forge or unresolved SSH
+#   alias cannot become GitHub by inference; github.com is auto-selected without it.
+#   --github-auth-required (scouts only) verifies a private-repository read or, with
+#   --github-organization, an authenticated organization-membership read. A relaunch
+#   reuses the recorded selection and refuses all three flags. The resolved
+#   selection is persisted verbatim (gh_forge, gh_selected_host, gh_target_kind,
+#   gh_target, gh_auth_required, gh_auth_capability, gh_organization) and is never a
+#   function of a probe outcome; gh_verified_dest, the one field a probe transitions,
+#   is written only on a successful verification and its absence re-probes on the
+#   next relaunch (fail-closed). A changed, mixed, missing, or malformed destination
+#   stays indeterminate and cannot launch.
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
@@ -252,6 +268,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-github-context-lib.sh
+. "$SCRIPT_DIR/fm-github-context-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -275,6 +293,17 @@ MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
 RELAUNCH=0
+# GitHub authentication-context selection. GITHUB_* hold the intake assertion
+# from firstmate; GH_* hold the resolved selection persisted into the task meta
+# and gated by bin/fm-github-context-lib.sh. GITHUB_AUTH_REQUIRED defaults off.
+GITHUB_HOST=
+GITHUB_HOST_SET=0
+GITHUB_AUTH_REQUIRED=0
+GITHUB_AUTH_CAPABILITY=
+GITHUB_ORGANIZATION=
+GH_GATED=0
+GH_RECORDED_STATE=none
+GH_LIFECYCLE_STATE=legacy
 POS=()
 want_value=
 for a in "$@"; do
@@ -290,6 +319,8 @@ for a in "$@"; do
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
       traceparent) TRACEPARENT_ARG=$a; TRACEPARENT_SET=1 ;;
+      github-host) GITHUB_HOST=$a; GITHUB_HOST_SET=1 ;;
+      github-organization) GITHUB_ORGANIZATION=$a ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -313,6 +344,12 @@ for a in "$@"; do
     --yolo=*) YOLO=${a#--yolo=}; YOLO_SET=1 ;;
     --traceparent) want_value=traceparent ;;
     --traceparent=*) TRACEPARENT_ARG=${a#--traceparent=}; TRACEPARENT_SET=1 ;;
+    --github-host) want_value=github-host ;;
+    --github-host=*) GITHUB_HOST=${a#--github-host=}; GITHUB_HOST_SET=1 ;;
+    --github-auth-required) GITHUB_AUTH_REQUIRED=1; GITHUB_AUTH_CAPABILITY=private-repository-read ;;
+    --github-auth-required=*) GITHUB_AUTH_REQUIRED=1; GITHUB_AUTH_CAPABILITY=${a#--github-auth-required=} ;;
+    --github-organization) want_value=github-organization ;;
+    --github-organization=*) GITHUB_ORGANIZATION=${a#--github-organization=} ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -341,6 +378,24 @@ case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
 esac
+# GitHub authentication-context flags are firstmate's intake-only assertion that
+# the selected remote is authoritatively GitHub. A relaunch reuses the recorded
+# selection and refuses them (below).
+[ "$GITHUB_HOST_SET" -eq 0 ] || [ -n "$GITHUB_HOST" ] || { echo "error: --github-host requires a non-empty value" >&2; exit 1; }
+if [ "$GITHUB_HOST_SET" -eq 1 ]; then
+  fm_github_validate_hostname "$GITHUB_HOST" || { echo "error: --github-host must be a lowercase canonical hostname" >&2; exit 1; }
+fi
+if [ "$GITHUB_AUTH_REQUIRED" -eq 1 ]; then
+  [ "$KIND" = scout ] || { echo "error: --github-auth-required applies only to --scout spawns" >&2; exit 1; }
+  case "$GITHUB_AUTH_CAPABILITY" in
+    private-repository-read|organization-membership-read) ;;
+    *) echo "error: --github-auth-required must be private-repository-read or organization-membership-read" >&2; exit 1 ;;
+  esac
+fi
+if [ "$GITHUB_AUTH_CAPABILITY" = organization-membership-read ]; then
+  [ -n "$GITHUB_ORGANIZATION" ] || { echo "error: --github-auth-required=organization-membership-read requires --github-organization" >&2; exit 1; }
+fi
+[ -z "$GITHUB_ORGANIZATION" ] || [ "$GITHUB_AUTH_CAPABILITY" = organization-membership-read ] || { echo "error: --github-organization applies only to --github-auth-required=organization-membership-read" >&2; exit 1; }
 
 # --relaunch reuses an existing task's endpoint, worktree, project, and kind,
 # so every axis this block resolves for a fresh spawn instead comes from that
@@ -351,6 +406,9 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$KIND_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded kind; --scout/--secondmate cannot override it" >&2; exit 1; }
   [ "$MODE_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded delivery mode; --mode cannot override it" >&2; exit 1; }
   [ "$YOLO_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded yolo posture; --yolo cannot override it" >&2; exit 1; }
+  [ "$GITHUB_HOST_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded GitHub selection; --github-host cannot override it" >&2; exit 1; }
+  [ "$GITHUB_AUTH_REQUIRED" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded GitHub selection; --github-auth-required cannot override it" >&2; exit 1; }
+  [ -z "$GITHUB_ORGANIZATION" ] || { echo "error: --relaunch reuses the task's recorded GitHub selection; --github-organization cannot override it" >&2; exit 1; }
 else
   # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
   # firstmate's per-task decision, so they are required and closed-set validated
@@ -608,6 +666,7 @@ spawn_remote_secondmate() {
     echo "kind=secondmate"
     echo "mode=secondmate"
     echo "yolo=off"
+    echo "gh_gated=${GH_GATED:-0}"
     echo "tasktmp="
     echo "model=${model#-}"
     echo "effort=${effort#-}"
@@ -664,6 +723,23 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+GATED_POOL_LEASE_ABORT_RETURN=0
+GATED_POOL_PREALLOCATED=0
+GATED_POOL_ENDPOINT_CREATION_STARTED=0
+
+write_github_context_meta() {
+  echo "gh_gated=${GH_GATED:-0}"
+  if [ "${GH_GATED:-0}" = 1 ]; then
+    echo "gh_forge=${GH_FORGE:-}"
+    echo "gh_selected_host=${GH_SEL_HOST:-}"
+    echo "gh_target_kind=${GH_TARGET_KIND:-}"
+    [ -z "${GH_TARGET:-}" ] || echo "gh_target=$GH_TARGET"
+    [ "${GITHUB_AUTH_REQUIRED:-0}" = 0 ] || echo "gh_auth_required=1"
+    [ -z "${GITHUB_AUTH_CAPABILITY:-}" ] || echo "gh_auth_capability=$GITHUB_AUTH_CAPABILITY"
+    [ -z "${GH_ORG:-}" ] || echo "gh_organization=$GH_ORG"
+    [ -z "${GH_VERIFIED_DEST:-}" ] || echo "gh_verified_dest=$GH_VERIFIED_DEST"
+  fi
+}
 
 parse_orca_worktree_result() {
   local raw=$1 rest
@@ -682,8 +758,65 @@ parse_orca_worktree_result() {
   fi
 }
 
+cleanup_unidentified_gated_pool_endpoint() {
+  local tabs title tab_id workspace_id
+  case "$BACKEND" in
+    zellij)
+      title=$(fm_backend_zellij_scoped_title "$W")
+      tabs=$(fm_backend_zellij_cli "${ZELLIJ_SES:-}" action list-tabs --json 2>/dev/null || true)
+      tab_id=$(printf '%s' "$tabs" | jq -r --arg want "$title" '[.[]? | select(.name == $want) | .tab_id] | if length == 1 then .[0] else empty end' 2>/dev/null)
+      case "$tab_id" in ''|*[!0-9]*) return 1 ;; esac
+      fm_backend_zellij_cli "$ZELLIJ_SES" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
+      ;;
+    cmux)
+      title=$(fm_backend_cmux_scoped_title "$W")
+      workspace_id=$(fm_backend_cmux_workspace_id_for_label "$title" 2>/dev/null || true)
+      [ -n "$workspace_id" ] || return 1
+      fm_backend_cmux_kill "$workspace_id:partial" >/dev/null 2>&1 || true
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+persist_gated_pool_recovery() {
+  local recovery_tmp
+  mkdir -p "$STATE" 2>/dev/null || return 1
+  recovery_tmp="$STATE/.$ID.meta.lease-recovery.${BASHPID:-$$}"
+  if ! {
+    echo "window=${T:-${W:-}}"
+    echo "endpoint_task_id=$ID"
+    echo "worktree=$WT"
+    echo "project=$PROJ_ABS"
+    echo "harness=$HARNESS"
+    echo "kind=$KIND"
+    [ -z "${MODE:-}" ] || echo "mode=$MODE"
+    [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
+    write_github_context_meta
+    echo "tasktmp=${TASK_TMP:-}"
+    echo "model=${MODEL:-default}"
+    echo "effort=${EFFORT:-default}"
+    echo "backend=$BACKEND"
+  } > "$recovery_tmp" 2>/dev/null; then
+    rm -f "$recovery_tmp" 2>/dev/null || true
+    return 1
+  fi
+  if [ "$GATED_POOL_ENDPOINT_CREATION_STARTED" = 1 ] \
+    && ! fm_backend_validate_task_endpoint "$recovery_tmp" "$ID" >/dev/null 2>&1; then
+    rm -f "$recovery_tmp" 2>/dev/null || true
+    cleanup_unidentified_gated_pool_endpoint || true
+    echo "error: $BACKEND may have left a partial endpoint for task $ID without recoverable exact identity; retained pooled-worktree lease '$WT' needs manual attention" >&2
+    return 1
+  fi
+  if mv -f "$recovery_tmp" "$STATE/$ID.meta" \
+    && printf 'failed: allocated worktree lease requires recovery after pre-endpoint launch failure\n' > "$STATE/$ID.status"; then
+    return 0
+  fi
+  rm -f "$recovery_tmp" 2>/dev/null || true
+  return 1
+}
+
 spawn_abort_cleanup() {
-  local status=$?
+  local status=$? recovery_retained
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -726,6 +859,25 @@ spawn_abort_cleanup() {
     HERDR_PRESENTATION_ORDER_LOCK_HELD=0
     fm_lock_release "$HERDR_PRESENTATION_ORDER_LOCK" || true
   fi
+  if [ "$GATED_POOL_LEASE_ABORT_RETURN" = 1 ] && [ -n "${WT:-}" ]; then
+    GATED_POOL_LEASE_ABORT_RETURN=0
+    recovery_retained=0
+    if [ "$GATED_POOL_ENDPOINT_CREATION_STARTED" = 1 ]; then
+      persist_gated_pool_recovery && recovery_retained=1
+      if [ "$recovery_retained" = 1 ]; then
+        echo "error: task $ID's endpoint creation was not confirmed; the allocated worktree lease and recovery metadata were retained" >&2
+      else
+        echo "error: task $ID's endpoint creation was not confirmed and recovery metadata could not be persisted; manual endpoint and lease recovery is required" >&2
+      fi
+    elif ! ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1; then
+      persist_gated_pool_recovery && recovery_retained=1
+      if [ "$recovery_retained" = 1 ]; then
+        echo "error: could not return blocked task $ID's allocated worktree '$WT'; the lease and recovery metadata were retained" >&2
+      else
+        echo "error: could not return blocked task $ID's allocated worktree '$WT' or persist its recovery metadata; manual lease recovery is required" >&2
+      fi
+    fi
+  fi
   if [ "$ORCA_ABORT_CLEANUP" = 1 ]; then
     ORCA_ABORT_CLEANUP=0
     if [ -n "${ORCA_TERMINAL:-}" ]; then
@@ -743,6 +895,7 @@ spawn_abort_cleanup() {
             echo "kind=$KIND"
             [ -z "${MODE:-}" ] || echo "mode=$MODE"
             [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
+            write_github_context_meta
             echo "tasktmp=${TASK_TMP:-}"
             echo "model=${MODEL:-default}"
             echo "effort=${EFFORT:-default}"
@@ -1003,9 +1156,35 @@ if [ "$RELAUNCH" -eq 1 ]; then
   }
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
+  RELAUNCH_RECORDED_KIND=$KIND
   [ -n "$KIND" ] || KIND=ship
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
   YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
+  # The recorded GitHub selection is authoritative and immutable across a
+  # relaunch: it is read here, carried verbatim into the republished meta, and
+  # revalidated by the gate. A relaunch never re-derives or clears it, so the
+  # erase-then-bypass class cannot occur.
+  GITHUB_AUTH_REQUIRED=$(fm_meta_get "$RELAUNCH_META" gh_auth_required)
+  GITHUB_AUTH_CAPABILITY=$(fm_meta_get "$RELAUNCH_META" gh_auth_capability)
+  GH_REC_GATED_PRESENT=0
+  grep -q '^gh_gated=' "$RELAUNCH_META" && GH_REC_GATED_PRESENT=1
+  GH_REC_GATED=$(fm_meta_get "$RELAUNCH_META" gh_gated)
+  GH_REC_FORGE=$(fm_meta_get "$RELAUNCH_META" gh_forge)
+  GH_REC_HOST=$(fm_meta_get "$RELAUNCH_META" gh_selected_host)
+  GH_REC_TARGET_KIND=$(fm_meta_get "$RELAUNCH_META" gh_target_kind)
+  GH_REC_TARGET=$(fm_meta_get "$RELAUNCH_META" gh_target)
+  GH_REC_ORG=$(fm_meta_get "$RELAUNCH_META" gh_organization)
+  GH_REC_VERIFIED=$(fm_meta_get "$RELAUNCH_META" gh_verified_dest)
+  GH_LIFECYCLE_STATE=$(fm_github_ctx_lifecycle_state "$GH_REC_GATED_PRESENT" "$GH_REC_GATED" "$RELAUNCH_RECORDED_KIND" "$MODE" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
+  case "$GH_LIFECYCLE_STATE" in
+    gated) GH_RECORDED_STATE=complete ;;
+    legacy|ungated) GH_RECORDED_STATE=none ;;
+    *)
+      echo "GH_AUTH_INDETERMINATE: task $ID has an incomplete or inconsistent recorded GitHub context" >&2
+      echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+      exit 1
+      ;;
+  esac
   RELAUNCH_WT=$(fm_meta_get "$RELAUNCH_META" worktree)
   [ -n "$RELAUNCH_WT" ] && [ -d "$RELAUNCH_WT" ] || {
     echo "error: task $ID's recorded worktree '${RELAUNCH_WT:-none}' is missing; refusing to relaunch without the local copy its work lives in" >&2
@@ -1608,6 +1787,81 @@ else
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
 
+# GitHub authentication-context gate. bin/fm-github-context-lib.sh is the single
+# owner of the decision; this block only resolves the selection (from intake
+# flags, or the recorded selection carried verbatim on a relaunch) and refuses to
+# launch when verification does not succeed. It runs before any worktree, window,
+# or endpoint is created, so a blocked task leaves no orphan and never mutates the
+# recorded meta. A launch that reaches here is either out of scope or verified.
+GH_GATED=0
+GH_FORGE=
+GH_SEL_HOST=
+GH_TARGET_KIND=
+GH_TARGET=
+GH_CAPABILITY=
+GH_ORG=
+GH_VERIFIED_DEST=
+GH_GATE_PROJECT=$PROJ_ABS
+GH_PUSH_BRANCH="fm/$ID"
+if [ "$RELAUNCH" -eq 1 ]; then
+  GH_GATE_PROJECT=$RELAUNCH_WT
+  GH_PUSH_BRANCH=current
+fi
+if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; }; then
+  GH_CAPABILITY=$(fm_github_ctx_capability "$KIND" "$GITHUB_AUTH_CAPABILITY") || {
+    echo "GH_AUTH_INDETERMINATE: task $ID has no resolvable GitHub authentication capability" >&2
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+    exit 1
+  }
+  if [ "$GH_RECORDED_STATE" = complete ]; then
+    GH_FORGE=$GH_REC_FORGE
+    GH_SEL_HOST=$GH_REC_HOST
+    GH_TARGET_KIND=$GH_REC_TARGET_KIND
+    GH_TARGET=$GH_REC_TARGET
+    GH_ORG=$GH_REC_ORG
+    GH_VERIFIED_DEST=$GH_REC_VERIFIED
+    GH_GATED=1
+  # The command substitution is kept in the `if` condition so `set -e` does not
+  # exit on the intended non-zero returns before they are handled.
+  elif GH_INTAKE=$(fm_github_ctx_intake "$GH_GATE_PROJECT" "$GH_CAPABILITY" "$GITHUB_HOST" "$GITHUB_ORGANIZATION" "$GH_PUSH_BRANCH"); then
+    IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
+$GH_INTAKE
+EOF
+    GH_FORGE=github
+    GH_ORG=$GITHUB_ORGANIZATION
+    GH_GATED=1
+  else
+    GH_INTAKE_RC=$?
+    case "$GH_INTAKE_RC" in
+      3)
+        if [ "$KIND" = scout ]; then
+          echo "GH_AUTH_INDETERMINATE: a GitHub authentication scout requires --github-host naming the canonical destination" >&2
+          exit 1
+        fi
+        GH_GATED=0
+        ;;
+      1) exit 1 ;;
+      *)
+        echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  if [ "$GH_GATED" -eq 1 ]; then
+    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$GH_GATE_PROJECT" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_VERIFIED_DEST" "$GH_PUSH_BRANCH"); then
+      GH_VERIFIED_DEST=$GH_VERIFIED_NEW
+    else
+      GH_GATE_RC=$?
+      if [ "$GH_GATE_RC" -eq 1 ]; then
+        echo "GitHub authentication or access blocks task $ID; worker launch is waiting" >&2
+      else
+        echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+      fi
+      exit 1
+    fi
+  fi
+fi
+
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
     no-mistakes) echo 3 ;;
@@ -1742,6 +1996,40 @@ herdr_projection_meta_field_exact() {  # <meta> <key>
   grep "^${key}=" "$meta" 2>/dev/null | cut -d= -f2-
 }
 
+reset_gated_pool_destination() {  # <worktree>
+  local worktree=$1 observed rc routes key
+  if [ "$(git -C "$worktree" config --bool extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
+    for key in remote.origin.url remote.origin.pushurl; do
+      if git -C "$worktree" config --worktree --unset-all "$key" 2>/dev/null; then
+        :
+      else
+        rc=$?
+        [ "$rc" -eq 5 ] || return 1
+      fi
+    done
+    if routes=$(git -C "$worktree" config --worktree --get-regexp '^(remote\.pushdefault|branch\..*\.(pushremote|remote))$' 2>/dev/null); then
+      :
+    else
+      rc=$?
+      [ "$rc" -eq 1 ] || return 1
+      routes=
+    fi
+    while read -r key _; do
+      [ -n "$key" ] || continue
+      if git -C "$worktree" config --worktree --unset-all "$key" 2>/dev/null; then
+        :
+      else
+        rc=$?
+        [ "$rc" -eq 5 ] || return 1
+      fi
+    done <<EOF
+$routes
+EOF
+  fi
+  observed=$(fm_github_ctx_observe "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_PUSH_BRANCH") || return 1
+  [ "$observed" = "$GH_VERIFIED_DEST" ]
+}
+
 # A stale presentation journal never grants launch authority.
 # Under the session lock, authoritative metadata must identify one positively
 # dead or agent-free endpoint before token inspection may allow flat fallback.
@@ -1810,6 +2098,23 @@ herdr_projection_existing_meta_allows_flat() {  # <meta>
   esac
 }
 
+SPAWN_START_DIR=$PROJ_ABS
+if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$GH_GATED" -eq 1 ]; then
+  WT=$(cd "$PROJ_ABS" && treehouse get --lease --lease-holder "$ID") || {
+    echo "error: treehouse get --lease failed to allocate a worktree for $ID" >&2
+    exit 1
+  }
+  GATED_POOL_LEASE_ABORT_RETURN=1
+  GATED_POOL_PREALLOCATED=1
+  validate_spawn_worktree "treehouse get --lease" "$ID"
+  if ! reset_gated_pool_destination "$WT"; then
+    echo "GH_AUTH_INDETERMINATE: the allocated worktree destination could not be reset to the verified primary destination" >&2
+    echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+    exit 1
+  fi
+  SPAWN_START_DIR=$WT
+fi
+
 W="fm-$ID"
 if [ "$RELAUNCH" -eq 1 ]; then
   # Adopt the recorded endpoint instead of creating one. This is what keeps a
@@ -1833,7 +2138,11 @@ case "$BACKEND" in
     # treehouse cd's into the worktree. WT_TARGET carries that stable id for the
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
-    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    GATED_POOL_ENDPOINT_CREATION_STARTED=1
+    WID=$(fm_backend_tmux_create_task "$SES" "$W" "$SPAWN_START_DIR") || exit 1
+    [ -n "$WID" ] || { echo "error: tmux did not return a window id for $W" >&2; exit 1; }
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -1882,6 +2191,7 @@ case "$BACKEND" in
           "$HERDR_SES" "$HERDR_PRESENTATION_JOURNAL" "$ID" || exit 1
         if [ "${HERDR_RECOVERY_BACKEND:-}" = herdr ]; then
           set +e
+          GATED_POOL_ENDPOINT_CREATION_STARTED=1
           FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_reclaim_task \
             "$HERDR_SES" "$HERDR_PRESENTATION_JOURNAL" "$ID" "$HERDR_LABEL_HOME" \
             "$HERDR_RECOVERY_WORKSPACE_ID" "$HERDR_RECOVERY_TAB_ID" "$HERDR_RECOVERY_PANE_ID" \
@@ -1899,8 +2209,11 @@ case "$BACKEND" in
               HERDR_PROJECTION_ABORT_SESSION=$HERDR_SES
               HERDR_PROJECTION_ABORT_TASK_PANE=$HERDR_PANE_ID
               HERDR_PROJECTION_ABORT_SEEDED_PANE=""
+              GATED_POOL_ENDPOINT_CREATION_STARTED=0
+              GATED_POOL_LEASE_ABORT_RETURN=0
               ;;
             2)
+              GATED_POOL_ENDPOINT_CREATION_STARTED=0
               spawn_herdr_presentation_order_lock_release
               ;;
             *) exit 1 ;;
@@ -1938,8 +2251,9 @@ case "$BACKEND" in
           else
             HERDR_PROJECTION_ID=$(fm_backend_herdr_projection_journal_create "$STATE" "$ID") || exit 1
             HERDR_PROJECTION_LABEL=$(fm_backend_herdr_projection_workspace_label "$ID" "$HERDR_PROJECTION_ID")
+            GATED_POOL_ENDPOINT_CREATION_STARTED=1
             if ! FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_projection_create_task \
-              "$PROJ_ABS" "$HERDR_PROJECTION_LABEL" "$W"; then
+              "$SPAWN_START_DIR" "$HERDR_PROJECTION_LABEL" "$W"; then
               if [ "${FM_BACKEND_HERDR_PROJECTION_CLEANUP_SAFE:-0}" = 1 ]; then
                 HERDR_PROJECTION_ABORT_CLEANUP=1
                 HERDR_PROJECTION_ABORT_SESSION=$FM_BACKEND_HERDR_PROJECTION_SESSION
@@ -1958,6 +2272,8 @@ case "$BACKEND" in
             HERDR_PROJECTION_ABORT_SESSION=$HERDR_SES
             HERDR_PROJECTION_ABORT_TASK_PANE=$HERDR_PANE_ID
             HERDR_PROJECTION_ABORT_SEEDED_PANE=$FM_BACKEND_HERDR_PROJECTION_SEEDED_PANE_ID
+            GATED_POOL_ENDPOINT_CREATION_STARTED=0
+            GATED_POOL_LEASE_ABORT_RETURN=0
             fm_backend_herdr_projection_order_best_effort \
               "$HERDR_SES" "$HERDR_WORKSPACE_ID" "$HERDR_PARENT_LABEL" "$HERDR_PARENT_WORKSPACE_ID"
             HERDR_HOME_ID=$(fm_backend_herdr_projection_home_identity "$HERDR_LABEL_HOME" 2>/dev/null || true)
@@ -1992,7 +2308,8 @@ case "$BACKEND" in
       HERDR_SEEDED_DEFAULT_TAB_ID=${HERDR_CONTAINER_RAW#*$'\t'}
       HERDR_SES=${CONTAINER%%:*}
       HERDR_WORKSPACE_ID=${CONTAINER#*:}
-      HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$PROJ_ABS" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
+      GATED_POOL_ENDPOINT_CREATION_STARTED=1
+      HERDR_TASK_IDS=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_create_task "$CONTAINER" "$W" "$SPAWN_START_DIR" "$HERDR_SEEDED_DEFAULT_TAB_ID") || exit 1
       read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
 $HERDR_TASK_IDS
 EOF
@@ -2001,11 +2318,33 @@ EOF
       echo "error: herdr did not return a tab/pane id for $W" >&2
       exit 1
     fi
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     T="$HERDR_SES:$HERDR_PANE_ID"
     ;;
   zellij)
     ZELLIJ_SES=$(fm_backend_zellij_container_ensure) || exit 1
-    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$PROJ_ABS") || exit 1
+    GATED_POOL_ENDPOINT_CREATION_STARTED=1
+    set +e
+    ZELLIJ_TASK_IDS=$(fm_backend_zellij_create_task "$ZELLIJ_SES" "$W" "$SPAWN_START_DIR")
+    ZELLIJ_CREATE_STATUS=$?
+    set -e
+    case "$ZELLIJ_CREATE_STATUS" in
+      0) ;;
+      2)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        exit 1
+        ;;
+      3)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        if [ "$GATED_POOL_LEASE_ABORT_RETURN" = 1 ]; then
+          echo "error: zellij partial-endpoint cleanup was not confirmed; retained pooled-worktree lease '$WT' needs manual attention" >&2
+          GATED_POOL_LEASE_ABORT_RETURN=0
+        fi
+        exit 1
+        ;;
+      *) exit 1 ;;
+    esac
     read -r ZELLIJ_TAB_ID ZELLIJ_PANE_ID <<EOF
 $ZELLIJ_TASK_IDS
 EOF
@@ -2013,11 +2352,33 @@ EOF
       echo "error: zellij did not return a tab/pane id for $W" >&2
       exit 1
     fi
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     T="$ZELLIJ_SES:$ZELLIJ_PANE_ID"
     ;;
   cmux)
     fm_backend_cmux_container_ensure || exit 1
-    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$PROJ_ABS") || exit 1
+    GATED_POOL_ENDPOINT_CREATION_STARTED=1
+    set +e
+    CMUX_TASK_IDS=$(fm_backend_cmux_create_task "$W" "$SPAWN_START_DIR")
+    CMUX_CREATE_STATUS=$?
+    set -e
+    case "$CMUX_CREATE_STATUS" in
+      0) ;;
+      2)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        exit 1
+        ;;
+      3)
+        GATED_POOL_ENDPOINT_CREATION_STARTED=0
+        if [ "$GATED_POOL_LEASE_ABORT_RETURN" = 1 ]; then
+          echo "error: cmux partial-endpoint cleanup was not confirmed; retained pooled-worktree lease '$WT' needs manual attention" >&2
+          GATED_POOL_LEASE_ABORT_RETURN=0
+        fi
+        exit 1
+        ;;
+      *) exit 1 ;;
+    esac
     read -r CMUX_WORKSPACE_ID CMUX_SURFACE_ID <<EOF
 $CMUX_TASK_IDS
 EOF
@@ -2025,6 +2386,8 @@ EOF
       echo "error: cmux did not return a workspace/surface id for $W" >&2
       exit 1
     fi
+    GATED_POOL_ENDPOINT_CREATION_STARTED=0
+    GATED_POOL_LEASE_ABORT_RETURN=0
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
     ;;
   orca)
@@ -2176,7 +2539,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
-elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$GATED_POOL_PREALLOCATED" -ne 1 ]; then
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
@@ -2574,7 +2937,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo gh_gated gh_forge gh_selected_host gh_target_kind gh_target gh_auth_required gh_auth_capability gh_organization gh_verified_dest tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2589,6 +2952,10 @@ preserve_relaunch_meta() {
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
+  # GitHub authentication-context classification and selection are written
+  # unconditionally from the resolved decision, so complete selection erasure
+  # cannot turn a previously gated record into an ungated relaunch.
+  write_github_context_meta
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
@@ -2646,6 +3013,7 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   fm_lock_release "$SPAWN_TASK_SET_LOCK"
 fi
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
+GATED_POOL_LEASE_ABORT_RETURN=0
 
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")

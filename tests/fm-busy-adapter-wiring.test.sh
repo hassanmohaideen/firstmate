@@ -30,7 +30,8 @@ esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|kill-window|send-keys) exit 0 ;;
+  new-window) printf '@busy-window\n'; exit 0 ;;
+  has-session|new-session|kill-window|send-keys) exit 0 ;;
 esac
 exit 0
 SH

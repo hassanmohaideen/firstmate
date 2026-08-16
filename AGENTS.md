@@ -295,6 +295,9 @@ Write the task-specific brief under section 11 before spawning.
 
 Spawn only through `bin/fm-spawn.sh` after the profile and backend checks in section 4.
 The spawn must resolve a genuine isolated task worktree distinct from the primary checkout; a failed isolation assertion stops the task.
+A ship push and an authentication scout verify their exact GitHub destination before launch and refuse to start until it succeeds, so when the selected remote is authoritatively GitHub on a non-`github.com` host pass its lowercase canonical host with `--github-host` (and, for a scout that needs authentication, `--github-auth-required` with `--github-organization` for organization-membership reads); `github.com` is auto-verified without it, and an arbitrary or Enterprise host is never inferred without the assertion (`bin/fm-github-context-lib.sh` owns the decision, `fm-spawn.sh`/`fm-promote.sh` headers own the flags and persisted selection).
+A well-formed launch blocked by GitHub authentication-context verification prints a `NEEDS_GH_AUTH`, `GITHUB_ACCESS_REQUIRED:`, or `GH_AUTH_INDETERMINATE:` line and is handled through `bootstrap-diagnostics`.
+A malformed flag or other input-validation rejection remains a plain input error distinct from authentication-context indeterminacy.
 After spawning, confirm the worker is processing the brief, handle any trust dialog through `harness-adapters`, and record ship or scout work as under way.
 A persistent secondmate is recorded in the secondmate registry and runtime state, never as a backlog work item.
 
@@ -462,6 +465,19 @@ Every escalation must stand alone and remain concise.
 Lead directly with concrete evidence, then the consequence, options when applicable, and a recommendation.
 Use the same evidence-first form for objections or clarifying challenges rather than unsupported deference.
 
+Authentication escalation is a shared default for all accepted work.
+When concrete evidence shows that absent, expired, insufficiently scoped, or unusable authentication blocks a required capability or would change the preferred execution path, promptly name the concrete accepted artifact or outcome - not merely the generic capability - and repeat the selected provider or service's proper name in every blocker or post-authentication restatement; do not silently route around it.
+Never resume or say you will resume from a user's authentication-complete report alone.
+That report does not clear the blocker: restate that the concrete outcome on the selected provider or service remains blocked, run every required post-authentication probe, and resume only after every probe succeeds.
+In the captain-facing blocker message, reproduce every exposed safe interactive login or authorization command and every required authoritative status or access probe exactly, including any execution prefix, state each probe's required successful account, scope, access, or boolean result, and explicitly say all must succeed before the blocked outcome resumes.
+Never invent a command when none is exposed, never ask for tokens, keys, credentials, device codes, or other secrets in chat, and explicitly say you will wait when the user must authenticate.
+After they finish, run the named probes and require every stated result before resuming.
+Do not request login from quota uncertainty, an unrelated credential source, a refreshable expired session, network unreachability, or a service the selected task does not use.
+For a session that the owning service says will refresh automatically, state that refresh and continue or retry noninteractively.
+When a failed authoritative probe leaves authentication unknown, name and resolve that failure and rerun the probe before deciding authentication is unusable.
+An authenticated preferred provider nearing quota may yield to another eligible provider without pausing solely for reset, while an explicit captain preference to authenticate an unavailable preferred provider wins.
+Keep provider-specific mechanics with their existing skill, script, or documentation owner, and keep every serious credential message plain, concise, outcome-focused, and in one paragraph without headings, lists, or code fences.
+
 Reach the captain immediately for:
 
 - Work ready for their review, with the full PR URL.
@@ -524,7 +540,7 @@ It performs guarded fast-forward updates of firstmate and registered secondmate 
 
 These skills are not captain-invocable; load them only at their precise triggers.
 
-- `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap or network-checks section prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `TANGLE:`, `STARTUP_MEMORY_BUDGET:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `NETWORK_CHECKS:`, `PR_CHECK_MIGRATION:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `SECONDMATE_HANDOFF:`, `NUDGE_SECONDMATES:`, or `FMX:`); silence and `BOOTSTRAP_INFO:` need no load.
+- `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap or network-checks section, or a direct `fm-bootstrap.sh`, `fm-startup-network.sh`, `fm-spawn.sh`, or `fm-promote.sh` run, prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `GITHUB_ACCESS_REQUIRED:`, `GH_AUTH_INDETERMINATE:`, `TANGLE:`, `STARTUP_MEMORY_BUDGET:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `NETWORK_CHECKS:`, `PR_CHECK_MIGRATION:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `SECONDMATE_HANDOFF:`, `NUDGE_SECONDMATES:`, or `FMX:`); silence and `BOOTSTRAP_INFO:` need no load.
 - `diagnostic-reasoning` - load before scoping a reported bug and before acting on a diagnostic report.
 - `ask-user-authority` - load before deciding any ask-user finding, regardless of the project's `yolo` posture.
 - `quota-array-dispatch` - load before choosing among a matched crew-dispatch profile array from current quota-axi output.

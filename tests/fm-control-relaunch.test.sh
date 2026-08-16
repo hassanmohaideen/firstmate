@@ -140,6 +140,7 @@ add_ship_task() {
   local dir=$1 id=$2 harness=${3:-claude}
   local home="$dir/home" proj="$dir/proj" wt="$dir/wt"
   fm_git_worktree "$proj" "$wt" "task-$id"
+  git -C "$proj" remote set-url origin https://gitlab.example/owner/repo.git
   mkdir -p "$home/data/$id"
   printf '# brief for %s\n\nDo the thing.\n' "$id" > "$home/data/$id/brief.md"
   {
@@ -263,6 +264,7 @@ test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint() {
     || fail "the worktree must be reused, not reallocated"
   [ "$(meta_field "$dir" rl1 kind)" = ship ] || fail "kind must survive the relaunch"
   [ "$(meta_field "$dir" rl1 project)" = "$dir/proj" ] || fail "project must survive the relaunch"
+  [ "$(meta_field "$dir" rl1 gh_gated)" = 0 ] || fail "the relaunch must persist its ungated classification"
   gen_after=$(meta_field "$dir" rl1 busy_gen)
   [ -n "$gen_after" ] && [ "$gen_after" != "$gen_before" ] \
     || fail "a relaunch must arm a fresh busy generation, got '$gen_after'"
@@ -1247,6 +1249,50 @@ test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution() {
   pass "fm-promote: promotion participates in lifecycle serialization"
 }
 
+test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree() {
+  local dir id out rc before after
+  id=promotemissing
+  dir=$(new_case promotemissing "$id")
+  {
+    echo "window=fmses:fm-$id"
+    echo "kind=scout"
+    echo "project=$dir/project"
+    echo "worktree=$dir/missing-worktree"
+    echo "harness=claude"
+  } > "$dir/home/state/$id.meta"
+  before=$(cksum < "$dir/home/state/$id.meta")
+
+  out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 \
+    "$PROMOTE" "$id" --mode direct-PR --yolo off 2>&1); rc=$?
+  expect_code 1 "$rc" "a non-local promotion with an unresolvable worktree must refuse"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "an unresolvable promotion worktree must be indeterminate"
+  assert_contains "$out" 'promotion is waiting' "an unresolvable promotion worktree must leave promotion waiting"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "an unresolvable worktree refusal must not mutate promotion metadata"
+  pass "fm-promote refuses a non-local promotion whose recorded worktree cannot be resolved"
+}
+
+test_promotion_observes_the_future_branch_push_remote() {
+  local dir id out rc
+  id=promoteroute
+  dir=$(new_case promoteroute "$id")
+  add_ship_task "$dir" "$id" claude
+  sed 's/^kind=ship$/kind=scout/' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.scout"
+  mv "$dir/home/state/$id.meta.scout" "$dir/home/state/$id.meta"
+  git -C "$dir/wt" remote set-url origin https://github.com/owner/repo.git
+  git -C "$dir/wt" remote add alternate https://gitlab.example/owner/repo.git
+  git -C "$dir/wt" config "branch.fm/$id.pushRemote" alternate
+  make_permissive_gh "$dir"
+
+  out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 \
+    "$PROMOTE" "$id" --mode direct-PR --yolo off 2>&1); rc=$?
+  expect_code 0 "$rc" "promotion must observe the configured push remote for its future ship branch"
+  [ "$(meta_field "$dir" "$id" kind)" = ship ] || fail "a routed promotion must publish ship identity"
+  [ "$(meta_field "$dir" "$id" gh_gated)" = 0 ] || fail "a GitLab-routed promotion must remain outside the GitHub gate"
+  [ ! -e "$dir/fake/gh.log" ] || fail "a GitLab-routed promotion must not probe GitHub"
+  pass "fm-promote observes the configured push remote for the future ship branch"
+}
+
 # --- 6. fm-spawn --relaunch's own refusals -----------------------------------
 
 test_spawn_relaunch_refuses_a_live_agent() {
@@ -1299,6 +1345,314 @@ test_spawn_relaunch_refuses_a_pane_outside_the_worktree() {
   pass "fm-spawn --relaunch: refuses to start a replacement outside the copy holding the work"
 }
 
+# A gh stub for the GitHub authentication-context gate. It always succeeds if it
+# is ever consulted, so a blocked launch proves the gate refused WITHOUT probing
+# a stale destination rather than because gh happened to fail.
+make_permissive_gh() {  # <case-dir>
+  cat > "$1/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_DIR/gh.log"
+case "$*" in
+  *"auth status --help"*) printf '  --active, --hostname\n'; exit 0 ;;
+  *"auth status"*) exit 0 ;;
+  *"repos/"*) printf 'true\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$1/fakebin/gh"
+}
+
+# Record an authoritative GitHub push selection on a ship task, verified for the
+# given host, and point the project's origin at it.
+record_github_selection() {  # <case-dir> <id> <host> [verified]
+  local dir=$1 id=$2 host=$3 verified=${4:-}
+  {
+    echo "gh_gated=1"
+    echo "gh_forge=github"
+    echo "gh_selected_host=$host"
+    echo "gh_target_kind=repository"
+    echo "gh_target=owner/repo"
+    [ -z "$verified" ] || echo "gh_verified_dest=github|$host|repository|owner/repo|push"
+  } >> "$dir/home/state/$id.meta"
+  git -C "$dir/proj" remote set-url origin "https://$host/owner/repo.git"
+}
+
+# The core regression: a changed GitHub destination must block EVERY relaunch and
+# never erase the recorded selection. This is the two-relaunch bypass that a
+# per-driver re-implementation produced (the first blocked relaunch erased the
+# context, the second treated it as unmodeled and launched). It must be
+# impossible here.
+test_a_changed_github_destination_blocks_every_relaunch_without_erasing() {
+  local dir id out rc gh_log
+  id=ghchange
+  dir=$(new_case ghchange "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  gh_log="$dir/fake/gh.log"
+  # the push destination changes out from under the recorded selection
+  git -C "$dir/proj" remote set-url origin https://github.new.example/owner/repo.git
+
+  # relaunch #1: blocks, keeps the selection, launches nothing, never probes B
+  : > "$dir/fake/literal"; rm -f "$gh_log"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "the first changed-host relaunch must not launch"
+  assert_contains "$out" 'waiting' "the first relaunch must report it is waiting on verification"
+  [ "$(meta_field "$dir" "$id" gh_selected_host)" = github.old.example ] \
+    || fail "the first relaunch must NOT erase the recorded GitHub selection"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "the first relaunch must not start the agent"
+  [ ! -e "$gh_log" ] || fail "a changed host must never be probed"
+
+  # relaunch #2: STILL blocks - the erase-then-bypass class cannot recur
+  : > "$dir/fake/literal"; rm -f "$gh_log"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "the SECOND changed-host relaunch must still block (the bypass regression)"
+  assert_contains "$out" 'waiting' "the second relaunch must still report waiting on verification"
+  [ "$(meta_field "$dir" "$id" gh_selected_host)" = github.old.example ] \
+    || fail "the recorded selection must survive repeated relaunches"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "the second relaunch must not start the agent"
+  [ ! -e "$gh_log" ] || fail "the second relaunch must never probe the changed host either"
+  pass "a changed GitHub destination blocks every relaunch and never erases the selection or bypasses"
+}
+
+test_a_context_with_a_dropped_classification_marker_blocks_relaunch() {
+  local dir id out rc before after
+  id=ghdroppedmarker
+  dir=$(new_case ghdroppedmarker "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  grep -v '^gh_gated=' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.unmarked"
+  mv "$dir/home/state/$id.meta.unmarked" "$dir/home/state/$id.meta"
+  git -C "$dir/wt" remote set-url origin https://gitlab.example/owner/repo.git
+  before=$(cksum < "$dir/home/state/$id.meta")
+  : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a recorded context missing only gh_gated must not launch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a dropped classification marker must report an indeterminate gate"
+  assert_contains "$out" 'worker launch is waiting' "a dropped classification marker must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a dropped classification marker must not start the agent"
+  [ ! -e "$dir/fake/gh.log" ] || fail "a dropped classification marker must block before probing"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "a dropped classification marker refusal must not mutate metadata"
+  pass "a dropped GitHub classification marker cannot bypass the recorded gate"
+}
+
+test_a_fully_erased_gated_context_blocks_relaunch_without_mutation() {
+  local dir id out rc before after
+  id=gherased
+  dir=$(new_case gherased "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  grep -v '^gh_' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.erased"
+  echo 'gh_gated=1' >> "$dir/home/state/$id.meta.erased"
+  mv "$dir/home/state/$id.meta.erased" "$dir/home/state/$id.meta"
+  git -C "$dir/proj" remote set-url origin https://gitlab.example/owner/repo.git
+  before=$(cksum < "$dir/home/state/$id.meta")
+  : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a gated record whose selection was fully erased must not launch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "an erased gated context must report an indeterminate gate"
+  assert_contains "$out" 'worker launch is waiting' "an erased gated context must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "an erased gated context must not start the agent"
+  [ ! -e "$dir/fake/gh.log" ] || fail "an erased gated context must block before probing"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "an erased gated-context refusal must not mutate metadata"
+  pass "a fully erased gated context blocks relaunch without mutation"
+}
+
+test_a_partial_github_context_blocks_every_relaunch_without_erasing() {
+  local dir id out rc before after gh_log
+  id=ghpartial
+  dir=$(new_case ghpartial "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  gh_log="$dir/fake/gh.log"
+  grep -v '^gh_selected_host=' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.partial"
+  mv "$dir/home/state/$id.meta.partial" "$dir/home/state/$id.meta"
+  before=$(cksum < "$dir/home/state/$id.meta")
+
+  : > "$dir/fake/literal"; rm -f "$gh_log"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a partial context must block the first relaunch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a partial context must report an indeterminate gate"
+  assert_contains "$out" "GitHub access verification for task $id is indeterminate; worker launch is waiting" "a partial context must report that launch is waiting"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "the first partial-context refusal must not mutate metadata"
+  [ ! -e "$gh_log" ] || fail "a partial context must block before probing"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a partial context must block every repeated relaunch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a repeated partial-context relaunch must remain indeterminate"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "a repeated partial-context refusal must not erase metadata"
+  [ ! -e "$gh_log" ] || fail "a repeated partial context must still block before probing"
+  pass "a partial GitHub context blocks every relaunch without probing or erasing metadata"
+}
+
+test_a_scout_with_a_dropped_authentication_requirement_stays_gated() {
+  local dir id out rc before after
+  id=ghdroppedscope
+  dir=$(new_case ghdroppedscope "$id")
+  add_ship_task "$dir" "$id" claude
+  sed 's/^kind=ship$/kind=scout/' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.scout"
+  mv "$dir/home/state/$id.meta.scout" "$dir/home/state/$id.meta"
+  {
+    echo 'gh_gated=1'
+    echo 'gh_forge=github'
+    echo 'gh_selected_host=github.com'
+    echo 'gh_target_kind=repository'
+    echo 'gh_target=owner/repo'
+    echo 'gh_auth_capability=private-repository-read'
+    echo 'gh_verified_dest=github|github.com|repository|owner/repo|fetch'
+  } >> "$dir/home/state/$id.meta"
+  git -C "$dir/proj" remote set-url origin https://github.com/owner/repo.git
+  make_permissive_gh "$dir"
+  before=$(cksum < "$dir/home/state/$id.meta")
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a scout with dropped gh_auth_required must remain blocked"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a dropped scout scope field must be indeterminate"
+  assert_contains "$out" 'worker launch is waiting' "a dropped scout scope field must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a dropped scout scope field must not launch"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "a dropped scout scope refusal must not mutate metadata"
+  pass "a dropped scout authentication requirement cannot bypass the recorded gate"
+}
+
+test_a_gated_relaunch_refuses_corrupted_scope_identity() {
+  local dir id scenario field value out rc before after
+  for scenario in kind-secondmate kind-missing mode-local mode-missing mode-arbitrary; do
+    id="ghscope-$scenario"
+    dir=$(new_case "ghscope-$scenario" "$id")
+    add_ship_task "$dir" "$id" claude
+    record_github_selection "$dir" "$id" github.com verified
+    make_permissive_gh "$dir"
+    case "$scenario" in
+      kind-secondmate) field=kind; value=secondmate ;;
+      kind-missing) field=kind; value= ;;
+      mode-local) field=mode; value=local-only ;;
+      mode-missing) field=mode; value= ;;
+      mode-arbitrary) field=mode; value=arbitrary ;;
+    esac
+    if [ -n "$value" ]; then
+      sed "s/^$field=.*/$field=$value/" "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.changed"
+    else
+      grep -v "^$field=" "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.changed"
+    fi
+    mv "$dir/home/state/$id.meta.changed" "$dir/home/state/$id.meta"
+    before=$(cksum < "$dir/home/state/$id.meta")
+    : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+    out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+    [ "$rc" -ne 0 ] || fail "a gated record with corrupted $field identity must not launch"
+    assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a corrupted gated $field must be indeterminate"
+    assert_contains "$out" 'worker launch is waiting' "a corrupted gated $field must leave launch waiting"
+    ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a corrupted gated $field must not launch"
+    [ ! -e "$dir/fake/gh.log" ] || fail "a corrupted gated $field must block before probing"
+    after=$(cksum < "$dir/home/state/$id.meta")
+    [ "$after" = "$before" ] || fail "a corrupted gated $field refusal must not mutate metadata"
+  done
+  pass "a gated relaunch cannot be de-gated by missing or corrupted kind or mode identity"
+}
+
+test_a_relaunch_gates_the_execution_worktree_destination() {
+  local dir id out rc
+  id=ghworktree
+  dir=$(new_case ghworktree "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  git -C "$dir/proj" config extensions.worktreeConfig true
+  git -C "$dir/wt" config --worktree remote.origin.url https://github.new.example/owner/repo.git
+  : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a relaunch with a divergent worktree destination must block"
+  assert_contains "$out" 'worker launch is waiting' "a divergent worktree destination must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a divergent worktree destination must not launch"
+  [ ! -e "$dir/fake/gh.log" ] || fail "a divergent worktree destination must block before probing"
+  pass "a relaunch gates the execution worktree rather than the primary checkout"
+}
+
+test_a_nonlocal_ship_without_an_origin_blocks_while_a_local_origin_launches_ungated() {
+  local dir id local_origin out rc
+  id=ghmissingorigin
+  dir=$(new_case ghmissingorigin "$id")
+  add_ship_task "$dir" "$id" claude
+  git -C "$dir/wt" remote remove origin
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a non-local ship with no origin must not launch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE: the selected project has no configured destination' "a missing origin must be auth-context indeterminate"
+  assert_contains "$out" 'worker launch is waiting' "a missing origin must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a ship with no origin must not start the agent"
+
+  local_origin="$dir/local-origin.git"
+  git init -q --bare "$local_origin"
+  git -C "$dir/wt" remote add origin "$local_origin"
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -eq 0 ] || fail "a ship with a local origin must launch ungated (rc $rc: $out)"
+  grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a ship with a local origin must start the agent"
+  [ "$(meta_field "$dir" "$id" gh_gated)" = 0 ] || fail "a local origin launch must persist its ungated classification"
+  pass "a missing origin blocks while a local origin launches ungated"
+}
+
+test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate() {
+  local dir id out rc
+  id=ghscout
+  dir=$(new_case ghscout "$id")
+  fm_git_init_commit "$dir/proj"
+  git -C "$dir/proj" remote add origin https://github.com/owner/repo.git
+  mkdir -p "$dir/home/data/$id"
+  printf '# Scout brief\n\nInspect the repository.\n' > "$dir/home/data/$id/brief.md"
+  : > "$dir/fake/windows"
+  make_permissive_gh "$dir"
+
+  out=$(run_spawn "$dir" "$id" "$dir/proj" --scout --github-auth-required --harness claude); rc=$?
+  [ -e "$dir/fake/gh.log" ] || fail "a github.com authentication scout without --github-host must reach the authentication gate (rc $rc: $out)"
+  ! printf '%s' "$out" | grep -q -- 'requires --github-host' || fail "github.com auto-selection must not demand --github-host"
+  pass "a github.com authentication scout without a host assertion is accepted and gated"
+}
+
+# The proven path: an unchanged destination re-verifies and launches, and the
+# task recovers once its remote is restored - so the block above is specific to a
+# changed destination, not a blanket refusal.
+test_an_unchanged_github_destination_reverifies_and_launches() {
+  local dir id out rc
+  id=ghsame
+  dir=$(new_case ghsame "$id")
+  add_ship_task "$dir" "$id" claude
+  # recorded selection with NO verified tuple: the gate must re-probe (migration)
+  record_github_selection "$dir" "$id" github.old.example
+  make_permissive_gh "$dir"
+  : > "$dir/fake/literal"; printf zsh > "$dir/fake/command"
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -eq 0 ] || fail "an unchanged destination with good access must launch (got rc $rc: $out)"
+  [ -e "$dir/fake/gh.log" ] || fail "a missing verified record must re-probe before launching"
+  grep -q 'encode launch-brief' "$dir/fake/literal" || fail "the verified relaunch must start the agent"
+  [ "$(meta_field "$dir" "$id" gh_verified_dest)" = 'github|github.old.example|repository|owner/repo|push' ] \
+    || fail "a successful verification must persist the verified destination tuple"
+  pass "an unchanged GitHub destination re-probes, verifies, launches, and records the verified tuple"
+}
+
+test_a_changed_github_destination_blocks_every_relaunch_without_erasing
+test_a_context_with_a_dropped_classification_marker_blocks_relaunch
+test_a_fully_erased_gated_context_blocks_relaunch_without_mutation
+test_a_partial_github_context_blocks_every_relaunch_without_erasing
+test_a_scout_with_a_dropped_authentication_requirement_stays_gated
+test_a_gated_relaunch_refuses_corrupted_scope_identity
+test_a_relaunch_gates_the_execution_worktree_destination
+test_a_nonlocal_ship_without_an_origin_blocks_while_a_local_origin_launches_ungated
+test_a_github_com_authentication_scout_without_a_host_assertion_reaches_the_gate
+test_an_unchanged_github_destination_reverifies_and_launches
 test_same_harness_relaunch_keeps_identity_and_reuses_the_endpoint
 test_relaunch_preserves_durable_task_metadata
 test_relaunch_serializes_concurrent_durable_metadata_publication
@@ -1340,6 +1694,8 @@ test_secondmate_checkpoint_refuses_unreadable_child_state
 test_concurrent_relaunch_is_refused
 test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
+test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree
+test_promotion_observes_the_future_branch_push_remote
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task

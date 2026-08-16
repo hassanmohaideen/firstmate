@@ -12,7 +12,13 @@
 # read the scout's report (AGENTS.md section 7); data/projects.md holds the
 # captain's standing posture as context, and this script never looks it up.
 # no-mistakes-prod-only is a registry policy rather than a task mode and is refused.
-# Usage: fm-promote.sh <task-id> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off>
+# A promoted scout becomes a ship push, so its push destination is verified now
+# through bin/fm-github-context-lib.sh (the same owner as fm-spawn): github.com is
+# auto-selected, an Enterprise host is gated only when firstmate asserts it with
+# --github-host, a non-GitHub or local-only push is not gated, and a blocked
+# verification refuses the promotion rather than flipping the contract. The
+# resolved selection and verified destination are written into the promoted meta.
+# Usage: fm-promote.sh <task-id> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--github-host <canonical-host>]
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,11 +30,15 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-github-context-lib.sh
+. "$SCRIPT_DIR/fm-github-context-lib.sh"
 
 MODE=
 YOLO=
 MODE_SET=0
 YOLO_SET=0
+GITHUB_HOST=
+GITHUB_HOST_SET=0
 POS=()
 want_value=
 for a in "$@"; do
@@ -39,6 +49,7 @@ for a in "$@"; do
     case "$want_value" in
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
+      github-host) GITHUB_HOST=$a; GITHUB_HOST_SET=1 ;;
     esac
     want_value=
     continue
@@ -48,6 +59,8 @@ for a in "$@"; do
     --mode=*) MODE=${a#--mode=}; MODE_SET=1 ;;
     --yolo) want_value=yolo ;;
     --yolo=*) YOLO=${a#--yolo=}; YOLO_SET=1 ;;
+    --github-host) want_value=github-host ;;
+    --github-host=*) GITHUB_HOST=${a#--github-host=}; GITHUB_HOST_SET=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -72,6 +85,10 @@ case "$YOLO" in
   on|off) ;;
   *) echo "error: --yolo must be on or off (got '$YOLO')" >&2; exit 1 ;;
 esac
+[ "$GITHUB_HOST_SET" -eq 0 ] || [ -n "$GITHUB_HOST" ] || { echo "error: --github-host requires a non-empty value" >&2; exit 1; }
+if [ "$GITHUB_HOST_SET" -eq 1 ]; then
+  fm_github_validate_hostname "$GITHUB_HOST" || { echo "error: --github-host must be a lowercase canonical hostname" >&2; exit 1; }
+fi
 
 ID=${POS[0]}
 fm_task_id_creation_valid "$ID" || { echo "error: invalid task id" >&2; exit 2; }
@@ -108,12 +125,70 @@ META_LOCK_HELD=1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }
 
+# Re-derive the promoted task's push selection through the shared owner before
+# changing its contract; a scout-only authentication selection cannot authorize
+# the new ship capability.
+PROMOTE_WORKTREE=$(awk -F= '$1 == "worktree" { print substr($0, index($0, "=") + 1); exit }' "$META" 2>/dev/null)
+GH_GATED=0
+GH_FORGE=
+GH_SEL_HOST=
+GH_TARGET_KIND=
+GH_TARGET=
+GH_VERIFIED_DEST=
+if [ "$MODE" != local-only ]; then
+  if [ -z "$PROMOTE_WORKTREE" ] || [ ! -d "$PROMOTE_WORKTREE" ]; then
+    echo "GH_AUTH_INDETERMINATE: the recorded worktree cannot be resolved for GitHub write-access verification" >&2
+    echo "error: GitHub write-access verification for task $ID is indeterminate; promotion is waiting" >&2
+    exit 1
+  fi
+  if GH_INTAKE=$(fm_github_ctx_intake "$PROMOTE_WORKTREE" push "$GITHUB_HOST" "" "fm/$ID"); then
+    IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
+$GH_INTAKE
+EOF
+    GH_FORGE=github
+    GH_GATED=1
+  else
+    GH_INTAKE_RC=$?
+    case "$GH_INTAKE_RC" in
+      3) GH_GATED=0 ;;
+      1) exit 1 ;;
+      *)
+        echo "error: GitHub write-access verification for task $ID is indeterminate; promotion is waiting" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  if [ "$GH_GATED" -eq 1 ]; then
+    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$PROMOTE_WORKTREE" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" push "" "$GH_VERIFIED_DEST" "fm/$ID"); then
+      GH_VERIFIED_DEST=$GH_VERIFIED_NEW
+    else
+      GH_GATE_RC=$?
+      if [ "$GH_GATE_RC" -eq 1 ]; then
+        echo "error: GitHub authentication or write access blocks task $ID; promotion is waiting" >&2
+      else
+        echo "error: GitHub write-access verification for task $ID is indeterminate; promotion is waiting" >&2
+      fi
+      exit 1
+    fi
+  fi
+fi
+
 TMP="$STATE/.$ID.meta.promote.${BASHPID:-$$}"
-grep -v -e '^kind=' -e '^mode=' -e '^yolo=' "$META" > "$TMP"
+grep -v -e '^kind=' -e '^mode=' -e '^yolo=' \
+  -e '^gh_gated=' -e '^gh_forge=' -e '^gh_selected_host=' -e '^gh_target_kind=' -e '^gh_target=' \
+  -e '^gh_auth_required=' -e '^gh_auth_capability=' -e '^gh_organization=' -e '^gh_verified_dest=' "$META" > "$TMP"
 {
   echo "kind=ship"
   echo "mode=$MODE"
   echo "yolo=$YOLO"
+  echo "gh_gated=$GH_GATED"
+  if [ "$GH_GATED" -eq 1 ]; then
+    echo "gh_forge=$GH_FORGE"
+    echo "gh_selected_host=$GH_SEL_HOST"
+    echo "gh_target_kind=$GH_TARGET_KIND"
+    [ -z "$GH_TARGET" ] || echo "gh_target=$GH_TARGET"
+    [ -z "$GH_VERIFIED_DEST" ] || echo "gh_verified_dest=$GH_VERIFIED_DEST"
+  fi
 } >> "$TMP"
 mv "$TMP" "$META"
 TMP=
