@@ -277,10 +277,21 @@ case "${1:-}" in
       case "$a" in
         *pane_current_command*)
           case "$mode" in
-            missing) printf '%s\n' node; exit 0 ;;
+            missing)
+              if [ -e "${FM_TMUX_CALL_LOG:?}.created" ]; then
+                printf '%s\n' pi
+              else
+                printf '%s\n' node
+              fi
+              exit 0
+              ;;
             unreadable) exit 1 ;;
             *) printf '%s\n' "$mode"; exit 0 ;;
           esac
+          ;;
+        *pane_current_path*)
+          [ -f "${FM_TMUX_CALL_LOG:?}.path" ] && cat "${FM_TMUX_CALL_LOG}.path"
+          exit 0
           ;;
       esac
     done
@@ -288,7 +299,14 @@ case "${1:-}" in
     ;;
   list-windows)
     case "$mode" in
-      missing) printf '%s\n' main; exit 0 ;;
+      missing)
+        if [ -e "${FM_TMUX_CALL_LOG:?}.created" ]; then
+          printf '%s\n' fm-sm1
+        else
+          printf '%s\n' main
+        fi
+        exit 0
+        ;;
       unreadable) exit 1 ;;
       *) [ -e "${FM_TMUX_CALL_LOG:?}.killed" ] || printf '%s\n' fm-sm1; exit 0 ;;
     esac
@@ -297,7 +315,18 @@ case "${1:-}" in
     printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
     [ "${1:-}" = kill-window ] && : > "${FM_TMUX_CALL_LOG}.killed"
     [ "${FM_TEST_FAIL_NEW_WINDOW:-0}" = 1 ] && [ "${1:-}" = new-window ] && exit 1
-    [ "${1:-}" = new-window ] && rm -f "${FM_TMUX_CALL_LOG}.killed"
+    if [ "${1:-}" = new-window ]; then
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = -c ] && [ "$#" -gt 1 ]; then
+          printf '%s\n' "$2" > "${FM_TMUX_CALL_LOG}.path"
+          break
+        fi
+        shift
+      done
+      rm -f "${FM_TMUX_CALL_LOG}.killed"
+      : > "${FM_TMUX_CALL_LOG}.created"
+      printf '%s\n' '@1'
+    fi
     exit 0
     ;;
   has-session) exit 0 ;;
