@@ -252,8 +252,9 @@ fm_github_auth_probe() {
 # destination tuple that must byte-equal the currently observed destination. A
 # missing, dropped, partial, or mismatched field can only move the gate toward
 # BLOCK; erasure is never a bypass. The verified tuple is written only by a
-# successful probe of the selected destination, so a legacy or corrupted record
-# with no matching tuple always re-probes (fail-closed migration).
+# successful probe of the selected destination. A legacy record or a complete
+# selection without a matching tuple re-probes, while an incomplete or
+# inconsistent recorded context blocks (fail-closed migration).
 # ---------------------------------------------------------------------------
 
 # A push (ship) task is in gated scope from its immutable kind/mode; a scout is
@@ -424,8 +425,8 @@ fm_github_ctx_intake() {
 #   BLOCK: prints a diagnostic to stderr, returns 1 (concrete auth/access failure)
 #          or 2 (indeterminate/retryable). The caller must not launch.
 # The gate probes the SELECTED host only; a changed observed host is never
-# adopted, so a repointed remote stays blocked until the destination is
-# re-selected.
+# adopted, so a repointed remote stays blocked until it is restored or a fresh
+# task intake selects the new destination.
 fm_github_ctx_observe() {
   local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} push_branch=${8:-current}
   local obs_host obs_repo obs_target obs_tuple target_owner target_repository st

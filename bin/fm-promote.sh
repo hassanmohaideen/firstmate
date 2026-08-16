@@ -125,13 +125,9 @@ META_LOCK_HELD=1
 [ -f "$META" ] || { echo "error: no meta for task $ID at $META" >&2; exit 1; }
 grep -qx 'kind=scout' "$META" || { echo "error: task $ID is not a scout task (kind=scout not in meta)" >&2; exit 1; }
 
-# A promoted scout becomes a ship push, so its push destination is verified now
-# through the one owner (bin/fm-github-context-lib.sh), exactly like a fresh ship
-# intake: github.com is auto-selected, an Enterprise host is gated only when
-# firstmate asserts it with --github-host, and a non-GitHub or local-only push is
-# not gated. A blocked verification refuses the promotion rather than flipping the
-# contract. Any scout-only authentication selection is dropped and re-derived for
-# the ship push.
+# Re-derive the promoted task's push selection through the shared owner before
+# changing its contract; a scout-only authentication selection cannot authorize
+# the new ship capability.
 PROMOTE_WORKTREE=$(awk -F= '$1 == "worktree" { print substr($0, index($0, "=") + 1); exit }' "$META" 2>/dev/null)
 GH_GATED=0
 GH_FORGE=

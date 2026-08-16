@@ -1272,8 +1272,8 @@ test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree() {
   pass "fm-promote refuses a non-local promotion whose recorded worktree cannot be resolved"
 }
 
-test_promotion_refuses_unknown_future_branch_push_routing() {
-  local dir id branch out rc before after
+test_promotion_observes_the_future_branch_push_remote() {
+  local dir id out rc
   id=promoteroute
   dir=$(new_case promoteroute "$id")
   add_ship_task "$dir" "$id" claude
@@ -1281,20 +1281,16 @@ test_promotion_refuses_unknown_future_branch_push_routing() {
   mv "$dir/home/state/$id.meta.scout" "$dir/home/state/$id.meta"
   git -C "$dir/wt" remote set-url origin https://github.com/owner/repo.git
   git -C "$dir/wt" remote add alternate https://gitlab.example/owner/repo.git
-  branch=$(git -C "$dir/wt" symbolic-ref --short HEAD)
-  git -C "$dir/wt" config "branch.$branch.pushRemote" alternate
+  git -C "$dir/wt" config "branch.fm/$id.pushRemote" alternate
   make_permissive_gh "$dir"
-  before=$(cksum < "$dir/home/state/$id.meta")
 
   out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 \
     "$PROMOTE" "$id" --mode direct-PR --yolo off 2>&1); rc=$?
-  expect_code 1 "$rc" "promotion must refuse ambiguous routing for its future ship branch"
-  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "future branch routing ambiguity must be indeterminate"
-  assert_contains "$out" 'promotion is waiting' "future branch routing ambiguity must leave promotion waiting"
-  after=$(cksum < "$dir/home/state/$id.meta")
-  [ "$after" = "$before" ] || fail "a future branch routing refusal must not mutate promotion metadata"
-  [ ! -e "$dir/fake/gh.log" ] || fail "ambiguous future branch routing must block before probing"
-  pass "fm-promote refuses routing that could redirect the future ship branch"
+  expect_code 0 "$rc" "promotion must observe the configured push remote for its future ship branch"
+  [ "$(meta_field "$dir" "$id" kind)" = ship ] || fail "a routed promotion must publish ship identity"
+  [ "$(meta_field "$dir" "$id" gh_gated)" = 0 ] || fail "a GitLab-routed promotion must remain outside the GitHub gate"
+  [ ! -e "$dir/fake/gh.log" ] || fail "a GitLab-routed promotion must not probe GitHub"
+  pass "fm-promote observes the configured push remote for the future ship branch"
 }
 
 # --- 6. fm-spawn --relaunch's own refusals -----------------------------------
@@ -1699,7 +1695,7 @@ test_concurrent_relaunch_is_refused
 test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
 test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree
-test_promotion_refuses_unknown_future_branch_push_routing
+test_promotion_observes_the_future_branch_push_remote
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task
