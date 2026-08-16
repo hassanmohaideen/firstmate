@@ -136,6 +136,7 @@ class Credentials:
     no_new_privs: int | None = None
     capabilities_clear: bool | None = None
     zombie: bool = False
+    supplementary_gids: tuple[int, ...] = ()
 
 
 class CredentialPlatform:
@@ -171,11 +172,12 @@ class CredentialPlatform:
                         fields[key] = value.strip()
                 uids = tuple(int(v) for v in fields["Uid"].split())
                 gids = tuple(int(v) for v in fields["Gid"].split())
+                supplementary_gids = tuple(int(v) for v in fields["Groups"].split())
                 caps = all(int(fields.get(k, "0"), 16) == 0 for k in ("CapInh", "CapPrm", "CapEff", "CapAmb"))
                 result[int(entry.name)] = Credentials(
                     int(entry.name), uids, gids,
                     int(fields.get("NoNewPrivs", "0")), caps,
-                    fields.get("State", "").startswith("Z"),
+                    fields.get("State", "").startswith("Z"), supplementary_gids,
                 )
             except FileNotFoundError:
                 continue
@@ -224,6 +226,12 @@ class CredentialPlatform:
                 raise InventoryError(f"proc_pidinfo unreadable for pid {pid}: errno={ctypes.get_errno()}")
             if got != ctypes.sizeof(info):
                 raise InventoryError(f"proc_pidinfo short read for pid {pid}: {got}")
+            # macOS has no public API for enumerating another process's supplementary groups.
+            # The residual risk is accepted because (1) the leased GID is an unassigned-high
+            # system GID on ephemeral clean runners; (2) the child already setgroups([]) clears
+            # its own supplementary groups; (3) private roots are mode 0700 with no group
+            # permission bits, so no group-permissioned cross-channel exists even if another
+            # process shared the GID.
             result[pid] = Credentials(
                 pid,
                 (int(info.pbi_ruid), int(info.pbi_uid), int(info.pbi_svuid), int(info.pbi_uid)),
@@ -244,7 +252,7 @@ class CredentialPlatform:
         except KeyError:
             pass
         for item in self.inventory().values():
-            if uid in item.uids or gid in item.gids:
+            if uid in item.uids or gid in item.gids or gid in item.supplementary_gids:
                 return False
         return True
 
@@ -893,6 +901,11 @@ class LaneExecutor:
             os.fsync(attempt.log_fd)
             os.close(attempt.log_fd)
             attempt.log_fd = None
+        diagnostics_fd = os.open(self.diagnostics, os.O_RDONLY)
+        try:
+            os.fsync(diagnostics_fd)
+        finally:
+            os.close(diagnostics_fd)
         duration_ms = int(max(0.0, time.monotonic() - (attempt.started_mono or time.monotonic())) * 1000)
         test_exit = self._exit_code(attempt.wait_status)
         output = bytes(attempt.tail).decode("utf-8", errors="replace")

@@ -887,6 +887,14 @@ pathlib.Path(manifest).write_text(json.dumps(doc), encoding="utf-8")
 PY
 }
 
+remove_privileged_fixture_tree() { # <path>
+  local path=$1
+  if rm -rf "$path" 2>/dev/null; then
+    return 0
+  fi
+  sudo -n rm -rf "$path"
+}
+
 wait_for_started_artifact() { # <artifact>
   local artifact=$1 n=0
   while [ "$n" -lt 500 ]; do
@@ -940,12 +948,13 @@ PY
 test_interruption_and_atomic_evidence() {
   local tmp artifact pid rc n
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-interrupt.XXXXXX")
+  chmod 0711 "$tmp"
   cat >"$tmp/hang.sh" <<'SH'
 #!/usr/bin/env bash
 trap '' TERM
 while :; do sleep 1; done
 SH
-  chmod +x "$tmp/hang.sh"
+  chmod 0755 "$tmp/hang.sh"
   artifact="$tmp/artifact.json"
   "$RUNNER" --json "$artifact" "$tmp/hang.sh" >"$tmp/out" 2>"$tmp/err" &
   pid=$!
@@ -972,7 +981,7 @@ assert artifact["run"]["complete"] is False
 assert "active" not in open(sys.argv[1], encoding="utf-8").read()
 assert row.get("diagnostic_log")
 PY
-  rm -rf "$tmp"
+  remove_privileged_fixture_tree "$tmp"
   pass "catchable interruption terminalizes after atomic valid snapshots"
 }
 
@@ -1078,6 +1087,7 @@ PY
 test_environment_isolation_in_serial_and_parallel_children() {
   local tmp repo evidence runner fakebin name
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-env.XXXXXX")
+  chmod 0711 "$tmp"
   repo="$tmp/repo"; evidence="$tmp/evidence"; fakebin="$tmp/fakebin"
   mkdir -p "$repo/bin" "$repo/tests" "$evidence" "$fakebin"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
@@ -1119,8 +1129,10 @@ if PATH="$FM_TEST_ENV_FAKEBIN:$PATH" fm_backend_detect >/dev/null; then
 fi
 touch "$FM_TEST_ENV_EVIDENCE/$(basename "$0").isolated"
 SH
-    chmod +x "$repo/tests/$name.test.sh"
+    chmod 0755 "$repo/tests/$name.test.sh"
   done
+  chmod -R a+rX "$repo" "$fakebin"
+  chmod 0777 "$evidence"
   FM_HOME=poison FM_STATE_OVERRIDE=poison FM_DATA_OVERRIDE=poison FM_ROOT_OVERRIDE=poison \
     FM_PROJECTS_OVERRIDE=poison FM_CONFIG_OVERRIDE=poison FM_BACKEND=poison \
     TMUX=poison TMUX_PANE=poison HERDR_ENV=1 HERDR_SESSION=poison \
@@ -1130,13 +1142,13 @@ SH
     NOT_ALLOWLISTED_AMBIENT=poison AMBIENT_API_TOKEN=poison FM_TEST_ENV_TOKEN_PROBE=poison \
     FM_TEST_ENV_ALLOWED_PROBE=carried \
     FM_TEST_ENV_EVIDENCE="$evidence" FM_TEST_ENV_FAKEBIN="$fakebin" \
-    "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
+    "$runner" --json "$tmp/artifact.json" --portable > "$tmp/out" 2> "$tmp/err" \
     || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "isolated environment fixture failed"; }
   [ -e "$evidence/fm-brief.test.sh.isolated" ] \
     || fail "parallel child did not observe an isolated fleet environment"
   [ -e "$evidence/fm-daemon.test.sh.isolated" ] \
     || fail "serial child did not observe an isolated fleet environment"
-  rm -rf "$tmp"
+  remove_privileged_fixture_tree "$tmp"
   pass "serial and parallel children isolate ambient fleet routing"
 }
 
@@ -1406,6 +1418,7 @@ test_required_containment_ambiguity_terminalizes() {
     return 0
   fi
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-ambiguous.XXXXXX")
+  chmod 0711 "$tmp"
   # Three normally-exiting bodies. The injected cleanup faults, not the process,
   # drive the required-mode ambiguity path: the real KILL still ran and the
   # process really exited, but the executor is forced to treat the domain as
@@ -1418,7 +1431,7 @@ test_required_containment_ambiguity_terminalizes() {
 echo "ok - fixture"
 exit 0
 SH
-    chmod +x "$tmp/$name.sh"
+    chmod 0755 "$tmp/$name.sh"
   done
   manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
   make_required_fault_manifest "$manifest" "$artifact" "$tmp" \
@@ -1451,7 +1464,7 @@ for row in (nq, up):
     assert log_path and pathlib.Path(log_path).exists(), log_path
     assert not any(event["name"] == "quiescence" and event.get("proved") for event in row["events"])
 PY
-  rm -rf "$tmp"
+  remove_privileged_fixture_tree "$tmp"
   pass "required non-quiescence and unreadable-probe cleanup terminalize as quarantined containment_ambiguous"
 }
 
