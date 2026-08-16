@@ -81,6 +81,20 @@
 # concurrent append -- the append-preserving invariant is protected at the
 # ledger-commit boundary, just as the at-most-once invariant is protected at the
 # response boundary.
+# One accepted residual remains at that boundary: the hash re-check and the
+# rename are separate steps, leaving a sub-instruction check-to-rename window in
+# which two concurrent committers could both see an unchanged ledger and both
+# rename, losing one update. It is deliberately left open, not closed with a
+# heavier mechanism, because a portable, crash-safe, truly atomic commit is not
+# available in shell: macOS provides no in-process kernel advisory lock (only the
+# wrapper-form lockf, which cannot bracket an in-process read/transform/rename)
+# and there is no atomic compare-and-swap-on-content primitive. The legitimate
+# response path never hits the window because it is fully serialized by the
+# kernel guard; reaching it requires invoking the undocumented internal entry
+# point directly, concurrently with a live responder, and winning a
+# sub-instruction race. Any actor that can invoke that entry point already has
+# write access to this private state directory and can rewrite or delete the
+# ledger outright, so the residual grants no capability a local actor lacks.
 # A repeated or concurrent response never invokes the underlying CLI twice:
 # once a disposition request exists, replay is refused and audit-ready performs
 # any later public-evidence reconciliation.
@@ -421,6 +435,18 @@ ledger_mutate() {
       : > "$FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO.reached" 2>/dev/null || true
       IFS= read -r _ledger_commit_release < "$FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO" || true
     fi
+    # Accepted residual: the hash re-check and the rename are separate steps, so
+    # a check-to-rename window remains where two concurrent committers could both
+    # observe an unchanged ledger and both rename, losing one update. This is
+    # unreachable on the legitimate path, which is fully serialized by the kernel
+    # guard, and is not closed further on purpose: a portable, crash-safe, truly
+    # atomic commit is not available in shell (macOS has no in-process kernel lock
+    # and there is no atomic compare-and-swap-on-content primitive). The only way
+    # to reach the window is to invoke the undocumented internal entry point
+    # directly while a legitimate responder is active and win a sub-instruction
+    # race, and any actor able to do that already has write access to this state
+    # directory and can rewrite or delete the ledger outright, so it adds no
+    # practical exposure. See the header note for the full rationale.
     if [ "$(ledger_content_hash)" = "$before" ]; then
       mv "$WORK_FILE" "$LEDGER" || die "cannot commit the disposition ledger"
       WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
