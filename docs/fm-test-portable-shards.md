@@ -211,6 +211,7 @@ Behavior jobs record T0 as their first executable step, before checkout, so the 
 They then pass one absolute deadline set to the executor.
 Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
 The final 120 seconds remain reserved for artifact upload and platform variance before the 600-second job ceiling.
+Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards. The executor publishes at most one terminal per scheduler iteration and reserves 15 seconds for every concurrently outstanding terminal, so all terminal evidence is published by T0+450. Per-attempt deadline enforcement therefore has jitter bounded by one terminal publication's sub-second fsync latency rather than a sub-millisecond guarantee; the required 120-second pre-ceiling margin absorbs that accepted jitter.
 The executor reserves startup and cleanup time for every unstarted script and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
 A timed-out attempt is terminal red, and later required scripts still execute exactly once when their reservations allow.
 Healthy complete CI remains targeted at roughly five to eight minutes.

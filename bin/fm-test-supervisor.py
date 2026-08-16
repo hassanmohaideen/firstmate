@@ -740,6 +740,51 @@ class LaneExecutor:
                 return max(0.0, completion - (baseline_start + baseline_seconds))
         return completion
 
+    def _qualify_host_primitives(self) -> None:
+        assert self.platform is not None
+        assert self.lease_pool is not None
+        lease = self.lease_pool.acquire()
+        target: int | None = None
+        quiet = False
+        failure: BaseException | None = None
+        try:
+            target = spawn_qualification_target(
+                lease.uid, lease.gid, ignore_term=True, session_escape=True,
+            )
+            self.platform.verify_pid(target, lease.uid, lease.gid)
+            delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGTERM)
+            if not delivered or code != 0:
+                raise ContainmentError(f"lane-host credential-scoped TERM failed: errno={code}")
+            self.platform.verify_pid(target, lease.uid, lease.gid)
+            present, code = helper_signal(lease.uid, lease.gid, 0)
+            if not present or code != 0:
+                raise ContainmentError(f"lane-host credential-domain probe failed: errno={code}")
+            delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+            if not delivered or code != 0:
+                raise ContainmentError(f"lane-host credential-scoped KILL failed: errno={code}")
+            if not bounded_reap(target, 2.0):
+                raise ContainmentError("lane-host qualification target did not exit after KILL")
+            quiet = prove_domain_quiescent(lease.uid, lease.gid, timeout=2.0)
+            if not quiet:
+                raise ContainmentError("lane-host qualification domain did not quiesce")
+        except BaseException as exc:
+            failure = exc
+        finally:
+            if not quiet:
+                try:
+                    helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                except BaseException:
+                    pass
+                if target is not None:
+                    bounded_reap(target, 1.0)
+                try:
+                    quiet = prove_domain_quiescent(lease.uid, lease.gid, timeout=1.0)
+                except BaseException:
+                    quiet = False
+            self.lease_pool.retire(lease, quarantine=not quiet)
+        if failure is not None:
+            raise ContainmentError(f"lane-host primitive qualification failed: {failure}") from failure
+
     def preflight(self) -> None:
         if not self.required:
             self.doc["containment"]["qualified"] = False
@@ -755,6 +800,7 @@ class LaneExecutor:
         scope_directory = LEASE_DIRECTORY_ROOT / hashlib.sha256(scope.encode()).hexdigest()
         self.lease_pool = LeasePool(self.platform, self.manifest["run_id"], scope_directory)
         try:
+            self._qualify_host_primitives()
             for row in self.doc["scripts"]:
                 self.preacquired_leases[row["index"]] = self.lease_pool.acquire()
             self._validate_schedule_window(time.monotonic())
@@ -1084,6 +1130,12 @@ class LaneExecutor:
         if not self.terminal_publications:
             return
         attempt = self.terminal_publications.pop(0)
+        # Publication stays synchronous because this privileged executor forks;
+        # threads would make fork-time library locks unsafe. Deadline enforcement
+        # therefore has jitter bounded by one terminal fsync publication, not a
+        # sub-millisecond bound. The scaled publication reserve lands all terminal
+        # evidence by T0+450, and the mandated 120-second job margin absorbs this
+        # accepted sub-second enforcement jitter before the T0+600 ceiling.
         self._terminalize_attempt(attempt)
 
     def _terminalize_attempt(self, attempt: Attempt) -> None:
@@ -1567,6 +1619,19 @@ def spawn_fork_storm_target(uid: int, gid: int) -> int:
     return pid
 
 
+def bounded_reap(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            found, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if found == pid:
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def prove_domain_quiescent(uid: int, gid: int, timeout: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1593,17 +1658,25 @@ def qualify(artifact: pathlib.Path) -> int:
     leases: list[Lease] = []
 
     def cleanup_domains() -> list[str]:
+        errors: list[str] = []
         for pid, lease in targets:
             try:
-                helper_signal(lease.uid, lease.gid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (OSError, ChildProcessError):
-                pass
-        return [
-            f"uid {lease.uid} remained non-quiescent"
-            for lease in leases
-            if not prove_domain_quiescent(lease.uid, lease.gid)
-        ]
+                delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                if not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
+                    errors.append(f"uid {lease.uid} KILL failed: errno={code}")
+                if not bounded_reap(pid, 1.0):
+                    errors.append(f"uid {lease.uid} target did not exit")
+            except BaseException as exc:
+                errors.append(f"uid {lease.uid} cleanup failed: {exc}")
+        for lease in leases:
+            try:
+                quiet = prove_domain_quiescent(lease.uid, lease.gid)
+            except BaseException as exc:
+                errors.append(f"uid {lease.uid} quiescence probe failed: {exc}")
+                continue
+            if not quiet:
+                errors.append(f"uid {lease.uid} remained non-quiescent")
+        return errors
 
     try:
         if os.geteuid() != 0:
@@ -1632,7 +1705,8 @@ def qualify(artifact: pathlib.Path) -> int:
         delivered, code = helper_signal(owned.uid, owned.gid, signal.SIGKILL)
         if not delivered or code != 0:
             raise ContainmentError(f"credential-scoped KILL failed: errno={code}")
-        os.waitpid(target, 0)
+        if not bounded_reap(target, 2.0):
+            raise ContainmentError("owned qualification target did not exit after KILL")
         targets = [(pid, lease) for pid, lease in targets if pid != target]
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -1664,10 +1738,15 @@ def qualify(artifact: pathlib.Path) -> int:
         storm = spawn_fork_storm_target(storm_lease.uid, storm_lease.gid)
         targets.append((storm, storm_lease))
         platform.verify_pid(storm, storm_lease.uid, storm_lease.gid)
-        helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGTERM)
+        term_delivered, term_code = helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGTERM)
+        if not term_delivered or term_code != 0:
+            raise ContainmentError(f"fork-storm credential-scoped TERM failed: errno={term_code}")
         time.sleep(0.1)
-        helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGKILL)
-        os.waitpid(storm, 0)
+        kill_delivered, kill_code = helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGKILL)
+        if not kill_delivered or kill_code != 0:
+            raise ContainmentError(f"fork-storm credential-scoped KILL failed: errno={kill_code}")
+        if not bounded_reap(storm, 2.0):
+            raise ContainmentError("fork-storm target did not exit after KILL")
         if not prove_domain_quiescent(storm_lease.uid, storm_lease.gid):
             raise ContainmentError("TERM-handler fork-storm domain did not quiesce")
         result["checks"].append({"name": "term-handler-fork-storm-quiescence", "passed": True})
