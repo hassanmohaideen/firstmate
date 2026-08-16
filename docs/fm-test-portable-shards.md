@@ -98,23 +98,23 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 `.github/workflows/ci.yml` derives the same `n` from `strategy.job-total` rather than a literal, so changing the shard count in either file without the other fails the lane loudly instead of leaving part of the required suite unrun.
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
-The retained per-script measurements come from green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), with `fm-watch-triage.test.sh` refreshed to its 212357 ms local measurement after the credential-domain CI lane exposed its stale 145269 ms scheduling reservation, and are refreshed through the procedure below.
+The retained per-script measurements come primarily from green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), with `fm-watch-triage.test.sh` refreshed to its 212357 ms local measurement after the credential-domain CI lane exposed its stale 145269 ms scheduling reservation and the new `fm-no-mistakes-review.test.sh` using its 30943 ms focused-run measurement until the next green-CI refresh.
 A script added since that run or otherwise lacking a hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of10` | 10 | 234508 ms (~234.5 s) |
-| `portable-serial-2of10` | 10 | 234502 ms (~234.5 s) |
-| `portable-serial-3of10` | 11 | 234510 ms (~234.5 s) |
-| `portable-serial-4of10` | 10 | 234509 ms (~234.5 s) |
-| `portable-serial-5of10` | 11 | 234494 ms (~234.5 s) |
-| `portable-serial-6of10` | 10 | 234493 ms (~234.5 s) |
-| `portable-serial-7of10` | 13 | 234494 ms (~234.5 s) |
-| `portable-serial-8of10` | 13 | 234507 ms (~234.5 s) |
-| `portable-serial-9of10` | 11 | 234493 ms (~234.5 s) |
-| `portable-serial-10of10` | 13 | 234506 ms (~234.5 s) |
-| imbalance | | 17 ms |
+| `portable-serial-1of10` | 8 | 237587 ms (~237.6 s) |
+| `portable-serial-2of10` | 9 | 237599 ms (~237.6 s) |
+| `portable-serial-3of10` | 10 | 237602 ms (~237.6 s) |
+| `portable-serial-4of10` | 11 | 237601 ms (~237.6 s) |
+| `portable-serial-5of10` | 12 | 237597 ms (~237.6 s) |
+| `portable-serial-6of10` | 11 | 237596 ms (~237.6 s) |
+| `portable-serial-7of10` | 13 | 237590 ms (~237.6 s) |
+| `portable-serial-8of10` | 12 | 237591 ms (~237.6 s) |
+| `portable-serial-9of10` | 13 | 237597 ms (~237.6 s) |
+| `portable-serial-10of10` | 14 | 237599 ms (~237.6 s) |
+| imbalance | | 15 ms |
 
 The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210119 ms in that run, is the floor for any serial shard count.
 Ten shards sit just above that floor, so more serial runners would stop paying off without first splitting or speeding that script.
