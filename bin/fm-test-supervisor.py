@@ -1212,13 +1212,6 @@ class LaneExecutor:
         env["TEMP"] = str(private / "tmp")
         env["GIT_CONFIG_GLOBAL"] = str(private / "home" / ".gitconfig")
         env["FM_TEST_CONTAINMENT_MODE"] = "required" if self.required else "developer-non-enforcing"
-        if self.required:
-            # A leased UID is intentionally absent from the account inventory.
-            # Remote-SSH fixtures still need to model the remote login account
-            # whose home OpenSSH would normally resolve through that inventory.
-            # This executor-owned value names only the child's private home; it
-            # is never accepted from the runner environment.
-            env["FM_TEST_CONTAINED_ACCOUNT_HOME"] = env["HOME"]
         return env
 
     def start(self, row: dict[str, Any]) -> Attempt | None:
