@@ -2836,6 +2836,24 @@ recovery_running_process_fixture() {  # <pane-id>
   printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":222,"foreground_process_group_id":333,"foreground_processes":[{"pid":333,"name":"node","argv0":"pi"}]}}}\n' "$1"
 }
 
+recovery_nested_shell_process_fixture() {  # <pane-id>
+  printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":222,"foreground_process_group_id":333,"foreground_processes":[{"pid":333,"name":"/bin/zsh","argv0":"-/bin/zsh"}]}}}\n' "$1"
+}
+
+make_running_recovery_ps() {  # <dir> <comm> [present]
+  local dir=$1 comm=$2 present=${3:-yes} rows='1 0\n222 1\n'
+  [ "$present" = yes ] && rows="${rows}333 222\n"
+  cat > "$dir/ps" <<SH
+#!/usr/bin/env bash
+case "\$*" in
+  "-axo pid=,ppid=") printf '$rows' ;;
+  "-p 333 -o comm=") printf '%s\n' '$comm' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$dir/ps"
+}
+
 make_recovery_ps() {  # <dir> <shell-comm>
   local dir=$1 comm=${2:--zsh}
   cat > "$dir/ps" <<SH
@@ -2875,8 +2893,9 @@ test_recovery_state_keeps_running_idle_done_and_blocked_agents_alive() {
     recovery_pane_fixture w1:p1 > "$resp/1.out"
     recovery_agent_fixture w1:p1 "$status" > "$resp/2.out"
     recovery_running_process_fixture w1:p1 > "$resp/3.out"
+    make_running_recovery_ps "$dir" node
     fb=$(make_herdr_fakebin "$dir")
-    out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" \
       bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
     [ "$out" = alive ] || fail "a genuinely running $status agent should remain alive, got '$out'"
   done
@@ -2908,7 +2927,7 @@ test_recovery_state_refuses_mismatched_and_foreign_identity() {
 
 test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
   local mode dir log resp fb out
-  for mode in unreadable malformed reused prompt-helper; do
+  for mode in unreadable malformed reused prompt-helper nested-shell absent-running reused-running; do
     dir="$TMP_ROOT/recovery-process-$mode"; mkdir -p "$dir/responses"
     log="$dir/log"; resp="$dir/responses"; : > "$log"
     recovery_pane_fixture w1:p1 > "$resp/1.out"
@@ -2923,6 +2942,18 @@ test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
       prompt-helper)
         printf '%s\n' '{"result":{"type":"pane_process_info","process_info":{"pane_id":"w1:p1","shell_pid":222,"foreground_process_group_id":222,"foreground_processes":[{"pid":222,"name":"zsh","argv0":"zsh"},{"pid":444,"name":"starship","argv0":"starship"}]}}}' > "$resp/3.out"
         make_recovery_ps "$dir" -zsh
+        ;;
+      nested-shell)
+        recovery_nested_shell_process_fixture w1:p1 > "$resp/3.out"
+        make_running_recovery_ps "$dir" -zsh
+        ;;
+      absent-running)
+        recovery_running_process_fixture w1:p1 > "$resp/3.out"
+        make_running_recovery_ps "$dir" node no
+        ;;
+      reused-running)
+        recovery_running_process_fixture w1:p1 > "$resp/3.out"
+        make_running_recovery_ps "$dir" python
         ;;
     esac
     fb=$(make_herdr_fakebin "$dir")

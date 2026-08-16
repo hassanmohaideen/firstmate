@@ -1941,6 +1941,7 @@ fm_backend_herdr_tab_is_husk() {  # <session> <pane_id>
 # never prove process ownership after a TUI has exited.
 fm_backend_herdr_registered_process_state() {  # <session> <pane-id>
   local session=$1 pane=$2 info shell_pid foreground_pgid count process_pid
+  local name argv0 process_name comm ps_bin rows
   info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane" 2>/dev/null) \
     || { printf 'unknown'; return 0; }
   if fm_backend_herdr_process_info_idle_shell_pid "$info" "$pane" >/dev/null 2>&1; then
@@ -1966,13 +1967,38 @@ fm_backend_herdr_registered_process_state() {  # <session> <pane-id>
   foreground_pgid=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_process_group_id | floor')
   count=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_processes | length')
   process_pid=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_processes[0].pid | floor')
-  if [ "$foreground_pgid" != "$shell_pid" ] \
-     && [ "$count" -ge 1 ] \
-     && [ "$process_pid" = "$foreground_pgid" ]; then
-    printf 'running'
-  else
+  name=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_processes[0].name')
+  argv0=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_processes[0] | .argv0 // .argv[0]')
+  process_name=${name##*/}
+  argv0=${argv0#-}
+  argv0=${argv0##*/}
+  if [ "$foreground_pgid" = "$shell_pid" ] \
+     || [ "$count" -lt 1 ] \
+     || [ "$process_pid" != "$foreground_pgid" ]; then
     printf 'unknown'
+    return 0
   fi
+  case "$process_name" in sh|bash|zsh|dash|ksh|fish) printf 'unknown'; return 0 ;; esac
+  case "$argv0" in sh|bash|zsh|dash|ksh|fish) printf 'unknown'; return 0 ;; esac
+
+  ps_bin=${FM_HERDR_PS_BIN:-ps}
+  command -v "$ps_bin" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  rows=$("$ps_bin" -axo pid=,ppid= 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  printf '%s\n' "$rows" | awk -v pid="$process_pid" '
+    $1 == pid { found++ }
+    END { exit(found == 1 ? 0 : 1) }
+  ' || { printf 'unknown'; return 0; }
+  fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$process_pid" \
+    && { printf 'unknown'; return 0; }
+  comm=$("$ps_bin" -p "$process_pid" -o comm= 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  comm=$(printf '%s' "$comm" | tr -d '[:space:]')
+  comm=${comm#-}
+  comm=${comm##*/}
+  [ -n "$comm" ] && [ "$comm" = "$process_name" ] \
+    || { printf 'unknown'; return 0; }
+  printf 'running'
 }
 
 # fm_backend_herdr_recovery_agent_state: recovery-grade state for one exact
