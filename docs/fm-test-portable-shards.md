@@ -25,7 +25,7 @@ Qualification proves that a live different-UID process is never signaled by its 
 A dedicated per-platform job runs the executor-behavior subset through the public runner on both `ubuntu-latest` and `macos-latest`.
 The required public-runner and non-quiescence/ambiguity fixtures self-escalate into credential domains, while timeout, interruption, atomic-evidence, environment-isolation, and scheduling fixtures exercise the same public interfaces in `developer-non-enforcing` mode because their runner-owned scratch is intentionally inaccessible to a leased identity.
 Linux currently qualifies the full boundary, including true same-number PID reuse.
-Darwin runs the required execute path but its current non-quiescence qualification remains red with bounded survivor-credential, zombie, and probe-errno diagnostics, so it does not yet publish passing containment evidence and is not classified as unsupported.
+The credential-domain qualification jobs currently pass on both `ubuntu-latest` and `macos-latest`, qualifying the boundary through the required execute path and quiescence/non-quiescence proofs, so on that CI evidence macOS is a passing, supported containment platform.
 Local execution is explicitly labeled `developer-non-enforcing`; it does not claim hard descendant containment, and credential-contained CI lanes never accept it.
 
 ## Schema-v2 evidence
