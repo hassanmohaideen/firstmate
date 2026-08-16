@@ -652,13 +652,14 @@ class LaneExecutor:
             baseline_ms = row["duration_baseline_ms"]
             if baseline_ms is None:
                 continue
-            wave = self.schedule_waves[self.wave_by_index[row["index"]]]
-            allowance = (
-                self.ordinary_deadline
-                - baseline_start
-                - CLEANUP_RESERVE * len(wave)
-                - self._remaining_schedule_reserve(row)
-            )
+            wave_index = self.wave_by_index[row["index"]]
+            unfinished = [
+                candidate
+                for wave in self.schedule_waves[wave_index:]
+                for candidate in wave
+                if candidate is not row
+            ]
+            allowance = self.ordinary_deadline - baseline_start - self._schedule_reserve(unfinished)
             baseline_seconds = float(baseline_ms) / 1000.0
             if baseline_seconds > allowance:
                 raise ContainmentError(
@@ -675,12 +676,18 @@ class LaneExecutor:
                 self.lease_pool.retire(lease, quarantine=False)
         self.preacquired_leases.clear()
 
-    def _remaining_schedule_reserve(self, row: dict[str, Any]) -> float:
-        following_waves = self.schedule_waves[self.wave_by_index[row["index"]] + 1:]
-        if not following_waves:
+    def _schedule_reserve(self, rows: list[dict[str, Any]]) -> float:
+        if not rows:
             return 0.0
-        completion, _launches = self._schedule(following_waves, 0.0)
+        completion, _launches = self._schedule(self._build_schedule_waves(rows), 0.0)
         return completion
+
+    def _remaining_schedule_reserve(self, row: dict[str, Any]) -> float:
+        unfinished = [
+            candidate for candidate in self.doc["scripts"]
+            if candidate is not row and candidate.get("terminal") is None
+        ]
+        return self._schedule_reserve(unfinished)
 
     def preflight(self) -> None:
         if not self.required:
@@ -835,10 +842,9 @@ class LaneExecutor:
             self.active[pid] = attempt
             attempt.started_mono = time.monotonic()
             reserved = self._remaining_schedule_reserve(row) if self.required else 0.0
-            cleanup = CLEANUP_RESERVE * len(self.schedule_waves[self.wave_by_index[row["index"]]]) if self.required else 0.0
             attempt.deadline_mono = min(
                 attempt.started_mono + float(budget_ms) / 1000.0,
-                self.ordinary_deadline - reserved - cleanup,
+                self.ordinary_deadline - reserved,
             )
             if self.required and baseline_ms is not None and attempt.deadline_mono - attempt.started_mono < baseline_seconds:
                 raise ContainmentError(f"startup exceeded the reserved window for {row['path']}")
@@ -1618,6 +1624,7 @@ def qualify(artifact: pathlib.Path) -> int:
         targets.clear()
         for lease in leases:
             pool.retire(lease, quarantine=False)
+        leases.clear()
         result["checks"].append({"name": "all-domains-quiescent-before-publish", "passed": True})
         result.update({"complete": True, "passed": True, "finished_at": iso_now()})
         atomic_json(artifact, result)
