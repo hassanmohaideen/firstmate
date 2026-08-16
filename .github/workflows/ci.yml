@@ -462,6 +462,17 @@ jobs:
     # after a prerequisite was skipped cannot produce useful lane evidence and
     # only creates a second, misleading failure.
     steps:
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
       - name: Download lane timing artifacts
         uses: actions/download-artifact@v4

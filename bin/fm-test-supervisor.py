@@ -99,35 +99,96 @@ class AtomicJsonError(RuntimeError):
         self.published = published
 
 
-def atomic_json(path: pathlib.Path, value: dict[str, Any]) -> None:
-    temporary: pathlib.Path | None = None
+def atomic_json(
+    path: pathlib.Path, value: dict[str, Any], *, directory_fd: int | None = None,
+) -> None:
+    temporary_name: str | None = None
     published = False
+    close_directory = False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if directory_fd is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            close_directory = True
         counter = getattr(atomic_json, "counter", 0) + 1
         atomic_json.counter = counter
-        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{counter}")
+        temporary_name = f".{path.name}.tmp.{os.getpid()}.{counter}"
         payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        fd = os.open(
+            temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644,
+            dir_fd=directory_fd,
+        )
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        os.replace(
+            temporary_name, path.name,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
         published = True
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.fsync(directory_fd)
     except BaseException as exc:
         raise AtomicJsonError(exc, published) from exc
     finally:
-        if temporary is not None:
+        if temporary_name is not None and directory_fd is not None:
             try:
-                temporary.unlink()
+                os.unlink(temporary_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
+        if close_directory and directory_fd is not None:
+            os.close(directory_fd)
+
+
+def invoking_uid() -> int:
+    value = os.environ.get("SUDO_UID")
+    if value is None:
+        return os.getuid()
+    try:
+        uid = int(value)
+    except ValueError as exc:
+        raise ContainmentError("SUDO_UID is not a valid uid") from exc
+    if uid < 0:
+        raise ContainmentError("SUDO_UID is not a valid uid")
+    return uid
+
+
+def normalized_privileged_artifact(path: pathlib.Path | str) -> pathlib.Path:
+    unresolved = pathlib.Path(os.path.abspath(path))
+    try:
+        info = os.stat(unresolved, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(info.st_mode):
+            raise ContainmentError(f"privileged artifact path is a symlink: {unresolved}")
+    return unresolved.resolve(strict=False)
+
+
+def open_verified_output_directory(artifact: pathlib.Path) -> int:
+    parent = artifact.parent
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    current = os.open("/", flags)
+    try:
+        for component in parent.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = next_fd
+        if os.fstat(current).st_uid != invoking_uid():
+            raise ContainmentError(
+                f"artifact directory is not owned by invoking uid {invoking_uid()}: {parent}"
+            )
+        for name in (artifact.name, f"{artifact.stem}.diagnostics"):
+            try:
+                info = os.stat(name, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                raise ContainmentError(f"privileged output path contains a symlink: {parent / name}")
+        return current
+    except BaseException:
+        os.close(current)
+        raise
 
 
 def event(name: str, **values: Any) -> dict[str, Any]:
@@ -262,12 +323,14 @@ class CredentialPlatform:
                 raise InventoryError(f"proc_pidinfo unreadable for pid {pid}: errno={ctypes.get_errno()}")
             if got != ctypes.sizeof(info):
                 raise InventoryError(f"proc_pidinfo short read for pid {pid}: {got}")
-            # macOS has no public API for enumerating another process's supplementary groups.
-            # The residual risk is accepted because (1) the leased GID is an unassigned-high
-            # system GID on ephemeral clean runners; (2) the child already setgroups([]) clears
-            # its own supplementary groups; (3) private roots are mode 0700 with no group
-            # permission bits, so no group-permissioned cross-channel exists even if another
-            # process shared the GID.
+            # Linux inventories every live process's /proc supplementary groups and fails
+            # closed before leasing a GID held there. macOS has no public API for enumerating
+            # another running process's supplementary groups, so the accepted Option A keeps
+            # containment with this residual risk: (1) the leased GID is an unassigned-high
+            # system GID on ephemeral clean runners; (2) the child setgroups([]) clears its own
+            # supplementary groups; (3) private roots are mode 0700 with no group permission
+            # bits, so no group-permissioned cross-channel exists even if another process
+            # shared the GID.
             result[pid] = Credentials(
                 pid,
                 (int(info.pbi_ruid), int(info.pbi_uid), int(info.pbi_svuid), int(info.pbi_uid)),
@@ -389,6 +452,11 @@ def drop_credentials(uid: int, gid: int) -> None:
         raise OSError(errno.ENOTSUP, "unsupported credential platform")
 
 
+# The signal-0 probe runs in an unprivileged helper dropped to the exact leased
+# UID, which can signal every same-UID process. ESRCH and EPERM therefore both
+# prove that no signalable leased-domain member remains; EPERM accounts only for
+# other-UID host processes. Treating EPERM as ambiguous would quarantine every
+# normally empty domain on a multi-user host.
 EMPTY_DOMAIN_PROBE_ERRNOS = (errno.ESRCH, errno.EPERM)
 
 
@@ -562,8 +630,14 @@ class Attempt:
 class LaneExecutor:
     def __init__(self, manifest: dict[str, Any]) -> None:
         self.manifest = manifest
-        self.artifact_path = pathlib.Path(manifest["artifact"]).resolve()
         self.required = manifest.get("containment") == "required"
+        self.output_directory_fd: int | None = None
+        self.diagnostics_fd: int | None = None
+        if self.required and os.geteuid() == 0:
+            self.artifact_path = normalized_privileged_artifact(manifest["artifact"])
+            self.output_directory_fd = open_verified_output_directory(self.artifact_path)
+        else:
+            self.artifact_path = pathlib.Path(manifest["artifact"]).resolve()
         self.platform: CredentialPlatform | None = None
         self.lease_pool: LeasePool | None = None
         self.preacquired_leases: dict[int, Lease] = {}
@@ -581,8 +655,19 @@ class LaneExecutor:
         self.transient = pathlib.Path(tempfile.mkdtemp(prefix="fm-test-executor."))
         os.chmod(self.transient, 0o711)
         self.diagnostics = self.artifact_path.parent / f"{self.artifact_path.stem}.diagnostics"
-        self.diagnostics.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.diagnostics, 0o755)
+        if self.output_directory_fd is None:
+            self.diagnostics.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.diagnostics, 0o755)
+        else:
+            try:
+                os.mkdir(self.diagnostics.name, 0o755, dir_fd=self.output_directory_fd)
+            except FileExistsError:
+                pass
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            self.diagnostics_fd = os.open(
+                self.diagnostics.name, flags, dir_fd=self.output_directory_fd,
+            )
+            os.fchmod(self.diagnostics_fd, 0o755)
         self.doc = self._initial_document()
         self.schedule_waves = self._build_schedule_waves(self.doc["scripts"])
         self.wave_by_index = {
@@ -677,7 +762,15 @@ class LaneExecutor:
             signal.signal(sig, receive)
 
     def publish(self) -> None:
-        atomic_json(self.artifact_path, self.doc)
+        atomic_json(self.artifact_path, self.doc, directory_fd=self.output_directory_fd)
+
+    def close_output_directories(self) -> None:
+        if self.diagnostics_fd is not None:
+            os.close(self.diagnostics_fd)
+            self.diagnostics_fd = None
+        if self.output_directory_fd is not None:
+            os.close(self.output_directory_fd)
+            self.output_directory_fd = None
 
     def append(self, attempt: Attempt, name: str, **values: Any) -> None:
         attempt.row["events"].append(event(name, **values))
@@ -964,7 +1057,13 @@ class LaneExecutor:
                 self.platform.verify_pid(pid, lease.uid, lease.gid)
             log_path = self.diagnostics / f"{row['index']:03d}-{pathlib.Path(row['path']).name}.log"
             attempt.log_path = log_path
-            attempt.log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            log_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            if self.diagnostics_fd is None:
+                attempt.log_fd = os.open(log_path, log_flags, 0o644)
+            else:
+                attempt.log_fd = os.open(
+                    log_path.name, log_flags, 0o644, dir_fd=self.diagnostics_fd,
+                )
             row["diagnostic_log"] = str(log_path)
             self.append(attempt, "prepared", uid=lease.uid if lease else os.getuid())
             self.selector.register(read_output, selectors.EVENT_READ, attempt)
@@ -1191,11 +1290,14 @@ class LaneExecutor:
             os.fsync(attempt.log_fd)
             os.close(attempt.log_fd)
             attempt.log_fd = None
-        diagnostics_fd = os.open(self.diagnostics, os.O_RDONLY)
-        try:
-            os.fsync(diagnostics_fd)
-        finally:
-            os.close(diagnostics_fd)
+        if self.diagnostics_fd is None:
+            diagnostics_fd = os.open(self.diagnostics, os.O_RDONLY)
+            try:
+                os.fsync(diagnostics_fd)
+            finally:
+                os.close(diagnostics_fd)
+        else:
+            os.fsync(self.diagnostics_fd)
         quiet = attempt.cleanup_quiet
         survivors = attempt.cleanup_survivors
         if attempt.cleanup_unattempted:
@@ -1721,6 +1823,12 @@ def prove_domain_quiescent(uid: int, gid: int, timeout: float = 3.0) -> bool:
 
 
 def qualify(artifact: pathlib.Path) -> int:
+    try:
+        artifact = normalized_privileged_artifact(artifact)
+        output_directory_fd = open_verified_output_directory(artifact)
+    except (ContainmentError, OSError) as exc:
+        print(f"fm-test-supervisor: qualification output refused: {exc}", file=sys.stderr)
+        return 2
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "kind": "fm-test-platform-qualification",
@@ -1730,7 +1838,7 @@ def qualify(artifact: pathlib.Path) -> int:
         "passed": False,
         "checks": [],
     }
-    atomic_json(artifact, result)
+    atomic_json(artifact, result, directory_fd=output_directory_fd)
     targets: list[tuple[int, Lease]] = []
     leases: list[Lease] = []
 
@@ -1881,7 +1989,7 @@ def qualify(artifact: pathlib.Path) -> int:
         leases.clear()
         result["checks"].append({"name": "all-domains-quiescent-before-publish", "passed": True})
         result.update({"complete": True, "passed": True, "finished_at": iso_now()})
-        atomic_json(artifact, result)
+        atomic_json(artifact, result, directory_fd=output_directory_fd)
         print(f"FM_TEST_QUALIFICATION platform={sys.platform} passed=true")
         return 0
     except BaseException as exc:
@@ -1890,7 +1998,7 @@ def qualify(artifact: pathlib.Path) -> int:
         if cleanup_errors:
             blocker = f"{blocker}; qualification cleanup failed: {', '.join(cleanup_errors)}"
         result.update({"complete": True, "passed": False, "blocker": blocker, "finished_at": iso_now()})
-        atomic_json(artifact, result)
+        atomic_json(artifact, result, directory_fd=output_directory_fd)
         print(f"fm-test-supervisor: platform qualification failed: {blocker}", file=sys.stderr)
         return 1
     finally:
@@ -1901,6 +2009,7 @@ def qualify(artifact: pathlib.Path) -> int:
                     pool.retire(lease, quarantine=bool(cleanup_errors))
         if "qualification_leases" in locals():
             shutil.rmtree(qualification_leases, ignore_errors=True)
+        os.close(output_directory_fd)
 
 
 def pid_reuse_fixture() -> int:
@@ -1956,7 +2065,15 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "execute":
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        return LaneExecutor(manifest).run()
+        try:
+            executor = LaneExecutor(manifest)
+        except (ContainmentError, OSError) as exc:
+            print(f"fm-test-supervisor: containment refused before test execution: {exc}", file=sys.stderr)
+            return 2
+        try:
+            return executor.run()
+        finally:
+            executor.close_output_directories()
     if args.command == "validate-artifact":
         valid, reason = validate_artifact(args.artifact)
         print(f"FM_TEST_ARTIFACT_VALID valid={'true' if valid else 'false'} reason={reason}")

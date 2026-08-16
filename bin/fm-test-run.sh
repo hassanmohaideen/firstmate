@@ -942,6 +942,7 @@ summary = {
     "critical_path_duration_ms": 0,
 }
 errors = []
+attempt_sources = {}
 for path_text in sys.argv[3:]:
     path = pathlib.Path(path_text)
     try:
@@ -954,6 +955,16 @@ for path_text in sys.argv[3:]:
         errors.append(f"{path}: {reason}")
         continue
     rows = doc["scripts"]
+    for row in rows:
+        identity = (row["path"], row["attempt"])
+        previous = attempt_sources.get(identity)
+        if previous is not None:
+            errors.append(
+                f"duplicate attempt identity path={identity[0]!r} attempt={identity[1]} "
+                f"across lane artifacts {previous} and {path}"
+            )
+        else:
+            attempt_sources[identity] = path
     lane_summary = doc["summary"]
     metrics = supervisor.artifact_terminal_metrics(rows)
     budget_mode = doc["duration_budget_mode"]

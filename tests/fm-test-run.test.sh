@@ -1355,6 +1355,15 @@ PY
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "aggregate accepted an unknown schema"
+  cp "$tmp/a.json" "$tmp/cross-lane-duplicate.json"
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/rejected.json" \
+    "$tmp/a.json" "$tmp/cross-lane-duplicate.json" >/dev/null 2>"$tmp/cross-lane.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate accepted the same path and attempt across lane artifacts"
+  grep -q 'duplicate attempt identity' "$tmp/cross-lane.err" \
+    || fail "cross-lane duplicate rejection was not actionable"
   rm -rf "$tmp"
   pass "aggregate accepts complete schema-v2 lanes and rejects incomplete, duplicate, or mixed evidence"
 }
