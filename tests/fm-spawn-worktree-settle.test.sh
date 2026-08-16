@@ -78,6 +78,7 @@ SH
 printf '%s\n' "$*" >> "${FM_FAKE_TREEHOUSE_LOG:-/dev/null}"
 case "$*" in
   get*--lease*) printf '%s\n' "${FM_FAKE_PANE_PATH:?FM_FAKE_PANE_PATH unset}" ;;
+  return*) [ "${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" != 1 ] || exit 1 ;;
 esac
 exit 0
 SH
@@ -128,6 +129,7 @@ run_settle_spawn() {
     FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
     FM_FAKE_WINDOW="$id" FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
     FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" FM_FAKE_PERSIST_DIVERGENCE="${FM_FAKE_PERSIST_DIVERGENCE:-0}" \
+    FM_FAKE_TREEHOUSE_RETURN_FAIL="${FM_FAKE_TREEHOUSE_RETURN_FAIL:-0}" FM_FAKE_FETCH_FAIL="${FM_FAKE_FETCH_FAIL:-0}" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
@@ -188,15 +190,11 @@ SH
   cat > "$fakebin/git" <<'SH'
 #!/usr/bin/env bash
 case " $* " in
-  *" fetch "*) printf '%s\n' "$*" >> "$FM_FAKE_GIT_LOG"; exit 0 ;;
+  *" fetch "*) printf '%s\n' "$*" >> "$FM_FAKE_GIT_LOG"; [ "${FM_FAKE_FETCH_FAIL:-0}" != 1 ] ; exit $? ;;
   *" config --worktree --unset-all remote.origin.url "*)
     [ "${FM_FAKE_PERSIST_DIVERGENCE:-0}" != 1 ] || exit 1
     ;;
   *" remote set-head origin --auto "*) exit 0 ;;
-  *" remote set-url origin "*)
-    printf '%s\n' "$*" >> "$FM_FAKE_GIT_LOG"
-    [ "${FM_FAKE_PERSIST_DIVERGENCE:-0}" != 1 ] || exit 0
-    ;;
 esac
 exec "$FM_REAL_GIT" "$@"
 SH
@@ -208,7 +206,8 @@ prepare_github_gate_case() {
   default=$($REAL_GIT -C "$PROJ_DIR" symbolic-ref --short HEAD)
   $REAL_GIT -C "$WT_DIR" update-ref "refs/remotes/origin/$default" HEAD
   $REAL_GIT -C "$WT_DIR" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default"
-  $REAL_GIT -C "$PROJ_DIR" remote set-url origin https://github.com/owner/repo.git
+  $REAL_GIT -C "$PROJ_DIR" remote set-url origin https://github.com/upstream/repo.git
+  $REAL_GIT -C "$PROJ_DIR" remote set-url --add --push origin https://github.com/owner/repo.git
   install_github_gate_stubs "$FAKEBIN_DIR"
 }
 
@@ -220,6 +219,7 @@ test_divergent_allocated_worktree_destination_is_reset_before_launch() {
   prepare_github_gate_case
   $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
   $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
+  $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.pushurl https://github.example/owner/repo.git
   git_log="$TMP_ROOT/reset-git.log"
   gh_log="$TMP_ROOT/reset-gh.log"
   send_log="$TMP_ROOT/reset-send.log"
@@ -231,7 +231,10 @@ test_divergent_allocated_worktree_destination_is_reset_before_launch() {
   status=$?
   expect_code 0 "$status" "a divergent pooled destination should be reset and launch"
   assert_contains "$out" "spawned $id" "the reset pooled worktree did not launch"
-  [ "$($REAL_GIT -C "$WT_DIR" remote get-url --push origin)" = https://github.com/owner/repo.git ] || fail "the pooled worktree did not inherit the verified primary destination"
+  [ "$($REAL_GIT -C "$WT_DIR" remote get-url origin)" = https://github.com/upstream/repo.git ] || fail "the pooled worktree did not inherit the primary fetch destination"
+  [ "$($REAL_GIT -C "$WT_DIR" remote get-url --push origin)" = https://github.com/owner/repo.git ] || fail "the pooled worktree did not inherit the verified primary push destination"
+  [ "$($REAL_GIT -C "$PROJ_DIR" remote get-url origin)" = https://github.com/upstream/repo.git ] || fail "the pool reset changed the shared primary fetch URL"
+  [ "$($REAL_GIT -C "$PROJ_DIR" remote get-url --push origin)" = https://github.com/owner/repo.git ] || fail "the pool reset changed the shared primary push URL"
   assert_grep 'encode launch-brief' "$send_log" "the reset pooled worktree did not start the worker"
   [ "$(grep -c 'repos/owner/repo' "$gh_log")" -eq 1 ] || fail "resetting the pooled destination triggered a second GitHub probe"
   assert_no_grep 'return --force' "$treehouse_log" "a launched pooled worktree was returned during spawn"
@@ -246,6 +249,7 @@ test_unverifiable_pool_reset_blocks_before_endpoint_creation() {
   prepare_github_gate_case
   $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
   $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
+  $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.pushurl https://github.example/owner/repo.git
   git_log="$TMP_ROOT/reset-failure-git.log"
   gh_log="$TMP_ROOT/reset-failure-gh.log"
   send_log="$TMP_ROOT/reset-failure-send.log"
@@ -263,9 +267,57 @@ test_unverifiable_pool_reset_blocks_before_endpoint_creation() {
   pass "an unverifiable pooled reset blocks before creating an endpoint"
 }
 
+test_failed_pre_endpoint_lease_return_retains_recovery_record() {
+  local rec id out status git_log gh_log send_log treehouse_log endpoint
+  id=allocated-github-return-failure-z5
+  rec=$(make_settle_case allocated-github-return-failure "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
+  $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
+  git_log="$TMP_ROOT/return-failure-git.log"
+  gh_log="$TMP_ROOT/return-failure-gh.log"
+  send_log="$TMP_ROOT/return-failure-send.log"
+  treehouse_log="$TMP_ROOT/return-failure-treehouse.log"
+  endpoint="$TMP_ROOT/return-failure-endpoint"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_PERSIST_DIVERGENCE=1 FM_FAKE_TREEHOUSE_RETURN_FAIL=1 run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a blocked spawn with a failed lease return must fail"
+  assert_contains "$out" "lease and recovery metadata were retained" "the failed lease return was not reported"
+  [ -d "$WT_DIR" ] || fail "the failed lease return discarded the allocated worktree"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" "the failed lease return did not retain recoverable worktree metadata"
+  [ ! -e "$endpoint" ] || fail "the pre-endpoint lease failure created an endpoint"
+  pass "a failed pre-endpoint lease return retains recovery metadata"
+}
+
+test_post_endpoint_failure_does_not_force_return_lease() {
+  local rec id out status git_log gh_log send_log treehouse_log endpoint
+  id=allocated-github-post-endpoint-failure-z6
+  rec=$(make_settle_case allocated-github-post-endpoint-failure "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  git_log="$TMP_ROOT/post-endpoint-git.log"
+  gh_log="$TMP_ROOT/post-endpoint-gh.log"
+  send_log="$TMP_ROOT/post-endpoint-send.log"
+  treehouse_log="$TMP_ROOT/post-endpoint-treehouse.log"
+  endpoint="$TMP_ROOT/post-endpoint"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_FETCH_FAIL=1 run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a failed post-endpoint refresh must fail the spawn"
+  [ -e "$endpoint" ] || fail "the fixture did not reach endpoint creation before failing"
+  assert_no_grep 'return --force' "$treehouse_log" "a post-endpoint failure force-returned the live endpoint's worktree"
+  pass "automatic lease return is disarmed after endpoint creation"
+}
+
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
 test_divergent_allocated_worktree_destination_is_reset_before_launch
 test_unverifiable_pool_reset_blocks_before_endpoint_creation
+test_failed_pre_endpoint_lease_return_retains_recovery_record
+test_post_endpoint_failure_does_not_force_return_lease
 
 echo "# all fm-spawn-worktree-settle tests passed"
