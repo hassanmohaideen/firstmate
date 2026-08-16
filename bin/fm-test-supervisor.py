@@ -516,6 +516,15 @@ class Attempt:
     line_has_content: bool = False
     required_skip_seen: bool = False
     token_overlap: bytes = b""
+    cleanup_state: str | None = None
+    cleanup_cause: str | None = None
+    cleanup_next_mono: float = 0.0
+    cleanup_present: bool = False
+    cleanup_probe_errno: int = 0
+    cleanup_quiet: bool = False
+    cleanup_survivors: list[int] = field(default_factory=list)
+    cleanup_unattempted: bool = False
+    cleanup_reason: str | None = None
 
 
 class LaneExecutor:
@@ -526,7 +535,7 @@ class LaneExecutor:
         self.platform: CredentialPlatform | None = None
         self.lease_pool: LeasePool | None = None
         self.preacquired_leases: dict[int, Lease] = {}
-        self.residual_cleanup_leases: list[Lease] = []
+        self.residual_cleanup_attempts: list[Attempt] = []
         self.selector = selectors.DefaultSelector()
         self.interrupted: int | None = None
         self.active: dict[int, Attempt] = {}
@@ -908,6 +917,8 @@ class LaneExecutor:
                 attempt.release_fd = None
             if started_committed:
                 row["events"].append(event("containment_error", reason=reason))
+                if attempt.pid is not None:
+                    self.active[attempt.pid] = attempt
                 self.finish(attempt, "startup_failure")
                 return None
             if attempt.pid is not None:
@@ -919,21 +930,20 @@ class LaneExecutor:
                     pass
             reason = str(exc)
             row["events"].append(event("readiness_refused", reason=reason))
-            if lease is not None:
-                quiet, _survivors = self._cleanup_domain(attempt, "readiness_refused")
+            attempt.cleanup_unattempted = True
+            attempt.cleanup_reason = reason
+            if attempt.pid is not None:
+                self.active[attempt.pid] = attempt
+                if attempt.output_fd is not None:
+                    try:
+                        self.selector.get_key(attempt.output_fd)
+                    except KeyError:
+                        self.selector.register(attempt.output_fd, selectors.EVENT_READ, attempt)
+                self._begin_cleanup(attempt, "readiness_refused")
             else:
-                quiet = True
-            if lease is None and attempt.pid is not None:
-                try:
-                    os.kill(attempt.pid, signal.SIGKILL)
-                    os.waitpid(attempt.pid, 0)
-                except OSError:
-                    pass
-            row["terminal"] = event("terminal", result="containment_refused", exit=126, attempted=False, reason=reason)
-            row["exit"] = 126
-            self.publish()
-            if lease is not None and self.lease_pool is not None:
-                self._retire_attempt_lease(lease, quiet)
+                attempt.cleanup_quiet = lease is None
+                attempt.cleanup_state = "terminalize"
+                self._advance_cleanup(attempt, time.monotonic())
             return None
 
     def _scan_output(self, attempt: Attempt, chunk: bytes, *, eof: bool = False) -> None:
@@ -1014,218 +1024,43 @@ class LaneExecutor:
         if attempt.deadline_expired:
             return
         attempt.deadline_expired = True
-        attempt.deadline_term_mono = time.monotonic()
-        self.append(attempt, "deadline_expired")
-        if self.required and attempt.lease is not None:
-            try:
-                delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGTERM)
-            except BaseException:
-                delivered, code = False, errno.EIO
-            if not delivered:
-                attempt.cleanup_ambiguous = True
-            attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
-        elif attempt.pid is not None:
-            try:
-                os.killpg(attempt.pid, signal.SIGTERM)
-            except OSError:
-                pass
+        attempt.row["events"].append(event("deadline_expired"))
+        self._begin_cleanup(attempt, "deadline")
 
-    def _escalate_expired_attempt(self, attempt: Attempt, now: float, *, force: bool = False) -> None:
-        if (
-            not self.required
-            or not attempt.deadline_expired
-            or attempt.deadline_kill_sent
-            or attempt.deadline_term_mono is None
-            or (not force and now < attempt.deadline_term_mono + TERM_GRACE)
-        ):
-            return
-        assert attempt.lease is not None
-        try:
-            delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGKILL)
-        except BaseException:
-            delivered, code = False, errno.EIO
-        attempt.deadline_kill_sent = True
-        if not delivered:
-            attempt.cleanup_ambiguous = True
-        attempt.row["events"].append(event("domain_signaled", signal="KILL", delivered=delivered, errno=code))
-
-    def _enforce_other_deadlines(self, current: Attempt) -> None:
-        now = time.monotonic()
-        others = [attempt for attempt in self.active.values() if attempt is not current]
-        for other in others:
-            if other.deadline_mono is not None and now >= other.deadline_mono:
-                self._expire_attempt(other)
-        now = time.monotonic()
-        for other in others:
-            self._escalate_expired_attempt(other, now)
-
-    def _broadcast_expired_deadlines(self) -> None:
-        if not self.required:
-            return
-        expired = [attempt for attempt in self.active.values() if attempt.deadline_expired and not attempt.deadline_kill_sent]
-        if not expired:
-            return
-        grace = min(self._cleanup_limit(), time.monotonic() + TERM_GRACE)
-        while time.monotonic() < grace:
-            now = time.monotonic()
-            for attempt in list(self.active.values()):
-                if attempt.deadline_mono is not None and now >= attempt.deadline_mono:
-                    self._expire_attempt(attempt)
-                self._drain(attempt)
-                self._poll_wait(attempt)
-            time.sleep(0.02)
-        now = time.monotonic()
-        for attempt in list(self.active.values()):
+    def _begin_cleanup(self, attempt: Attempt, cause: str) -> None:
+        if attempt.cleanup_state is not None:
             if attempt.deadline_expired:
-                self._escalate_expired_attempt(attempt, now, force=True)
-
-    def _cleanup_domain(self, attempt: Attempt, reason: str) -> tuple[bool, list[int]]:
-        if not self.required:
-            # Explicitly non-enforcing developer behavior. This is never used by
-            # required CI and does not claim descendants that leave the session.
-            if attempt.pid is not None:
-                try:
-                    os.killpg(attempt.pid, signal.SIGTERM)
-                except OSError:
-                    pass
-                time.sleep(0.05)
-                try:
-                    os.killpg(attempt.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    os.waitpid(attempt.pid, 0)
-                except (OSError, ChildProcessError):
-                    pass
-            return True, []
-        assert attempt.lease is not None and self.platform is not None and self.lease_pool is not None
-        lease = attempt.lease
-        diagnostics: list[int] = []
-        ambiguous = attempt.cleanup_ambiguous
-        cleanup_limit = self._cleanup_limit()
-
-        def checked_helper(sig: int) -> tuple[bool, int]:
-            nonlocal ambiguous
-            try:
-                return helper_signal(lease.uid, lease.gid, sig)
-            except BaseException:
-                ambiguous = True
-                return False, errno.EIO
-
-        try:
-            if time.monotonic() >= cleanup_limit:
-                raise InventoryError("terminal-evidence deadline reached before cleanup diagnostics")
-            diagnostics = self.platform.domain_members(lease.uid, deadline=cleanup_limit)
-            attempt.row["events"].append(event("cleanup_diagnostics", reason=reason, member_pids=diagnostics))
-        except InventoryError as exc:
-            ambiguous = True
-            attempt.row["events"].append(event("cleanup_diagnostics_unreadable", reason=str(exc)))
-        if diagnostics:
-            delivered, code = checked_helper(signal.SIGTERM)
-            if not delivered:
-                ambiguous = True
-            attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
-        grace = min(cleanup_limit, time.monotonic() + TERM_GRACE)
-        present = bool(diagnostics)
-        last_code = 0
-        while time.monotonic() < grace:
-            self._enforce_other_deadlines(attempt)
-            self._drain(attempt)
-            self._poll_wait(attempt)
-            present, last_code = checked_helper(0)
-            if last_code not in (0, *EMPTY_DOMAIN_PROBE_ERRNOS):
-                ambiguous = True
-            if domain_probe_empty(present, last_code):
-                break
-            time.sleep(0.05)
-        limit = min(cleanup_limit, time.monotonic() + QUIESCE_GRACE)
-        while present and time.monotonic() < limit:
-            self._enforce_other_deadlines(attempt)
-            delivered, code = checked_helper(signal.SIGKILL)
-            if not delivered:
-                ambiguous = True
-            attempt.row["events"].append(event("domain_signaled", signal="KILL", delivered=delivered, errno=code))
-            self._drain(attempt)
-            self._poll_wait(attempt)
-            present, last_code = checked_helper(0)
-            if last_code not in (0, *EMPTY_DOMAIN_PROBE_ERRNOS):
-                ambiguous = True
-            if domain_probe_empty(present, last_code):
-                break
-            time.sleep(0.05)
-        fault = attempt.row.get("test_fault")
-        try:
-            if time.monotonic() >= cleanup_limit:
-                raise InventoryError("terminal-evidence deadline reached before quiescence proof")
-            if fault == "unreadable_probe":
-                raise InventoryError("test_fault injected an unreadable quiescence probe")
-            survivors = self.platform.domain_members(lease.uid, live_only=True, deadline=cleanup_limit)
-        except InventoryError as exc:
-            ambiguous = True
-            attempt.row["events"].append(event("quiescence_unreadable", reason=str(exc)))
-            survivors = diagnostics
-        if fault == "nonquiescent":
-            attempt.row["events"].append(event("nonquiescence_injected"))
-            ambiguous = True
-        quiet = not ambiguous and domain_probe_empty(present, last_code) and not survivors
-        attempt.row["events"].append(event("quiescence", proved=quiet, survivors=survivors, probe_errno=last_code))
-        if attempt.wait_status is None and attempt.pid is not None:
-            try:
-                found, status = os.waitpid(attempt.pid, os.WNOHANG)
-                if found == attempt.pid:
-                    attempt.wait_status = status
-            except (OSError, ChildProcessError):
-                pass
-        if not quiet:
-            self.doc["containment"]["quarantined_uids"].append(lease.uid)
-        return quiet, survivors
-
-    def _retire_attempt_lease(self, lease: Lease, quiet: bool) -> None:
-        assert self.lease_pool is not None
-        self.lease_pool.retire(lease, quarantine=not quiet)
-        if quiet:
+                attempt.cleanup_cause = "deadline"
             return
-        try:
-            helper_signal(lease.uid, lease.gid, signal.SIGKILL)
-        except BaseException:
-            pass
-        if all(item.uid != lease.uid for item in self.residual_cleanup_leases):
-            self.residual_cleanup_leases.append(lease)
-
-    def _cleanup_residual_domains(self) -> None:
-        pending = [lease for lease in self.residual_cleanup_leases if lease.path.exists()]
-        while pending and time.monotonic() < self.cleanup_deadline:
-            remaining: list[Lease] = []
-            for lease in pending:
-                try:
-                    present, code = helper_signal(lease.uid, lease.gid, 0)
-                except BaseException:
-                    present, code = False, errno.EIO
-                if domain_probe_empty(present, code):
-                    continue
-                try:
-                    helper_signal(lease.uid, lease.gid, signal.SIGKILL)
-                except BaseException:
-                    pass
-                remaining.append(lease)
-            pending = remaining
-            if pending:
-                time.sleep(min(0.05, max(0.0, self.cleanup_deadline - time.monotonic())))
-        self.residual_cleanup_leases.clear()
-
-    def finish(self, attempt: Attempt, cause: str) -> None:
         if attempt.deadline_expired:
             cause = "deadline"
-        self._drain(attempt)
-        root_exited = self._poll_wait(attempt)
-        if cause == "deadline":
-            self._expire_attempt(attempt)
-        elif root_exited:
-            self.append(attempt, "test_exited", exit=self._exit_code(attempt.wait_status))
+        attempt.cleanup_cause = cause
+        if cause == "exit":
+            attempt.row["events"].append(event("test_exited", exit=self._exit_code(attempt.wait_status)))
         elif cause == "interrupted":
-            self.append(attempt, "interruption_received", signal=self.interrupted)
-        quiet, survivors = self._cleanup_domain(attempt, cause)
+            attempt.row["events"].append(event("interruption_received", signal=self.interrupted))
+        if self.required:
+            attempt.cleanup_state = "term" if cause in {"deadline", "interrupted"} else "probe"
+        else:
+            attempt.cleanup_state = "developer_term"
+        attempt.cleanup_next_mono = time.monotonic()
+
+    def _checked_helper(self, attempt: Attempt, sig: int) -> tuple[bool, int]:
+        assert attempt.lease is not None
+        try:
+            delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, sig)
+        except BaseException:
+            delivered, code = False, errno.EIO
+        if code not in (0, *EMPTY_DOMAIN_PROBE_ERRNOS):
+            attempt.cleanup_ambiguous = True
+        if sig != 0 and not delivered:
+            attempt.cleanup_ambiguous = True
+        return delivered, code
+
+    def _terminalize_attempt(self, attempt: Attempt) -> None:
+        cause = "deadline" if attempt.deadline_expired else str(attempt.cleanup_cause)
         self._drain(attempt)
+        self._poll_wait(attempt)
         if attempt.output_fd is not None:
             try:
                 self.selector.unregister(attempt.output_fd)
@@ -1242,43 +1077,159 @@ class LaneExecutor:
             os.fsync(diagnostics_fd)
         finally:
             os.close(diagnostics_fd)
-        duration_ms = int(max(0.0, time.monotonic() - (attempt.started_mono or time.monotonic())) * 1000)
-        test_exit = self._exit_code(attempt.wait_status)
-        output = bytes(attempt.tail).decode("utf-8", errors="replace")
-        gate_skip = test_exit == 0 and attempt.first_meaningful_gate_skip
-        required_skip = attempt.required_skip_seen
-        budget = attempt.row.get("duration_budget_ms")
-        exceeded = budget is not None and duration_ms > int(budget)
-        if cause == "interrupted":
-            result, public_exit = "interrupted", 128 + int(self.interrupted or signal.SIGTERM)
-        elif cause == "deadline":
-            result, public_exit = "timeout", 124
-        elif not quiet:
-            result, public_exit = "containment_ambiguous", 125
-        elif required_skip:
-            result, public_exit = "failed", 1
-        elif test_exit == 0:
-            result, public_exit = "passed", 0
+        quiet = attempt.cleanup_quiet
+        survivors = attempt.cleanup_survivors
+        if attempt.cleanup_unattempted:
+            result, public_exit = "containment_refused", 126
+            attempt.row["terminal"] = event(
+                "terminal", result=result, exit=public_exit, attempted=False,
+                reason=attempt.cleanup_reason, quiescent=quiet, survivors=survivors,
+            )
+            attempt.row["exit"] = public_exit
         else:
-            result, public_exit = "failed", test_exit
-        attempt.row.update({
-            "duration_ms": duration_ms,
-            "exit": public_exit,
-            "gate_skip": gate_skip,
-            "required_gate_skip_seen": required_skip,
-            "duration_budget_exceeded": exceeded,
-            "output_tail": output,
-            "terminal": event(
-                "terminal", result=result, exit=public_exit, test_exit=test_exit,
-                attempted=True, quiescent=quiet, survivors=survivors,
-            ),
-        })
+            duration_ms = int(max(0.0, time.monotonic() - (attempt.started_mono or time.monotonic())) * 1000)
+            test_exit = self._exit_code(attempt.wait_status)
+            required_skip = attempt.required_skip_seen
+            budget = attempt.row.get("duration_budget_ms")
+            exceeded = budget is not None and duration_ms > int(budget)
+            if cause == "interrupted":
+                result, public_exit = "interrupted", 128 + int(self.interrupted or signal.SIGTERM)
+            elif cause == "deadline":
+                result, public_exit = "timeout", 124
+            elif not quiet:
+                result, public_exit = "containment_ambiguous", 125
+            elif required_skip:
+                result, public_exit = "failed", 1
+            elif test_exit == 0:
+                result, public_exit = "passed", 0
+            else:
+                result, public_exit = "failed", test_exit
+            attempt.row.update({
+                "duration_ms": duration_ms,
+                "exit": public_exit,
+                "gate_skip": test_exit == 0 and attempt.first_meaningful_gate_skip,
+                "required_gate_skip_seen": required_skip,
+                "duration_budget_exceeded": exceeded,
+                "output_tail": bytes(attempt.tail).decode("utf-8", errors="replace"),
+                "terminal": event(
+                    "terminal", result=result, exit=public_exit, test_exit=test_exit,
+                    attempted=True, quiescent=quiet, survivors=survivors,
+                ),
+            })
         attempt.row["events"].append(event("terminal", result=result, exit=public_exit))
-        self.publish()  # Terminal evidence precedes lease/transient finalization.
+        self.publish()
         if attempt.lease is not None and self.lease_pool is not None:
-            self._retire_attempt_lease(attempt.lease, quiet)
+            self.lease_pool.retire(attempt.lease, quarantine=not quiet)
+            if not quiet:
+                if attempt.lease.uid not in self.doc["containment"]["quarantined_uids"]:
+                    self.doc["containment"]["quarantined_uids"].append(attempt.lease.uid)
+                attempt.cleanup_state = "residual_probe"
+                attempt.cleanup_next_mono = time.monotonic()
+                self.residual_cleanup_attempts.append(attempt)
         if attempt.pid is not None:
             self.active.pop(attempt.pid, None)
+        if quiet or attempt.lease is None:
+            attempt.cleanup_state = "done"
+
+    def _advance_cleanup(self, attempt: Attempt, now: float) -> None:
+        state = attempt.cleanup_state
+        if state is None or state == "done" or now < attempt.cleanup_next_mono:
+            return
+        if state == "developer_term":
+            if attempt.pid is not None:
+                try:
+                    os.killpg(attempt.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            attempt.cleanup_state = "developer_kill"
+            attempt.cleanup_next_mono = now + 0.05
+            return
+        if state == "developer_kill":
+            if attempt.pid is not None:
+                try:
+                    os.killpg(attempt.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            attempt.cleanup_quiet = True
+            attempt.cleanup_state = "terminalize"
+            return
+        if state == "terminalize":
+            self._terminalize_attempt(attempt)
+            return
+        if not self.required or attempt.lease is None:
+            attempt.cleanup_quiet = True
+            attempt.cleanup_state = "terminalize"
+            return
+        if now >= self._cleanup_limit() and state not in {"residual_probe", "residual_kill"}:
+            attempt.cleanup_ambiguous = True
+            attempt.cleanup_survivors = [attempt.pid] if attempt.pid is not None and not self._poll_wait(attempt) else []
+            attempt.row["events"].append(event("quiescence", proved=False, survivors=attempt.cleanup_survivors))
+            attempt.cleanup_state = "terminalize"
+            return
+        if state == "probe":
+            present, code = self._checked_helper(attempt, 0)
+            if attempt.row.get("test_fault") == "unreadable_probe":
+                present, code = False, errno.EIO
+                attempt.cleanup_ambiguous = True
+                attempt.row["events"].append(event("quiescence_unreadable", reason="test_fault injected an unreadable quiescence probe"))
+            attempt.cleanup_present = present
+            attempt.cleanup_probe_errno = code
+            attempt.row["events"].append(event("cleanup_probe", reason=attempt.cleanup_cause, present=present, errno=code))
+            if domain_probe_empty(present, code):
+                if attempt.row.get("test_fault") == "nonquiescent":
+                    attempt.cleanup_ambiguous = True
+                    attempt.row["events"].append(event("nonquiescence_injected"))
+                attempt.cleanup_quiet = not attempt.cleanup_ambiguous
+                attempt.row["events"].append(event("quiescence", proved=attempt.cleanup_quiet, survivors=[], probe_errno=code))
+                attempt.cleanup_state = "terminalize"
+            else:
+                attempt.cleanup_state = "term"
+            return
+        if state == "term":
+            delivered, code = self._checked_helper(attempt, signal.SIGTERM)
+            attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
+            attempt.cleanup_state = "kill"
+            attempt.cleanup_next_mono = min(self._cleanup_limit(), now + TERM_GRACE)
+            return
+        if state == "kill":
+            delivered, code = self._checked_helper(attempt, signal.SIGKILL)
+            attempt.deadline_kill_sent = attempt.deadline_expired
+            attempt.row["events"].append(event("domain_signaled", signal="KILL", delivered=delivered, errno=code))
+            attempt.cleanup_state = "quiescence_probe"
+            attempt.cleanup_next_mono = now + 0.05
+            return
+        if state == "quiescence_probe":
+            present, code = self._checked_helper(attempt, 0)
+            attempt.cleanup_present = present
+            attempt.cleanup_probe_errno = code
+            if domain_probe_empty(present, code):
+                attempt.cleanup_quiet = not attempt.cleanup_ambiguous
+                attempt.row["events"].append(event("quiescence", proved=attempt.cleanup_quiet, survivors=[], probe_errno=code))
+                attempt.cleanup_state = "terminalize"
+            else:
+                attempt.cleanup_state = "kill"
+                attempt.cleanup_next_mono = now + 0.05
+            return
+        if state == "residual_probe":
+            if now >= self.cleanup_deadline:
+                attempt.cleanup_state = "done"
+                return
+            present, code = self._checked_helper(attempt, 0)
+            if domain_probe_empty(present, code):
+                attempt.cleanup_state = "done"
+            else:
+                attempt.cleanup_state = "residual_kill"
+            return
+        if state == "residual_kill":
+            if now >= self.cleanup_deadline:
+                attempt.cleanup_state = "done"
+                return
+            self._checked_helper(attempt, signal.SIGKILL)
+            attempt.cleanup_state = "residual_probe"
+            attempt.cleanup_next_mono = now + 0.05
+
+    def finish(self, attempt: Attempt, cause: str) -> None:
+        self._begin_cleanup(attempt, cause)
 
     def _launchable(self, pending: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not pending:
@@ -1336,7 +1287,6 @@ class LaneExecutor:
         }
         self.publish()
         if self.lease_pool is not None:
-            self._cleanup_residual_domains()
             self._release_preacquired_leases()
             self.lease_pool.finalize()
         shutil.rmtree(self.transient, ignore_errors=True)
@@ -1350,48 +1300,40 @@ class LaneExecutor:
         active = list(self.active.values())
         now = time.monotonic()
         for attempt in active:
+            self._drain(attempt)
+            root_exited = self._poll_wait(attempt)
             if (
-                not attempt.deadline_expired
+                attempt.cleanup_state is None
+                and not attempt.deadline_expired
                 and attempt.deadline_mono is not None
                 and now >= attempt.deadline_mono
-                and not self._poll_wait(attempt)
+                and not root_exited
             ):
                 self._expire_attempt(attempt)
-        self._broadcast_expired_deadlines()
+            elif attempt.cleanup_state is None and root_exited:
+                self._begin_cleanup(attempt, "exit")
         for attempt in active:
-            if attempt.pid not in self.active:
-                continue
-            if attempt.deadline_expired:
-                self.finish(attempt, "deadline")
-            elif self._poll_wait(attempt):
-                self.finish(attempt, "exit")
+            if attempt.pid in self.active:
+                self._advance_cleanup(attempt, time.monotonic())
+        for attempt in list(self.residual_cleanup_attempts):
+            self._advance_cleanup(attempt, time.monotonic())
+            if attempt.cleanup_state == "done":
+                self.residual_cleanup_attempts.remove(attempt)
 
     def _broadcast_interruption(self) -> None:
-        attempts = list(self.active.values())
-        for attempt in attempts:
-            assert attempt.lease is not None
-            try:
-                delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGTERM)
-            except BaseException:
-                delivered, code = False, errno.EIO
-            if not delivered:
-                attempt.cleanup_ambiguous = True
-            attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
-        grace = min(self._cleanup_limit(), time.monotonic() + TERM_GRACE)
-        while time.monotonic() < grace:
-            for attempt in attempts:
-                self._drain(attempt)
-                self._poll_wait(attempt)
-            time.sleep(0.05)
-        for attempt in attempts:
-            assert attempt.lease is not None
-            try:
-                delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGKILL)
-            except BaseException:
-                delivered, code = False, errno.EIO
-            if not delivered:
-                attempt.cleanup_ambiguous = True
-            attempt.row["events"].append(event("domain_signaled", signal="KILL", delivered=delivered, errno=code))
+        now = time.monotonic()
+        for attempt in list(self.active.values()):
+            if attempt.cleanup_state is None:
+                self._begin_cleanup(attempt, "interrupted")
+            elif not attempt.deadline_expired:
+                attempt.cleanup_cause = "interrupted"
+            if self.required and attempt.lease is not None:
+                delivered, code = self._checked_helper(attempt, signal.SIGTERM)
+                attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
+                attempt.cleanup_state = "kill"
+                attempt.cleanup_next_mono = min(self._cleanup_limit(), now + TERM_GRACE)
+            else:
+                self._advance_cleanup(attempt, now)
 
     def run(self) -> int:
         self.publish()  # Complete planned manifest exists before any preflight/launch.
@@ -1401,14 +1343,14 @@ class LaneExecutor:
             self._release_preacquired_leases()
             return self.unsupported(str(exc))
         pending = list(self.doc["scripts"])
-        while pending or self.active:
+        interruption_broadcast = False
+        while pending or self.active or self.residual_cleanup_attempts:
             if self.interrupted is not None:
-                if self.required:
+                pending.clear()
+                if not interruption_broadcast:
                     self._broadcast_interruption()
-                for attempt in list(self.active.values()):
-                    self.finish(attempt, "interrupted")
-                break
-            while True:
+                    interruption_broadcast = True
+            while self.interrupted is None:
                 row = self._launchable(pending)
                 if row is None:
                     break
