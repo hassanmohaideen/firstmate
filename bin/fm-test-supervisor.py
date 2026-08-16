@@ -978,6 +978,7 @@ class LaneExecutor:
         lease = self.lease_pool.acquire()
         target: int | None = None
         quiet = False
+        cleanup_ambiguous = False
         failure: BaseException | None = None
         try:
             target = spawn_qualification_target(
@@ -1001,19 +1002,25 @@ class LaneExecutor:
                 raise ContainmentError("lane-host qualification domain did not quiesce")
         except BaseException as exc:
             failure = exc
+            cleanup_ambiguous = True
         finally:
             if not quiet:
                 try:
-                    helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                    delivered, code = helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                    if not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
+                        cleanup_ambiguous = True
                 except BaseException:
-                    pass
-                if target is not None:
-                    bounded_reap(target, 1.0)
+                    cleanup_ambiguous = True
+                if target is not None and not bounded_reap(target, 1.0):
+                    cleanup_ambiguous = True
                 try:
                     quiet = prove_domain_quiescent(lease.uid, lease.gid, timeout=1.0)
                 except BaseException:
                     quiet = False
-            self.lease_pool.retire(lease, quarantine=not quiet)
+                    cleanup_ambiguous = True
+                if not quiet:
+                    cleanup_ambiguous = True
+            self.lease_pool.retire(lease, quarantine=cleanup_ambiguous or not quiet)
         if failure is not None:
             raise ContainmentError(f"lane-host primitive qualification failed: {failure}") from failure
 
@@ -2156,16 +2163,26 @@ def pid_reuse_fixture() -> int:
         target = spawn_qualification_target(old.uid, old.gid)
         if target != 5000:
             raise ContainmentError(f"controlled target PID is {target}, expected 5000")
-        helper_signal(old.uid, old.gid, signal.SIGKILL)
-        os.waitpid(target, 0)
+        delivered, code = helper_signal(old.uid, old.gid, signal.SIGKILL)
+        if not delivered or code != 0:
+            raise ContainmentError(f"old credential-domain KILL failed: errno={code}")
+        if not bounded_reap(target, 2.0):
+            raise ContainmentError("old credential-domain target did not exit after KILL")
         last_pid.write_text("4999\n", encoding="ascii")
         sentinel = spawn_qualification_target(other.uid, other.gid, ignore_term=True)
         if sentinel != target:
             raise ContainmentError(f"numeric PID was not reused: old={target} replacement={sentinel}")
-        helper_signal(old.uid, old.gid, signal.SIGKILL)
+        delivered, code = helper_signal(old.uid, old.gid, signal.SIGKILL)
+        if not domain_probe_empty(delivered, code):
+            raise ContainmentError(
+                f"old credential domain remained signalable after PID reuse: errno={code}"
+            )
         platform.verify_pid(sentinel, other.uid, other.gid)
-        helper_signal(other.uid, other.gid, signal.SIGKILL)
-        os.waitpid(sentinel, 0)
+        delivered, code = helper_signal(other.uid, other.gid, signal.SIGKILL)
+        if not delivered or code != 0:
+            raise ContainmentError(f"replacement credential-domain KILL failed: errno={code}")
+        if not bounded_reap(sentinel, 2.0):
+            raise ContainmentError("replacement credential-domain target did not exit after KILL")
         print(f"FM_TEST_PID_REUSE old_pid={target} replacement_pid={sentinel} different_uid=true survived=true")
         return 0
     except BaseException as exc:
