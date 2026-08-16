@@ -1018,10 +1018,22 @@ SH
 import json, sys
 artifact = json.load(open(sys.argv[1]))
 row = artifact["scripts"][0]
-assert row["terminal"]["result"] == "interrupted"
-assert artifact["run"]["complete"] is False
-assert "active" not in open(sys.argv[1], encoding="utf-8").read()
-assert row.get("diagnostic_log")
+assert row["terminal"]["result"] == "interrupted", row["terminal"]
+assert artifact["run"]["complete"] is False, artifact["run"]
+# Schema v2 forbids durable result:active state. Assert that owned semantic
+# contract rather than rejecting an unrelated string value that happens to
+# contain the word "active" (for example a platform-specific path).
+def values(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "result":
+                yield child
+            yield from values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from values(child)
+assert "active" not in set(values(artifact)), set(values(artifact))
+assert row.get("diagnostic_log"), row
 PY
   remove_privileged_fixture_tree "$tmp"
   pass "catchable interruption terminalizes after atomic valid snapshots"
@@ -1407,9 +1419,13 @@ doc = {
     },
     "bash": "/bin/bash", "scripts": scripts,
     "deadlines": {
-        "t0_epoch": now, "ordinary_epoch": now + 40,
-        "terminal_epoch": now + 50, "cleanup_epoch": now + 55,
-        "ceiling_epoch": now + 60,
+        # Required mode reserves 30 seconds for two terminal publications plus
+        # per-attempt startup and cleanup. Keep this fixture comfortably beyond
+        # that conservative schedule model so host inventory latency cannot turn
+        # the intended ambiguity execution into a preflight refusal.
+        "t0_epoch": now, "ordinary_epoch": now + 90,
+        "terminal_epoch": now + 100, "cleanup_epoch": now + 105,
+        "ceiling_epoch": now + 120,
     },
 }
 pathlib.Path(manifest).write_text(json.dumps(doc), encoding="utf-8")

@@ -150,6 +150,7 @@ class Credentials:
     no_new_privs: int | None = None
     capabilities_clear: bool | None = None
     zombie: bool = False
+    exiting: bool = False
     supplementary_gids: tuple[int, ...] = ()
 
 
@@ -198,7 +199,7 @@ class CredentialPlatform:
             caps = all(int(fields.get(k, "0"), 16) == 0 for k in ("CapInh", "CapPrm", "CapEff", "CapAmb"))
             return Credentials(
                 pid, uids, gids, int(fields.get("NoNewPrivs", "0")), caps,
-                fields.get("State", "").startswith("Z"), supplementary_gids,
+                fields.get("State", "").startswith("Z"), False, supplementary_gids,
             )
         except (KeyError, ValueError, OSError) as exc:
             raise InventoryError(f"could not inspect /proc/{pid}/status: {exc}") from exc
@@ -272,6 +273,11 @@ class CredentialPlatform:
                 (int(info.pbi_ruid), int(info.pbi_uid), int(info.pbi_svuid), int(info.pbi_uid)),
                 (int(info.pbi_rgid), int(info.pbi_gid), int(info.pbi_svgid), int(info.pbi_gid)),
                 zombie=int(info.pbi_status) == 5,
+                # PROC_FLAG_INEXIT: the kernel has committed this process to
+                # exit, so it has no remaining executable context from which
+                # descendants can escape. Darwin may retain this state briefly
+                # after a credential-scoped KILL and waitpid.
+                exiting=bool(int(info.pbi_flags) & 0x4),
             )
         return result
 
@@ -321,6 +327,7 @@ class CredentialPlatform:
                 (int(info.pbi_ruid), int(info.pbi_uid), int(info.pbi_svuid), int(info.pbi_uid)),
                 (int(info.pbi_rgid), int(info.pbi_gid), int(info.pbi_svgid), int(info.pbi_gid)),
                 zombie=int(info.pbi_status) == 5,
+                exiting=bool(int(info.pbi_flags) & 0x4),
             )
         return result
 
@@ -342,7 +349,7 @@ class CredentialPlatform:
     ) -> list[int]:
         return sorted(
             pid for pid, item in self.inventory(deadline).items()
-            if uid in item.uids[:3] and (not live_only or not item.zombie)
+            if uid in item.uids[:3] and (not live_only or not (item.zombie or item.exiting))
         )
 
 
