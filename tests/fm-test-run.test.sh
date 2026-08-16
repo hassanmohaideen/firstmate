@@ -1554,7 +1554,11 @@ test_required_containment_ambiguity_terminalizes() {
     printf 'skip: privileged executor unavailable; no containment_ambiguous claim\n'
     return 0
   fi
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-ambiguous.XXXXXX")
+  # Do not use macOS TMPDIR here: its per-user parent is mode 0700, so a
+  # deliberately dropped leased UID cannot traverse it even when this leaf is
+  # world-traversable. /tmp is the cross-platform shared temporary root needed
+  # by these credential-domain fixtures.
+  tmp=$(mktemp -d "/tmp/fm-test-executor-ambiguous.XXXXXX")
   chmod 0711 "$tmp"
   # Three normally-exiting bodies. The injected cleanup faults, not the process,
   # drive the required-mode ambiguity path: the real KILL still ran and the
@@ -1577,8 +1581,8 @@ SH
   "${py[@]}" "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err"
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "ambiguous containment must be red"; }
-  python3 - "$artifact" <<'PY' || { cat "$tmp/err"; rm -rf "$tmp"; fail "containment ambiguity evidence is wrong"; }
+  [ "$rc" -ne 0 ] || { cat "$tmp/out" "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "ambiguous containment must be red"; }
+  python3 - "$artifact" <<'PY' || { cat "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "containment ambiguity evidence is wrong"; }
 import json, pathlib, sys
 doc = json.load(open(sys.argv[1]))
 rows = doc["scripts"]
@@ -1606,7 +1610,7 @@ PY
 }
 
 test_required_public_runner_leased_uid() {
-  local tmp artifact rc
+  local tmp artifact fixture_runner rc
   # Proves the required credential-domain path through the PUBLIC runner: a test
   # script is executed as a leased high UID and terminalizes passed. Self-skips
   # when no root and no noninteractive sudo (the runner cannot self-escalate),
@@ -1618,8 +1622,18 @@ test_required_public_runner_leased_uid() {
     printf 'skip: privileged executor unavailable; no required public-runner claim\n'
     return 0
   fi
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-required-runner.XXXXXX")
+  # macOS TMPDIR lives below a mode-0700 per-user directory. A leased UID must
+  # be able to traverse every parent, so use the shared /tmp hierarchy.
+  tmp=$(mktemp -d "/tmp/fm-test-required-runner.XXXXXX")
   chmod 0711 "$tmp"
+  # The public runner makes its repository root the child's working directory.
+  # A hosted checkout may itself sit below a private home directory, so execute
+  # the current runner and supervisor from a minimal world-traversable fixture
+  # root rather than accidentally testing the host checkout's parent modes.
+  mkdir -p "$tmp/repo/bin"
+  cp "$RUNNER" "$SUPERVISOR" "$tmp/repo/bin/"
+  chmod -R a+rX "$tmp/repo"
+  fixture_runner="$tmp/repo/bin/fm-test-run.sh"
   cat >"$tmp/leased.test.sh" <<'SH'
 #!/usr/bin/env bash
 echo "runuid=$(id -u)"
@@ -1628,12 +1642,12 @@ SH
   chmod 0755 "$tmp/leased.test.sh"
   artifact="$tmp/artifact.json"
   set +e
-  FM_TEST_CONTAINMENT=required "$RUNNER" --json "$artifact" \
+  FM_TEST_CONTAINMENT=required "$fixture_runner" --json "$artifact" \
     --duration-baseline-ms 1000 "$tmp/leased.test.sh" >"$tmp/out" 2>"$tmp/err"
   rc=$?
   set -e
-  [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "required public-runner leased-UID run should pass"; }
-  python3 - "$artifact" "$(id -u)" <<'PY' || { cat "$tmp/err"; rm -rf "$tmp"; fail "required public-runner leased-UID evidence is wrong"; }
+  [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "required public-runner leased-UID run should pass"; }
+  python3 - "$artifact" "$(id -u)" <<'PY' || { cat "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "required public-runner leased-UID evidence is wrong"; }
 import json, re, sys
 doc = json.load(open(sys.argv[1]))
 caller = int(sys.argv[2])
@@ -1647,7 +1661,7 @@ runuid = int(match.group(1))
 assert runuid != caller, f"script ran as caller uid {runuid}, expected a leased identity"
 assert 61000 <= runuid <= 64999, f"script uid {runuid} outside the leased range 61000-64999"
 PY
-  rm -rf "$tmp"
+  remove_privileged_fixture_tree "$tmp"
   pass "required public-runner path runs a test as a leased high UID with passed terminal"
 }
 
