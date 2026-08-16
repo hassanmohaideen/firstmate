@@ -504,6 +504,7 @@ class Attempt:
     log_path: pathlib.Path | None = None
     started_mono: float | None = None
     deadline_mono: float | None = None
+    budget_deadline_derived: bool = False
     wait_status: int | None = None
     completion_observed_mono: float | None = None
     deadline_expired: bool = False
@@ -944,10 +945,9 @@ class LaneExecutor:
             scheduling_deadline = self._execution_deadline() if self.required else self.ordinary_deadline
             attempt.deadline_mono = scheduling_deadline - reserved
             if enforce_budget and budget_ms is not None:
-                attempt.deadline_mono = min(
-                    attempt.started_mono + float(budget_ms) / 1000.0,
-                    attempt.deadline_mono,
-                )
+                budget_deadline = attempt.started_mono + float(budget_ms) / 1000.0
+                attempt.budget_deadline_derived = budget_deadline <= attempt.deadline_mono
+                attempt.deadline_mono = min(budget_deadline, attempt.deadline_mono)
             if self.required and baseline_ms is not None and attempt.deadline_mono - attempt.started_mono < baseline_seconds:
                 raise ContainmentError(f"startup exceeded the reserved window for {row['path']}")
             row["attempt_count"] = 1
@@ -1186,6 +1186,8 @@ class LaneExecutor:
             required_skip = attempt.required_skip_seen
             budget = attempt.row.get("duration_budget_ms")
             exceeded = budget is not None and duration_ms > int(budget)
+            if cause == "deadline" and attempt.deadline_expired and attempt.budget_deadline_derived:
+                exceeded = True
             if cause == "interrupted":
                 result, public_exit = "interrupted", 128 + int(self.interrupted or signal.SIGTERM)
             elif cause == "deadline":

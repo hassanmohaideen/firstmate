@@ -949,6 +949,8 @@ import json, pathlib, sys
 artifact = json.load(open(sys.argv[1]))
 assert [row["terminal"]["result"] for row in artifact["scripts"]] == ["timeout", "passed"]
 assert all(row.get("attempt_count") == 1 for row in artifact["scripts"])
+assert artifact["scripts"][0]["duration_budget_exceeded"] is True, artifact["scripts"][0]
+assert artifact["summary"]["duration_budget_exceeded"] == 1, artifact["summary"]
 assert artifact["summary"]["failed"] == 1, artifact["summary"]
 assert artifact["summary"]["failed"] <= artifact["summary"]["total"]
 assert pathlib.Path(sys.argv[2]).read_text().splitlines() == ["hang", "after"]
