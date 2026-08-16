@@ -406,6 +406,23 @@ SH
 
 make_fake_herdr_secondmate_recovery() {
   local fakebin=$1
+  mv "$fakebin/ps" "$fakebin/ps-session-base"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  "-axo pid=,ppid=")
+    printf '41001 1\n41002 41001\n42001 1\n'
+    /bin/ps "$@"
+    ;;
+  "-p 41002 -o comm=") printf 'pi\n' ;;
+  "-p 41002 -o pgid=") printf '41002\n' ;;
+  "-p 42001 -o comm=") printf 'zsh\n' ;;
+  "-p 42001 -o stat=") printf 'S\n' ;;
+  *) exec "${0%/*}/ps-session-base" "$@" ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
   # The recovery kill now requires the shared named-session lock and an exact
   # focus snapshot. Keep a focused sibling tab so this test's husk close is
   # provably non-workspace-emptying and never needs to signal a fake shell pid.
@@ -453,9 +470,9 @@ case "${1:-} ${2:-}" in
   "pane get")
     pane=${3:-}
     if [ "$pane" = p-new ] && [ -e "$spawned" ]; then
-      printf '%s\n' '{"result":{"pane":{"pane_id":"p-new","tab_id":"t-new","workspace_id":"ws1"}}}'
+      printf '%s\n' '{"result":{"pane":{"pane_id":"p-new","tab_id":"t-new","workspace_id":"ws1","terminal_id":"terminal-new"}}}'
     elif [ "$pane" = p-old ] && [ ! -e "$killed" ]; then
-      printf '%s\n' '{"result":{"pane":{"pane_id":"p-old","tab_id":"t-old","workspace_id":"ws1"}}}'
+      printf '%s\n' '{"result":{"pane":{"pane_id":"p-old","tab_id":"t-old","workspace_id":"ws1","terminal_id":"terminal-old"}}}'
     else
       printf '%s\n' '{"error":{"code":"pane_not_found"}}' >&2
       exit 1
@@ -463,9 +480,18 @@ case "${1:-} ${2:-}" in
     ;;
   "agent get")
     if [ "${3:-}" = p-new ] && [ -e "$spawned" ]; then
-      printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}'
+      printf '%s\n' '{"result":{"agent":{"pane_id":"p-new","tab_id":"t-new","workspace_id":"ws1","terminal_id":"terminal-new","agent_status":"idle"}}}'
     else
       printf '%s\n' '{"error":{"code":"agent_not_found"}}' >&2
+      exit 1
+    fi
+    ;;
+  "pane process-info")
+    if [ "${3:-}" = --pane ] && [ "${4:-}" = p-new ] && [ -e "$spawned" ]; then
+      printf '%s\n' '{"result":{"type":"pane_process_info","process_info":{"pane_id":"p-new","shell_pid":41001,"foreground_process_group_id":41002,"foreground_processes":[{"pid":41002,"name":"pi","argv0":"pi"}]}}}'
+    elif [ "${3:-}" = --pane ] && [ "${4:-}" = p-old ] && [ ! -e "$killed" ]; then
+      printf '%s\n' '{"result":{"type":"pane_process_info","process_info":{"pane_id":"p-old","shell_pid":42001,"foreground_process_group_id":42001,"foreground_processes":[{"pid":42001,"name":"zsh","argv0":"-zsh"}]}}}'
+    else
       exit 1
     fi
     ;;

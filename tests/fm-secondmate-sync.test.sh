@@ -578,19 +578,24 @@ make_nudge_herdr_fake() {
   cat > "$fakebin/herdr" <<SH
 #!/usr/bin/env bash
 set -u
-cmd=\${1:-}; sub=\${2:-}; arg=\${3:-}
+cmd=\${1:-}; sub=\${2:-}; arg=\${3:-}; arg2=\${4:-}
 case "\$cmd \$sub" in
   "status --json")
     printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
     ;;
   "pane get")
-    if [ "\$arg" = "${stale#*:}" ]; then
-      printf '{"result":{"pane":{"pane_id":"${stale#*:}"}}}\n'
-    elif [ "\$arg" = "${fresh#*:}" ]; then
-      printf '{"result":{"pane":{"pane_id":"${fresh#*:}"}}}\n'
+    if [ "\$arg" = "${stale#*:}" ] || [ "\$arg" = "${fresh#*:}" ]; then
+      printf '{"result":{"pane":{"pane_id":"%s","tab_id":"tab-1","workspace_id":"workspace-1","terminal_id":"terminal-1"}}}\n' "\$arg"
     else
       printf '{"error":{"code":"pane_not_found","message":"missing"}}\n' >&2
       exit 0
+    fi
+    ;;
+  "pane process-info")
+    if [ "\$arg" = "--pane" ] && [ "\$arg2" = "${stale#*:}" ]; then
+      printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"${stale#*:}","shell_pid":41001,"foreground_process_group_id":41001,"foreground_processes":[{"pid":41001,"name":"zsh","argv0":"-zsh"}]}}}\n'
+    else
+      exit 1
     fi
     ;;
   "agent get")
@@ -612,6 +617,16 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/herdr"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  "-p 41001 -o comm=") printf 'zsh\n' ;;
+  "-p 41001 -o stat=") printf 'S\n' ;;
+  "-axo pid=,ppid=") printf '41001 1\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
   printf '%s\n' "$fakebin"
 }
 
