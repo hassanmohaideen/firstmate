@@ -73,6 +73,8 @@ jobs:
             echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
           } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Prove credential-domain containment semantics
         run: |
           set -eu
@@ -132,6 +134,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -182,6 +185,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -246,6 +250,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install pinned ShellCheck
         run: |
           set -eu

@@ -1634,13 +1634,25 @@ test_required_public_runner_leased_uid() {
   # A hosted checkout may itself sit below a private home directory, so execute
   # the current runner and supervisor from a minimal world-traversable fixture
   # root rather than accidentally testing the host checkout's parent modes.
-  mkdir -p "$tmp/repo/bin"
+  mkdir -p "$tmp/repo/bin" "$tmp/repo/.git"
   cp "$RUNNER" "$SUPERVISOR" "$tmp/repo/bin/"
-  chmod -R a+rX "$tmp/repo"
+  chmod 0755 "$tmp/repo" "$tmp/repo/bin" "$tmp/repo/bin/fm-test-run.sh"
+  chmod 0700 "$tmp/repo/bin/fm-test-supervisor.py"
+  printf 'checkout_readable=true\n' >"$tmp/repo/support.sh"
+  chmod 0600 "$tmp/repo/support.sh"
+  printf 'runner-secret\n' >"$tmp/repo/.git/config"
+  chmod 0755 "$tmp/repo/.git"
+  chmod 0644 "$tmp/repo/.git/config"
   fixture_runner="$tmp/repo/bin/fm-test-run.sh"
   cat >"$tmp/leased.test.sh" <<'SH'
 #!/usr/bin/env bash
-echo "runuid=$(id -u)"
+. "$PWD/support.sh"
+[ "$checkout_readable" = true ]
+if cat "$PWD/.git/config" >/dev/null 2>&1; then
+  echo "leased identity read checkout Git metadata" >&2
+  exit 9
+fi
+echo "runuid=$(id -u) git_metadata=unreadable"
 exit 0
 SH
   chmod 0755 "$tmp/leased.test.sh"
@@ -1661,6 +1673,7 @@ row = doc["scripts"][0]
 assert row["terminal"]["result"] == "passed", row["terminal"]
 match = re.search(r"runuid=(\d+)", row.get("output_tail", ""))
 assert match, row.get("output_tail")
+assert "git_metadata=unreadable" in row.get("output_tail", ""), row.get("output_tail")
 runuid = int(match.group(1))
 assert runuid != caller, f"script ran as caller uid {runuid}, expected a leased identity"
 assert 61000 <= runuid <= 64999, f"script uid {runuid} outside the leased range 61000-64999"

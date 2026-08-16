@@ -1094,8 +1094,8 @@ class LaneExecutor:
             self._qualify_host_primitives()
             for row in self.doc["scripts"]:
                 self.preacquired_leases[row["index"]] = self.lease_pool.acquire()
-            self._validate_schedule_window(time.monotonic())
             self._grant_leased_checkout_access()
+            self._validate_schedule_window(time.monotonic())
         except BaseException:
             self._release_preacquired_leases()
             raise
@@ -1108,10 +1108,10 @@ class LaneExecutor:
         # script sources. The checkout is owned by the unprivileged runner user,
         # so a leased identity outside that user's groups can traverse into it
         # (directories are commonly world-executable) yet cannot necessarily read
-        # its files. Grant world read+traverse on the checkout tree, read-only, so
-        # every leased identity can read the scripts; the tree stays unwritable by
-        # children, and no secret material lives in a source checkout. Also grant
-        # traverse on each ancestor directory so a leased identity can descend to
+        # its files. Grant world read+traverse on the checkout tree except its Git
+        # metadata, read-only, so every leased identity can read the scripts while
+        # the tree stays unwritable by children. Also grant traverse on each
+        # ancestor directory so a leased identity can descend to
         # the checkout even when an intermediate directory is not world-executable.
         # Best-effort: a residual permission problem then surfaces per script as a
         # captured setup error rather than silently exiting 126.
@@ -1124,9 +1124,18 @@ class LaneExecutor:
             except OSError:
                 pass
             parent = os.path.dirname(parent)
+        git_metadata = os.path.join(root, ".git")
+        try:
+            metadata_stat = os.lstat(git_metadata)
+        except FileNotFoundError:
+            metadata_stat = None
+        if metadata_stat is not None:
+            if stat.S_ISLNK(metadata_stat.st_mode):
+                raise ContainmentError("checkout Git metadata must not be a symlink")
+            os.chmod(git_metadata, stat.S_IMODE(metadata_stat.st_mode) & ~0o077)
         try:
             subprocess.run(
-                ["chmod", "-R", "o+rX", root],
+                ["find", root, "-path", git_metadata, "-prune", "-o", "-exec", "chmod", "o+rX", "{}", "+"],
                 check=False,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
