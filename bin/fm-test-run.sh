@@ -952,20 +952,22 @@ for path_text in sys.argv[3:]:
         errors.append(f"{path}: {reason}")
         continue
     rows = doc["scripts"]
-    lane_summary = doc.get("summary") or {}
+    lane_summary = doc["summary"]
+    metrics = supervisor.artifact_terminal_metrics(rows)
     lanes.append({
         "path": str(path), "run_id": doc.get("run_id"),
         "selection": doc.get("selection"), "started_at": doc.get("started_at"),
         "finished_at": doc.get("finished_at"), "summary": lane_summary,
     })
     summary["lanes"] += 1
-    summary["total"] += int(lane_summary.get("total") or 0)
-    summary["failed"] += int(lane_summary.get("failed") or 0)
-    summary["skipped_gate"] += int(lane_summary.get("skipped_gate") or 0)
-    summary["duration_budget_exceeded"] += int(lane_summary.get("duration_budget_exceeded") or 0)
-    summary["duration_budget_missing"] += int(lane_summary.get("duration_budget_missing") or 0)
+    summary["total"] += metrics["total"]
+    summary["failed"] += metrics["failed"]
+    summary["skipped_gate"] += metrics["skipped_gate"]
+    summary["duration_budget_exceeded"] += metrics["duration_budget_exceeded"]
+    summary["duration_budget_missing"] += metrics["duration_budget_missing"]
     summary["critical_path_duration_ms"] = max(
-        summary["critical_path_duration_ms"], int(lane_summary.get("duration_ms") or 0)
+        summary["critical_path_duration_ms"],
+        max((int(row.get("duration_ms") or 0) for row in rows), default=0),
     )
     for row in rows:
         item = dict(row)

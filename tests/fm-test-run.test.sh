@@ -1233,17 +1233,22 @@ assert doc["complete"] is True
 assert doc["summary"]["lanes"] == 2 and doc["summary"]["total"] == 2
 assert doc["summary"]["failed"] == 1 and len(doc["scripts"]) == 2
 PY
-  python3 - "$tmp/a.json" "$tmp/incomplete.json" "$tmp/duplicate.json" <<'PY'
+  python3 - "$tmp/a.json" "$tmp/b.json" "$tmp/incomplete.json" "$tmp/duplicate.json" "$tmp/dishonest.json" <<'PY'
 import json, sys
-source = json.load(open(sys.argv[1]))
-incomplete = json.loads(json.dumps(source))
+passing = json.load(open(sys.argv[1]))
+failing = json.load(open(sys.argv[2]))
+incomplete = json.loads(json.dumps(passing))
 incomplete["run"]["complete"] = False
-json.dump(incomplete, open(sys.argv[2], "w"))
-duplicate = json.loads(json.dumps(source))
+json.dump(incomplete, open(sys.argv[3], "w"))
+duplicate = json.loads(json.dumps(passing))
 duplicate["scripts"][0]["events"].append(dict(duplicate["scripts"][0]["events"][-1]))
-json.dump(duplicate, open(sys.argv[3], "w"))
+json.dump(duplicate, open(sys.argv[4], "w"))
+dishonest = json.loads(json.dumps(failing))
+dishonest["summary"]["failed"] = 0
+dishonest["run"]["result"] = "passed"
+json.dump(dishonest, open(sys.argv[5], "w"))
 PY
-  for bad in "$tmp/incomplete.json" "$tmp/duplicate.json"; do
+  for bad in "$tmp/incomplete.json" "$tmp/duplicate.json" "$tmp/dishonest.json"; do
     set +e
     "$RUNNER" --aggregate-json "$tmp/rejected.json" "$bad" >"$tmp/reject.out" 2>"$tmp/reject.err"
     rc=$?

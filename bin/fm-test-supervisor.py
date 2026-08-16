@@ -1256,6 +1256,17 @@ class LaneExecutor:
         return self.finalize()
 
 
+def artifact_terminal_metrics(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "total": len(rows),
+        "attempted": sum(1 for row in rows if row.get("attempt_count") == 1),
+        "failed": sum(1 for row in rows if row["terminal"]["result"] != "passed"),
+        "skipped_gate": sum(1 for row in rows if row.get("gate_skip") is True),
+        "duration_budget_exceeded": sum(1 for row in rows if row.get("duration_budget_exceeded") is True),
+        "duration_budget_missing": sum(1 for row in rows if row["duration_baseline_ms"] is None),
+    }
+
+
 def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
     if doc.get("schema_version") != SCHEMA_VERSION or doc.get("kind") != "fm-test-lane":
         return False, "unknown or mixed artifact schema"
@@ -1274,14 +1285,45 @@ def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
     if inventory(planned) != inventory(rows):
         return False, "planned/executed inventory mismatch"
     for row in rows:
-        starts = [item for item in row.get("events", []) if item.get("name") == "started"]
-        terminals = [item for item in row.get("events", []) if item.get("name") == "terminal"]
+        events = row.get("events")
+        if not isinstance(events, list) or any(not isinstance(item, dict) for item in events):
+            return False, f"invalid event inventory for {row.get('path')}"
+        starts = [item for item in events if item.get("name") == "started"]
+        terminals = [item for item in events if item.get("name") == "terminal"]
         if row.get("attempt_count") != 1 or len(starts) != 1:
             return False, f"missing or duplicate attempt for {row.get('path')}"
-        if not isinstance(row.get("terminal"), dict) or len(terminals) != 1:
+        terminal = row.get("terminal")
+        if (
+            not isinstance(terminal, dict)
+            or not isinstance(terminal.get("result"), str)
+            or len(terminals) != 1
+        ):
             return False, f"missing or duplicate terminal for {row.get('path')}"
-    if not doc.get("run", {}).get("complete"):
+    run = doc.get("run")
+    if not isinstance(run, dict) or run.get("complete") is not True:
         return False, "lane artifact is incomplete"
+    metrics = artifact_terminal_metrics(rows)
+    summary = doc.get("summary")
+    if not isinstance(summary, dict):
+        return False, "lane summary is inconsistent with terminal evidence"
+    for field in (
+        "total", "attempted", "failed", "skipped_gate",
+        "duration_budget_exceeded", "duration_budget_missing",
+    ):
+        if not isinstance(summary.get(field), int) or isinstance(summary.get(field), bool):
+            return False, "lane summary is inconsistent with terminal evidence"
+    for field in (
+        "total", "attempted", "skipped_gate",
+        "duration_budget_exceeded", "duration_budget_missing",
+    ):
+        if summary[field] != metrics[field]:
+            return False, "lane summary is inconsistent with terminal evidence"
+    policy_failed = metrics["failed"] + metrics["duration_budget_exceeded"] + metrics["duration_budget_missing"]
+    if summary["failed"] not in {metrics["failed"], policy_failed}:
+        return False, "lane summary is inconsistent with terminal evidence"
+    expected_result = "passed" if summary["failed"] == 0 else "failed"
+    if run.get("result") != expected_result:
+        return False, "lane result is inconsistent with terminal evidence"
     return True, "ok"
 
 
