@@ -757,7 +757,7 @@ parse_orca_worktree_result() {
 }
 
 spawn_abort_cleanup() {
-  local status=$?
+  local status=$? endpoint_kill_status=0 endpoint_state=
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] \
      && [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] \
      && [ -n "$SPAWN_META_TMP" ] \
@@ -803,12 +803,23 @@ spawn_abort_cleanup() {
   if [ "$GH_ALLOCATED_BLOCK_CLEANUP" = 1 ]; then
     GH_ALLOCATED_BLOCK_CLEANUP=0
     case "${BACKEND:-}" in
-      zellij) fm_backend_kill "$BACKEND" "${T:-}" "${ZELLIJ_TAB_ID:-}" "${W:-}" 2>/dev/null || true ;;
+      zellij)
+        fm_backend_kill "$BACKEND" "${T:-}" "${ZELLIJ_TAB_ID:-}" "${W:-}" 2>/dev/null \
+          || endpoint_kill_status=$?
+        ;;
       '') ;;
-      *) fm_backend_kill "$BACKEND" "${T:-}" 2>/dev/null || true ;;
+      *)
+        fm_backend_kill "$BACKEND" "${T:-}" 2>/dev/null \
+          || endpoint_kill_status=$?
+        ;;
     esac
-    if [ -n "${BACKEND:-}" ] && [ -n "${T:-}" ] \
-       && fm_backend_target_exists "$BACKEND" "$T" "${W:-}"; then
+    endpoint_state=unreadable
+    if [ -z "${BACKEND:-}" ] || [ -z "${T:-}" ]; then
+      endpoint_state=missing
+    else
+      endpoint_state=$(fm_backend_agent_state "$BACKEND" "$T")
+    fi
+    if [ "$endpoint_state" != missing ]; then
       mkdir -p "$STATE" 2>/dev/null || true
       if [ -d "$STATE" ]; then
         {
@@ -833,7 +844,7 @@ spawn_abort_cleanup() {
           [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
         } > "$STATE/$ID.meta" 2>/dev/null || true
       fi
-      echo "error: could not remove blocked task $ID's endpoint '$T'; worktree '${WT:-unknown}' remains leased and requires manual cleanup" >&2
+      echo "error: could not confirm removal of blocked task $ID's endpoint '$T' (kill_status=$endpoint_kill_status endpoint_state=$endpoint_state); worktree '${WT:-unknown}' remains leased and requires manual cleanup" >&2
     elif [ -n "${WT:-}" ]; then
       ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 \
         || echo "warning: could not return blocked task $ID's allocated worktree '$WT'" >&2

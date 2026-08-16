@@ -54,7 +54,13 @@ case "${1:-}" in
     printf 'firstmate\n'
     exit 0
     ;;
-  list-windows) exit 0 ;;
+  list-windows)
+    [ "${FM_FAKE_READ_FAIL:-0}" != 1 ] || exit 2
+    if [ -n "${FM_FAKE_ENDPOINT:-}" ] && [ -e "$FM_FAKE_ENDPOINT" ]; then
+      printf '%s\n' "${FM_FAKE_WINDOW:?FM_FAKE_WINDOW unset}"
+    fi
+    exit 0
+    ;;
   has-session|new-session) exit 0 ;;
   new-window) [ -z "${FM_FAKE_ENDPOINT:-}" ] || : > "$FM_FAKE_ENDPOINT"; exit 0 ;;
   kill-window)
@@ -117,8 +123,8 @@ run_settle_spawn() {
     FM_REAL_GIT="${FM_REAL_GIT:-}" FM_FAKE_GIT_LOG="${FM_FAKE_GIT_LOG:-}" \
     FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
     FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
-    FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
-    PATH="$FAKEBIN_DIR:$PATH" \
+    FM_FAKE_WINDOW="$id" FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
+    FM_FAKE_READ_FAIL="${FM_FAKE_READ_FAIL:-0}" PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
 
@@ -237,16 +243,17 @@ test_failed_endpoint_removal_retains_lease_and_recovery_record() {
   endpoint="$TMP_ROOT/cleanup-failure-endpoint"
   : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
 
-  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_KILL_FAIL=1 run_settle_spawn "$id")
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_KILL_FAIL=1 FM_FAKE_READ_FAIL=1 run_settle_spawn "$id")
   status=$?
   [ "$status" -ne 0 ] || fail "a divergent allocated worktree destination must block when endpoint cleanup fails"
-  assert_contains "$out" "could not remove blocked task $id's endpoint" "endpoint cleanup failure was not reported"
+  assert_contains "$out" "could not confirm removal of blocked task $id's endpoint" "unreadable endpoint cleanup failure was not reported"
+  assert_contains "$out" "endpoint_state=unreadable" "endpoint cleanup did not report its unreadable confirmation"
   assert_contains "$out" "$WT_DIR" "endpoint cleanup failure did not name the retained worktree"
   [ -e "$endpoint" ] || fail "the cleanup-failure fixture did not retain the endpoint"
-  assert_no_grep "return --force $WT_DIR" "$treehouse_log" "a worktree was returned while its endpoint remained"
+  assert_no_grep "return --force $WT_DIR" "$treehouse_log" "a worktree was returned while endpoint absence was unreadable"
   assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" "cleanup failure did not retain recoverable worktree metadata"
   assert_grep 'gh_gated=1' "$HOME_DIR/state/$id.meta" "cleanup failure did not retain the gated classification"
-  pass "failed endpoint removal retains the lease and a recoverable record"
+  pass "failed endpoint removal and unreadable liveness retain the lease and recovery record"
 }
 
 test_matching_allocated_worktree_destination_fast_paths_without_reprobe() {
