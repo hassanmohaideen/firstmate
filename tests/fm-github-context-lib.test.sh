@@ -446,9 +446,17 @@ test_gate_blocks_a_malformed_repository_owner_before_fast_path() {
 }
 
 test_gate_reports_when_gh_is_not_installed() {
-  local proj err rc
+  local proj err rc no_gh_bin command_path command_name
   proj=$(make_project gatenogh https://github.com/owner/repo.git)
-  err=$(PATH=/usr/bin:/bin fm_github_ctx_gate "$proj" github github.com repository owner/repo push '' '' 2>&1 >/dev/null)
+  no_gh_bin="$proj/no-gh-bin"
+  mkdir -p "$no_gh_bin"
+  # Preserve the gate's real Git and URL-normalization behavior.
+  # Make gh deterministically absent even when a CI image installs it in /usr/bin.
+  for command_name in git tr; do
+    command_path=$(command -v "$command_name") || fail "required test command $command_name is unavailable"
+    ln -s "$command_path" "$no_gh_bin/$command_name"
+  done
+  err=$(PATH="$no_gh_bin" fm_github_ctx_gate "$proj" github github.com repository owner/repo push '' '' 2>&1 >/dev/null)
   rc=$?
   [ "$rc" -eq 2 ] || fail "a gate without gh must block indeterminate (rc $rc)"
   case "$err" in
