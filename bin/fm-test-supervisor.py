@@ -543,38 +543,45 @@ class LaneExecutor:
         print(f"fm-test-supervisor: containment refused before test execution: {reason}", file=sys.stderr)
         return 2
 
+    def _script_allowance(self, row: dict[str, Any], unstarted: int, now: float) -> tuple[float, float]:
+        jobs = max(1, int(self.manifest["jobs"]))
+        budget_ms = row.get("duration_budget_ms") or 30000
+        reserve = CLEANUP_RESERVE + math.ceil(unstarted / jobs) * (START_RESERVE + CLEANUP_RESERVE)
+        allowance = min(float(budget_ms) / 1000.0, self.ordinary_deadline - now - reserve)
+        return allowance, reserve
+
     def _validate_schedule_window(self) -> None:
         jobs = max(1, int(self.manifest["jobs"]))
         pending = list(self.doc["scripts"])
-        active: list[tuple[float, int, str]] = []
-        elapsed = 0.0
-        available = self.ordinary_deadline - time.monotonic()
+        active: list[tuple[float, str]] = []
+        projected = time.monotonic()
 
         while pending or active:
             launched = False
             while pending and len(active) < jobs:
                 row = pending[0]
-                if row.get("phase") == "serial" and active:
+                if row["phase"] == "serial" and active:
                     break
-                if any(phase == "serial" for _, _, phase in active):
+                if any(phase == "serial" for _, phase in active):
                     break
                 pending.pop(0)
-                baseline_ms = row.get("duration_baseline_ms")
-                required = START_RESERVE + CLEANUP_RESERVE
-                if baseline_ms is not None:
-                    required += float(baseline_ms) / 1000.0
-                completion = elapsed + required
-                if completion >= available:
-                    raise ContainmentError(
-                        f"manifest schedule cannot fit {row['path']}: "
-                        f"requires {completion:.1f}s, available {max(0.0, available):.1f}s "
-                        "before the ordinary deadline"
-                    )
-                active.append((completion, int(row["index"]), row.get("phase", "serial")))
+                baseline_ms = row["duration_baseline_ms"]
+                if baseline_ms is None:
+                    baseline_seconds = 0.0
+                else:
+                    baseline_seconds = float(baseline_ms) / 1000.0
+                    allowance, _reserve = self._script_allowance(row, len(pending), projected)
+                    if allowance < baseline_seconds:
+                        raise ContainmentError(
+                            f"manifest schedule cannot fit {row['path']}: "
+                            f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
+                            "before the ordinary deadline"
+                        )
+                active.append((projected + baseline_seconds, row["phase"]))
                 launched = True
             if active and (not launched or len(active) >= jobs or not pending):
-                elapsed = min(completion for completion, _, _ in active)
-                active = [entry for entry in active if entry[0] > elapsed]
+                projected = min(completion for completion, _ in active)
+                active = [entry for entry in active if entry[0] > projected]
 
     def preflight(self) -> None:
         self._validate_schedule_window()
@@ -636,10 +643,10 @@ class LaneExecutor:
 
     def start(self, row: dict[str, Any], unstarted: int) -> Attempt | None:
         attempt = Attempt(row)
-        budget_ms = row.get("duration_budget_ms") or 30000
-        reserve = CLEANUP_RESERVE + math.ceil(unstarted / max(1, int(self.manifest["jobs"]))) * (START_RESERVE + CLEANUP_RESERVE)
-        allowance = min(float(budget_ms) / 1000.0, self.ordinary_deadline - time.monotonic() - reserve)
-        if allowance <= START_RESERVE:
+        allowance, reserve = self._script_allowance(row, unstarted, time.monotonic())
+        baseline_ms = row.get("duration_baseline_ms")
+        baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
+        if allowance < max(START_RESERVE, baseline_seconds):
             row["events"].append(event("deadline_unavailable", remaining_reserve_seconds=reserve))
             row["terminal"] = event("terminal", result="deadline_unavailable", exit=125, attempted=False)
             row["exit"] = 125
@@ -721,18 +728,31 @@ class LaneExecutor:
             attempt.log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             row["diagnostic_log"] = str(log_path)
             self.append(attempt, "prepared", uid=lease.uid if lease else os.getuid())
-            attempt.started_mono = time.monotonic()
-            attempt.deadline_mono = attempt.started_mono + allowance
-            row["attempt_count"] = 1
-            self.doc["summary"]["attempted"] += 1
-            self.append(attempt, "started", allowance_ms=int(allowance * 1000))
             os.write(write_release, b"R")
             os.close(write_release)
             attempt.release_fd = None
             self.selector.register(read_output, selectors.EVENT_READ, attempt)
             self.active[pid] = attempt
+            attempt.started_mono = time.monotonic()
+            attempt.deadline_mono = attempt.started_mono + allowance
+            row["attempt_count"] = 1
+            self.doc["summary"]["attempted"] += 1
+            try:
+                self.append(attempt, "started", allowance_ms=int(allowance * 1000))
+            except BaseException:
+                row.pop("attempt_count", None)
+                row["events"] = [item for item in row["events"] if item.get("name") != "started"]
+                self.doc["summary"]["attempted"] -= 1
+                raise
             return attempt
         except BaseException as exc:
+            if attempt.pid is not None:
+                self.active.pop(attempt.pid, None)
+            if attempt.output_fd is not None:
+                try:
+                    self.selector.unregister(attempt.output_fd)
+                except (KeyError, ValueError):
+                    pass
             if attempt.release_fd is not None:
                 os.close(attempt.release_fd)
                 attempt.release_fd = None
@@ -1042,10 +1062,14 @@ def validate_artifact_document(doc: dict[str, Any]) -> tuple[bool, str]:
     rows = doc.get("scripts")
     if not isinstance(planned, list) or not isinstance(rows, list):
         return False, "planned/scripts inventories are missing"
-    identities = lambda values: [(v.get("path"), v.get("attempt")) for v in values]
+    if any(not isinstance(row, dict) for row in planned + rows):
+        return False, "planned/executed inventory mismatch"
+    if any(any(field not in row for field in IMMUTABLE_PLANNED_FIELDS) for row in planned + rows):
+        return False, "planned/executed inventory mismatch"
+    identities = lambda values: [(v["path"], v["attempt"]) for v in values]
     if len(set(identities(planned))) != len(planned) or len(set(identities(rows))) != len(rows):
         return False, "duplicate planned or attempted identity"
-    inventory = lambda values: [tuple(v.get(field) for field in IMMUTABLE_PLANNED_FIELDS) for v in values]
+    inventory = lambda values: [tuple(v[field] for field in IMMUTABLE_PLANNED_FIELDS) for v in values]
     if inventory(planned) != inventory(rows):
         return False, "planned/executed inventory mismatch"
     for row in rows:
@@ -1178,6 +1202,20 @@ def qualify(artifact: pathlib.Path) -> int:
     atomic_json(artifact, result)
     targets: list[tuple[int, Lease]] = []
     leases: list[Lease] = []
+
+    def cleanup_domains() -> list[str]:
+        for pid, lease in targets:
+            try:
+                helper_signal(lease.uid, lease.gid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (OSError, ChildProcessError):
+                pass
+        return [
+            f"uid {lease.uid} remained non-quiescent"
+            for lease in leases
+            if not prove_domain_quiescent(lease.uid, lease.gid)
+        ]
+
     # Qualification leases live in a private temp directory, never beside the
     # uploaded artifact, and are removed whole on exit. This keeps identity lock
     # bytes (including any .quarantine files) out of the evidence upload and
@@ -1228,6 +1266,7 @@ def qualify(artifact: pathlib.Path) -> int:
         reparented_lease = pool.acquire()
         leases.append(reparented_lease)
         reparented = spawn_reparented_target(reparented_lease.uid, reparented_lease.gid)
+        targets.append((reparented, reparented_lease))
         platform.verify_pid(reparented, reparented_lease.uid, reparented_lease.gid)
         if not prove_domain_quiescent(reparented_lease.uid, reparented_lease.gid):
             raise ContainmentError("reparented setsid qualification domain did not quiesce")
@@ -1236,6 +1275,7 @@ def qualify(artifact: pathlib.Path) -> int:
         storm_lease = pool.acquire()
         leases.append(storm_lease)
         storm = spawn_fork_storm_target(storm_lease.uid, storm_lease.gid)
+        targets.append((storm, storm_lease))
         platform.verify_pid(storm, storm_lease.uid, storm_lease.gid)
         helper_signal(storm_lease.uid, storm_lease.gid, signal.SIGTERM)
         time.sleep(0.1)
@@ -1258,18 +1298,11 @@ def qualify(artifact: pathlib.Path) -> int:
         # BEFORE publishing a passing result. A surviving, unreadable, or
         # non-quiescent domain must make qualification red here, never a pass
         # printed ahead of a best-effort finally that could swallow the failure.
-        for pid, lease in targets:
-            try:
-                helper_signal(lease.uid, lease.gid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (OSError, ChildProcessError):
-                pass
-        targets.clear()
-        for lease in leases:
-            if not prove_domain_quiescent(lease.uid, lease.gid):
-                raise ContainmentError(
-                    f"qualification lease uid {lease.uid} did not quiesce before publication"
-                )
+        cleanup_errors = cleanup_domains()
+        if cleanup_errors:
+            raise ContainmentError(
+                f"qualification cleanup failed: {', '.join(cleanup_errors)}"
+            )
         shutil.rmtree(lease_root, ignore_errors=True)
         result["checks"].append({"name": "all-domains-quiescent-before-publish", "passed": True})
         result.update({"complete": True, "passed": True, "finished_at": iso_now()})
@@ -1277,20 +1310,17 @@ def qualify(artifact: pathlib.Path) -> int:
         print(f"FM_TEST_QUALIFICATION platform={sys.platform} passed=true")
         return 0
     except BaseException as exc:
-        result.update({"complete": True, "passed": False, "blocker": str(exc), "finished_at": iso_now()})
+        cleanup_errors = cleanup_domains()
+        blocker = str(exc)
+        if cleanup_errors:
+            blocker = f"{blocker}; qualification cleanup failed: {', '.join(cleanup_errors)}"
+        result.update({"complete": True, "passed": False, "blocker": blocker, "finished_at": iso_now()})
         atomic_json(artifact, result)
-        print(f"fm-test-supervisor: platform qualification failed: {exc}", file=sys.stderr)
+        print(f"fm-test-supervisor: platform qualification failed: {blocker}", file=sys.stderr)
         return 1
     finally:
-        for pid, lease in targets:
-            try:
-                helper_signal(lease.uid, lease.gid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (OSError, ChildProcessError):
-                pass
-        # Remove the whole private lease directory so no identity lock bytes
-        # survive the qualification or reach the evidence upload.
-        shutil.rmtree(lease_root, ignore_errors=True)
+        if not cleanup_domains():
+            shutil.rmtree(lease_root, ignore_errors=True)
 
 
 def pid_reuse_fixture() -> int:
