@@ -543,8 +543,11 @@ class Lease:
 class LeasePool:
     def __init__(self, platform: CredentialPlatform, seed: str, directory: pathlib.Path) -> None:
         self.platform = platform
-        self.directory = directory
-        self._ensure_root_directory(self.directory)
+        self.metadata_directory = directory
+        self._ensure_root_directory(self.metadata_directory)
+        self.directory = LEASE_DIRECTORY_ROOT
+        if self.directory != self.metadata_directory:
+            self._ensure_root_directory(self.directory)
         self.offset = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % (UID_MAX - UID_MIN + 1)
         self.allocated: set[int] = set()
         owner = self.platform.pid_credentials(os.getpid())
