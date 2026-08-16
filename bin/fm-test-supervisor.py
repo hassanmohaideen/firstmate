@@ -1124,7 +1124,7 @@ class LaneExecutor:
             delivered, code = False, errno.EIO
         if code not in (0, *EMPTY_DOMAIN_PROBE_ERRNOS):
             attempt.cleanup_ambiguous = True
-        if sig != 0 and not delivered:
+        if sig != 0 and not delivered and code not in EMPTY_DOMAIN_PROBE_ERRNOS:
             attempt.cleanup_ambiguous = True
         return delivered, code
 
