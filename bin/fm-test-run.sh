@@ -1848,7 +1848,7 @@ if [ -n "$FAIL_ON_GATE_SKIP" ] && python3 - "$JSON_PATH" "$FAIL_ON_GATE_SKIP" <<
 import json, pathlib, sys
 doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 raise SystemExit(0 if any(
-    row.get("terminal", {}).get("result") == "failed" and f"skip: {sys.argv[2]}" in row.get("output_tail", "")
+    row.get("terminal", {}).get("result") == "failed" and row.get("required_gate_skip_seen") is True
     for row in doc.get("scripts", [])
 ) else 1)
 PY

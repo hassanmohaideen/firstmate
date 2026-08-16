@@ -341,6 +341,9 @@ test_fail_on_gate_skip_token() {
   cat >"$skip_f" <<'SH'
 #!/usr/bin/env bash
 echo "skip: herdr not found"
+python3 - <<'PY'
+print("x" * 40000)
+PY
 exit 0
 SH
   chmod +x "$skip_f"

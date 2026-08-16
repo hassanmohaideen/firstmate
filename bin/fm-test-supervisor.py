@@ -41,6 +41,7 @@ CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
 LEASE_DIRECTORY_ROOT = pathlib.Path("/tmp/fm-test-credential-leases")
 QUIESCE_GRACE = 3.0
+TERMINAL_PUBLISH_RESERVE = 1.0
 OUTPUT_TAIL_BYTES = 32768
 IMMUTABLE_PLANNED_FIELDS = (
     "index",
@@ -178,10 +179,10 @@ class CredentialPlatform:
         else:
             raise ContainmentError(f"unsupported platform: {sys.platform}")
 
-    def inventory(self) -> dict[int, Credentials]:
+    def inventory(self, deadline: float | None = None) -> dict[int, Credentials]:
         if self.name == "linux":
-            return self._linux_inventory()
-        return self._darwin_inventory()
+            return self._linux_inventory(deadline)
+        return self._darwin_inventory(deadline)
 
     @staticmethod
     def _linux_pid_credentials(pid: int) -> Credentials:
@@ -203,13 +204,15 @@ class CredentialPlatform:
             raise InventoryError(f"could not inspect /proc/{pid}/status: {exc}") from exc
 
     @classmethod
-    def _linux_inventory(cls) -> dict[int, Credentials]:
+    def _linux_inventory(cls, deadline: float | None = None) -> dict[int, Credentials]:
         result: dict[int, Credentials] = {}
         proc = pathlib.Path("/proc")
         if not proc.is_dir():
             raise InventoryError("/proc is unavailable")
         unreadable: list[str] = []
         for entry in proc.iterdir():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise InventoryError("credential inventory exceeded its deadline")
             if not entry.name.isdigit():
                 continue
             try:
@@ -225,13 +228,15 @@ class CredentialPlatform:
             raise InventoryError(f"credential inventory unreadable for pids: {','.join(unreadable[:8])}")
         return result
 
-    def _darwin_inventory(self) -> dict[int, Credentials]:
+    def _darwin_inventory(self, deadline: float | None = None) -> dict[int, Credentials]:
         count = int(self._libproc.proc_listpids(1, 0, None, 0))
         if count <= 0:
             err = ctypes.get_errno()
             raise InventoryError(f"proc_listpids sizing failed: errno={err}")
         capacity = max(1024, count // ctypes.sizeof(ctypes.c_int) + 256)
         for _ in range(8):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise InventoryError("credential inventory exceeded its deadline")
             array = (ctypes.c_int * capacity)()
             byte_capacity = ctypes.sizeof(array)
             size = int(self._libproc.proc_listpids(1, 0, array, byte_capacity))
@@ -244,6 +249,8 @@ class CredentialPlatform:
             raise InventoryError("proc_listpids remained possibly truncated")
         result: dict[int, Credentials] = {}
         for pid in array[: size // ctypes.sizeof(ctypes.c_int)]:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise InventoryError("credential inventory exceeded its deadline")
             if pid <= 0:
                 continue
             info = DarwinProcBSDInfo()
@@ -330,9 +337,11 @@ class CredentialPlatform:
                 raise ContainmentError("blocked child retains Linux capabilities")
         return item
 
-    def domain_members(self, uid: int, *, live_only: bool = False) -> list[int]:
+    def domain_members(
+        self, uid: int, *, live_only: bool = False, deadline: float | None = None,
+    ) -> list[int]:
         return sorted(
-            pid for pid, item in self.inventory().items()
+            pid for pid, item in self.inventory(deadline).items()
             if uid in item.uids[:3] and (not live_only or not item.zombie)
         )
 
@@ -501,6 +510,12 @@ class Attempt:
     deadline_kill_sent: bool = False
     cleanup_ambiguous: bool = False
     tail: bytearray = field(default_factory=bytearray)
+    first_meaningful_seen: bool = False
+    first_meaningful_gate_skip: bool = False
+    line_prefix: bytearray = field(default_factory=bytearray)
+    line_has_content: bool = False
+    required_skip_seen: bool = False
+    token_overlap: bytes = b""
 
 
 class LaneExecutor:
@@ -514,10 +529,12 @@ class LaneExecutor:
         self.selector = selectors.DefaultSelector()
         self.interrupted: int | None = None
         self.active: dict[int, Attempt] = {}
+        self.max_active_seen = 1
         self.run_start_mono = time.monotonic()
         self.run_start_wall = time.time()
         self.ordinary_deadline = self._to_monotonic(float(manifest["deadlines"]["ordinary_epoch"]))
         self.terminal_deadline = self._to_monotonic(float(manifest["deadlines"]["terminal_epoch"]))
+        self.cleanup_deadline = self._to_monotonic(float(manifest["deadlines"]["cleanup_epoch"]))
         self.transient = pathlib.Path(tempfile.mkdtemp(prefix="fm-test-executor."))
         os.chmod(self.transient, 0o711)
         self.diagnostics = self.artifact_path.parent / f"{self.artifact_path.stem}.diagnostics"
@@ -534,6 +551,10 @@ class LaneExecutor:
 
     def _to_monotonic(self, epoch: float) -> float:
         return self.run_start_mono + (epoch - self.run_start_wall)
+
+    def _cleanup_limit(self) -> float:
+        publication_reserve = TERMINAL_PUBLISH_RESERVE * (self.max_active_seen + 1)
+        return min(self.terminal_deadline - publication_reserve, self.cleanup_deadline)
 
     def _initial_document(self) -> dict[str, Any]:
         scripts = []
@@ -557,6 +578,7 @@ class LaneExecutor:
                 "duration_ms": 0,
                 "exit": None,
                 "gate_skip": False,
+                "required_gate_skip_seen": False,
                 "duration_budget_exceeded": False,
                 "duration_baseline_measured": item.get("duration_baseline_ms") is not None,
                 # Test-only cleanup fault switch. Production manifests never set
@@ -844,6 +866,7 @@ class LaneExecutor:
             self.append(attempt, "prepared", uid=lease.uid if lease else os.getuid())
             self.selector.register(read_output, selectors.EVENT_READ, attempt)
             self.active[pid] = attempt
+            self.max_active_seen = max(self.max_active_seen, len(self.active))
             attempt.started_mono = time.monotonic()
             reserved = self._remaining_schedule_reserve(row) if self.required else 0.0
             attempt.deadline_mono = min(
@@ -912,6 +935,32 @@ class LaneExecutor:
                 self.lease_pool.retire(lease, quarantine=not quiet)
             return None
 
+    def _scan_output(self, attempt: Attempt, chunk: bytes, *, eof: bool = False) -> None:
+        required_token = self.manifest.get("fail_on_gate_skip") or ""
+        if required_token and not attempt.required_skip_seen:
+            needle = f"skip: {required_token}".encode()
+            searchable = attempt.token_overlap + chunk
+            attempt.required_skip_seen = needle in searchable
+            attempt.token_overlap = searchable[-max(0, len(needle) - 1):]
+        if attempt.first_meaningful_seen:
+            return
+        for byte in chunk:
+            if byte == 10:
+                if attempt.line_has_content:
+                    attempt.first_meaningful_seen = True
+                    attempt.first_meaningful_gate_skip = bytes(attempt.line_prefix).startswith(b"skip:")
+                    return
+                attempt.line_prefix.clear()
+                attempt.line_has_content = False
+                continue
+            if len(attempt.line_prefix) < 5:
+                attempt.line_prefix.append(byte)
+            if byte not in b" \t\r\v\f":
+                attempt.line_has_content = True
+        if eof and attempt.line_has_content:
+            attempt.first_meaningful_seen = True
+            attempt.first_meaningful_gate_skip = bytes(attempt.line_prefix).startswith(b"skip:")
+
     def _drain(self, attempt: Attempt) -> None:
         if attempt.output_fd is None:
             return
@@ -923,6 +972,7 @@ class LaneExecutor:
             except OSError:
                 chunk = b""
             if not chunk:
+                self._scan_output(attempt, b"", eof=True)
                 try:
                     self.selector.unregister(attempt.output_fd)
                 except (KeyError, ValueError):
@@ -932,6 +982,7 @@ class LaneExecutor:
                 return
             if attempt.log_fd is not None:
                 os.write(attempt.log_fd, chunk)
+            self._scan_output(attempt, chunk)
             attempt.tail.extend(chunk)
             if len(attempt.tail) > OUTPUT_TAIL_BYTES:
                 del attempt.tail[:-OUTPUT_TAIL_BYTES]
@@ -1013,7 +1064,7 @@ class LaneExecutor:
         expired = [attempt for attempt in self.active.values() if attempt.deadline_expired and not attempt.deadline_kill_sent]
         if not expired:
             return
-        grace = min(self.terminal_deadline, time.monotonic() + TERM_GRACE)
+        grace = min(self._cleanup_limit(), time.monotonic() + TERM_GRACE)
         while time.monotonic() < grace:
             now = time.monotonic()
             for attempt in list(self.active.values()):
@@ -1050,6 +1101,7 @@ class LaneExecutor:
         lease = attempt.lease
         diagnostics: list[int] = []
         ambiguous = attempt.cleanup_ambiguous
+        cleanup_limit = self._cleanup_limit()
 
         def checked_helper(sig: int) -> tuple[bool, int]:
             nonlocal ambiguous
@@ -1060,7 +1112,9 @@ class LaneExecutor:
                 return False, errno.EIO
 
         try:
-            diagnostics = self.platform.domain_members(lease.uid)
+            if time.monotonic() >= cleanup_limit:
+                raise InventoryError("terminal-evidence deadline reached before cleanup diagnostics")
+            diagnostics = self.platform.domain_members(lease.uid, deadline=cleanup_limit)
             attempt.row["events"].append(event("cleanup_diagnostics", reason=reason, member_pids=diagnostics))
         except InventoryError as exc:
             ambiguous = True
@@ -1070,7 +1124,7 @@ class LaneExecutor:
             if not delivered:
                 ambiguous = True
             attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
-        grace = time.monotonic() + TERM_GRACE
+        grace = min(cleanup_limit, time.monotonic() + TERM_GRACE)
         present = bool(diagnostics)
         last_code = 0
         while time.monotonic() < grace:
@@ -1083,7 +1137,7 @@ class LaneExecutor:
             if domain_probe_empty(present, last_code):
                 break
             time.sleep(0.05)
-        limit = min(self.terminal_deadline, time.monotonic() + QUIESCE_GRACE)
+        limit = min(cleanup_limit, time.monotonic() + QUIESCE_GRACE)
         while present and time.monotonic() < limit:
             self._enforce_other_deadlines(attempt)
             delivered, code = checked_helper(signal.SIGKILL)
@@ -1100,9 +1154,11 @@ class LaneExecutor:
             time.sleep(0.05)
         fault = attempt.row.get("test_fault")
         try:
+            if time.monotonic() >= cleanup_limit:
+                raise InventoryError("terminal-evidence deadline reached before quiescence proof")
             if fault == "unreadable_probe":
                 raise InventoryError("test_fault injected an unreadable quiescence probe")
-            survivors = self.platform.domain_members(lease.uid, live_only=True)
+            survivors = self.platform.domain_members(lease.uid, live_only=True, deadline=cleanup_limit)
         except InventoryError as exc:
             ambiguous = True
             attempt.row["events"].append(event("quiescence_unreadable", reason=str(exc)))
@@ -1114,7 +1170,9 @@ class LaneExecutor:
         attempt.row["events"].append(event("quiescence", proved=quiet, survivors=survivors, probe_errno=last_code))
         if attempt.wait_status is None and attempt.pid is not None:
             try:
-                _, attempt.wait_status = os.waitpid(attempt.pid, 0)
+                found, status = os.waitpid(attempt.pid, os.WNOHANG)
+                if found == attempt.pid:
+                    attempt.wait_status = status
             except (OSError, ChildProcessError):
                 pass
         if not quiet:
@@ -1153,10 +1211,8 @@ class LaneExecutor:
         duration_ms = int(max(0.0, time.monotonic() - (attempt.started_mono or time.monotonic())) * 1000)
         test_exit = self._exit_code(attempt.wait_status)
         output = bytes(attempt.tail).decode("utf-8", errors="replace")
-        first = next((line for line in output.splitlines() if line.strip()), "")
-        gate_skip = test_exit == 0 and first.startswith("skip:")
-        required_token = self.manifest.get("fail_on_gate_skip") or ""
-        required_skip = bool(required_token and f"skip: {required_token}" in output)
+        gate_skip = test_exit == 0 and attempt.first_meaningful_gate_skip
+        required_skip = attempt.required_skip_seen
         budget = attempt.row.get("duration_budget_ms")
         exceeded = budget is not None and duration_ms > int(budget)
         if cause == "interrupted":
@@ -1175,6 +1231,7 @@ class LaneExecutor:
             "duration_ms": duration_ms,
             "exit": public_exit,
             "gate_skip": gate_skip,
+            "required_gate_skip_seen": required_skip,
             "duration_budget_exceeded": exceeded,
             "output_tail": output,
             "terminal": event(
@@ -1285,7 +1342,7 @@ class LaneExecutor:
             if not delivered:
                 attempt.cleanup_ambiguous = True
             attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
-        grace = min(self.terminal_deadline, time.monotonic() + TERM_GRACE)
+        grace = min(self._cleanup_limit(), time.monotonic() + TERM_GRACE)
         while time.monotonic() < grace:
             for attempt in attempts:
                 self._drain(attempt)
