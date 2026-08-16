@@ -28,6 +28,7 @@ import selectors
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -1094,11 +1095,46 @@ class LaneExecutor:
             for row in self.doc["scripts"]:
                 self.preacquired_leases[row["index"]] = self.lease_pool.acquire()
             self._validate_schedule_window(time.monotonic())
+            self._grant_leased_checkout_access()
         except BaseException:
             self._release_preacquired_leases()
             raise
         self.doc["containment"]["qualified"] = True
         self.publish()
+
+    def _grant_leased_checkout_access(self) -> None:
+        # A leased-UID child runs each script with the checkout as its working
+        # directory and must read the selected test script plus every file that
+        # script sources. The checkout is owned by the unprivileged runner user,
+        # so a leased identity outside that user's groups can traverse into it
+        # (directories are commonly world-executable) yet cannot necessarily read
+        # its files. Grant world read+traverse on the checkout tree, read-only, so
+        # every leased identity can read the scripts; the tree stays unwritable by
+        # children, and no secret material lives in a source checkout. Also grant
+        # traverse on each ancestor directory so a leased identity can descend to
+        # the checkout even when an intermediate directory is not world-executable.
+        # Best-effort: a residual permission problem then surfaces per script as a
+        # captured setup error rather than silently exiting 126.
+        root = os.path.realpath(self.manifest["root"])
+        parent = os.path.dirname(root)
+        while parent and parent != os.path.dirname(parent):
+            try:
+                mode = stat.S_IMODE(os.stat(parent).st_mode)
+                os.chmod(parent, mode | 0o001)
+            except OSError:
+                pass
+            parent = os.path.dirname(parent)
+        try:
+            subprocess.run(
+                ["chmod", "-R", "o+rX", root],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _private_root(self, row: dict[str, Any], lease: Lease | None) -> pathlib.Path:
         root = self.transient / f"attempt-{row['index']}"
@@ -1187,10 +1223,21 @@ class LaneExecutor:
                     env = self._child_environment(private)
                     os.execve(self.manifest["bash"], [self.manifest["bash"], row["path"]], env)
                 except BaseException as exc:
-                    try:
-                        os.write(write_ready, (json.dumps({"error": repr(exc)}) + "\n").encode())
-                    except OSError:
-                        pass
+                    payload = (json.dumps({"error": repr(exc)}) + "\n").encode()
+                    # A pre-release failure (before the readiness pipe was closed)
+                    # is reported to the parent as a structured containment error
+                    # through write_ready. A post-release failure (chdir, child
+                    # environment build, or execve) happens after write_ready is
+                    # closed and after stderr was dup2'd onto the captured output
+                    # pipe, so also emit the reason on fd 2; that reaches the
+                    # durable diagnostic log and explains an exit 126 that would
+                    # otherwise be silent. Both writes are guarded because exactly
+                    # one channel is live depending on where the failure occurred.
+                    for target_fd in (write_ready, 2):
+                        try:
+                            os.write(target_fd, payload)
+                        except OSError:
+                            pass
                     os._exit(126)
             os.close(write_output)
             os.close(write_ready)
