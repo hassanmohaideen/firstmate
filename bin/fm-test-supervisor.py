@@ -477,6 +477,7 @@ class Attempt:
     started_mono: float | None = None
     deadline_mono: float | None = None
     wait_status: int | None = None
+    deadline_expired: bool = False
     cleanup_ambiguous: bool = False
     tail: bytearray = field(default_factory=bytearray)
 
@@ -925,27 +926,31 @@ class LaneExecutor:
             return 128 + os.WTERMSIG(status)
         return 1
 
+    def _expire_attempt(self, attempt: Attempt) -> None:
+        if attempt.deadline_expired:
+            return
+        attempt.deadline_expired = True
+        self.append(attempt, "deadline_expired")
+        if self.required and attempt.lease is not None:
+            try:
+                delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGTERM)
+            except BaseException:
+                delivered, code = False, errno.EIO
+            if not delivered:
+                attempt.cleanup_ambiguous = True
+            attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
+        elif attempt.pid is not None:
+            try:
+                os.killpg(attempt.pid, signal.SIGTERM)
+            except OSError:
+                pass
+
     def _enforce_other_deadlines(self, current: Attempt) -> None:
         now = time.monotonic()
         for other in list(self.active.values()):
             if other is current or other.deadline_mono is None or now < other.deadline_mono:
                 continue
-            if any(item.get("name") == "deadline_expired" for item in other.row["events"]):
-                continue
-            self.append(other, "deadline_expired")
-            if self.required and other.lease is not None:
-                try:
-                    delivered, code = helper_signal(other.lease.uid, other.lease.gid, signal.SIGTERM)
-                except BaseException:
-                    delivered, code = False, errno.EIO
-                if not delivered:
-                    other.cleanup_ambiguous = True
-                other.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
-            elif other.pid is not None:
-                try:
-                    os.killpg(other.pid, signal.SIGTERM)
-                except OSError:
-                    pass
+            self._expire_attempt(other)
 
     def _cleanup_domain(self, attempt: Attempt, reason: str) -> tuple[bool, list[int]]:
         if not self.required:
@@ -1042,11 +1047,12 @@ class LaneExecutor:
         return quiet, survivors
 
     def finish(self, attempt: Attempt, cause: str) -> None:
+        if attempt.deadline_expired:
+            cause = "deadline"
         self._drain(attempt)
         root_exited = self._poll_wait(attempt)
         if cause == "deadline":
-            if not any(item.get("name") == "deadline_expired" for item in attempt.row["events"]):
-                self.append(attempt, "deadline_expired")
+            self._expire_attempt(attempt)
         elif root_exited:
             self.append(attempt, "test_exited", exit=self._exit_code(attempt.wait_status))
         elif cause == "interrupted":
@@ -1176,34 +1182,48 @@ class LaneExecutor:
             self._drain(key.data)
         active = list(self.active.values())
         now = time.monotonic()
-        expired = [
-            attempt for attempt in active
-            if attempt.deadline_mono is not None and now >= attempt.deadline_mono
-            and not self._poll_wait(attempt)
-        ]
-        for attempt in expired:
-            if not any(item.get("name") == "deadline_expired" for item in attempt.row["events"]):
-                self.append(attempt, "deadline_expired")
-            if self.required and attempt.lease is not None:
-                try:
-                    delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGTERM)
-                except BaseException:
-                    delivered, code = False, errno.EIO
-                if not delivered:
-                    attempt.cleanup_ambiguous = True
-                attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
-            elif attempt.pid is not None:
-                try:
-                    os.killpg(attempt.pid, signal.SIGTERM)
-                except OSError:
-                    pass
+        for attempt in active:
+            if (
+                not attempt.deadline_expired
+                and attempt.deadline_mono is not None
+                and now >= attempt.deadline_mono
+                and not self._poll_wait(attempt)
+            ):
+                self._expire_attempt(attempt)
         for attempt in active:
             if attempt.pid not in self.active:
                 continue
-            if attempt in expired:
+            if attempt.deadline_expired:
                 self.finish(attempt, "deadline")
             elif self._poll_wait(attempt):
                 self.finish(attempt, "exit")
+
+    def _broadcast_interruption(self) -> None:
+        attempts = list(self.active.values())
+        for attempt in attempts:
+            assert attempt.lease is not None
+            try:
+                delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGTERM)
+            except BaseException:
+                delivered, code = False, errno.EIO
+            if not delivered:
+                attempt.cleanup_ambiguous = True
+            attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
+        grace = min(self.terminal_deadline, time.monotonic() + TERM_GRACE)
+        while time.monotonic() < grace:
+            for attempt in attempts:
+                self._drain(attempt)
+                self._poll_wait(attempt)
+            time.sleep(0.05)
+        for attempt in attempts:
+            assert attempt.lease is not None
+            try:
+                delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGKILL)
+            except BaseException:
+                delivered, code = False, errno.EIO
+            if not delivered:
+                attempt.cleanup_ambiguous = True
+            attempt.row["events"].append(event("domain_signaled", signal="KILL", delivered=delivered, errno=code))
 
     def run(self) -> int:
         self.publish()  # Complete planned manifest exists before any preflight/launch.
@@ -1215,6 +1235,8 @@ class LaneExecutor:
         pending = list(self.doc["scripts"])
         while pending or self.active:
             if self.interrupted is not None:
+                if self.required:
+                    self._broadcast_interruption()
                 for attempt in list(self.active.values()):
                     self.finish(attempt, "interrupted")
                 break
