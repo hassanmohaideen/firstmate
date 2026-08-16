@@ -1541,7 +1541,7 @@ PY
 }
 
 test_required_containment_ambiguity_terminalizes() {
-  local tmp manifest artifact rc
+  local tmp tmp_root manifest artifact rc
   local -a py=()
   # A contained caller under NO_NEW_PRIVS cannot escalate, so this self-skips
   # there instead of failing; the dedicated executor-behavior CI job runs it
@@ -1556,9 +1556,11 @@ test_required_containment_ambiguity_terminalizes() {
   fi
   # Do not use macOS TMPDIR here: its per-user parent is mode 0700, so a
   # deliberately dropped leased UID cannot traverse it even when this leaf is
-  # world-traversable. /tmp is the cross-platform shared temporary root needed
-  # by these credential-domain fixtures.
-  tmp=$(mktemp -d "/tmp/fm-test-executor-ambiguous.XXXXXX")
+  # world-traversable. Use the physical shared temporary root: macOS exposes it
+  # through the fixed /tmp -> /private/tmp compatibility symlink, while the
+  # privileged executor deliberately refuses all symlinked artifact paths.
+  tmp_root=$(python3 -c 'import os; print(os.path.realpath("/tmp"))')
+  tmp=$(mktemp -d "$tmp_root/fm-test-executor-ambiguous.XXXXXX")
   chmod 0711 "$tmp"
   # Three normally-exiting bodies. The injected cleanup faults, not the process,
   # drive the required-mode ambiguity path: the real KILL still ran and the
@@ -1610,7 +1612,7 @@ PY
 }
 
 test_required_public_runner_leased_uid() {
-  local tmp artifact fixture_runner rc
+  local tmp tmp_root artifact fixture_runner rc
   # Proves the required credential-domain path through the PUBLIC runner: a test
   # script is executed as a leased high UID and terminalizes passed. Self-skips
   # when no root and no noninteractive sudo (the runner cannot self-escalate),
@@ -1623,8 +1625,10 @@ test_required_public_runner_leased_uid() {
     return 0
   fi
   # macOS TMPDIR lives below a mode-0700 per-user directory. A leased UID must
-  # be able to traverse every parent, so use the shared /tmp hierarchy.
-  tmp=$(mktemp -d "/tmp/fm-test-required-runner.XXXXXX")
+  # be able to traverse every parent. Use the physical shared temporary root so
+  # the artifact path does not retain macOS's /tmp compatibility symlink.
+  tmp_root=$(python3 -c 'import os; print(os.path.realpath("/tmp"))')
+  tmp=$(mktemp -d "$tmp_root/fm-test-required-runner.XXXXXX")
   chmod 0711 "$tmp"
   # The public runner makes its repository root the child's working directory.
   # A hosted checkout may itself sit below a private home directory, so execute
