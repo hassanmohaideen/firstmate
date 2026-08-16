@@ -838,6 +838,37 @@ test_inflight_marker_prevents_duplicate_under_contention() {
   pass "the atomic in-flight marker prevents a duplicate response even under guard contention"
 }
 
+# The second side-effect the piggyback could corrupt is the ledger itself: a copy
+# computed from an old ledger must not overwrite a concurrent append. Optimistic-
+# concurrency commits detect the changed ledger and recompute from it instead.
+test_stale_ledger_commit_cannot_clobber_concurrent_append() {
+  local d f release reached p spins=0 ledger_path other
+  d=$(new_case ledger-cas)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  ledger_path=$(ledger "$d")
+  release="$d/commit-release"
+  reached="$release.reached"
+  mkfifo "$release"
+  (FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO="$release" run_driver "$d" respond --approve accepted >"$d/cas-out" 2>&1) & p=$!
+  while [ ! -e "$reached" ]; do
+    kill -0 "$p" 2>/dev/null || fail "the responder exited before reaching its ledger commit"
+    spins=$((spins + 1)); [ "$spins" -lt 1000000 ] || fail "the responder never reached its ledger commit"
+  done
+  # While the responder is paused before its commit, append an unrelated run that
+  # the responder's stale copy must not erase.
+  other='{"id":"OTHER-RUN","branch":"fm/other","rounds":[]}'
+  jq --argjson other "$other" '.runs += [$other]' "$ledger_path" > "$ledger_path.inject"
+  mv "$ledger_path.inject" "$ledger_path"
+  printf 'release\n' > "$release"
+  wait "$p" || fail "the paused responder did not complete after release"
+  [ "$(jq '[.runs[] | select(.id == "OTHER-RUN")] | length' "$ledger_path")" -eq 1 ] \
+    || fail "the stale ledger copy clobbered the concurrent append"
+  [ "$(jq -r '.runs[] | select(.id == "RUN-11") | .rounds[0].dispositions[0].state' "$ledger_path")" = approved_as_is ] \
+    || fail "the responder did not record its own disposition after recomputing from the current ledger"
+  pass "an optimistic-concurrency commit recomputes instead of clobbering a concurrent ledger append"
+}
+
 test_all_findings_fixed_and_audited_ready
 test_all_approved_and_explicit_rejection
 test_pr11_partial_fix_reproduction_and_proven_path
@@ -866,3 +897,4 @@ test_concurrent_direct_reentry_cannot_both_bypass
 test_probe_operational_error_refuses_closed
 test_inflight_marker_blocks_duplicate_response
 test_inflight_marker_prevents_duplicate_under_contention
+test_stale_ledger_commit_cannot_clobber_concurrent_append

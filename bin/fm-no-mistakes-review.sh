@@ -74,6 +74,13 @@
 # response twice -- a file cannot be atomically created twice.
 # Every ledger write is a same-directory atomic rename, so a crash mid-write
 # leaves the ledger at its prior or next complete state, never a partial one.
+# Ledger commits also use optimistic concurrency: the content hash captured when
+# a mutation reads the ledger is re-checked at the rename, and a changed ledger
+# forces a recompute from the current contents instead of overwriting it. So a
+# stale copy computed by a caller that bypassed the guard cannot clobber a
+# concurrent append -- the append-preserving invariant is protected at the
+# ledger-commit boundary, just as the at-most-once invariant is protected at the
+# response boundary.
 # A repeated or concurrent response never invokes the underlying CLI twice:
 # once a disposition request exists, replay is refused and audit-ready performs
 # any later public-evidence reconciliation.
@@ -101,11 +108,13 @@
 #   FM_NM_REVIEW_TEST_CRASH_HOLDING  kills the holder just after it takes the lock.
 #   FM_NM_REVIEW_TEST_NO_LOCKER      simulates an unavailable kernel lock primitive.
 #   FM_NM_REVIEW_TEST_INFLIGHT_FIFO  blocks a responder after it claims the in-flight marker.
+#   FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO  blocks a ledger mutation once before its first commit.
 set -eu
 
 SCRIPT_NAME=${0##*/}
 NM=${FM_NO_MISTAKES_BIN:-no-mistakes}
 LOCK_GUARD=
+LEDGER_COMMIT_HOOK_FIRED=0
 WORK_FILE=
 MODEL_FILE=
 CAPTURE_STATUS=
@@ -381,6 +390,49 @@ run_with_kernel_lock() {
   return "$rc"
 }
 
+ledger_content_hash() {
+  # Stable content hash of the current ledger, or a sentinel when it does not
+  # exist yet, used for optimistic-concurrency commits.
+  [ -e "$LEDGER" ] || { printf 'absent'; return 0; }
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum < "$LEDGER" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 < "$LEDGER" | awk '{print $1}'
+  else
+    cksum < "$LEDGER" | awk '{print $1 "-" $2}'
+  fi
+}
+
+ledger_mutate() {
+  # Commit a ledger mutation with optimistic concurrency so a stale copy can
+  # never clobber a concurrent append. The mutation callback reads $LEDGER and
+  # writes the next content to $WORK_FILE; we capture the ledger hash at read
+  # time and rename only if the on-disk ledger is still unchanged at commit,
+  # otherwise we recompute from the now-current ledger. The legitimate path is
+  # already serialized by the kernel guard, so this protects the append-preserving
+  # invariant against a caller that reached the ledger by bypassing the guard.
+  local mutation=$1 before attempts=0
+  shift
+  while :; do
+    before=$(ledger_content_hash)
+    "$mutation" "$@"
+    if [ "$LEDGER_COMMIT_HOOK_FIRED" -eq 0 ] && [ -n "${FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO:-}" ]; then
+      LEDGER_COMMIT_HOOK_FIRED=1
+      : > "$FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO.reached" 2>/dev/null || true
+      IFS= read -r _ledger_commit_release < "$FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO" || true
+    fi
+    if [ "$(ledger_content_hash)" = "$before" ]; then
+      mv "$WORK_FILE" "$LEDGER" || die "cannot commit the disposition ledger"
+      WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
+        || die "cannot allocate an atomic ledger work file"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 128 ] \
+      || die "the disposition ledger changed concurrently repeatedly; refusing to overwrite a concurrently updated ledger"
+  done
+}
+
 prepare_work_files() {
   mkdir -p "$STATE_DIR"
   WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
@@ -388,18 +440,21 @@ prepare_work_files() {
   MODEL_FILE=$(mktemp "$STATE_DIR/.firstmate-review-model.XXXXXX") \
     || die "cannot allocate an atomic review-history work file"
   printf '%s\n' "$CAPTURE_MODEL" > "$MODEL_FILE"
-  if [ -e "$LEDGER" ]; then
-    jq -e '.version == 1 and (.runs | type) == "array"' "$LEDGER" >/dev/null 2>&1 \
-      || die "ledger $LEDGER is malformed or has an unsupported version"
-  else
-    printf '%s\n' '{"version":1,"runs":[]}' > "$WORK_FILE"
-    mv "$WORK_FILE" "$LEDGER"
-    WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
-      || die "cannot allocate an atomic ledger work file"
+  if [ ! -e "$LEDGER" ]; then
+    # Atomic create so a concurrent initializer cannot be clobbered; if another
+    # process wins the race the file simply already exists and is validated below.
+    (umask 077; set -C; printf '%s\n' '{"version":1,"runs":[]}' > "$LEDGER") 2>/dev/null || true
+    [ -e "$LEDGER" ] || die "cannot initialize the disposition ledger"
   fi
+  jq -e '.version == 1 and (.runs | type) == "array"' "$LEDGER" >/dev/null 2>&1 \
+    || die "ledger $LEDGER is malformed or has an unsupported version"
 }
 
 sync_ledger() {
+  ledger_mutate _sync_ledger_apply
+}
+
+_sync_ledger_apply() {
   local errors
   errors=$(jq -r --slurpfile model "$MODEL_FILE" '
     ($model[0]) as $m
@@ -476,9 +531,6 @@ sync_ledger() {
                   else . end]
           else . end]
   ' "$LEDGER" > "$WORK_FILE" || die "cannot extend the disposition ledger"
-  mv "$WORK_FILE" "$LEDGER"
-  WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
-    || die "cannot allocate an atomic ledger work file"
 }
 
 current_round_number() {
@@ -486,6 +538,10 @@ current_round_number() {
 }
 
 append_requested_dispositions() {
+  ledger_mutate _append_requested_dispositions_apply "$@"
+}
+
+_append_requested_dispositions_apply() {
   local kind=$1 round=$2 errors
   errors=$(jq -r --arg run "$CAPTURE_RUN_ID" --argjson round "$round" '
     (.runs[] | select(.id == $run) | .rounds[] | select(.round == $round)) as $r
@@ -514,12 +570,13 @@ append_requested_dispositions() {
             }
         ]
     ' "$LEDGER" > "$WORK_FILE" || die "cannot record explicit disposition requests"
-  mv "$WORK_FILE" "$LEDGER"
-  WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
-    || die "cannot allocate an atomic ledger work file"
 }
 
 confirm_uniform_disposition() {
+  ledger_mutate _confirm_uniform_disposition_apply "$@"
+}
+
+_confirm_uniform_disposition_apply() {
   local kind=$1 round=$2 final_state
   case "$kind" in
     approve) final_state=approved_as_is ;;
@@ -532,9 +589,6 @@ confirm_uniform_disposition() {
       | .runs[$ri].rounds[$rdi].dispositions |= map(
           if .state == "requested" then .state = $state else . end)
     ' "$LEDGER" > "$WORK_FILE" || die "cannot confirm explicit $kind dispositions"
-  mv "$WORK_FILE" "$LEDGER"
-  WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
-    || die "cannot allocate an atomic ledger work file"
 }
 
 claim_response_inflight() {
