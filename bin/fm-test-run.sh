@@ -1719,6 +1719,8 @@ def _allowed(key):
         return False
     return key in _supervisor.ALLOWED_ENV_NAMES or key.startswith(_supervisor.ALLOWED_ENV_PREFIXES)
 environment = {key: value for key, value in os.environ.items() if _allowed(key)}
+ci_scope = [os.environ.get(name) for name in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB")]
+job_scope = ":".join(ci_scope) if all(ci_scope) else run_id
 scripts = []
 for line in pathlib.Path(rows_path).read_text(encoding="utf-8").splitlines():
     if not line:
@@ -1733,7 +1735,8 @@ for line in pathlib.Path(rows_path).read_text(encoding="utf-8").splitlines():
 scripts.sort(key=lambda row: 0 if row["phase"] == "parallel" else 1)
 manifest = {
     "manifest_version": 2, "artifact": artifact, "root": root,
-    "run_id": run_id, "selection": selection, "jobs": int(jobs),
+    "run_id": run_id, "job_scope": job_scope,
+    "selection": selection, "jobs": int(jobs),
     "containment": containment, "duration_budget_mode": budget_mode,
     "fail_on_gate_skip": fail_token, "environment": environment,
     "bash": bash_path, "scripts": scripts,

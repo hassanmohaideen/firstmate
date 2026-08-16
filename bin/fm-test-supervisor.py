@@ -39,7 +39,7 @@ UID_MAX = 64999
 READINESS_RESERVE = 5.0
 CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
-SHARED_LEASE_DIRECTORY = pathlib.Path("/tmp/fm-test-credential-leases")
+LEASE_DIRECTORY_ROOT = pathlib.Path("/tmp/fm-test-credential-leases")
 QUIESCE_GRACE = 3.0
 OUTPUT_TAIL_BYTES = 32768
 IMMUTABLE_PLANNED_FIELDS = (
@@ -140,6 +140,22 @@ class Credentials:
     supplementary_gids: tuple[int, ...] = ()
 
 
+class DarwinProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
 class CredentialPlatform:
     def __init__(self) -> None:
         if sys.platform.startswith("linux"):
@@ -156,7 +172,26 @@ class CredentialPlatform:
         return self._darwin_inventory()
 
     @staticmethod
-    def _linux_inventory() -> dict[int, Credentials]:
+    def _linux_pid_credentials(pid: int) -> Credentials:
+        try:
+            fields: dict[str, str] = {}
+            for line in pathlib.Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    fields[key] = value.strip()
+            uids = tuple(int(v) for v in fields["Uid"].split())
+            gids = tuple(int(v) for v in fields["Gid"].split())
+            supplementary_gids = tuple(int(v) for v in fields["Groups"].split())
+            caps = all(int(fields.get(k, "0"), 16) == 0 for k in ("CapInh", "CapPrm", "CapEff", "CapAmb"))
+            return Credentials(
+                pid, uids, gids, int(fields.get("NoNewPrivs", "0")), caps,
+                fields.get("State", "").startswith("Z"), supplementary_gids,
+            )
+        except (KeyError, ValueError, OSError) as exc:
+            raise InventoryError(f"could not inspect /proc/{pid}/status: {exc}") from exc
+
+    @classmethod
+    def _linux_inventory(cls) -> dict[int, Credentials]:
         result: dict[int, Credentials] = {}
         proc = pathlib.Path("/proc")
         if not proc.is_dir():
@@ -166,60 +201,40 @@ class CredentialPlatform:
             if not entry.name.isdigit():
                 continue
             try:
-                fields: dict[str, str] = {}
-                for line in (entry / "status").read_text(encoding="utf-8").splitlines():
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        fields[key] = value.strip()
-                uids = tuple(int(v) for v in fields["Uid"].split())
-                gids = tuple(int(v) for v in fields["Gid"].split())
-                supplementary_gids = tuple(int(v) for v in fields["Groups"].split())
-                caps = all(int(fields.get(k, "0"), 16) == 0 for k in ("CapInh", "CapPrm", "CapEff", "CapAmb"))
-                result[int(entry.name)] = Credentials(
-                    int(entry.name), uids, gids,
-                    int(fields.get("NoNewPrivs", "0")), caps,
-                    fields.get("State", "").startswith("Z"), supplementary_gids,
-                )
-            except FileNotFoundError:
-                continue
-            except PermissionError:
-                unreadable.append(entry.name)
-            except (KeyError, ValueError, OSError) as exc:
-                raise InventoryError(f"could not inspect /proc/{entry.name}/status: {exc}") from exc
+                result[int(entry.name)] = cls._linux_pid_credentials(int(entry.name))
+            except InventoryError as exc:
+                if isinstance(exc.__cause__, FileNotFoundError):
+                    continue
+                if isinstance(exc.__cause__, PermissionError):
+                    unreadable.append(entry.name)
+                    continue
+                raise
         if unreadable:
             raise InventoryError(f"credential inventory unreadable for pids: {','.join(unreadable[:8])}")
         return result
 
     def _darwin_inventory(self) -> dict[int, Credentials]:
-        class ProcBSDInfo(ctypes.Structure):
-            _fields_ = [
-                ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
-                ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
-                ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
-                ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
-                ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
-                ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
-                ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
-                ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
-                ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
-                ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
-                ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64),
-            ]
-
         count = int(self._libproc.proc_listpids(1, 0, None, 0))
         if count <= 0:
             err = ctypes.get_errno()
             raise InventoryError(f"proc_listpids sizing failed: errno={err}")
         capacity = max(1024, count // ctypes.sizeof(ctypes.c_int) + 256)
-        array = (ctypes.c_int * capacity)()
-        size = int(self._libproc.proc_listpids(1, 0, array, ctypes.sizeof(array)))
-        if size < 0:
-            raise InventoryError(f"proc_listpids failed: errno={ctypes.get_errno()}")
+        for _ in range(8):
+            array = (ctypes.c_int * capacity)()
+            byte_capacity = ctypes.sizeof(array)
+            size = int(self._libproc.proc_listpids(1, 0, array, byte_capacity))
+            if size <= 0:
+                raise InventoryError(f"proc_listpids failed: errno={ctypes.get_errno()}")
+            if size < byte_capacity:
+                break
+            capacity *= 2
+        else:
+            raise InventoryError("proc_listpids remained possibly truncated")
         result: dict[int, Credentials] = {}
         for pid in array[: size // ctypes.sizeof(ctypes.c_int)]:
             if pid <= 0:
                 continue
-            info = ProcBSDInfo()
+            info = DarwinProcBSDInfo()
             got = int(self._libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)))
             if got == 0:
                 if ctypes.get_errno() in (errno.ESRCH, 0):
@@ -257,10 +272,41 @@ class CredentialPlatform:
                 return False
         return True
 
-    def verify_pid(self, pid: int, uid: int, gid: int) -> Credentials:
-        item = self.inventory().get(pid)
+    def pid_credentials(self, pid: int) -> Credentials:
+        if self.name == "linux":
+            try:
+                return self._linux_pid_credentials(pid)
+            except InventoryError as exc:
+                if isinstance(exc.__cause__, FileNotFoundError):
+                    raise InventoryError(f"blocked child {pid} disappeared before credential verification") from exc
+                raise
+        inventory = self._darwin_inventory_for_pids((pid,))
+        item = inventory.get(pid)
         if item is None:
             raise InventoryError(f"blocked child {pid} disappeared before credential verification")
+        return item
+
+    def _darwin_inventory_for_pids(self, pids: tuple[int, ...]) -> dict[int, Credentials]:
+        result: dict[int, Credentials] = {}
+        for pid in pids:
+            info = DarwinProcBSDInfo()
+            got = int(self._libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)))
+            if got == 0:
+                if ctypes.get_errno() in (errno.ESRCH, 0):
+                    continue
+                raise InventoryError(f"proc_pidinfo unreadable for pid {pid}: errno={ctypes.get_errno()}")
+            if got != ctypes.sizeof(info):
+                raise InventoryError(f"proc_pidinfo short read for pid {pid}: {got}")
+            result[pid] = Credentials(
+                pid,
+                (int(info.pbi_ruid), int(info.pbi_uid), int(info.pbi_svuid), int(info.pbi_uid)),
+                (int(info.pbi_rgid), int(info.pbi_gid), int(info.pbi_svgid), int(info.pbi_gid)),
+                zombie=int(info.pbi_status) == 5,
+            )
+        return result
+
+    def verify_pid(self, pid: int, uid: int, gid: int) -> Credentials:
+        item = self.pid_credentials(pid)
         if any(value != uid for value in item.uids[:3]):
             raise ContainmentError(f"blocked child uid tuple is {item.uids}, expected {uid}")
         if any(value != gid for value in item.gids[:3]):
@@ -354,21 +400,23 @@ class Lease:
 
 
 class LeasePool:
-    def __init__(self, platform: CredentialPlatform, seed: str) -> None:
+    def __init__(self, platform: CredentialPlatform, seed: str, directory: pathlib.Path) -> None:
         self.platform = platform
-        self.directory = SHARED_LEASE_DIRECTORY
-        try:
-            os.mkdir(self.directory, 0o700)
-        except FileExistsError:
-            metadata = self.directory.lstat()
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
-                raise ContainmentError("shared credential lease namespace is not root-owned")
-        metadata = self.directory.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
-            raise ContainmentError("shared credential lease namespace is not root-owned")
-        os.chmod(self.directory, 0o700)
+        self.directory = directory
+        self._ensure_root_directory(self.directory)
         self.offset = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % (UID_MAX - UID_MIN + 1)
         self.allocated: set[int] = set()
+
+    @staticmethod
+    def _ensure_root_directory(directory: pathlib.Path) -> None:
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        metadata = directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+            raise ContainmentError("credential lease namespace is not root-owned")
+        os.chmod(directory, 0o700)
 
     def acquire(self) -> Lease:
         width = UID_MAX - UID_MIN + 1
@@ -631,7 +679,10 @@ class LaneExecutor:
             raise ContainmentError("required containment needs noninteractive uid 0 execution")
         self.platform = CredentialPlatform()
         self.platform.inventory()
-        self.lease_pool = LeasePool(self.platform, self.manifest["run_id"])
+        scope = str(self.manifest.get("job_scope") or self.manifest["run_id"])
+        LeasePool._ensure_root_directory(LEASE_DIRECTORY_ROOT)
+        scope_directory = LEASE_DIRECTORY_ROOT / hashlib.sha256(scope.encode()).hexdigest()
+        self.lease_pool = LeasePool(self.platform, self.manifest["run_id"], scope_directory)
         try:
             for row in self.doc["scripts"]:
                 self.preacquired_leases[row["index"]] = self.lease_pool.acquire()
@@ -744,6 +795,7 @@ class LaneExecutor:
             os.set_blocking(read_ready, False)
             ready_limit = time.monotonic() + 3.0
             while b"\n" not in ready_payload and time.monotonic() < ready_limit:
+                self._service_active()
                 try:
                     chunk = os.read(read_ready, 4096)
                 except BlockingIOError:
@@ -898,32 +950,51 @@ class LaneExecutor:
         assert attempt.lease is not None and self.platform is not None and self.lease_pool is not None
         lease = attempt.lease
         diagnostics: list[int] = []
+        ambiguous = False
+
+        def checked_helper(sig: int) -> tuple[bool, int]:
+            nonlocal ambiguous
+            try:
+                return helper_signal(lease.uid, lease.gid, sig)
+            except BaseException:
+                ambiguous = True
+                return False, errno.EIO
+
         try:
             diagnostics = self.platform.domain_members(lease.uid)
             attempt.row["events"].append(event("cleanup_diagnostics", reason=reason, member_pids=diagnostics))
         except InventoryError as exc:
+            ambiguous = True
             attempt.row["events"].append(event("cleanup_diagnostics_unreadable", reason=str(exc)))
-        helper_signal(lease.uid, lease.gid, signal.SIGTERM)
-        attempt.row["events"].append(event("domain_signaled", signal="TERM"))
+        if diagnostics:
+            delivered, code = checked_helper(signal.SIGTERM)
+            if not delivered:
+                ambiguous = True
+            attempt.row["events"].append(event("domain_signaled", signal="TERM", delivered=delivered, errno=code))
         grace = time.monotonic() + TERM_GRACE
+        present = bool(diagnostics)
+        last_code = 0
         while time.monotonic() < grace:
             self._drain(attempt)
             self._poll_wait(attempt)
-            present, code = helper_signal(lease.uid, lease.gid, 0)
-            if not present and code == errno.ESRCH:
+            present, last_code = checked_helper(0)
+            if last_code not in (0, errno.ESRCH):
+                ambiguous = True
+            if not present and last_code == errno.ESRCH:
                 break
             time.sleep(0.05)
         limit = min(self.terminal_deadline, time.monotonic() + QUIESCE_GRACE)
-        quiet = False
-        last_code = 0
-        while time.monotonic() < limit:
-            helper_signal(lease.uid, lease.gid, signal.SIGKILL)
-            attempt.row["events"].append(event("domain_signaled", signal="KILL"))
+        while present and time.monotonic() < limit:
+            delivered, code = checked_helper(signal.SIGKILL)
+            if not delivered:
+                ambiguous = True
+            attempt.row["events"].append(event("domain_signaled", signal="KILL", delivered=delivered, errno=code))
             self._drain(attempt)
             self._poll_wait(attempt)
-            present, last_code = helper_signal(lease.uid, lease.gid, 0)
+            present, last_code = checked_helper(0)
+            if last_code not in (0, errno.ESRCH):
+                ambiguous = True
             if not present and last_code == errno.ESRCH:
-                quiet = True
                 break
             time.sleep(0.05)
         fault = attempt.row.get("test_fault")
@@ -932,18 +1003,13 @@ class LaneExecutor:
                 raise InventoryError("test_fault injected an unreadable quiescence probe")
             survivors = self.platform.domain_members(lease.uid, live_only=True)
         except InventoryError as exc:
+            ambiguous = True
             attempt.row["events"].append(event("quiescence_unreadable", reason=str(exc)))
             survivors = diagnostics
-            quiet = False
         if fault == "nonquiescent":
-            # The real KILL already ran and the process really died; the fault
-            # only forces the executor to treat the domain as unproven, so the
-            # genuine ambiguity path (quarantine, containment_ambiguous, no
-            # numeric fallback) is exercised end to end.
             attempt.row["events"].append(event("nonquiescence_injected"))
-            quiet = False
-        if quiet and survivors:
-            quiet = False
+            ambiguous = True
+        quiet = not ambiguous and not present and last_code == errno.ESRCH and not survivors
         attempt.row["events"].append(event("quiescence", proved=quiet, survivors=survivors, probe_errno=last_code))
         if attempt.wait_status is None and attempt.pid is not None:
             try:
@@ -1083,6 +1149,15 @@ class LaneExecutor:
             return 128 + self.interrupted
         return 0 if result == "passed" else 1
 
+    def _service_active(self, timeout: float = 0.0) -> None:
+        for key, _mask in self.selector.select(timeout=timeout):
+            self._drain(key.data)
+        for attempt in list(self.active.values()):
+            if self._poll_wait(attempt):
+                self.finish(attempt, "exit")
+            elif attempt.deadline_mono is not None and time.monotonic() >= attempt.deadline_mono:
+                self.finish(attempt, "deadline")
+
     def run(self) -> int:
         self.publish()  # Complete planned manifest exists before any preflight/launch.
         try:
@@ -1101,13 +1176,7 @@ class LaneExecutor:
                 if row is None:
                     break
                 self.start(row)
-            for key, _mask in self.selector.select(timeout=0.02):
-                self._drain(key.data)
-            for attempt in list(self.active.values()):
-                if self._poll_wait(attempt):
-                    self.finish(attempt, "exit")
-                elif attempt.deadline_mono is not None and time.monotonic() >= attempt.deadline_mono:
-                    self.finish(attempt, "deadline")
+            self._service_active(timeout=0.02)
             if not self.active and pending and time.monotonic() >= self.ordinary_deadline:
                 for row in pending:
                     row["events"].append(event("deadline_unavailable"))
@@ -1283,7 +1352,9 @@ def qualify(artifact: pathlib.Path) -> int:
         if os.geteuid() != 0:
             raise ContainmentError("platform qualification requires noninteractive uid 0")
         platform = CredentialPlatform()
-        pool = LeasePool(platform, f"qualification-{os.getpid()}")
+        qualification_leases = pathlib.Path(tempfile.mkdtemp(prefix="fm-test-qualification-leases."))
+        os.chmod(qualification_leases, 0o700)
+        pool = LeasePool(platform, f"qualification-{os.getpid()}", qualification_leases)
         owned = pool.acquire()
         leases.append(owned)
         sentinel = pool.acquire()
@@ -1386,13 +1457,16 @@ def qualify(artifact: pathlib.Path) -> int:
             for lease in leases:
                 if lease.path.exists() and not lease.quarantined:
                     pool.retire(lease, quarantine=bool(cleanup_errors))
+        if "qualification_leases" in locals():
+            shutil.rmtree(qualification_leases, ignore_errors=True)
 
 
 def pid_reuse_fixture() -> int:
     if os.geteuid() != 0 or not sys.platform.startswith("linux"):
         return 2
     platform = CredentialPlatform()
-    pool = LeasePool(platform, f"pid-reuse-{os.getpid()}")
+    lease_directory = pathlib.Path(tempfile.mkdtemp(prefix="fm-test-pid-reuse-leases."))
+    pool = LeasePool(platform, f"pid-reuse-{os.getpid()}", lease_directory)
     leases: list[Lease] = []
     try:
         old = pool.acquire()
@@ -1424,6 +1498,7 @@ def pid_reuse_fixture() -> int:
             quiet = prove_domain_quiescent(lease.uid, lease.gid)
             if lease.path.exists() and not lease.quarantined:
                 pool.retire(lease, quarantine=not quiet)
+        shutil.rmtree(lease_directory, ignore_errors=True)
 
 
 def main() -> int:
