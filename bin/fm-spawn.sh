@@ -807,7 +807,34 @@ spawn_abort_cleanup() {
       '') ;;
       *) fm_backend_kill "$BACKEND" "${T:-}" 2>/dev/null || true ;;
     esac
-    if [ -n "${WT:-}" ]; then
+    if [ -n "${BACKEND:-}" ] && [ -n "${T:-}" ] \
+       && fm_backend_target_exists "$BACKEND" "$T" "${W:-}"; then
+      mkdir -p "$STATE" 2>/dev/null || true
+      if [ -d "$STATE" ]; then
+        {
+          echo "window=$T"
+          echo "endpoint_task_id=$ID"
+          echo "worktree=${WT:-}"
+          echo "project=$PROJ_ABS"
+          echo "harness=$HARNESS"
+          echo "kind=$KIND"
+          [ -z "${MODE:-}" ] || echo "mode=$MODE"
+          [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
+          write_github_context_meta
+          [ "${BACKEND:-tmux}" = tmux ] || echo "backend=$BACKEND"
+          [ -z "${HERDR_SES:-}" ] || echo "herdr_session=$HERDR_SES"
+          [ -z "${HERDR_WORKSPACE_ID:-}" ] || echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
+          [ -z "${HERDR_TAB_ID:-}" ] || echo "herdr_tab_id=$HERDR_TAB_ID"
+          [ -z "${HERDR_PANE_ID:-}" ] || echo "herdr_pane_id=$HERDR_PANE_ID"
+          [ -z "${ZELLIJ_SES:-}" ] || echo "zellij_session=$ZELLIJ_SES"
+          [ -z "${ZELLIJ_TAB_ID:-}" ] || echo "zellij_tab_id=$ZELLIJ_TAB_ID"
+          [ -z "${ZELLIJ_PANE_ID:-}" ] || echo "zellij_pane_id=$ZELLIJ_PANE_ID"
+          [ -z "${CMUX_WORKSPACE_ID:-}" ] || echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
+          [ -z "${CMUX_SURFACE_ID:-}" ] || echo "cmux_surface_id=$CMUX_SURFACE_ID"
+        } > "$STATE/$ID.meta" 2>/dev/null || true
+      fi
+      echo "error: could not remove blocked task $ID's endpoint '$T'; worktree '${WT:-unknown}' remains leased and requires manual cleanup" >&2
+    elif [ -n "${WT:-}" ]; then
       ( cd "$PROJ_ABS" && treehouse return --force "$WT" ) >/dev/null 2>&1 \
         || echo "warning: could not return blocked task $ID's allocated worktree '$WT'" >&2
     fi

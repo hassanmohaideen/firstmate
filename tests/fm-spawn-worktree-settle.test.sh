@@ -47,11 +47,21 @@ case "$*" in
     ;;
 esac
 case "${1:-}" in
-  display-message) printf 'firstmate\n'; exit 0 ;;
+  display-message)
+    if [[ " $* " == *" -t "* ]] && [ -n "${FM_FAKE_ENDPOINT:-}" ] && [ ! -e "$FM_FAKE_ENDPOINT" ]; then
+      exit 1
+    fi
+    printf 'firstmate\n'
+    exit 0
+    ;;
   list-windows) exit 0 ;;
   has-session|new-session) exit 0 ;;
   new-window) [ -z "${FM_FAKE_ENDPOINT:-}" ] || : > "$FM_FAKE_ENDPOINT"; exit 0 ;;
-  kill-window) [ -z "${FM_FAKE_ENDPOINT:-}" ] || rm -f "$FM_FAKE_ENDPOINT"; exit 0 ;;
+  kill-window)
+    [ "${FM_FAKE_KILL_FAIL:-0}" != 1 ] || exit 1
+    [ -z "${FM_FAKE_ENDPOINT:-}" ] || rm -f "$FM_FAKE_ENDPOINT"
+    exit 0
+    ;;
   send-keys) printf '%s\n' "$*" >> "${FM_FAKE_SEND_LOG:-/dev/null}"; exit 0 ;;
 esac
 exit 0
@@ -107,6 +117,7 @@ run_settle_spawn() {
     FM_REAL_GIT="${FM_REAL_GIT:-}" FM_FAKE_GIT_LOG="${FM_FAKE_GIT_LOG:-}" \
     FM_FAKE_GH_LOG="${FM_FAKE_GH_LOG:-}" FM_FAKE_SEND_LOG="${FM_FAKE_SEND_LOG:-}" \
     FM_FAKE_TREEHOUSE_LOG="${FM_FAKE_TREEHOUSE_LOG:-}" FM_FAKE_ENDPOINT="${FM_FAKE_ENDPOINT:-}" \
+    FM_FAKE_KILL_FAIL="${FM_FAKE_KILL_FAIL:-0}" \
     PATH="$FAKEBIN_DIR:$PATH" \
     "$SPAWN" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off 2>&1
 }
@@ -211,9 +222,36 @@ test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch() {
   pass "a divergent allocated worktree destination blocks without leaving an endpoint or lease"
 }
 
+test_failed_endpoint_removal_retains_lease_and_recovery_record() {
+  local rec id out status git_log gh_log send_log treehouse_log endpoint
+  id=allocated-github-cleanup-failure-z4
+  rec=$(make_settle_case allocated-github-cleanup-failure "$id" 0)
+  read_settle_record "$rec"
+  prepare_github_gate_case
+  $REAL_GIT -C "$PROJ_DIR" config extensions.worktreeConfig true
+  $REAL_GIT -C "$WT_DIR" config --worktree remote.origin.url https://github.example/owner/repo.git
+  git_log="$TMP_ROOT/cleanup-failure-git.log"
+  gh_log="$TMP_ROOT/cleanup-failure-gh.log"
+  send_log="$TMP_ROOT/cleanup-failure-send.log"
+  treehouse_log="$TMP_ROOT/cleanup-failure-treehouse.log"
+  endpoint="$TMP_ROOT/cleanup-failure-endpoint"
+  : > "$git_log"; : > "$gh_log"; : > "$send_log"; : > "$treehouse_log"
+
+  out=$(FM_REAL_GIT="$REAL_GIT" FM_FAKE_GIT_LOG="$git_log" FM_FAKE_GH_LOG="$gh_log" FM_FAKE_SEND_LOG="$send_log" FM_FAKE_TREEHOUSE_LOG="$treehouse_log" FM_FAKE_ENDPOINT="$endpoint" FM_FAKE_KILL_FAIL=1 run_settle_spawn "$id")
+  status=$?
+  [ "$status" -ne 0 ] || fail "a divergent allocated worktree destination must block when endpoint cleanup fails"
+  assert_contains "$out" "could not remove blocked task $id's endpoint" "endpoint cleanup failure was not reported"
+  assert_contains "$out" "$WT_DIR" "endpoint cleanup failure did not name the retained worktree"
+  [ -e "$endpoint" ] || fail "the cleanup-failure fixture did not retain the endpoint"
+  assert_no_grep "return --force $WT_DIR" "$treehouse_log" "a worktree was returned while its endpoint remained"
+  assert_grep "worktree=$WT_DIR" "$HOME_DIR/state/$id.meta" "cleanup failure did not retain recoverable worktree metadata"
+  assert_grep 'gh_gated=1' "$HOME_DIR/state/$id.meta" "cleanup failure did not retain the gated classification"
+  pass "failed endpoint removal retains the lease and a recoverable record"
+}
+
 test_matching_allocated_worktree_destination_fast_paths_without_reprobe() {
   local rec id out status git_log gh_log send_log
-  id=allocated-github-matching-z4
+  id=allocated-github-matching-z5
   rec=$(make_settle_case allocated-github-matching "$id" 0)
   read_settle_record "$rec"
   prepare_github_gate_case
@@ -235,6 +273,7 @@ test_matching_allocated_worktree_destination_fast_paths_without_reprobe() {
 test_single_stale_first_read_is_not_accepted
 test_already_settled_pane_costs_one_confirm_sleep
 test_divergent_allocated_worktree_destination_blocks_before_fetch_or_launch
+test_failed_endpoint_removal_retains_lease_and_recovery_record
 test_matching_allocated_worktree_destination_fast_paths_without_reprobe
 
 echo "# all fm-spawn-worktree-settle tests passed"
