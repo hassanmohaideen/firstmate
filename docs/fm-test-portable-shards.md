@@ -15,6 +15,7 @@ Because each leased identity runs its script with the runner-owned checkout as t
 The grant never follows symlinks and fails containment preflight on any permission error.
 Checkout credential persistence is disabled in every leased-test job, so the runner token is never written into the checkout the leased identities can read.
 A released child that cannot start its script, for example because of a residual checkout permission problem, reports the exact failing operation on its captured output rather than exiting silently, so the durable per-lane log explains the outcome.
+For in-process SSH fixtures, the executor also identifies the leased child's private home so the remote entrypoint can model the account home that a real SSH login supplies; the fallback is limited to leased high UIDs with no account-database home and is not imported from runner input.
 The credential boundary remains stable across fork, exec, parent exit, reparenting, `setsid`, signal handlers, and PID reuse.
 An unreadable, ambiguous, or non-quiescent identity is quarantined while later scripts use fresh identities.
 Required Linux and macOS qualification fails closed before tests execute when noninteractive privilege, credential inspection, permanent drop, signal scope, or platform semantics are unavailable.

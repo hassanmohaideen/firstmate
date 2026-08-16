@@ -98,8 +98,28 @@ case "$COMMAND" in */*|*..*) die "command contains a path or traversal: $COMMAND
 COMMAND_PATH="$ROOT/bin/$COMMAND"
 [ -f "$COMMAND_PATH" ] && [ ! -L "$COMMAND_PATH" ] && [ -x "$COMMAND_PATH" ] \
   || die "command is not a genuine executable in the configured remote root: $COMMAND"
+# A real SSH login always has an account-database home. Required containment
+# deliberately leases UIDs that are absent from that database, so an in-process
+# SSH fixture cannot resolve `~` even though the executor gave it an isolated,
+# owned home. Accept only that executor-owned compatibility value, only for a
+# leased high UID, and only when it exactly matches the inherited HOME. This
+# keeps ordinary remote execution account-database authoritative.
+INHERITED_HOME=${HOME:-}
 unset HOME
-ACCOUNT_HOME=$(CDPATH='' cd ~ 2>/dev/null && pwd -P) || die "cannot resolve the remote account home"
+if ! ACCOUNT_HOME=$(CDPATH='' cd ~ 2>/dev/null && pwd -P); then
+  CONTAINED_UID=$(id -u 2>/dev/null || true)
+  case "$CONTAINED_UID" in
+    61[0-9][0-9][0-9]|62[0-9][0-9][0-9]|63[0-9][0-9][0-9]|64[0-9][0-9][0-9]) ;;
+    *) die "cannot resolve the remote account home" ;;
+  esac
+  [ "${FM_TEST_CONTAINMENT_MODE:-}" = required ] \
+    && [ -n "${FM_TEST_CONTAINED_ACCOUNT_HOME:-}" ] \
+    && [ "$FM_TEST_CONTAINED_ACCOUNT_HOME" = "$INHERITED_HOME" ] \
+    || die "cannot resolve the remote account home"
+  ACCOUNT_HOME=$(fm_remote_job_canonical_existing_dir "$FM_TEST_CONTAINED_ACCOUNT_HOME") \
+    || die "cannot resolve the remote account home"
+fi
+unset FM_TEST_CONTAINED_ACCOUNT_HOME INHERITED_HOME CONTAINED_UID
 fm_remote_job_compose_operator_path "$ACCOUNT_HOME" >/dev/null
 GIT_BIN=$(fm_remote_job_operator_tool git 2>/dev/null || true)
 if [ -n "$GIT_BIN" ]; then
