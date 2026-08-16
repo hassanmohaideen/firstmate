@@ -443,6 +443,7 @@ class LaneExecutor:
         self.required = manifest.get("containment") == "required"
         self.platform: CredentialPlatform | None = None
         self.lease_pool: LeasePool | None = None
+        self.preacquired_leases: dict[int, Lease] = {}
         self.selector = selectors.DefaultSelector()
         self.interrupted: int | None = None
         self.active: dict[int, Attempt] = {}
@@ -456,6 +457,12 @@ class LaneExecutor:
         self.diagnostics.mkdir(parents=True, exist_ok=True)
         os.chmod(self.diagnostics, 0o755)
         self.doc = self._initial_document()
+        self.schedule_waves = self._build_schedule_waves(self.doc["scripts"])
+        self.wave_by_index = {
+            row["index"]: wave_index
+            for wave_index, wave in enumerate(self.schedule_waves)
+            for row in wave
+        }
         self._install_signal_handlers()
 
     def _to_monotonic(self, epoch: float) -> float:
@@ -544,41 +551,78 @@ class LaneExecutor:
         print(f"fm-test-supervisor: containment refused before test execution: {reason}", file=sys.stderr)
         return 2
 
-    def _validate_schedule_window(self) -> None:
+    def _build_schedule_waves(self, rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         jobs = max(1, int(self.manifest["jobs"]))
-        pending = list(self.doc["scripts"])
-        active: list[tuple[float, str]] = []
-        projected = time.monotonic()
+        waves: list[list[dict[str, Any]]] = []
+        parallel: list[dict[str, Any]] = []
+        for row in rows:
+            if row["phase"] == "serial":
+                while parallel:
+                    waves.append(parallel[:jobs])
+                    parallel = parallel[jobs:]
+                waves.append([row])
+            else:
+                parallel.append(row)
+                if len(parallel) == jobs:
+                    waves.append(parallel)
+                    parallel = []
+        if parallel:
+            waves.append(parallel)
+        return waves
 
-        while pending or active:
-            launched = False
-            while pending and len(active) < jobs:
-                row = pending[0]
-                if row["phase"] == "serial" and active:
-                    break
-                if any(phase == "serial" for _, phase in active):
-                    break
-                pending.pop(0)
+    def _schedule(self, waves: list[list[dict[str, Any]]], start: float) -> tuple[float, list[tuple[dict[str, Any], float, float]]]:
+        projected = start
+        launches: list[tuple[dict[str, Any], float, float]] = []
+        for wave in waves:
+            executions: list[tuple[dict[str, Any], float, float]] = []
+            for row in wave:
                 projected += READINESS_RESERVE
                 baseline_ms = row["duration_baseline_ms"]
                 baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
-                completion = projected + baseline_seconds + CLEANUP_RESERVE
-                if baseline_ms is not None and completion > self.ordinary_deadline:
-                    allowance = self.ordinary_deadline - projected - CLEANUP_RESERVE
-                    raise ContainmentError(
-                        f"manifest schedule cannot fit {row['path']}: "
-                        f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
-                        "before the ordinary deadline"
-                    )
-                active.append((completion, row["phase"]))
-                launched = True
-            if active and (not launched or len(active) >= jobs or not pending):
-                projected = max(projected, min(completion for completion, _ in active))
-                active = [entry for entry in active if entry[0] > projected]
+                executions.append((row, projected, projected + baseline_seconds))
+            wave_completion = max(completion for _row, _start, completion in executions) + CLEANUP_RESERVE * len(wave)
+            launches.extend((row, baseline_start, wave_completion) for row, baseline_start, _completion in executions)
+            projected = wave_completion
+        return projected, launches
+
+    def _validate_schedule_window(self, start: float) -> None:
+        _completion, launches = self._schedule(self.schedule_waves, start)
+        for row, baseline_start, _completion in launches:
+            baseline_ms = row["duration_baseline_ms"]
+            if baseline_ms is None:
+                continue
+            wave = self.schedule_waves[self.wave_by_index[row["index"]]]
+            allowance = (
+                self.ordinary_deadline
+                - baseline_start
+                - CLEANUP_RESERVE * len(wave)
+                - self._remaining_schedule_reserve(row)
+            )
+            baseline_seconds = float(baseline_ms) / 1000.0
+            if baseline_seconds > allowance:
+                raise ContainmentError(
+                    f"manifest schedule cannot fit {row['path']}: "
+                    f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
+                    "before the ordinary deadline"
+                )
+
+    def _release_preacquired_leases(self) -> None:
+        if self.lease_pool is None:
+            return
+        for lease in list(self.preacquired_leases.values()):
+            if lease.path.exists() and not lease.quarantined:
+                self.lease_pool.retire(lease, quarantine=False)
+        self.preacquired_leases.clear()
+
+    def _remaining_schedule_reserve(self, row: dict[str, Any]) -> float:
+        following_waves = self.schedule_waves[self.wave_by_index[row["index"]] + 1:]
+        if not following_waves:
+            return 0.0
+        completion, _launches = self._schedule(following_waves, 0.0)
+        return completion
 
     def preflight(self) -> None:
         if not self.required:
-            self._validate_schedule_window()
             self.doc["containment"]["qualified"] = False
             self.doc["containment"]["blocker"] = "developer mode does not enforce descendant containment"
             self.publish()
@@ -588,7 +632,13 @@ class LaneExecutor:
         self.platform = CredentialPlatform()
         self.platform.inventory()
         self.lease_pool = LeasePool(self.platform, self.manifest["run_id"])
-        self._validate_schedule_window()
+        try:
+            for row in self.doc["scripts"]:
+                self.preacquired_leases[row["index"]] = self.lease_pool.acquire()
+            self._validate_schedule_window(time.monotonic())
+        except BaseException:
+            self._release_preacquired_leases()
+            raise
         self.doc["containment"]["qualified"] = True
         self.publish()
 
@@ -634,7 +684,7 @@ class LaneExecutor:
         env["FM_TEST_CONTAINMENT_MODE"] = "required" if self.required else "developer-non-enforcing"
         return env
 
-    def start(self, row: dict[str, Any], unstarted: int) -> Attempt | None:
+    def start(self, row: dict[str, Any]) -> Attempt | None:
         attempt = Attempt(row)
         baseline_ms = row.get("duration_baseline_ms")
         baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
@@ -644,7 +694,7 @@ class LaneExecutor:
         try:
             if self.required:
                 assert self.lease_pool is not None
-                lease = self.lease_pool.acquire()
+                lease = self.preacquired_leases.pop(row["index"])
                 attempt.lease = lease
                 self.append(attempt, "lease_acquired", uid=lease.uid, gid=lease.gid)
             private = self._private_root(row, lease)
@@ -719,12 +769,14 @@ class LaneExecutor:
             self.selector.register(read_output, selectors.EVENT_READ, attempt)
             self.active[pid] = attempt
             attempt.started_mono = time.monotonic()
-            if baseline_ms is not None and attempt.started_mono + baseline_seconds + CLEANUP_RESERVE > self.ordinary_deadline:
-                raise ContainmentError(f"startup exceeded the reserved window for {row['path']}")
+            reserved = self._remaining_schedule_reserve(row) if self.required else 0.0
+            cleanup = CLEANUP_RESERVE * len(self.schedule_waves[self.wave_by_index[row["index"]]]) if self.required else 0.0
             attempt.deadline_mono = min(
                 attempt.started_mono + float(budget_ms) / 1000.0,
-                self.ordinary_deadline,
+                self.ordinary_deadline - reserved - cleanup,
             )
+            if self.required and baseline_ms is not None and attempt.deadline_mono - attempt.started_mono < baseline_seconds:
+                raise ContainmentError(f"startup exceeded the reserved window for {row['path']}")
             row["attempt_count"] = 1
             self.doc["summary"]["attempted"] += 1
             try:
@@ -971,10 +1023,16 @@ class LaneExecutor:
     def _launchable(self, pending: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not pending:
             return None
+        row = pending[0]
+        if self.required:
+            if self.active:
+                active_wave = self.wave_by_index[next(iter(self.active.values())).row["index"]]
+                if self.wave_by_index[row["index"]] != active_wave:
+                    return None
+            return pending.pop(0)
         jobs = max(1, int(self.manifest["jobs"]))
         if len(self.active) >= jobs:
             return None
-        row = pending[0]
         if row.get("phase") == "serial" and self.active:
             return None
         if any(active.row.get("phase") == "serial" for active in self.active.values()):
@@ -1018,6 +1076,7 @@ class LaneExecutor:
         }
         self.publish()
         if self.lease_pool is not None:
+            self._release_preacquired_leases()
             self.lease_pool.finalize()
         shutil.rmtree(self.transient, ignore_errors=True)
         if self.interrupted is not None:
@@ -1029,6 +1088,7 @@ class LaneExecutor:
         try:
             self.preflight()
         except BaseException as exc:
+            self._release_preacquired_leases()
             return self.unsupported(str(exc))
         pending = list(self.doc["scripts"])
         while pending or self.active:
@@ -1040,7 +1100,7 @@ class LaneExecutor:
                 row = self._launchable(pending)
                 if row is None:
                     break
-                self.start(row, len(pending))
+                self.start(row)
             for key, _mask in self.selector.select(timeout=0.02):
                 self._drain(key.data)
             for attempt in list(self.active.values()):
