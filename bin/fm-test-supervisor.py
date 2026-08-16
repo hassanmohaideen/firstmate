@@ -305,8 +305,17 @@ class CredentialPlatform:
             raise InventoryError(f"credential inventory unreadable for pids: {','.join(unreadable[:8])}")
         return result
 
-    def _darwin_inventory(self, deadline: float | None = None) -> dict[int, Credentials]:
-        count = int(self._libproc.proc_listpids(1, 0, None, 0))
+    def _darwin_inventory(
+        self, deadline: float | None = None, *, uid: int | None = None,
+    ) -> dict[int, Credentials]:
+        # PROC_UID_ONLY avoids querying unrelated processes after the probe
+        # helper has dropped to an unassigned high UID. macOS can deny
+        # proc_pidinfo for other users even though same-UID process metadata is
+        # readable; treating that unrelated denial as a domain-probe failure
+        # made every empty leased domain ambiguous on hosted runners.
+        list_type = 4 if uid is not None else 1  # PROC_UID_ONLY / PROC_ALL_PIDS
+        type_info = uid if uid is not None else 0
+        count = int(self._libproc.proc_listpids(list_type, type_info, None, 0))
         if count <= 0:
             err = ctypes.get_errno()
             raise InventoryError(f"proc_listpids sizing failed: errno={err}")
@@ -316,7 +325,7 @@ class CredentialPlatform:
                 raise InventoryError("credential inventory exceeded its deadline")
             array = (ctypes.c_int * capacity)()
             byte_capacity = ctypes.sizeof(array)
-            size = int(self._libproc.proc_listpids(1, 0, array, byte_capacity))
+            size = int(self._libproc.proc_listpids(list_type, type_info, array, byte_capacity))
             if size <= 0:
                 raise InventoryError(f"proc_listpids failed: errno={ctypes.get_errno()}")
             if size < byte_capacity:
@@ -427,8 +436,13 @@ class CredentialPlatform:
     def domain_members(
         self, uid: int, *, live_only: bool = False, deadline: float | None = None,
     ) -> list[int]:
+        inventory = (
+            self._darwin_inventory(deadline, uid=uid)
+            if self.name == "darwin"
+            else self.inventory(deadline)
+        )
         return sorted(
-            pid for pid, item in self.inventory(deadline).items()
+            pid for pid, item in inventory.items()
             if uid in item.uids[:3] and (not live_only or not (item.zombie or item.exiting))
         )
 
@@ -2228,7 +2242,13 @@ def pid_reuse_fixture() -> int:
         if sentinel != target:
             raise ContainmentError(f"numeric PID was not reused: old={target} replacement={sentinel}")
         delivered, code = helper_signal(old.uid, old.gid, signal.SIGKILL)
-        if not domain_probe_empty(delivered, code):
+        if not delivered or code != 0:
+            raise ContainmentError(f"old credential-domain sweep failed after PID reuse: errno={code}")
+        # A SIGKILL-scoped helper can itself be killed by kill(-1), so successful
+        # delivery is not an emptiness probe. Prove the old identity absent with
+        # a separate credential-scoped signal-0 operation.
+        present, code = helper_signal(old.uid, old.gid, 0)
+        if not domain_probe_empty(present, code):
             raise ContainmentError(
                 f"old credential domain remained signalable after PID reuse: errno={code}"
             )
