@@ -620,4 +620,46 @@ wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
 RECOVERY_WORKER_PID=
 pass "quarantine clears only after recorded execution has stopped"
 
+# The Linux readiness recovery must re-run the idempotent worker start more than
+# once. A replaced supervisor can lose its ownership handoff for longer than a
+# single probe window under load - or a KILL-forced quarantine recovery can
+# stall - leaving no worker running rather than a merely slow one, and a lone
+# retry then reports "did not report ready after startup" while the handoff was
+# still converging. Pin the bounded-retry contract by counting start attempts
+# against injected probe outcomes inside a subshell, so the overrides stay
+# contained and no real worker or wall-clock timing is involved.
+(
+  export FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux
+  ENSURE_ACCOUNT="$TMP_ROOT/ensure-retry-account"
+  mkdir -p "$ENSURE_ACCOUNT"
+  START_COUNT_FILE="$TMP_ROOT/ensure-start-count"
+  # Inject the collaborators ensure_worker drives during recovery so the test
+  # observes only the loop's own retry behavior, never a real start or probe.
+  fm_remote_job_worker_identity_matches() { return 1; }
+  fm_remote_job_start_linux_worker() { printf 'x' >> "$START_COUNT_FILE"; return 0; }
+  start_attempts() { LC_ALL=C wc -c < "$START_COUNT_FILE" | tr -d ' '; }
+
+  # The worker never probes ready: ensure must exhaust exactly one initial start
+  # plus its configured retries, then fail closed with the readiness error.
+  : > "$START_COUNT_FILE"
+  export FM_REMOTE_JOB_STARTUP_RETRIES=4
+  fm_remote_job_wait_for_probe() { return 1; }
+  fm_remote_job_ensure_worker "$REMOTE_ROOT" "$ENSURE_ACCOUNT" \
+    && fail "ensure reported ready when the worker never probed ready"
+  [ "$FM_REMOTE_JOB_ERROR" = "remote job worker did not report ready after startup" ] \
+    || fail "ensure did not report the startup-readiness failure after exhausting retries"
+  [ "$(start_attempts)" -eq 5 ] \
+    || fail "ensure did not bound recovery to one start plus its configured retries (saw $(start_attempts))"
+
+  # The handoff converges on a later attempt: ensure must keep restarting past
+  # the first retry and stop the moment the worker probes ready.
+  : > "$START_COUNT_FILE"
+  fm_remote_job_wait_for_probe() { [ "$(start_attempts)" -ge 3 ]; }
+  fm_remote_job_ensure_worker "$REMOTE_ROOT" "$ENSURE_ACCOUNT" \
+    || fail "ensure gave up before a delayed ownership handoff converged"
+  [ "$(start_attempts)" -eq 3 ] \
+    || fail "ensure kept restarting after the worker became ready (saw $(start_attempts))"
+) || exit 1
+pass "Linux readiness recovery retries a stalled ownership handoff within a bounded budget"
+
 echo "ALL TESTS PASSED"
