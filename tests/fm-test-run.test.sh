@@ -11,7 +11,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 RUNNER="$ROOT/bin/fm-test-run.sh"
+SUPERVISOR="$ROOT/bin/fm-test-supervisor.py"
 
+assert_present "$SUPERVISOR" "bin/fm-test-supervisor.py is missing"
+[ -x "$SUPERVISOR" ] || fail "bin/fm-test-supervisor.py must be executable"
 assert_present "$RUNNER" "bin/fm-test-run.sh is missing"
 [ -x "$RUNNER" ] || fail "bin/fm-test-run.sh must be executable"
 
@@ -92,6 +95,8 @@ init_changed_fixture_repo() {
   local repo=$1 script
   mkdir -p "$repo/bin" "$repo/tests"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  chmod +x "$repo/bin/fm-test-supervisor.py"
   chmod +x "$repo/bin/fm-test-run.sh"
   for script in \
     fm-brief.test.sh \
@@ -201,14 +206,19 @@ test_empty_selection_emits_summary() {
   printf 'documentation only\n' >"$repo/README.md"
   out=$(cd "$repo" && bin/fm-test-run.sh --changed --base HEAD --json "$tmp/artifacts/timing.json" 2>"$tmp/err") \
     || fail "empty valid changed selection must pass"
-  [ "$out" = "$(printf 'FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0 duration_ms=0\nFM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=0 mode=warn')" ] \
-    || fail "empty selection summary is missing or non-deterministic: $out"
+  assert_contains "$out" "FM_TEST_CONTAINMENT mode=developer-non-enforcing enforcement=none" "empty selection containment label"
+  assert_contains "$out" "FM_TEST_SUMMARY total=0 failed=0 skipped_gate=0" "empty selection summary"
+  assert_contains "$out" "FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=0 mode=warn" "empty selection budget summary"
   json="$tmp/artifacts/timing.json"
   python3 -c '
 import json, sys
 doc = json.load(open(sys.argv[1]))
-assert doc["summary"] == {"duration_budget_exceeded": 0, "duration_budget_missing": 0, "duration_ms": 0, "failed": 0, "skipped_gate": 0, "total": 0}
+assert doc["schema_version"] == 2
+assert doc["run"]["complete"] is True
+assert doc["summary"]["total"] == 0
+assert doc["summary"]["failed"] == 0
 assert doc["scripts"] == []
+assert doc["planned"] == []
 assert doc["families"] == []
 ' "$json" || { rm -rf "$tmp"; fail "empty selection JSON summary is wrong"; }
   rm -rf "$tmp"
@@ -331,6 +341,9 @@ test_fail_on_gate_skip_token() {
   cat >"$skip_f" <<'SH'
 #!/usr/bin/env bash
 echo "skip: herdr not found"
+python3 - <<'PY'
+print("x" * 40000)
+PY
 exit 0
 SH
   chmod +x "$skip_f"
@@ -391,6 +404,8 @@ test_portable_shard_union_and_coverage_guard() {
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-coverage.XXXXXX")
   mkdir -p "$tmp/repo/bin" "$tmp/repo/tests"
   cp "$RUNNER" "$tmp/repo/bin/fm-test-run.sh"
+  cp "$SUPERVISOR" "$tmp/repo/bin/fm-test-supervisor.py"
+  chmod +x "$tmp/repo/bin/fm-test-supervisor.py"
   cp "$ROOT"/tests/*.test.sh "$tmp/repo/tests/"
   cat >"$tmp/repo/tests/fm-new-required.test.sh" <<'SH'
 #!/usr/bin/env bash
@@ -576,6 +591,41 @@ test_real_herdr_shard_lane_refusals() {
   pass "real-Herdr shard lanes refuse mismatched, out-of-range, and countless names"
 }
 
+test_real_herdr_lane_shares_only_runner_runtime() {
+  local tmp repo shared evidence runner
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-herdr-runtime.XXXXXX")
+  repo="$tmp/repo"; shared="$tmp/runner-home"; evidence="$tmp/evidence"
+  mkdir -p "$repo/bin" "$repo/tests" "$shared/.config/herdr" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  runner="$repo/bin/fm-test-run.sh"
+  chmod +x "$runner" "$repo/bin/fm-test-supervisor.py"
+  printf 'job-owned-runtime\n' > "$shared/.config/herdr/session-marker"
+  cat > "$repo/tests/fm-backend-herdr-presentation-e2e.test.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[ "$(cat "$HOME/.config/herdr/session-marker")" = job-owned-runtime ]
+[ ! -e "$HOME/runner-private-file" ]
+printf '%s\n' "$HOME" > "$FM_TEST_ENV_EVIDENCE"
+SH
+  chmod +x "$repo/tests/fm-backend-herdr-presentation-e2e.test.sh"
+  printf 'private\n' > "$shared/runner-private-file"
+  HOME="$shared" FM_TEST_ENV_EVIDENCE="$evidence/home" \
+    "$runner" --lane real-herdr-gated-1of2 --json "$tmp/artifact.json" \
+    >"$tmp/out" 2>"$tmp/err" \
+    || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "real-Herdr runtime sharing fixture failed"; }
+  [ -s "$evidence/home" ] || fail "real-Herdr child did not publish its observed HOME"
+  [ "$(cat "$evidence/home")" != "$shared" ] \
+    || fail "real-Herdr lane exposed the runner's whole HOME instead of only its runtime"
+  python3 - "$tmp/artifact.json" <<'PY' || fail "real-Herdr runtime fixture did not pass"
+import json, sys
+row = json.load(open(sys.argv[1]))["scripts"][0]
+assert row["terminal"]["result"] == "passed", row["terminal"]
+PY
+  rm -rf "$tmp"
+  pass "real-Herdr lane reaches the job server without exposing the runner HOME"
+}
+
 test_jobs_requires_proven_isolated() {
   local tmp rc shard_lane
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-jobs.XXXXXX")
@@ -617,6 +667,8 @@ test_jobs_parallel_scheduler_and_failure_propagation() {
   d=tests/fm-supervision-instructions.test.sh
   mkdir -p "$repo/bin" "$repo/tests" "$evidence" "$fake_bin"
   cp "$RUNNER" "$runner"
+  cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  chmod +x "$repo/bin/fm-test-supervisor.py"
   cat >"$fake_bin/stat" <<'SH'
 #!/usr/bin/env bash
 if [ "$1" = "-c" ] && [ "$2" = "%a" ]; then
@@ -636,14 +688,14 @@ SH
   # of hanging.
   cat >"$repo/$a" <<'SH'
 #!/usr/bin/env bash
-if [ -n "${SCHED_WAIT_FOR_REPLACEMENT:-}" ]; then
+if [ -n "${FM_TEST_ENV_SCHED_WAIT:-}" ]; then
   waited=0
-  while [ ! -e "$SCHED_EVIDENCE/replacement-started" ] && [ "$waited" -lt 600 ]; do
+  while [ ! -e "$FM_TEST_ENV_SCHED_EVIDENCE/replacement-started" ] && [ "$waited" -lt 600 ]; do
     sleep 0.05
     waited=$((waited + 1))
   done
 fi
-touch "$SCHED_EVIDENCE/slow-done"
+touch "$FM_TEST_ENV_SCHED_EVIDENCE/slow-done"
 echo "ok - slow fixture"
 SH
   cat >"$repo/$b" <<'SH'
@@ -654,17 +706,17 @@ SH
 #!/usr/bin/env bash
 # Read the evidence before releasing the slow fixture, so the release can never
 # race ahead of the check it is being used to make.
-if [ -e "$SCHED_EVIDENCE/slow-done" ]; then
-  touch "$SCHED_EVIDENCE/replacement-started"
+if [ -e "$FM_TEST_ENV_SCHED_EVIDENCE/slow-done" ]; then
+  touch "$FM_TEST_ENV_SCHED_EVIDENCE/replacement-started"
   echo "not ok - scheduler waited for oldest worker"
   exit 1
 fi
-touch "$SCHED_EVIDENCE/replacement-started"
+touch "$FM_TEST_ENV_SCHED_EVIDENCE/replacement-started"
 echo "ok - replacement fixture started before slow fixture finished"
 SH
   chmod +x "$runner" "$repo/$a" "$repo/$b" "$repo/$c" "$fake_bin/stat"
   set +e
-  PATH="$fake_bin:$PATH" SCHED_EVIDENCE="$evidence" SCHED_WAIT_FOR_REPLACEMENT=1 \
+  PATH="$fake_bin:$PATH" FM_TEST_ENV_SCHED_EVIDENCE="$evidence" FM_TEST_ENV_SCHED_WAIT=1 \
     "$runner" --jobs 2 --json "$tmp/timing.json" \
     "$a" "$b" "$c" >"$tmp/out" 2>"$tmp/err"
   rc=$?
@@ -705,7 +757,7 @@ exit 1
 SH
   chmod +x "$repo/$b"
   set +e
-  SCHED_EVIDENCE="$evidence" "$runner" --jobs 2 "$a" "$b" >"$tmp/out4" 2>"$tmp/err4"
+  FM_TEST_ENV_SCHED_EVIDENCE="$evidence" "$runner" --jobs 2 "$a" "$b" >"$tmp/out4" 2>"$tmp/err4"
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || { rm -rf "$tmp"; fail "jobs aggregate must be non-zero when a proven worker fails"; }
@@ -764,35 +816,37 @@ make_mixed_runner_fixture() { # <repo> <evidence>
   local repo=$1 evidence=$2 script
   mkdir -p "$repo/bin" "$repo/tests" "$evidence"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  chmod +x "$repo/bin/fm-test-supervisor.py"
   chmod +x "$repo/bin/fm-test-run.sh"
   for script in fm-brief.test.sh fm-composer-lib.test.sh; do
     cat > "$repo/tests/$script" <<'SH'
 #!/usr/bin/env bash
 name=$(basename "$0" .test.sh)
-touch "$MIXED_EVIDENCE/$name.started"
+touch "$FM_TEST_ENV_MIXED_EVIDENCE/$name.started"
 other=fm-brief
 [ "$name" = fm-brief ] && other=fm-composer-lib
 n=0
-while [ ! -e "$MIXED_EVIDENCE/$other.started" ] && [ "$n" -lt 200 ]; do
+while [ ! -e "$FM_TEST_ENV_MIXED_EVIDENCE/$other.started" ] && [ "$n" -lt 200 ]; do
   sleep 0.01
   n=$((n + 1))
 done
-[ -e "$MIXED_EVIDENCE/$other.started" ] || exit 9
-printf '%s\n' "$name" >> "$MIXED_EVIDENCE/counts"
-touch "$MIXED_EVIDENCE/$name.done"
+[ -e "$FM_TEST_ENV_MIXED_EVIDENCE/$other.started" ] || exit 9
+printf '%s\n' "$name" >> "$FM_TEST_ENV_MIXED_EVIDENCE/counts"
+touch "$FM_TEST_ENV_MIXED_EVIDENCE/$name.done"
 echo "ok - $name"
 SH
   done
   cat > "$repo/tests/fm-daemon.test.sh" <<'SH'
 #!/usr/bin/env bash
-[ -e "$MIXED_EVIDENCE/fm-brief.done" ] || exit 8
-[ -e "$MIXED_EVIDENCE/fm-composer-lib.done" ] || exit 8
-printf '%s\n' fm-daemon >> "$MIXED_EVIDENCE/counts"
-if [ "${MIXED_SERIAL_FAIL:-0}" = 1 ]; then
+[ -e "$FM_TEST_ENV_MIXED_EVIDENCE/fm-brief.done" ] || exit 8
+[ -e "$FM_TEST_ENV_MIXED_EVIDENCE/fm-composer-lib.done" ] || exit 8
+printf '%s\n' fm-daemon >> "$FM_TEST_ENV_MIXED_EVIDENCE/counts"
+if [ "${FM_TEST_ENV_MIXED_SERIAL_FAIL:-0}" = 1 ]; then
   echo "not ok - serial failure"
   exit 1
 fi
-if [ "${MIXED_SERIAL_SKIP:-0}" = 1 ]; then
+if [ "${FM_TEST_ENV_MIXED_SERIAL_SKIP:-0}" = 1 ]; then
   echo "skip: optional mixed fixture"
   exit 0
 fi
@@ -800,7 +854,7 @@ echo "ok - serial"
 SH
   cat > "$repo/tests/fm-backend-herdr-smoke.test.sh" <<'SH'
 #!/usr/bin/env bash
-touch "$MIXED_EVIDENCE/herdr-ran"
+touch "$FM_TEST_ENV_MIXED_EVIDENCE/herdr-ran"
 exit 0
 SH
   chmod +x "$repo"/tests/*.test.sh
@@ -814,7 +868,7 @@ test_mixed_complete_scheduler_exact_once_and_failures() {
   make_mixed_runner_fixture "$repo" "$evidence"
   runner="$repo/bin/fm-test-run.sh"
 
-  MIXED_EVIDENCE="$evidence" "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
+  FM_TEST_ENV_MIXED_EVIDENCE="$evidence" "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
     || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "mixed portable fixture failed"; }
   [ ! -e "$evidence/herdr-ran" ] || fail "portable mixed scheduler ran real-Herdr family"
   [ "$(LC_ALL=C sort "$evidence/counts")" = "$(printf 'fm-brief\nfm-composer-lib\nfm-daemon')" ] \
@@ -824,7 +878,7 @@ test_mixed_complete_scheduler_exact_once_and_failures() {
 
   rm -rf "$evidence"; mkdir -p "$evidence"
   set +e
-  MIXED_EVIDENCE="$evidence" MIXED_SERIAL_FAIL=1 "$runner" --portable > "$tmp/fail.out" 2> "$tmp/fail.err"
+  FM_TEST_ENV_MIXED_EVIDENCE="$evidence" FM_TEST_ENV_MIXED_SERIAL_FAIL=1 "$runner" --portable > "$tmp/fail.out" 2> "$tmp/fail.err"
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "mixed serial functional failure did not propagate"
@@ -832,7 +886,7 @@ test_mixed_complete_scheduler_exact_once_and_failures() {
     || fail "mixed failure summary was wrong: $(grep FM_TEST_SUMMARY "$tmp/fail.out")"
 
   rm -rf "$evidence"; mkdir -p "$evidence"
-  MIXED_EVIDENCE="$evidence" MIXED_SERIAL_SKIP=1 "$runner" --portable > "$tmp/skip.out" 2> "$tmp/skip.err" \
+  FM_TEST_ENV_MIXED_EVIDENCE="$evidence" FM_TEST_ENV_MIXED_SERIAL_SKIP=1 "$runner" --portable > "$tmp/skip.out" 2> "$tmp/skip.err" \
     || fail "ordinary mixed gate skip should remain successful"
   grep -q 'FM_TEST_SUMMARY total=3 failed=0 skipped_gate=1' "$tmp/skip.out" \
     || fail "mixed gate-skip accounting was wrong: $(grep FM_TEST_SUMMARY "$tmp/skip.out")"
@@ -840,190 +894,333 @@ test_mixed_complete_scheduler_exact_once_and_failures() {
   pass "mixed complete scheduling is parallel/serial exact-once with failure and gate-skip propagation"
 }
 
-test_parallel_signal_cleanup() {
-  local tmp repo evidence runner pid child rc n watchdog
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-signal.XXXXXX")
-  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
-  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
-  cat > "$repo/tests/fm-brief.test.sh" <<'SH'
-#!/usr/bin/env bash
-trap '' TERM INT HUP
-sleep 300 &
-printf '%s\n' "$!" > "$SIGNAL_EVIDENCE/child.pid"
-touch "$SIGNAL_EVIDENCE/fm-brief.ready"
-wait
-SH
-  cat > "$repo/tests/fm-composer-lib.test.sh" <<'SH'
-#!/usr/bin/env bash
-cleanup() { touch "$SIGNAL_EVIDENCE/fm-composer-lib.cleaned"; exit 143; }
-trap cleanup TERM INT HUP
-touch "$SIGNAL_EVIDENCE/fm-composer-lib.ready"
-while :; do sleep 1; done
-SH
-  chmod +x "$repo"/tests/*.test.sh
-  SIGNAL_EVIDENCE="$evidence" "$runner" --jobs 2 \
-    tests/fm-brief.test.sh tests/fm-composer-lib.test.sh > "$tmp/out" 2> "$tmp/err" &
-  pid=$!
-  n=0
-  while { [ ! -e "$evidence/fm-brief.ready" ] || [ ! -e "$evidence/fm-composer-lib.ready" ]; } && [ "$n" -lt 300 ]; do
+make_executor_manifest() { # <manifest> <artifact> <root> <budget-ms:path>...
+  local manifest=$1 artifact=$2 root=$3
+  shift 3
+  python3 - "$manifest" "$artifact" "$root" "$SUPERVISOR" "$@" <<'PY'
+import json, os, pathlib, sys, time
+manifest, artifact, root, _supervisor, *specs = sys.argv[1:]
+scripts = []
+for spec in specs:
+    budget, path = spec.split(":", 1)
+    scripts.append({
+        "path": path, "family": "fixture", "expected_gate_skip": "none",
+        "duration_baseline_ms": max(1, int(budget) // 2),
+        "duration_budget_ms": int(budget), "phase": "serial",
+    })
+now = int(time.time())
+doc = {
+    "manifest_version": 2, "artifact": artifact, "root": root,
+    "run_id": f"fixture-{os.getpid()}-{time.time_ns()}", "selection": "fixture",
+    "jobs": 1, "containment": "developer-non-enforcing",
+    "duration_budget_mode": "warn", "fail_on_gate_skip": "",
+    "environment": dict(os.environ), "bash": "/bin/bash", "scripts": scripts,
+    "deadlines": {
+        "t0_epoch": now, "ordinary_epoch": now + 40,
+        "terminal_epoch": now + 50, "cleanup_epoch": now + 55,
+        "ceiling_epoch": now + 60,
+    },
+}
+pathlib.Path(manifest).write_text(json.dumps(doc), encoding="utf-8")
+PY
+}
+
+remove_privileged_fixture_tree() { # <path>
+  local path=$1
+  if rm -rf "$path" 2>/dev/null; then
+    return 0
+  fi
+  sudo -n rm -rf "$path"
+}
+
+wait_for_started_artifact() { # <artifact>
+  local artifact=$1 n=0
+  while [ "$n" -lt 500 ]; do
+    if python3 - "$artifact" <<'PY' >/dev/null 2>&1
+import json, sys
+rows = json.load(open(sys.argv[1])).get("scripts", [])
+assert rows and any(event.get("name") == "started" for event in rows[0].get("events", []))
+PY
+    then
+      return 0
+    fi
     sleep 0.01
     n=$((n + 1))
   done
-  [ -e "$evidence/fm-brief.ready" ] && [ -e "$evidence/fm-composer-lib.ready" ] \
-    || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"; fail "parallel cleanup fixtures never started"; }
-  child=$(cat "$evidence/child.pid")
-  kill -TERM "$pid"
-  (
-    sleep 5
-    if kill -0 "$pid" 2>/dev/null; then
-      touch "$evidence/cleanup-timed-out"
-      kill -KILL "$child" 2>/dev/null || true
-    fi
-  ) &
-  watchdog=$!
-  set +e
-  wait "$pid"
-  rc=$?
-  kill "$watchdog" 2>/dev/null || true
-  wait "$watchdog" 2>/dev/null || true
-  set -e
-  [ ! -e "$evidence/cleanup-timed-out" ] || fail "interrupted runner hung on a TERM-resistant descendant"
-  [ "$rc" -ne 0 ] || fail "interrupted runner exited successfully"
-  [ -e "$evidence/fm-composer-lib.cleaned" ] \
-    || fail "interrupted runner did not run the trapping fixture cleanup"
-  if kill -0 "$child" 2>/dev/null; then
-    kill -KILL "$child" 2>/dev/null || true
-    fail "interrupted runner left a non-trapping fixture child alive"
-  fi
-  rm -rf "$tmp"
-  pass "parallel signal cleanup terminates and waits for every active process tree"
+  return 1
 }
 
-test_serial_signal_cleanup() {
-  local tmp repo evidence runner pid child rc n watchdog
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-serial-signal.XXXXXX")
-  repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
-  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
-  cat >"$repo/tests/fm-daemon.test.sh" <<'SH'
+test_timeout_then_remaining_exact_once() {
+  local tmp manifest artifact rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-timeout.XXXXXX")
+  cat >"$tmp/hang.sh" <<'SH'
 #!/usr/bin/env bash
-trap '' TERM INT HUP
-sleep 300 &
-printf '%s\n' "$!" >"$SIGNAL_EVIDENCE/child.pid"
-touch "$SIGNAL_EVIDENCE/ready"
-wait
-SH
-  chmod +x "$repo/tests/fm-daemon.test.sh"
-  SIGNAL_EVIDENCE="$evidence" "$runner" tests/fm-daemon.test.sh >"$tmp/out" 2>"$tmp/err" &
-  pid=$!
-  n=0
-  while [ ! -e "$evidence/ready" ] && [ "$n" -lt 300 ]; do
-    sleep 0.01
-    n=$((n + 1))
-  done
-  [ -e "$evidence/ready" ] \
-    || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"; fail "serial cleanup fixture never started"; }
-  child=$(cat "$evidence/child.pid")
-  kill -TERM "$pid"
-  (
-    sleep 5
-    if kill -0 "$pid" 2>/dev/null; then
-      touch "$evidence/cleanup-timed-out"
-      kill -KILL "$child" 2>/dev/null || true
-    fi
-  ) &
-  watchdog=$!
-  set +e
-  wait "$pid"
-  rc=$?
-  kill "$watchdog" 2>/dev/null || true
-  wait "$watchdog" 2>/dev/null || true
-  set -e
-  [ ! -e "$evidence/cleanup-timed-out" ] || fail "interrupted serial runner hung on a TERM-resistant descendant"
-  [ "$rc" -ne 0 ] || fail "interrupted serial runner exited successfully"
-  if kill -0 "$child" 2>/dev/null; then
-    kill -KILL "$child" 2>/dev/null || true
-    fail "interrupted serial runner left a TERM-resistant descendant alive"
-  fi
-  rm -rf "$tmp"
-  pass "serial signal cleanup terminates and waits for its complete process group"
-}
-
-test_completed_worker_descendant_cleanup() {
-  local mode tmp repo evidence runner pid child rc n watchdog
-  for mode in serial parallel; do
-    tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-completed-group.XXXXXX")
-    repo="$tmp/repo"; evidence="$tmp/evidence"; mkdir -p "$repo/bin" "$repo/tests" "$evidence"
-    cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
-    cat >"$repo/tests/fm-brief.test.sh" <<'SH'
-#!/usr/bin/env bash
-bash -c 'trap "" TERM INT HUP; touch "$SIGNAL_EVIDENCE/descendant.ready"; while :; do sleep 1; done' \
-  >/dev/null 2>&1 &
-printf '%s\n' "$!" >"$SIGNAL_EVIDENCE/descendant.pid"
-n=0
-while [ ! -e "$SIGNAL_EVIDENCE/descendant.ready" ] && [ "$n" -lt 300 ]; do
-  sleep 0.01
-  n=$((n + 1))
-done
-[ -e "$SIGNAL_EVIDENCE/descendant.ready" ] || exit 9
-exit 0
-SH
-    cat >"$repo/tests/fm-composer-lib.test.sh" <<'SH'
-#!/usr/bin/env bash
-trap 'exit 143' TERM INT HUP
-touch "$SIGNAL_EVIDENCE/blocker.ready"
+printf 'hang\n' >>"$FM_TEST_ENV_EXEC_EVIDENCE"
+trap '' TERM
 while :; do sleep 1; done
 SH
-    chmod +x "$repo"/tests/*.test.sh
-    set -- tests/fm-brief.test.sh tests/fm-composer-lib.test.sh
-    [ "$mode" = parallel ] && set -- --jobs 2 "$@"
-    SIGNAL_EVIDENCE="$evidence" "$runner" "$@" >"$tmp/out" 2>"$tmp/err" &
-    pid=$!
-    n=0
-    while { [ ! -e "$evidence/blocker.ready" ] || ! grep -q 'FM_TEST_END .*tests/fm-brief.test.sh' "$tmp/out" 2>/dev/null; } \
-      && [ "$n" -lt 500 ]; do
-      sleep 0.01
-      n=$((n + 1))
-    done
-    if [ ! -e "$evidence/blocker.ready" ] || ! grep -q 'FM_TEST_END .*tests/fm-brief.test.sh' "$tmp/out" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-      rm -rf "$tmp"
-      fail "$mode completed-group fixture never reached its interruptible state"
-    fi
-    child=$(cat "$evidence/descendant.pid")
-    kill -TERM "$pid"
-    (
-      sleep 5
-      if kill -0 "$pid" 2>/dev/null; then
-        touch "$evidence/cleanup-timed-out"
-        kill -KILL "$child" 2>/dev/null || true
-      fi
-    ) &
-    watchdog=$!
-    set +e
-    wait "$pid"
-    rc=$?
-    kill "$watchdog" 2>/dev/null || true
-    wait "$watchdog" 2>/dev/null || true
-    set -e
-    [ "$rc" -ne 0 ] || fail "$mode interrupted runner exited successfully"
-    [ ! -e "$evidence/cleanup-timed-out" ] \
-      || fail "$mode cleanup hung on a completed worker's TERM-resistant descendant"
-    if kill -0 "$child" 2>/dev/null; then
-      kill -KILL "$child" 2>/dev/null || true
-      fail "$mode cleanup lost a completed worker's TERM-resistant descendant"
-    fi
+  cat >"$tmp/after.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'after\n' >>"$FM_TEST_ENV_EXEC_EVIDENCE"
+SH
+  chmod +x "$tmp"/*.sh
+  manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
+  FM_TEST_ENV_EXEC_EVIDENCE="$tmp/counts" make_executor_manifest "$manifest" "$artifact" "$tmp" \
+    "1200:$tmp/hang.sh" "3000:$tmp/after.sh"
+  python3 - "$manifest" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["duration_budget_mode"] = "enforce"
+path.write_text(json.dumps(doc))
+PY
+  set +e
+  FM_TEST_ENV_EXEC_EVIDENCE="$tmp/counts" python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "timeout fixture unexpectedly passed"
+  python3 - "$artifact" "$tmp/counts" <<'PY' || fail "timeout evidence or exact-once coverage is wrong"
+import json, pathlib, sys
+artifact = json.load(open(sys.argv[1]))
+assert [row["terminal"]["result"] for row in artifact["scripts"]] == ["timeout", "passed"]
+assert all(row.get("attempt_count") == 1 for row in artifact["scripts"])
+assert artifact["scripts"][0]["duration_budget_exceeded"] is True, artifact["scripts"][0]
+assert artifact["summary"]["duration_budget_exceeded"] == 1, artifact["summary"]
+assert artifact["summary"]["failed"] == 1, artifact["summary"]
+assert artifact["summary"]["failed"] <= artifact["summary"]["total"]
+assert pathlib.Path(sys.argv[2]).read_text().splitlines() == ["hang", "after"]
+PY
+  rm -rf "$tmp"
+  pass "timeout is terminal red and remaining coverage executes exactly once"
+}
+
+test_warn_budget_overrun_completes() {
+  local tmp manifest artifact
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-budget-warn.XXXXXX")
+  cat >"$tmp/slow.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 0.2
+echo "ok - warn budget overrun"
+SH
+  chmod +x "$tmp/slow.sh"
+  manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
+  make_executor_manifest "$manifest" "$artifact" "$tmp" "50:$tmp/slow.sh"
+  python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err" \
+    || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "warn-mode budget overrun was killed"; }
+  python3 - "$artifact" <<'PY' || fail "warn-mode budget evidence is wrong"
+import json, sys
+doc = json.load(open(sys.argv[1]))
+row = doc["scripts"][0]
+assert row["terminal"]["result"] == "passed", row["terminal"]
+assert row["duration_budget_exceeded"] is True, row
+assert row["duration_ms"] >= 50, row["duration_ms"]
+assert doc["run"]["result"] == "passed", doc["run"]
+PY
+  rm -rf "$tmp"
+  pass "warn-mode budget overruns complete and remain warnings"
+}
+
+test_interruption_and_atomic_evidence() {
+  local tmp artifact pid rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-interrupt.XXXXXX")
+  chmod 0711 "$tmp"
+  cat >"$tmp/hang.sh" <<'SH'
+#!/usr/bin/env bash
+trap '' TERM
+while :; do sleep 1; done
+SH
+  chmod 0755 "$tmp/hang.sh"
+  artifact="$tmp/artifact.json"
+  "$RUNNER" --json "$artifact" "$tmp/hang.sh" >"$tmp/out" 2>"$tmp/err" &
+  pid=$!
+  wait_for_started_artifact "$artifact" \
+    || { kill -KILL "$pid" 2>/dev/null || true; fail "interruption fixture never published started evidence"; }
+  # The executor's durable started transition is the public proof that launch
+  # and credential verification succeeded. Interrupt at that boundary rather
+  # than adding a second filesystem handshake after the child is released;
+  # that handshake made this timing test depend on platform scheduling.
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$artifact" \
+    || { kill -KILL "$pid" 2>/dev/null || true; fail "started artifact is invalid JSON"; }
+  kill -TERM "$pid" 2>/dev/null \
+    || { wait "$pid" 2>/dev/null || true; fail "runner exited before catchable interruption"; }
+  set +e
+  wait "$pid"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "catchable interruption exited successfully"
+  python3 - "$artifact" <<'PY' || fail "catchable interruption evidence is not terminal and truthful"
+import json, sys
+artifact = json.load(open(sys.argv[1]))
+row = artifact["scripts"][0]
+assert row["terminal"]["result"] == "interrupted", row["terminal"]
+assert artifact["run"]["complete"] is False, artifact["run"]
+# Schema v2 forbids durable result:active state. Assert that owned semantic
+# contract rather than rejecting an unrelated string value that happens to
+# contain the word "active" (for example a platform-specific path).
+def values(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "result":
+                yield child
+            yield from values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from values(child)
+assert "active" not in set(values(artifact)), set(values(artifact))
+assert row.get("diagnostic_log"), row
+PY
+  remove_privileged_fixture_tree "$tmp"
+  pass "catchable interruption terminalizes after atomic valid snapshots"
+}
+
+test_uncatchable_interruption_is_incomplete_red() {
+  local tmp manifest artifact pid rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-kill.XXXXXX")
+  cat >"$tmp/short.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+SH
+  chmod +x "$tmp/short.sh"
+  manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
+  make_executor_manifest "$manifest" "$artifact" "$tmp" "5000:$tmp/short.sh"
+  python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err" &
+  pid=$!
+  wait_for_started_artifact "$artifact" \
+    || { kill -KILL "$pid" 2>/dev/null || true; fail "uncatchable fixture never published started evidence"; }
+  kill -KILL "$pid"
+  set +e
+  wait "$pid" 2>/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "KILLed executor exited successfully"
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$artifact" \
+    || fail "KILL left malformed evidence"
+  set +e
+  python3 "$SUPERVISOR" validate-artifact "$artifact" >"$tmp/validate"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "incomplete KILL evidence validated as complete"
+  grep -Fq 'valid=false' "$tmp/validate" || fail "incomplete validator result is missing"
+  sleep 1.2
+  rm -rf "$tmp"
+  pass "uncatchable executor death leaves valid incomplete red evidence"
+}
+
+test_required_unsupported_refuses_before_execution() {
+  local tmp manifest artifact rc
+  if [ "$(id -u)" -eq 0 ]; then
+    printf 'skip: unsupported-privilege refusal fixture requires an unprivileged caller\n'
+    return 0
+  fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-refusal.XXXXXX")
+  cat >"$tmp/body.sh" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_ENV_REFUSAL_BODY_MARKER"
+SH
+  chmod +x "$tmp/body.sh"
+  manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
+  FM_TEST_ENV_REFUSAL_BODY_MARKER="$tmp/body-ran" make_executor_manifest \
+    "$manifest" "$artifact" "$tmp" "3000:$tmp/body.sh"
+  python3 - "$manifest" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["containment"] = "required"
+path.write_text(json.dumps(doc))
+PY
+  set +e
+  FM_TEST_ENV_REFUSAL_BODY_MARKER="$tmp/body-ran" python3 "$SUPERVISOR" execute --manifest "$manifest" \
+    >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "missing required privilege became a pass"
+  [ ! -e "$tmp/body-ran" ] || fail "unsupported containment executed the test body"
+  python3 - "$artifact" <<'PY' || fail "unsupported refusal evidence is incomplete"
+import json, sys
+artifact = json.load(open(sys.argv[1]))
+assert artifact["planned"] and artifact["summary"]["attempted"] == 0
+assert artifact["run"]["result"] == "containment_unsupported"
+assert artifact["run"]["complete"] is False
+assert artifact["containment"]["blocker"]
+PY
+  rm -rf "$tmp"
+  pass "unsupported required containment refuses red before test execution"
+}
+
+test_privileged_artifact_rejects_intermediate_symlink() {
+  local tmp artifact rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-artifact-symlink.XXXXXX")
+  mkdir "$tmp/owned"
+  ln -s "$tmp/owned" "$tmp/linked"
+  artifact="$tmp/linked/qualification.json"
+  set +e
+  python3 "$SUPERVISOR" qualify --artifact "$artifact" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || { rm -rf "$tmp"; fail "privileged artifact accepted an intermediate symlink"; }
+  [ ! -e "$tmp/owned/qualification.json" ] \
+    || { rm -rf "$tmp"; fail "privileged artifact wrote through an intermediate symlink"; }
+  grep -Fq 'contains a symlink' "$tmp/err" \
+    || { cat "$tmp/err"; rm -rf "$tmp"; fail "privileged artifact symlink refusal was not actionable"; }
+  rm -rf "$tmp"
+  pass "privileged artifact refuses intermediate symlink components"
+}
+
+test_required_platform_qualification() {
+  local tmp rc qualification_pid lease guard observed
+  local -a inspect=()
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-qualification.XXXXXX")
+  mkdir "$tmp/private"
+  if [ "$(id -u)" -eq 0 ]; then
+    TMPDIR="$tmp/private" python3 "$SUPERVISOR" qualify --artifact "$tmp/qualification.json" &
+    qualification_pid=$!
+  elif sudo -n true >/dev/null 2>&1; then
+    inspect=(sudo -n)
+    sudo -n env TMPDIR="$tmp/private" "$(command -v python3)" "$SUPERVISOR" qualify --artifact "$tmp/qualification.json" &
+    qualification_pid=$!
+  else
+    printf 'skip: privileged platform qualification unavailable; no containment pass claimed\n'
     rm -rf "$tmp"
+    return 0
+  fi
+  observed=false
+  for _ in $(seq 1 500); do
+    lease=$("${inspect[@]}" find "$tmp/private" -name 'uid-*.lease' -type f -print -quit 2>/dev/null || true)
+    if [ -n "$lease" ]; then
+      guard="/tmp/fm-test-credential-leases/$(basename "$lease")"
+      if "${inspect[@]}" test -f "$guard"; then
+        observed=true
+        break
+      fi
+    fi
+    kill -0 "$qualification_pid" 2>/dev/null || break
+    sleep 0.01
   done
-  pass "completed worker groups remain owned through serial and parallel interruption"
+  set +e
+  wait "$qualification_pid"
+  rc=$?
+  set -e
+  [ "$observed" = true ] || { rm -rf "$tmp"; fail "qualification lease was not job-local with host-wide exclusion"; }
+  [ "$rc" -eq 0 ] || { rm -rf "$tmp"; fail "required platform qualification failed"; }
+  python3 - "$tmp/qualification.json" <<'PY' || fail "qualification artifact is not a complete pass"
+import json, sys
+artifact = json.load(open(sys.argv[1]))
+assert artifact["complete"] is True and artifact["passed"] is True
+assert all(check["passed"] for check in artifact["checks"])
+PY
+  rm -rf "$tmp"
+  pass "required platform qualification proves credential and signal scope"
 }
 
 test_environment_isolation_in_serial_and_parallel_children() {
   local tmp repo evidence runner fakebin name
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-env.XXXXXX")
+  chmod 0711 "$tmp"
   repo="$tmp/repo"; evidence="$tmp/evidence"; fakebin="$tmp/fakebin"
   mkdir -p "$repo/bin" "$repo/tests" "$evidence" "$fakebin"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  chmod +x "$repo/bin/fm-test-supervisor.py"
   cp "$ROOT/bin/fm-backend.sh" "$repo/bin/fm-backend.sh"
   runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
   printf '#!/bin/sh\necho Darwin\n' > "$fakebin/uname"
@@ -1039,201 +1236,591 @@ SH
   for name in fm-brief fm-daemon; do
     cat > "$repo/tests/$name.test.sh" <<'SH'
 #!/usr/bin/env bash
+# Fleet routing, an arbitrary non-allowlisted ambient variable, and a
+# secret-shaped name must all be absent: the executor builds the child
+# environment from an explicit allowlist, so none of these reach the test.
 for key in FM_HOME FM_STATE_OVERRIDE FM_DATA_OVERRIDE FM_ROOT_OVERRIDE FM_PROJECTS_OVERRIDE FM_CONFIG_OVERRIDE FM_BACKEND \
   TMUX TMUX_PANE HERDR_ENV HERDR_SESSION HERDR_SOCKET_PATH HERDR_PANE_ID \
-  CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID __CFBundleIdentifier; do
+  CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_SOCKET_PATH CMUX_TAB_ID CMUX_PANEL_ID __CFBundleIdentifier \
+  NOT_ALLOWLISTED_AMBIENT AMBIENT_API_TOKEN FM_TEST_ENV_TOKEN_PROBE; do
   eval "value=\${$key-}"
   [ -z "$value" ] || exit 9
 done
+# The sanctioned FM_TEST_ENV_ pass-through channel must survive, and PATH must
+# be present so the child can still find its tools.
+[ "${FM_TEST_ENV_ALLOWED_PROBE-}" = "carried" ] || exit 11
+[ -n "${PATH-}" ] || exit 12
+# Installer scratch must follow the leased-writable temp, and the executor's
+# private HOME must leave room for a 39-character Herdr session name on Darwin
+# (sun_path includes a trailing NUL, so a 104-byte pathname is already too long).
+[ "$RUNNER_TEMP" = "$TMPDIR" ] || exit 13
+touch "$RUNNER_TEMP/installer-scratch" || exit 14
+socket_dir="$HOME/.config/herdr/sessions/firstmate-real-herdr-regression-session"
+mkdir -p "$socket_dir" || exit 15
+python3 - "$socket_dir/herdr.sock" <<'PY' || exit 16
+import socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
 root=$(cd "$(dirname "$0")/.." && pwd)
 . "$root/bin/fm-backend.sh"
-if PATH="$ENV_FAKEBIN:$PATH" fm_backend_detect >/dev/null; then
+if PATH="$FM_TEST_ENV_FAKEBIN:$PATH" fm_backend_detect >/dev/null; then
   exit 10
 fi
-touch "$ENV_EVIDENCE/$(basename "$0").isolated"
+touch "$FM_TEST_ENV_EVIDENCE/$(basename "$0").isolated"
 SH
-    chmod +x "$repo/tests/$name.test.sh"
+    chmod 0755 "$repo/tests/$name.test.sh"
   done
+  chmod -R a+rX "$repo" "$fakebin"
+  chmod 0777 "$evidence"
   FM_HOME=poison FM_STATE_OVERRIDE=poison FM_DATA_OVERRIDE=poison FM_ROOT_OVERRIDE=poison \
     FM_PROJECTS_OVERRIDE=poison FM_CONFIG_OVERRIDE=poison FM_BACKEND=poison \
     TMUX=poison TMUX_PANE=poison HERDR_ENV=1 HERDR_SESSION=poison \
     HERDR_SOCKET_PATH=poison HERDR_PANE_ID=poison CMUX_WORKSPACE_ID=poison \
     CMUX_SURFACE_ID=poison CMUX_SOCKET_PATH=poison CMUX_TAB_ID=poison \
     CMUX_PANEL_ID=poison __CFBundleIdentifier=com.cmuxterm.app \
-    ENV_EVIDENCE="$evidence" ENV_FAKEBIN="$fakebin" \
-    "$runner" --portable > "$tmp/out" 2> "$tmp/err" \
+    NOT_ALLOWLISTED_AMBIENT=poison AMBIENT_API_TOKEN=poison FM_TEST_ENV_TOKEN_PROBE=poison \
+    FM_TEST_ENV_ALLOWED_PROBE=carried \
+    FM_TEST_ENV_EVIDENCE="$evidence" FM_TEST_ENV_FAKEBIN="$fakebin" \
+    "$runner" --json "$tmp/artifact.json" --portable > "$tmp/out" 2> "$tmp/err" \
     || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "isolated environment fixture failed"; }
   [ -e "$evidence/fm-brief.test.sh.isolated" ] \
     || fail "parallel child did not observe an isolated fleet environment"
   [ -e "$evidence/fm-daemon.test.sh.isolated" ] \
     || fail "serial child did not observe an isolated fleet environment"
-  rm -rf "$tmp"
+  remove_privileged_fixture_tree "$tmp"
   pass "serial and parallel children isolate ambient fleet routing"
 }
 
 test_duration_budget_warns_and_ci_enforces() {
-  local tmp repo runner fakebin real_python rc
+  local tmp repo runner rc
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-budget.XXXXXX")
-  repo="$tmp/repo"; fakebin="$tmp/fakebin"; mkdir -p "$repo/bin" "$repo/tests" "$fakebin"
-  cp "$RUNNER" "$repo/bin/fm-test-run.sh"; runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
-  cat > "$repo/tests/fm-backend-herdr.test.sh" <<'SH'
+  repo="$tmp/repo"; mkdir -p "$repo/bin" "$repo/tests"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  runner="$repo/bin/fm-test-run.sh"
+  chmod +x "$runner" "$repo/bin/fm-test-supervisor.py"
+  cat >"$repo/tests/fm-backend-herdr.test.sh" <<'SH'
 #!/usr/bin/env bash
 echo "ok - measured budget fixture"
 SH
-  cat > "$repo/tests/fm-backend-herdr-smoke.test.sh" <<'SH'
-#!/usr/bin/env bash
-echo "ok - measured real-Herdr fixture"
-SH
-  cat > "$repo/tests/fm-new-required.test.sh" <<'SH'
+  cat >"$repo/tests/fm-new-required.test.sh" <<'SH'
 #!/usr/bin/env bash
 echo "ok - unmeasured fixture"
 SH
-  cat > "$repo/tests/fm-afk-inject-herdr-e2e.test.sh" <<'SH'
-#!/usr/bin/env bash
-echo "ok - long measured Herdr fixture"
-SH
-  cat > "$repo/tests/fm-backend-herdr-focus-flash-e2e.test.sh" <<'SH'
-#!/usr/bin/env bash
-echo "ok - measured focus-flash fixture"
-SH
   chmod +x "$repo"/tests/*.test.sh
-  real_python=$(command -v python3)
-  cat > "$fakebin/python3" <<SH
-#!/usr/bin/env bash
-if [ "\${1:-}" = -c ] && printf '%s' "\${2:-}" | grep -Fq 'time.time()'; then
-  n=0
-  [ ! -f '$tmp/clock' ] || n=\$(cat '$tmp/clock')
-  n=\$((n + 1)); printf '%s\n' "\$n" > '$tmp/clock'
-  case "\$n" in 1|2) echo 0 ;; *) echo "\${FAKE_DURATION_MS:-200000}" ;; esac
-  exit 0
-fi
-exec '$real_python' "\$@"
-SH
-  chmod +x "$fakebin/python3"
 
-  PATH="$fakebin:$PATH" "$runner" tests/fm-backend-herdr.test.sh > "$tmp/warn.out" 2> "$tmp/warn.err" \
-    || fail "local duration budget warning must not fail a functional pass"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 missing=0 mode=warn' "$tmp/warn.out" \
-    || fail "local duration budget warning summary was missing"
-  grep -q 'duration budget exceeded:' "$tmp/warn.err" || fail "duration overrun was not actionable"
+  "$runner" tests/fm-backend-herdr.test.sh >"$tmp/measured.out" 2>"$tmp/measured.err" \
+    || fail "measured duration fixture failed"
+  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 missing=0 mode=warn' "$tmp/measured.out" \
+    || fail "measured duration summary is missing"
 
-  rm -f "$tmp/clock"
-  set +e
-  PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
-    tests/fm-backend-herdr.test.sh > "$tmp/enforce.out" 2> "$tmp/enforce.err"
-  rc=$?
-  set -e
-  [ "$rc" -ne 0 ] || fail "CI duration budget enforcement did not fail"
-  grep -q 'FM_TEST_SUMMARY total=1 failed=0' "$tmp/enforce.out" \
-    || fail "duration enforcement hid or rewrote the functional result"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=1 missing=0 mode=enforce' "$tmp/enforce.out" \
-    || fail "duration enforcement summary was missing"
-
-  rm -f "$tmp/clock"
-  PATH="$fakebin:$PATH" "$runner" tests/fm-new-required.test.sh > "$tmp/missing-warn.out" 2> "$tmp/missing-warn.err" \
+  "$runner" tests/fm-new-required.test.sh >"$tmp/missing-warn.out" 2>"$tmp/missing-warn.err" \
     || fail "local execution must only warn for an unmeasured script"
   grep -q 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=1 mode=warn' "$tmp/missing-warn.out" \
     || fail "local execution did not report an explicitly missing measurement"
-  grep -q 'duration budget missing:' "$tmp/missing-warn.err" \
-    || fail "missing local duration measurement was not actionable"
 
-  rm -f "$tmp/clock"
   set +e
-  PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
-    tests/fm-new-required.test.sh > "$tmp/missing-enforce.out" 2> "$tmp/missing-enforce.err"
+  "$runner" --enforce-duration-budgets tests/fm-new-required.test.sh \
+    >"$tmp/missing-enforce.out" 2>"$tmp/missing-enforce.err"
   rc=$?
   set -e
   [ "$rc" -ne 0 ] || fail "enforced execution accepted an unmeasured script"
-  grep -q 'FM_TEST_SUMMARY total=1 failed=0' "$tmp/missing-enforce.out" \
-    || fail "missing-budget enforcement hid the functional result"
   grep -q 'FM_TEST_BUDGET_SUMMARY checked=0 exceeded=0 missing=1 mode=enforce' "$tmp/missing-enforce.out" \
     || fail "enforced execution did not report the missing measurement"
-
-  rm -f "$tmp/clock"
-  FAKE_DURATION_MS=65000 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
-    tests/fm-afk-inject-herdr-e2e.test.sh > "$tmp/herdr.out" 2> "$tmp/herdr.err" \
-    || fail "measured long Herdr duration was rejected by the default fallback budget"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 missing=0 mode=enforce' "$tmp/herdr.out" \
-    || fail "long Herdr duration did not use its measured budget"
-
-  rm -f "$tmp/clock"
-  FAKE_DURATION_MS=17520 PATH="$fakebin:$PATH" "$runner" --enforce-duration-budgets \
-    tests/fm-backend-herdr-focus-flash-e2e.test.sh > "$tmp/focus.out" 2> "$tmp/focus.err" \
-    || fail "measured focus-flash budget rejected its inclusive boundary"
-  grep -q 'FM_TEST_BUDGET_SUMMARY checked=1 exceeded=0 missing=0 mode=enforce' "$tmp/focus.out" \
-    || fail "focus-flash duration did not use its measured real-Herdr budget"
   rm -rf "$tmp"
-  pass "duration budgets warn locally and enforce every required CI script"
+  pass "duration inventory warns locally and required execution rejects missing data"
 }
 
 test_aggregate_json() {
-  local tmp a b
+  local tmp out rc
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-aggjson.XXXXXX")
-  cat >"$tmp/a.json" <<'JSON'
-{
-  "run_id": "a",
-  "selection": "lane=portable-parallel-1",
-  "started_at": "2026-07-22T00:00:00Z",
-  "finished_at": "2026-07-22T00:01:00Z",
-  "summary": {"total": 1, "failed": 0, "skipped_gate": 0, "duration_ms": 1000},
-  "scripts": [{"path": "tests/a.test.sh", "family": "pure-contract-unit", "duration_ms": 1000, "exit": 0, "gate_skip": false}]
-}
-JSON
-  cat >"$tmp/b.json" <<'JSON'
-{
-  "run_id": "b",
-  "selection": "lane=portable-serial",
-  "started_at": "2026-07-22T00:00:00Z",
-  "finished_at": "2026-07-22T00:02:00Z",
-  "summary": {"total": 2, "failed": 1, "skipped_gate": 0, "duration_ms": 2000},
-  "scripts": [
-    {"path": "tests/b.test.sh", "family": "afk", "duration_ms": 1500, "exit": 1, "gate_skip": false},
-    {"path": "tests/c.test.sh", "family": "afk", "duration_ms": 500, "exit": 0, "gate_skip": false}
-  ]
-}
-JSON
+  cat >"$tmp/a.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo ok
+SH
+  cat >"$tmp/b.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo not-ok
+exit 1
+SH
+  chmod +x "$tmp"/*.test.sh
+  "$RUNNER" --json "$tmp/a.json" "$tmp/a.test.sh" >/dev/null 2>"$tmp/a.err" \
+    || fail "aggregate passing input fixture failed"
+  "$RUNNER" --aggregate-json "$tmp/warn.json" "$tmp/a.json" >/dev/null \
+    || fail "aggregate enforced a warn-mode missing duration budget"
+  python3 - "$tmp/a.json" "$tmp/enforce.json" <<'PY'
+import json, sys
+lane = json.load(open(sys.argv[1]))
+lane["duration_budget_mode"] = "enforce"
+lane["summary"]["failed"] += lane["summary"]["duration_budget_missing"]
+lane["run"]["result"] = "failed"
+json.dump(lane, open(sys.argv[2], "w"))
+PY
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/enforced.json" "$tmp/enforce.json" >/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate ignored an enforced missing duration budget"
+  set +e
+  "$RUNNER" --json "$tmp/b.json" "$tmp/b.test.sh" >/dev/null 2>"$tmp/b.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate failing input fixture passed"
+  python3 - "$tmp/b.json" "$tmp/failing-enforce.json" <<'PY'
+import json, sys
+lane = json.load(open(sys.argv[1]))
+lane["duration_budget_mode"] = "enforce"
+json.dump(lane, open(sys.argv[2], "w"))
+PY
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/failing-enforce-aggregate.json" "$tmp/failing-enforce.json" >/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate ignored an enforced failing lane"
+  python3 - "$tmp/failing-enforce-aggregate.json" <<'PY' \
+    || fail "aggregate double-counted a failed script's budget violation"
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["summary"]["total"] == 1, doc["summary"]
+assert doc["summary"]["failed"] == 1, doc["summary"]
+PY
+  set +e
   out=$("$RUNNER" --aggregate-json "$tmp/out.json" "$tmp/a.json" "$tmp/b.json")
-  assert_contains "$out" "FM_TEST_AGGREGATE lanes=2 total=3 failed=1" "aggregate summary line"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate with a failed lane exited successfully"
+  assert_contains "$out" "FM_TEST_AGGREGATE lanes=2 total=2 failed=1" "aggregate summary line"
+  set +e
   "$RUNNER" --aggregate-json "$tmp/reversed.json" "$tmp/b.json" "$tmp/a.json" >/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "reversed aggregate with a failed lane exited successfully"
   cmp -s "$tmp/out.json" "$tmp/reversed.json" \
     || { rm -rf "$tmp"; fail "aggregate JSON depends on input order"; }
-  python3 -c '
-import json,sys
-doc=json.load(open(sys.argv[1]))
-assert doc["kind"]=="aggregate"
-assert doc["summary"]["lanes"]==2
-assert doc["summary"]["total"]==3
-assert doc["summary"]["failed"]==1
-assert doc["summary"]["critical_path_duration_ms"]==2000
-assert len(doc["scripts"])==3
-' "$tmp/out.json" || { rm -rf "$tmp"; fail "aggregate JSON shape wrong"; }
+  python3 - "$tmp/out.json" <<'PY' || fail "aggregate JSON shape is wrong"
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["schema_version"] == 2 and doc["kind"] == "fm-test-aggregate"
+assert doc["complete"] is True
+assert doc["summary"]["lanes"] == 2 and doc["summary"]["total"] == 2
+assert doc["summary"]["failed"] == 1 and len(doc["scripts"]) == 2
+PY
+  python3 - "$tmp/a.json" "$tmp/b.json" "$tmp/incomplete.json" "$tmp/duplicate.json" \
+    "$tmp/dishonest.json" "$tmp/unattempted.json" "$tmp/green-required-skip.json" <<'PY'
+import json, sys
+passing = json.load(open(sys.argv[1]))
+failing = json.load(open(sys.argv[2]))
+incomplete = json.loads(json.dumps(passing))
+incomplete["run"]["complete"] = False
+json.dump(incomplete, open(sys.argv[3], "w"))
+duplicate = json.loads(json.dumps(passing))
+duplicate["scripts"][0]["events"].append(dict(duplicate["scripts"][0]["events"][-1]))
+json.dump(duplicate, open(sys.argv[4], "w"))
+dishonest = json.loads(json.dumps(failing))
+dishonest["summary"]["failed"] = 0
+dishonest["run"]["result"] = "passed"
+json.dump(dishonest, open(sys.argv[5], "w"))
+unattempted = json.loads(json.dumps(passing))
+unattempted["scripts"][0]["terminal"]["attempted"] = False
+json.dump(unattempted, open(sys.argv[6], "w"))
+green_required_skip = json.loads(json.dumps(passing))
+green_required_skip["scripts"][0]["required_gate_skip_seen"] = True
+json.dump(green_required_skip, open(sys.argv[7], "w"))
+PY
+  for bad in "$tmp/incomplete.json" "$tmp/duplicate.json" "$tmp/dishonest.json" \
+    "$tmp/unattempted.json" "$tmp/green-required-skip.json"; do
+    set +e
+    "$RUNNER" --aggregate-json "$tmp/rejected.json" "$bad" >"$tmp/reject.out" 2>"$tmp/reject.err"
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ] || fail "aggregate accepted invalid evidence: $bad"
+  done
+  printf '{"schema_version":1}\n' >"$tmp/unknown.json"
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/rejected.json" "$tmp/unknown.json" >/dev/null 2>"$tmp/unknown.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate accepted an unknown schema"
+  cp "$tmp/a.json" "$tmp/cross-lane-duplicate.json"
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/rejected.json" \
+    "$tmp/a.json" "$tmp/cross-lane-duplicate.json" >/dev/null 2>"$tmp/cross-lane.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate accepted the same path and attempt across lane artifacts"
+  grep -q 'duplicate attempt identity' "$tmp/cross-lane.err" \
+    || fail "cross-lane duplicate rejection was not actionable"
   rm -rf "$tmp"
-  pass "aggregate-json merges lane timing artifacts"
+  pass "aggregate accepts complete schema-v2 lanes and rejects incomplete, duplicate, or mixed evidence"
 }
 
-test_list_all_exact_suite_coverage
-test_family_selection
-test_single_script_selection
-test_changed_file_selection_is_conservative
-test_changed_dependency_selection_and_unmapped_failure
-test_empty_selection_emits_summary
-test_timing_markers_and_json
-test_aggregate_exit_behavior
-test_gate_skip_accounting
-test_fail_on_gate_skip_token
-test_exclude_family
-test_portable_shard_union_and_coverage_guard
-test_portable_serial_shards_partition_the_serial_lane
-test_portable_serial_shard_lane_refusals
-test_real_herdr_shards_partition_the_family
-test_real_herdr_shard_lane_refusals
-test_jobs_requires_proven_isolated
-test_jobs_parallel_scheduler_and_failure_propagation
-test_default_changed_and_portable_selection
-test_mixed_complete_scheduler_exact_once_and_failures
-test_parallel_signal_cleanup
-test_serial_signal_cleanup
-test_completed_worker_descendant_cleanup
-test_environment_isolation_in_serial_and_parallel_children
-test_duration_budget_warns_and_ci_enforces
-test_aggregate_json
+make_parallel_dev_manifest() { # <manifest> <artifact> <root> <jobs> <budget-ms:path>...
+  local manifest=$1 artifact=$2 root=$3 jobs=$4
+  shift 4
+  python3 - "$manifest" "$artifact" "$root" "$jobs" "$@" <<'PY'
+import json, os, pathlib, sys, time
+manifest, artifact, root, jobs, *specs = sys.argv[1:]
+scripts = []
+for spec in specs:
+    budget, path = spec.split(":", 1)
+    scripts.append({
+        "path": path, "family": "fixture", "expected_gate_skip": "none",
+        "duration_baseline_ms": max(1, int(budget) // 2),
+        "duration_budget_ms": int(budget), "phase": "parallel",
+    })
+now = int(time.time())
+doc = {
+    "manifest_version": 2, "artifact": artifact, "root": root,
+    "run_id": f"parallel-{os.getpid()}-{time.time_ns()}", "selection": "parallel-fixture",
+    "jobs": int(jobs), "containment": "developer-non-enforcing",
+    "duration_budget_mode": "warn", "fail_on_gate_skip": "",
+    "environment": dict(os.environ), "bash": "/bin/bash", "scripts": scripts,
+    "deadlines": {
+        "t0_epoch": now, "ordinary_epoch": now + 40,
+        "terminal_epoch": now + 50, "cleanup_epoch": now + 55,
+        "ceiling_epoch": now + 60,
+    },
+}
+pathlib.Path(manifest).write_text(json.dumps(doc), encoding="utf-8")
+PY
+}
+
+make_required_fault_manifest() { # <manifest> <artifact> <root> <fault:budget:path>...
+  local manifest=$1 artifact=$2 root=$3
+  shift 3
+  python3 - "$manifest" "$artifact" "$root" "$@" <<'PY'
+import json, os, pathlib, sys, time
+manifest, artifact, root, *specs = sys.argv[1:]
+# The privileged executor accepts only physical, symlink-free output paths.
+# Normalize macOS's fixed /var compatibility alias as the runner does without
+# resolving any caller-controlled intermediate or final symlink.
+artifact = os.path.abspath(artifact)
+if sys.platform == "darwin" and artifact.startswith("/var/") and os.path.realpath("/var") == "/private/var":
+    artifact = "/private" + artifact
+secret = ("TOKEN", "SECRET", "PASSWORD", "COOKIE", "CREDENTIAL", "AUTHORIZATION", "PRIVATE_KEY")
+scripts = []
+for spec in specs:
+    fault, budget, path = spec.split(":", 2)
+    scripts.append({
+        "path": path, "family": "fixture", "expected_gate_skip": "none",
+        "duration_baseline_ms": max(1, int(budget) // 2),
+        "duration_budget_ms": int(budget), "phase": "serial",
+        "test_fault": None if fault == "none" else fault,
+    })
+now = int(time.time())
+doc = {
+    "manifest_version": 2, "artifact": artifact, "root": root,
+    "run_id": f"fault-{os.getpid()}-{time.time_ns()}", "selection": "fault-fixture",
+    "jobs": 1, "containment": "required", "duration_budget_mode": "warn",
+    "fail_on_gate_skip": "",
+    "environment": {
+        key: value for key, value in os.environ.items()
+        if not any(part in key.upper() for part in secret)
+    },
+    "bash": "/bin/bash", "scripts": scripts,
+    "deadlines": {
+        # Required mode reserves 30 seconds for two terminal publications plus
+        # per-attempt startup and cleanup. Keep this fixture comfortably beyond
+        # that conservative schedule model so host inventory latency cannot turn
+        # the intended ambiguity execution into a preflight refusal.
+        "t0_epoch": now, "ordinary_epoch": now + 90,
+        "terminal_epoch": now + 100, "cleanup_epoch": now + 105,
+        "ceiling_epoch": now + 120,
+    },
+}
+pathlib.Path(manifest).write_text(json.dumps(doc), encoding="utf-8")
+PY
+}
+
+test_concurrent_atomic_polling_across_parallel_transitions() {
+  local tmp manifest artifact poll_pid rc i reads invalid
+  local -a specs=()
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-poll.XXXXXX")
+  i=1
+  while [ "$i" -le 6 ]; do
+    cat >"$tmp/p$i.sh" <<'SH'
+#!/usr/bin/env bash
+# A short bounded body so the executor cycles started->terminal for several
+# scripts concurrently while the artifact is polled from outside.
+sleep 0.15
+echo "ok - $(basename "$0")"
+SH
+    chmod +x "$tmp/p$i.sh"
+    specs+=("2000:$tmp/p$i.sh")
+    i=$((i + 1))
+  done
+  manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
+  make_parallel_dev_manifest "$manifest" "$artifact" "$tmp" 4 "${specs[@]}"
+  # A tight in-process poller races the executor's atomic artifact replacements:
+  # it reads the file as fast as it can for the whole run and records any
+  # observation that is missing mid-write, truncated, or not valid JSON. Because
+  # every publish uses os.replace, a racing reader must always see a complete
+  # prior or next version, never a partial one.
+  cat >"$tmp/poll.py" <<'PY'
+import json, os, sys
+artifact, stop_flag, result = sys.argv[1], sys.argv[2], sys.argv[3]
+reads = invalid = 0
+def read_once():
+    global reads, invalid
+    try:
+        with open(artifact, encoding="utf-8") as handle:
+            json.load(handle)
+        reads += 1
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, ValueError):
+        invalid += 1
+while not os.path.exists(stop_flag):
+    read_once()
+for _ in range(500):  # keep racing the final replacements after the run stops
+    read_once()
+with open(result, "w", encoding="utf-8") as handle:
+    handle.write(f"{reads} {invalid}")
+PY
+  python3 "$tmp/poll.py" "$artifact" "$tmp/stop" "$tmp/poll.result" &
+  poll_pid=$!
+  set +e
+  python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  : >"$tmp/stop"
+  wait "$poll_pid" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "parallel developer run should pass"; }
+  reads=$(cut -d' ' -f1 "$tmp/poll.result"); invalid=$(cut -d' ' -f2 "$tmp/poll.result")
+  [ "$invalid" -eq 0 ] \
+    || { rm -rf "$tmp"; fail "poller saw $invalid truncated/invalid JSON reads while artifact replacements were in flight"; }
+  [ "${reads:-0}" -ge 1 ] || { rm -rf "$tmp"; fail "poller never observed the artifact during the run"; }
+  python3 - "$artifact" <<'PY' || { rm -rf "$tmp"; fail "final artifact wrong after parallel transitions"; }
+import json, pathlib, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["run"]["complete"] is True, doc["run"]
+assert len(doc["scripts"]) == 6
+assert all(row["terminal"]["result"] == "passed" for row in doc["scripts"])
+assert all(row.get("attempt_count") == 1 for row in doc["scripts"])
+# Terminal evidence references only durable diagnostics that survive transient
+# cleanup at the end of the run.
+for row in doc["scripts"]:
+    log_path = row.get("diagnostic_log")
+    assert log_path and pathlib.Path(log_path).exists(), log_path
+PY
+  rm -rf "$tmp"
+  pass "concurrent JSON polling stays valid while artifact replacements are in flight"
+}
+
+test_required_containment_ambiguity_terminalizes() {
+  local tmp tmp_root manifest artifact rc
+  local -a py=()
+  # A contained caller under NO_NEW_PRIVS cannot escalate, so this self-skips
+  # there instead of failing; the dedicated executor-behavior CI job runs it
+  # with real privilege on both platforms.
+  if [ "$(id -u)" -eq 0 ]; then
+    py=("$(command -v python3)")
+  elif sudo -n true >/dev/null 2>&1; then
+    py=(sudo -n "$(command -v python3)")
+  else
+    printf 'skip: privileged executor unavailable; no containment_ambiguous claim\n'
+    return 0
+  fi
+  # Do not use macOS TMPDIR here: its per-user parent is mode 0700, so a
+  # deliberately dropped leased UID cannot traverse it even when this leaf is
+  # world-traversable. Use the physical shared temporary root: macOS exposes it
+  # through the fixed /tmp -> /private/tmp compatibility symlink, while the
+  # privileged executor deliberately refuses all symlinked artifact paths.
+  tmp_root=$(python3 -c 'import os; print(os.path.realpath("/tmp"))')
+  tmp=$(mktemp -d "$tmp_root/fm-test-executor-ambiguous.XXXXXX")
+  chmod 0711 "$tmp"
+  # Three normally-exiting bodies. The injected cleanup faults, not the process,
+  # drive the required-mode ambiguity path: the real KILL still ran and the
+  # process really exited, but the executor is forced to treat the domain as
+  # unproven (non-quiescent or unreadable probe), so it must quarantine and
+  # commit containment_ambiguous with no numeric fallback.
+  local name
+  for name in ok nq up; do
+    cat >"$tmp/$name.sh" <<'SH'
+#!/usr/bin/env bash
+echo "ok - fixture"
+exit 0
+SH
+    chmod 0755 "$tmp/$name.sh"
+  done
+  manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
+  make_required_fault_manifest "$manifest" "$artifact" "$tmp" \
+    "none:3000:$tmp/ok.sh" "nonquiescent:3000:$tmp/nq.sh" "unreadable_probe:3000:$tmp/up.sh"
+  set +e
+  "${py[@]}" "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || { cat "$tmp/out" "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "ambiguous containment must be red"; }
+  python3 - "$artifact" <<'PY' || { cat "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "containment ambiguity evidence is wrong"; }
+import json, pathlib, sys
+doc = json.load(open(sys.argv[1]))
+rows = doc["scripts"]
+results = [row["terminal"]["result"] for row in rows]
+assert results == ["passed", "containment_ambiguous", "containment_ambiguous"], results
+assert doc["run"]["complete"] is True
+assert doc["run"]["result"] == "failed"
+# Both faulted identities are quarantined; the passing one is not.
+assert len(doc["containment"]["quarantined_uids"]) == 2, doc["containment"]["quarantined_uids"]
+assert all(row.get("attempt_count") == 1 for row in rows)
+nq, up = rows[1], rows[2]
+names = lambda row: [event["name"] for event in row["events"]]
+assert "nonquiescence_injected" in names(nq), names(nq)
+assert "quiescence_unreadable" in names(up), names(up)
+# No numeric fallback: the required cleanup path never signals by PID or group,
+# so the terminal must record the ambiguity rather than a kill-by-pid outcome,
+# and diagnostics survive the transient cleanup.
+for row in (nq, up):
+    log_path = row.get("diagnostic_log")
+    assert log_path and pathlib.Path(log_path).exists(), log_path
+    assert not any(event["name"] == "quiescence" and event.get("proved") for event in row["events"])
+PY
+  remove_privileged_fixture_tree "$tmp"
+  pass "required non-quiescence and unreadable-probe cleanup terminalize as quarantined containment_ambiguous"
+}
+
+test_required_public_runner_leased_uid() {
+  local tmp tmp_root artifact fixture_runner rc
+  # Proves the required credential-domain path through the PUBLIC runner: a test
+  # script is executed as a leased high UID and terminalizes passed. Self-skips
+  # when no root and no noninteractive sudo (the runner cannot self-escalate),
+  # like the other privileged fixtures; the executor-behavior CI job runs it with
+  # real privilege on both platforms. Unlike the interruption/env-isolation
+  # fixtures, this one is designed for required mode: its fixture root is
+  # traversable, while its checkout scripts begin runner-readable only and prove
+  # the executor's leased-identity read grant. Five attempts under a bounded
+  # window also prove the lane reserves launches without double-counting them.
+  if [ "$(id -u)" -ne 0 ] && ! sudo -n true >/dev/null 2>&1; then
+    printf 'skip: privileged executor unavailable; no required public-runner claim\n'
+    return 0
+  fi
+  # macOS TMPDIR lives below a mode-0700 per-user directory. A leased UID must
+  # be able to traverse every parent. Use the physical shared temporary root so
+  # the artifact path does not retain macOS's /tmp compatibility symlink.
+  tmp_root=$(python3 -c 'import os; print(os.path.realpath("/tmp"))')
+  tmp=$(mktemp -d "$tmp_root/fm-test-required-runner.XXXXXX")
+  chmod 0711 "$tmp"
+  # The public runner makes its repository root the child's working directory.
+  # A hosted checkout may itself sit below a private home directory, so execute
+  # the current runner and supervisor from a minimal world-traversable fixture
+  # root rather than accidentally testing the host checkout's parent modes.
+  mkdir -p "$tmp/repo/bin" "$tmp/repo/.git"
+  cp "$RUNNER" "$SUPERVISOR" "$tmp/repo/bin/"
+  chmod 0755 "$tmp/repo" "$tmp/repo/bin" "$tmp/repo/bin/fm-test-run.sh"
+  chmod 0700 "$tmp/repo/bin/fm-test-supervisor.py"
+  printf 'checkout_readable=true\n' >"$tmp/repo/support.sh"
+  chmod 0600 "$tmp/repo/support.sh"
+  printf 'fixture-git-metadata\n' >"$tmp/repo/.git/config"
+  chmod 0700 "$tmp/repo/.git"
+  chmod 0600 "$tmp/repo/.git/config"
+  # An untracked FIFO must not block the deadline-bounded checkout grant.
+  # Exercise this through the public required runner, not the implementation.
+  mkfifo "$tmp/repo/untracked-pipe"
+  chmod 0600 "$tmp/repo/untracked-pipe"
+  printf 'runner-secret\n' >"$tmp/runner-secret"
+  chmod 0600 "$tmp/runner-secret"
+  ln -s "$tmp/runner-secret" "$tmp/repo/external-secret"
+  fixture_runner="$tmp/repo/bin/fm-test-run.sh"
+  mkdir -p "$tmp/repo/tests"
+  for name in fm-classify-decision-key fm-brief fm-composer-lib fm-supervision-instructions fm-transition-lib; do
+    cat >"$tmp/repo/tests/$name.test.sh" <<'SH'
+#!/usr/bin/env bash
+. "$PWD/support.sh"
+[ "$checkout_readable" = true ]
+[ "$(cat "$PWD/.git/config")" = fixture-git-metadata ]
+if cat "$PWD/external-secret" >/dev/null 2>&1; then
+  echo "leased identity read an out-of-checkout symlink target" >&2
+  exit 9
+fi
+echo "runuid=$(id -u) git_metadata=readable symlink_target=unreadable"
+exit 0
+SH
+    chmod 0600 "$tmp/repo/tests/$name.test.sh"
+  done
+  artifact="$tmp/artifact.json"
+  t0=$(date +%s)
+  set +e
+  FM_TEST_CONTAINMENT=required \
+    FM_TEST_JOB_T0_EPOCH="$t0" \
+    FM_TEST_ORDINARY_DEADLINE_EPOCH="$((t0 + 80))" \
+    FM_TEST_TERMINAL_DEADLINE_EPOCH="$((t0 + 100))" \
+    FM_TEST_CLEANUP_DEADLINE_EPOCH="$((t0 + 130))" \
+    FM_TEST_CEILING_DEADLINE_EPOCH="$((t0 + 160))" \
+    "$fixture_runner" --json "$artifact" \
+    tests/fm-classify-decision-key.test.sh tests/fm-brief.test.sh \
+    tests/fm-composer-lib.test.sh tests/fm-supervision-instructions.test.sh \
+    tests/fm-transition-lib.test.sh >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "required public-runner leased-UID lane should fit and pass"; }
+  python3 - "$artifact" "$(id -u)" <<'PY' || { cat "$tmp/err"; remove_privileged_fixture_tree "$tmp"; fail "required public-runner leased-UID evidence is wrong"; }
+import json, re, sys
+doc = json.load(open(sys.argv[1]))
+caller = int(sys.argv[2])
+assert doc["containment"]["mode"] == "required" and doc["containment"]["enforcing"] is True, doc["containment"]
+assert doc["run"]["complete"] is True, doc["run"]
+assert len(doc["scripts"]) == 5, doc["scripts"]
+for row in doc["scripts"]:
+    assert row["terminal"]["result"] == "passed", row["terminal"]
+    match = re.search(r"runuid=(\d+)", row.get("output_tail", ""))
+    assert match, row.get("output_tail")
+    assert "git_metadata=readable symlink_target=unreadable" in row.get("output_tail", ""), row.get("output_tail")
+    runuid = int(match.group(1))
+    assert runuid != caller, f"script ran as caller uid {runuid}, expected a leased identity"
+    assert 61000 <= runuid <= 64999, f"script uid {runuid} outside the leased range 61000-64999"
+PY
+  remove_privileged_fixture_tree "$tmp"
+  pass "required public-runner path runs a test as a leased high UID with passed terminal"
+}
+
+ALL_TESTS=(
+  test_list_all_exact_suite_coverage
+  test_family_selection
+  test_single_script_selection
+  test_changed_file_selection_is_conservative
+  test_changed_dependency_selection_and_unmapped_failure
+  test_empty_selection_emits_summary
+  test_timing_markers_and_json
+  test_aggregate_exit_behavior
+  test_gate_skip_accounting
+  test_fail_on_gate_skip_token
+  test_exclude_family
+  test_portable_shard_union_and_coverage_guard
+  test_portable_serial_shards_partition_the_serial_lane
+  test_portable_serial_shard_lane_refusals
+  test_real_herdr_shards_partition_the_family
+  test_real_herdr_shard_lane_refusals
+  test_real_herdr_lane_shares_only_runner_runtime
+  test_jobs_requires_proven_isolated
+  test_jobs_parallel_scheduler_and_failure_propagation
+  test_default_changed_and_portable_selection
+  test_mixed_complete_scheduler_exact_once_and_failures
+  test_timeout_then_remaining_exact_once
+  test_warn_budget_overrun_completes
+  test_interruption_and_atomic_evidence
+  test_uncatchable_interruption_is_incomplete_red
+  test_concurrent_atomic_polling_across_parallel_transitions
+  test_required_unsupported_refuses_before_execution
+  test_required_containment_ambiguity_terminalizes
+  test_required_public_runner_leased_uid
+  test_privileged_artifact_rejects_intermediate_symlink
+  test_required_platform_qualification
+  test_environment_isolation_in_serial_and_parallel_children
+  test_duration_budget_warns_and_ci_enforces
+  test_aggregate_json
+)
+
+# Optional targeted subset: FM_TEST_RUN_ONLY="test_a test_b" runs only those,
+# used by the cross-platform executor-behavior CI job to exercise the privileged
+# executor paths on both required platforms. Unset runs the whole file.
+if [ -n "${FM_TEST_RUN_ONLY:-}" ]; then
+  for fn in $FM_TEST_RUN_ONLY; do
+    declare -F "$fn" >/dev/null || fail "FM_TEST_RUN_ONLY names an unknown test: $fn"
+    "$fn"
+  done
+else
+  for fn in "${ALL_TESTS[@]}"; do
+    "$fn"
+  done
+fi

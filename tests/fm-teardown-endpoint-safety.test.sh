@@ -102,7 +102,7 @@ test_control_lock_contention_refuses_before_mutation() {
   lock="$dir/home/state/.control-$id.lock"
   (
     # shellcheck source=/dev/null
-    . "$ROOT/bin/fm-wake-lib.sh"
+    FM_HOME="$dir/home" . "$ROOT/bin/fm-wake-lib.sh"
     fm_lock_try_acquire "$lock" || exit 1
     sleep 30
   ) &
@@ -148,7 +148,7 @@ test_metadata_lock_serializes_destructive_cleanup() {
   release="$dir/meta-lock-release"
   (
     # shellcheck source=/dev/null
-    . "$ROOT/bin/fm-wake-lib.sh"
+    FM_HOME="$dir/home" . "$ROOT/bin/fm-wake-lib.sh"
     fm_lock_try_acquire "$lock" || exit 1
     trap 'fm_lock_release "$lock"' EXIT
     : > "$ready"

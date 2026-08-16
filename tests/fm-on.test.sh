@@ -191,8 +191,14 @@ pass "the fixed entrypoint runs every command in the worker's explicit environme
 # expectation is rebuilt here from the documented contract - fixed head, the
 # package-manager directories that exist on this host, fixed tail - so a host
 # with nix, homebrew, or neither exercises both the include and omit directions.
-ACCOUNT_HOME=$(unset HOME; CDPATH='' cd ~ && pwd -P)
-ACCOUNT_USER=$(id -un)
+if ACCOUNT_USER=$(id -un 2>/dev/null); then
+  ACCOUNT_HOME=$(unset HOME; CDPATH='' cd ~ && pwd -P)
+else
+  # Required containment deliberately runs as an accountless leased UID. Match
+  # the entrypoint's observable fallback to that identity's private HOME.
+  ACCOUNT_USER=
+  ACCOUNT_HOME=$(CDPATH='' cd "$HOME" && pwd -P)
+fi
 MANAGER_DIRS=(
   "$ACCOUNT_HOME/.asdf/shims"
   "$ACCOUNT_HOME"/.asdf/installs/*/*/bin
@@ -201,9 +207,11 @@ MANAGER_DIRS=(
   "$ACCOUNT_HOME"/.local/share/mise/installs/*/*/bin
   "$ACCOUNT_HOME"/.mise/installs/*/*/bin
 )
-OPTIONAL_DIRS=(
-  "$ACCOUNT_HOME/.nix-profile/bin"
-  "/etc/profiles/per-user/$ACCOUNT_USER/bin"
+OPTIONAL_DIRS=("$ACCOUNT_HOME/.nix-profile/bin")
+if [ -n "$ACCOUNT_USER" ]; then
+  OPTIONAL_DIRS+=("/etc/profiles/per-user/$ACCOUNT_USER/bin")
+fi
+OPTIONAL_DIRS+=(
   /run/current-system/sw/bin
   /opt/homebrew/bin
   /usr/local/bin
@@ -219,12 +227,18 @@ NVM_CHILD_DIRS=()
 while IFS= read -r candidate; do
   [ -z "$candidate" ] || NVM_CHILD_DIRS+=("$candidate")
 done < <(printf '%s\n' "$CHILD_PATH" | tr ':' '\n' | sed -n "\|^$ACCOUNT_HOME/.nvm/versions/node/[^/]*/bin$|p")
-[ "${#NVM_CHILD_DIRS[@]}" -le 1 ] || fail "the child PATH selected more than one nvm version"
+NVM_CHILD_COUNT=0
+if [ "${NVM_CHILD_DIRS[*]+set}" = set ]; then
+  NVM_CHILD_COUNT=${#NVM_CHILD_DIRS[@]}
+fi
+[ "$NVM_CHILD_COUNT" -le 1 ] || fail "the child PATH selected more than one nvm version"
 expect_dir "$REMOTE_ROOT/bin"
 if [ -d "$ACCOUNT_HOME/.local/bin" ] && [ ! -L "$ACCOUNT_HOME/.local/bin" ]; then
   expect_dir "$ACCOUNT_HOME/.local/bin"
 fi
-for candidate in "${NVM_CHILD_DIRS[@]}"; do expect_dir "$candidate"; done
+if [ "$NVM_CHILD_COUNT" -gt 0 ]; then
+  for candidate in "${NVM_CHILD_DIRS[@]}"; do expect_dir "$candidate"; done
+fi
 for candidate in "${MANAGER_DIRS[@]}"; do
   [ -d "$candidate" ] && [ ! -L "$candidate" ] && expect_dir "$candidate"
 done

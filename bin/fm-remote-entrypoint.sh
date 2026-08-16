@@ -98,8 +98,29 @@ case "$COMMAND" in */*|*..*) die "command contains a path or traversal: $COMMAND
 COMMAND_PATH="$ROOT/bin/$COMMAND"
 [ -f "$COMMAND_PATH" ] && [ ! -L "$COMMAND_PATH" ] && [ -x "$COMMAND_PATH" ] \
   || die "command is not a genuine executable in the configured remote root: $COMMAND"
+# A real SSH login has both an account-database home and an inherited HOME.
+# Required credential containment deliberately uses accountless UIDs, so its
+# in-process SSH fixtures have only the latter. Prefer the account database, but
+# for an accountless identity accept its inherited HOME only when it is an
+# existing canonical directory owned by that identity. This is not keyed to a
+# forgeable test-mode variable and grants no access the caller does not already
+# own.
+INHERITED_HOME=${HOME:-}
 unset HOME
-ACCOUNT_HOME=$(CDPATH='' cd ~ 2>/dev/null && pwd -P) || die "cannot resolve the remote account home"
+# Do not use failure of `cd ~` as the account-existence test. With HOME unset,
+# bash can treat an unresolved bare tilde as an empty cd operand and succeed in
+# the current directory for an accountless UID. Ask the credential database via
+# id first; only an identity with a name may take the ordinary account-home path.
+if id -un >/dev/null 2>&1; then
+  ACCOUNT_HOME=$(CDPATH='' cd ~ 2>/dev/null && pwd -P) \
+    || die "cannot resolve the remote account home"
+else
+  [ -n "$INHERITED_HOME" ] && [ -O "$INHERITED_HOME" ] \
+    || die "cannot resolve the remote account home"
+  ACCOUNT_HOME=$(fm_remote_job_canonical_existing_dir "$INHERITED_HOME") \
+    || die "cannot resolve the remote account home"
+fi
+unset INHERITED_HOME
 fm_remote_job_compose_operator_path "$ACCOUNT_HOME" >/dev/null
 GIT_BIN=$(fm_remote_job_operator_tool git 2>/dev/null || true)
 if [ -n "$GIT_BIN" ]; then

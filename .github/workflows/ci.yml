@@ -13,6 +13,7 @@ jobs:
   lint:
     name: Lint shell scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned ShellCheck
@@ -36,23 +37,104 @@ jobs:
   test-coverage:
     name: Test coverage guard
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Prove complete regression partition
         run: bin/fm-test-run.sh --check-coverage
 
+  # Required kernel qualification and executor behavior on both containment
+  # platforms. Capability absence is red and can never be reported as a passing
+  # skipped case. The executor-behavior step drives the real credential-domain
+  # execute path (credential drop, signal scope, terminal evidence, timeout,
+  # interruption, non-quiescence/ambiguity) through the public test interface on
+  # macOS as well as Linux, so Darwin containment is proven end to end and not
+  # only at the primitive level.
+  test-containment-qualification:
+    name: Containment qualification and executor behavior (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      # T0 is the first executable behavior step, before checkout, so the
+      # absolute deadline budget covers checkout and tool setup too.
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prove credential-domain containment semantics
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/fm-test"
+          sudo -n "$(command -v python3)" bin/fm-test-supervisor.py qualify \
+            --artifact "$RUNNER_TEMP/fm-test/fm-test-containment-qualification.json"
+      - name: Prove executor behavior on this platform
+        run: |
+          set -eu
+          # Prove the REQUIRED credential-domain path through the public runner
+          # with fixtures designed for it: test_required_public_runner_leased_uid
+          # (runs a world-readable test as a leased high UID via the runner's own
+          # sudo -n self-escalation) and the privileged non-quiescence/ambiguity
+          # fixture. The interruption, atomic-evidence, env-isolation, timeout,
+          # and scheduling fixtures run developer-non-enforcing here on both
+          # platforms; they are not designed to execute under a leased UID (their
+          # scratch is runner-owned and not reachable by a dropped child), so
+          # forcing them into required mode is not how the required path is
+          # proven. The step therefore does not set FM_TEST_CONTAINMENT=required;
+          # the required fixtures self-escalate internally.
+          FM_TEST_RUN_ONLY="test_timeout_then_remaining_exact_once test_interruption_and_atomic_evidence test_uncatchable_interruption_is_incomplete_red test_concurrent_atomic_polling_across_parallel_transitions test_environment_isolation_in_serial_and_parallel_children test_required_containment_ambiguity_terminalizes test_required_public_runner_leased_uid" \
+            bash tests/fm-test-run.test.sh
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm-test-containment-qualification-${{ matrix.os }}
+          path: ${{ runner.temp }}/fm-test/
+          if-no-files-found: error
+
   # Two duration-balanced portable parallel shards of the Phase 2 proven-isolated
   # set only. Composition owner: bin/fm-test-run.sh (docs/fm-test-portable-shards.md).
   tests-portable-parallel-1:
     name: Behavior portable parallel 1
+    needs: test-containment-qualification
     runs-on: ubuntu-latest
+    env:
+      FM_TEST_CONTAINMENT: required
     # Measured shard wall is ~1 min of serial sum on proven scripts; this cap is
     # a hang tripwire with margin, not the expected healthy end of the lane.
     timeout-minutes: 10
     steps:
+      # T0 is the first executable behavior step, before checkout, so the
+      # absolute deadline budget covers checkout and tool setup too. Recording
+      # it after checkout would leave that time unaccounted against the ceiling.
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -75,17 +157,35 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fm-test-timing-portable-parallel-1
-          path: ${{ runner.temp }}/fm-test/fm-test-timing-portable-parallel-1.json
+          path: ${{ runner.temp }}/fm-test/
           if-no-files-found: warn
 
   tests-portable-parallel-2:
     name: Behavior portable parallel 2
+    needs: test-containment-qualification
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      FM_TEST_CONTAINMENT: required
     steps:
+      # T0 is the first executable behavior step, before checkout, so the
+      # absolute deadline budget covers checkout and tool setup too. Recording
+      # it after checkout would leave that time unaccounted against the ceiling.
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -108,7 +208,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fm-test-timing-portable-parallel-2
-          path: ${{ runner.temp }}/fm-test/fm-test-timing-portable-parallel-2.json
+          path: ${{ runner.temp }}/fm-test/
           if-no-files-found: warn
 
   # Required portable serial remainder: watcher, lock, AFK, tmux, daemon,
@@ -119,20 +219,38 @@ jobs:
   # whose "ofN" disagrees with it (docs/fm-test-portable-shards.md).
   tests-portable-serial:
     name: Behavior portable serial ${{ matrix.shard }}
+    needs: test-containment-qualification
     runs-on: ubuntu-latest
-    # Current measured hints total about 37 min of serial work; the balanced
-    # shards are about 3.7 min each. Cap is a hang tripwire with margin, not
+    env:
+      FM_TEST_CONTAINMENT: required
+    # Current measured hints total about 38 min of serial work; the balanced
+    # shards are about 3.8 min each. Cap is a hang tripwire with margin, not
     # the expected healthy end of the lane.
-    timeout-minutes: 30
+    timeout-minutes: 10
     strategy:
       # Every shard reports so one failure never hides another shard's result.
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
+      # T0 is the first executable behavior step, before checkout, so the
+      # absolute deadline budget covers checkout and tool setup too. Recording
+      # it after checkout would leave that time unaccounted against the ceiling.
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -169,29 +287,47 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fm-test-timing-portable-serial-${{ matrix.shard }}
-          path: ${{ runner.temp }}/fm-test/fm-test-timing-portable-serial-${{ matrix.shard }}.json
+          path: ${{ runner.temp }}/fm-test/
           if-no-files-found: warn
 
-  # Required real-Herdr lane: pinned install, serial real-herdr-gated shards,
-  # hard-fail on "skip: herdr not found". Each shard is strictly serial on its
-  # own runner with its own default session, snapshot, and cleanup; shard
+  # Real Herdr is a GUI-backend integration lane incompatible with per-UID home
+  # isolation, so it runs without hard descendant containment. Portable behavior
+  # lanes retain required credential-domain containment. Pinned install, serial
+  # real-herdr-gated shards, and hard-fail on "skip: herdr not found" remain.
+  # Each shard is strictly serial on its own runner with its own default session,
+  # snapshot, and cleanup; shard
   # membership and the shard count belong to bin/fm-test-run.sh, which refuses
   # a lane whose "ofN" disagrees with it. Starts on Linux x86_64; if a genuine
   # platform invariant fails (focus, cleanup, default-session tripwire), keep
   # the failure evidence and move the job to macOS rather than skip assertions.
   tests-herdr:
     name: Behavior tests (Herdr ${{ matrix.shard }})
+    needs: test-containment-qualification
     runs-on: ubuntu-latest
     # Real Herdr is slower than the portable suite; this is a hang tripwire,
     # not the expected healthy end of the lane (balanced shards are under
     # five minutes each).
-    timeout-minutes: 30
+    timeout-minutes: 10
     strategy:
       # Every shard reports so one failure never hides another shard's result.
       fail-fast: false
       matrix:
         shard: [1, 2]
     steps:
+      # T0 is the first executable behavior step, before checkout, so the
+      # absolute deadline budget covers checkout and tool setup too. Recording
+      # it after checkout would leave that time unaccounted against the ceiling.
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -269,8 +405,16 @@ jobs:
           set -eu
           mkdir -p "$RUNNER_TEMP/fm-herdr"
           bin/fm-herdr-ci-cleanup.sh snapshot "$RUNNER_TEMP/fm-herdr/sessions-before.json"
-      - name: Run real-Herdr shard ${{ matrix.shard }} (serial, required)
+      - name: Run real-Herdr shard ${{ matrix.shard }} (serial)
         env:
+          # Real Herdr is a GUI-backend integration lane that is intentionally not
+          # credential-contained. The shard runs a shared herdr server as the
+          # runner and reaches it over a Unix socket under the runner's home; a
+          # per-UID leased identity could not share that socket, so this lane runs
+          # developer-non-enforcing (as the runner) rather than required. Set it
+          # explicitly so a future default change cannot silently push real Herdr
+          # into credential containment, where it would fail.
+          FM_TEST_CONTAINMENT: developer-non-enforcing
           # job-total rather than a literal, so shrinking or growing the matrix
           # without matching bin/fm-test-run.sh is refused instead of quietly
           # leaving a shard of the required lane unrun.
@@ -289,19 +433,29 @@ jobs:
         if: always()
         run: |
           set -eu
-          bin/fm-herdr-ci-cleanup.sh teardown "$RUNNER_TEMP/fm-herdr/sessions-before.json" || {
-            echo "::warning::lab session cleanup reported a problem; see logs"
-            # Surface diagnostics without weakening the suite result above.
-            herdr session list --json || true
-            exit 1
-          }
+          python3 - "$FM_TEST_CLEANUP_DEADLINE_EPOCH" "$RUNNER_TEMP/fm-herdr/sessions-before.json" <<'PY'
+          import subprocess, sys, time
+          deadline = int(sys.argv[1])
+          remaining = deadline - time.time()
+          if remaining <= 0:
+              raise SystemExit("job cleanup reserve was exhausted before Herdr teardown")
+          try:
+              subprocess.run(
+                  ["bin/fm-herdr-ci-cleanup.sh", "teardown", sys.argv[2]],
+                  check=True,
+                  timeout=remaining,
+              )
+          except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+              subprocess.run(["herdr", "session", "list", "--json"], check=False)
+              raise SystemExit(f"job-owned Herdr cleanup failed before T0+480: {exc}")
+          PY
       - name: Upload Herdr shard ${{ matrix.shard }} timing and diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fm-test-timing-herdr-${{ matrix.shard }}
           path: |
-            ${{ runner.temp }}/fm-test/fm-test-timing-herdr-${{ matrix.shard }}.json
+            ${{ runner.temp }}/fm-test/
             ${{ runner.temp }}/fm-herdr/sessions-before.json
             ${{ runner.temp }}/fm-herdr/default-server.log
           if-no-files-found: warn
@@ -310,13 +464,28 @@ jobs:
   tests-timing-aggregate:
     name: Behavior timing aggregate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs:
       - tests-portable-parallel-1
       - tests-portable-parallel-2
       - tests-portable-serial
       - tests-herdr
-    if: always()
+    # Aggregate only a complete set of successful lane artifacts. The
+    # aggregator still rejects incomplete evidence when invoked; running it
+    # after a prerequisite was skipped cannot produce useful lane evidence and
+    # only creates a second, misleading failure.
     steps:
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
       - name: Download lane timing artifacts
         uses: actions/download-artifact@v4
@@ -338,8 +507,8 @@ jobs:
             done < <(find "$RUNNER_TEMP/fm-test-aggregate" -name 'fm-test-timing-*.json' -type f | LC_ALL=C sort)
           fi
           if [ "${#inputs[@]}" -eq 0 ]; then
-            echo "::warning::no per-lane timing JSON found to aggregate"
-            exit 0
+            echo "::error::no complete schema-v2 lane evidence found to aggregate"
+            exit 1
           fi
           bin/fm-test-run.sh --aggregate-json \
             "$RUNNER_TEMP/fm-test/fm-test-timing-aggregate.json" \
@@ -357,6 +526,17 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
+      - name: Record absolute test deadlines
+        run: |
+          set -eu
+          t0=$(date +%s)
+          {
+            echo "FM_TEST_JOB_T0_EPOCH=$t0"
+            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
+            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
+            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
+            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
       - name: Run snapshot consumers with stock Bash
         shell: /bin/bash {0}
@@ -398,6 +578,7 @@ jobs:
   invariants:
     name: Repo invariants
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - name: Symlinks must stay intact

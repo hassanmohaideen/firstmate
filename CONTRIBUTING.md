@@ -42,9 +42,9 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
   A local `config/backlog-backend=manual` opt-out forces firstmate's routine backlog updates to hand-editing and stays gitignored; validated secondmate handoffs still delegate through `tasks-axi mv`.
   A local `config/backend` file explicitly overrides runtime auto-detection for new task endpoints and stays gitignored; spawn-supported values are `tmux` plus experimental `herdr`, `zellij`, `orca`, and `cmux`, while `codex-app` is documented only in `docs/codex-app-backend.md`.
   It does not make `data/` tracked.
-- Helper scripts in `bin/` are plain bash.
-  Each starts with a usage header comment; keep it accurate when you change behavior.
-  Test scripts and helpers in `tests/` are plain bash too.
+- Shell helpers in `bin/` are plain Bash and start with a usage header comment; keep it accurate when you change behavior.
+  `bin/fm-test-supervisor.py` is the Python credential-domain executor described in [`docs/fm-test-portable-shards.md`](docs/fm-test-portable-shards.md).
+  Test scripts and helpers in `tests/` are plain Bash too.
   `bin/fm-lint.sh` must pass: it is the single owner of the lint definition (the shellcheck file set, config, and pinned shellcheck version), and both CI and the no-mistakes pre-push gate run it, so local and CI can never diverge.
   It pins one exact shellcheck version and refuses to run under any other; print it with `bin/fm-lint.sh --required-version` and install that build locally.
 - Harness-adapter ownership spans detection in `bin/fm-harness.sh`, launch and hook mechanics in `bin/fm-spawn.sh`, semantic busy sources and trust gates in `bin/fm-busy-lib.sh`, delivery-only rendered guards in `bin/fm-tmux-lib.sh`, cleanup in `bin/fm-teardown.sh`, and facts in `.agents/skills/harness-adapters/SKILL.md`; the `firstmate-coding-guidelines` skill owns the validation policy for checks that depend on those harnesses.
@@ -89,7 +89,8 @@ bin/fm-test-isolation-proof.sh --jobs 4 --json /tmp/fm-isolation-proof.json   # 
 tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVERRIDE="$tmp" FM_SIGNAL_GRACE=1 FM_POLL=1 FM_HEARTBEAT=999999 bin/fm-watch-arm.sh  # watcher re-arm smoke test (prints arm status, then an actionable signal)
 ```
 
-`bin/fm-test-run.sh` is the single owner of behavior-suite selection, mixed local portable scheduling, portable CI lane composition, bounded parallelism for the proven-isolated set, per-script timing markers and duration budgets, family totals, the coverage guard, and the optional JSON timing artifact.
+`bin/fm-test-run.sh` owns behavior-suite selection, lane composition, duration inputs, manifest construction, coverage, aggregation, and readable output, while `bin/fm-test-supervisor.py` exclusively owns attempts, required credential-domain containment, deadlines, interruption, cleanup, and schema-v2 evidence.
+Containment claims and the explicitly non-enforcing real-Herdr exception are documented in [`docs/fm-test-portable-shards.md`](docs/fm-test-portable-shards.md).
 Its header and `--help` own the flags, family labels, lanes, and changed-file map; this section only documents the entry points.
 `bin/fm-test-isolation-proof.sh` remains the single owner of the Phase 2 concurrent isolation proof and the exact proven candidate set; see `docs/fm-test-isolation-proof.md`.
 CI shard balance evidence lives in `docs/fm-test-portable-shards.md`.

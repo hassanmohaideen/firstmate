@@ -1,7 +1,42 @@
 # Firstmate test shards
 
-`bin/fm-test-run.sh` owns behavior-test lane composition and execution.
+`bin/fm-test-run.sh` owns behavior-test selection, deterministic lane composition, duration inputs, manifest construction, coverage, aggregation, and human-readable output.
+`bin/fm-test-supervisor.py` is the single owner of manifest scheduling, attempts, credential-domain containment, deadlines, diagnostics, interruption, cleanup, and durable evidence.
 `bin/fm-test-isolation-proof.sh` owns the proven-isolated candidate set.
+
+## Required containment
+
+Required containment mode leases one otherwise-unused high numeric UID/GID for each selected script after proving that identity absent from account and process credential inventories under a root-owned job-local lock.
+The executor remains outside every test identity, releases a blocked child only after permanent credential drop and verification, and uses an unprivileged helper in that exact identity for every signal and quiescence probe.
+Numeric PIDs, process groups, mutable ancestry, and environment markers are diagnostics at most and are never cleanup authority in required CI.
+The executor is the single owner of the contained child environment and builds it from an explicit default-deny allowlist, so fleet routing, runner secrets, and unknown ambient variables never reach a test and only the sanctioned `FM_TEST_ENV_` channel and a small safe base set pass through.
+`bin/fm-test-run.sh` imports that same allowlist when it constructs the manifest, so secrets such as `GITHUB_TOKEN`, `DATABASE_URL`, or `SSH_AUTH_SOCK` are never written to the on-disk manifest that passes through `sudo` to the executor.
+The executor gives each child a private `HOME` and `TMPDIR`, and redirects `RUNNER_TEMP` to the same location, so a test writes state and scratch where its identity can write rather than into the runner-owned checkout or the runner-owned temp directory.
+That private home is rooted at a short, canonical base so a Unix-domain socket a test binds under `HOME`, such as a herdr session control socket, stays within the `sockaddr_un` path limit.
+Because each leased identity runs its script with the runner-owned checkout as the working directory, the executor uses a deadline-bounded, in-process walk to grant world read and traverse on non-symlink checkout entries, including `.git` for required read-only Git commands, so any leased identity can read the selected script and the files it sources without granting tests write permission.
+The grant never follows symlinks and fails containment preflight on any permission error.
+Checkout credential persistence is disabled in every leased-test job, so the runner token is never written into the checkout the leased identities can read.
+A released child that cannot start its script, for example because of a residual checkout permission problem, reports the exact failing operation on its captured output rather than exiting silently, so the durable per-lane log explains the outcome.
+For in-process SSH fixtures, an accountless leased identity uses its inherited private home when no account-database home exists; the remote entrypoint accepts only an existing canonical directory owned by that identity, without trusting a test-mode marker.
+The credential boundary remains stable across fork, exec, parent exit, reparenting, `setsid`, signal handlers, and PID reuse.
+An unreadable, ambiguous, or non-quiescent identity is quarantined while later scripts use fresh identities.
+Required Linux and macOS qualification fails closed before tests execute when noninteractive privilege, credential inspection, permanent drop, signal scope, or platform semantics are unavailable.
+Qualification proves that a live different-UID process is never signaled by its numeric PID during a credential-scoped sweep, and Linux additionally manufactures a true same-numeric-PID reuse in a private PID namespace; macOS relies on the same UID-scoped `kill(-1)` making the numeric PID irrelevant, because deterministic same-number reuse is not available there without exhausting the PID space.
+A dedicated per-platform job runs the executor-behavior subset through the public runner on both `ubuntu-latest` and `macos-latest`.
+The required public-runner and non-quiescence/ambiguity fixtures self-escalate into credential domains, while timeout, interruption, atomic-evidence, environment-isolation, and scheduling fixtures exercise the same public interfaces in `developer-non-enforcing` mode because their runner-owned scratch is intentionally inaccessible to a leased identity.
+Linux currently qualifies the full boundary, including true same-number PID reuse.
+The credential-domain qualification jobs currently pass on both `ubuntu-latest` and `macos-latest`, qualifying the boundary through the required execute path and quiescence/non-quiescence proofs, so on that CI evidence macOS is a passing, supported containment platform.
+Local execution defaults to the explicitly labeled `developer-non-enforcing` mode unless required containment is selected; that default makes no hard descendant-containment claim, and credential-contained CI lanes never accept it.
+
+## Schema-v2 evidence
+
+The executor atomically publishes the complete planned manifest before releasing the first script.
+Each attempted script has immutable path, family, and attempt fields, append-preserving events, one historical `started` event, and exactly one terminal object.
+There is no durable active result.
+A started row without a terminal object remains valid JSON but makes the run incomplete and red after uncatchable executor death.
+Every update uses a sibling temporary file, file fsync, atomic replacement, and directory fsync.
+Diagnostics are durable before transient files are removed.
+Aggregation rejects unknown or mixed schemas, incomplete runs, missing or duplicate attempts, missing or duplicate terminals, and planned/executed inventory mismatch.
 
 ## Verification inputs
 
@@ -55,7 +90,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 147-script inventory leaves 110 scripts in the portable serial remainder.
+The current 149-script inventory leaves 112 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 
@@ -63,23 +98,23 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 `.github/workflows/ci.yml` derives the same `n` from `strategy.job-total` rather than a literal, so changing the shard count in either file without the other fails the lane loudly instead of leaving part of the required suite unrun.
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
-The hints are the complete per-script measurements from the retained per-shard timing artifacts of green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), refreshed through the procedure below.
-A script with no hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
+The retained per-script measurements come from green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), with `fm-watch-triage.test.sh` refreshed to its 212357 ms local measurement after the credential-domain CI lane exposed its stale 145269 ms scheduling reservation, and are refreshed through the procedure below.
+A script added since that run or otherwise lacking a hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
 | Lane | Script count | Estimated duration |
 |---|---:|---:|
-| `portable-serial-1of10` | 10 | 221044 ms (~221.0 s) |
-| `portable-serial-2of10` | 11 | 221049 ms (~221.0 s) |
-| `portable-serial-3of10` | 7 | 221526 ms (~221.5 s) |
-| `portable-serial-4of10` | 12 | 221048 ms (~221.0 s) |
-| `portable-serial-5of10` | 15 | 221055 ms (~221.1 s) |
-| `portable-serial-6of10` | 8 | 221483 ms (~221.5 s) |
-| `portable-serial-7of10` | 12 | 221056 ms (~221.1 s) |
-| `portable-serial-8of10` | 9 | 221143 ms (~221.1 s) |
-| `portable-serial-9of10` | 12 | 221053 ms (~221.1 s) |
-| `portable-serial-10of10` | 14 | 221053 ms (~221.1 s) |
-| imbalance | | 482 ms |
+| `portable-serial-1of10` | 10 | 234508 ms (~234.5 s) |
+| `portable-serial-2of10` | 10 | 234502 ms (~234.5 s) |
+| `portable-serial-3of10` | 11 | 234510 ms (~234.5 s) |
+| `portable-serial-4of10` | 10 | 234509 ms (~234.5 s) |
+| `portable-serial-5of10` | 11 | 234494 ms (~234.5 s) |
+| `portable-serial-6of10` | 10 | 234493 ms (~234.5 s) |
+| `portable-serial-7of10` | 13 | 234494 ms (~234.5 s) |
+| `portable-serial-8of10` | 13 | 234507 ms (~234.5 s) |
+| `portable-serial-9of10` | 11 | 234493 ms (~234.5 s) |
+| `portable-serial-10of10` | 13 | 234506 ms (~234.5 s) |
+| imbalance | | 17 ms |
 
 The single longest measured script, `tests/fm-pr-check-security.test.sh` at 210119 ms in that run, is the floor for any serial shard count.
 Ten shards sit just above that floor, so more serial runners would stop paying off without first splitting or speeding that script.
@@ -88,6 +123,7 @@ Ten shards sit just above that floor, so more serial runners would stop paying o
 
 `real-herdr-gated-<k>of<n>` splits the required real-Herdr family across `n` separate CI runners under the same contract as the serial shards.
 Each shard is strictly serial in itself, and each runner provisions its own pinned Herdr, default session, pre-suite snapshot, and cleanup, so the split needs no concurrency isolation proof and every default-session tripwire stays job-local.
+These GUI-backend integration shards explicitly use `developer-non-enforcing` mode because their runner-owned Herdr server is reached through a Unix socket under the runner's home that a leased identity cannot share; the required portable lanes and qualification jobs retain the hard containment claim.
 `bin/fm-test-run.sh` owns this `n` with the same `of<n>` refusal, `.github/workflows/ci.yml` derives it from `strategy.job-total`, and every shard keeps `--fail-on-gate-skip 'herdr not found'` so a missing pin can never pass as a gate skip.
 Assignment reuses the longest-processing-time packing over `real_herdr_duration_hints`.
 
@@ -143,7 +179,7 @@ Its failures were pre-existing failures unrelated to the scheduling and slow-tes
 
 Green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13) completed in 10 minutes 48 seconds of wall-clock at four serial shards.
 Its critical path was portable serial shard 2's test step at 10 minutes 18 seconds, with shards 1 and 4 near 9 minutes 35 seconds, the single Herdr lane at 6 minutes 25 seconds, and the full-set lint job at 6 minutes 54 seconds under two bounded workers.
-The 2026-08-13 recomposition answers each of those: ten balanced serial shards near 221 seconds of hinted work each, two real-Herdr shards, and four lint workers over eight stable shards.
+The current composition answers each of those: ten balanced serial shards near 228 seconds of hinted work each, two real-Herdr shards, and four lint workers over eight stable shards.
 A local full-set lint measurement on an arm64 host fell from 209.7 seconds at two workers to 126.4 seconds at four workers with byte-identical diagnostics.
 The per-lane timing artifacts and aggregate of the next green CI run are the after measurement for this recomposition.
 The aggregate now finds nested timing JSON recursively; the prior top-level-only glob silently dropped the Herdr lane from the aggregate artifact.
@@ -153,7 +189,7 @@ Refresh the hints by downloading the per-shard timing artifacts from a green CI 
 
 ```sh
 gh run download <run-id> -R hassanmohaideen/firstmate --pattern 'fm-test-timing-portable-serial-*' -D /tmp/fm-serial
-jq -r '.scripts[] | [.path, .duration_ms] | @tsv' /tmp/fm-serial/*.json | LC_ALL=C sort
+find /tmp/fm-serial -type f -name 'fm-test-timing-portable-serial-*.json' -exec jq -r '.scripts[] | [.path, .duration_ms] | @tsv' {} \; | LC_ALL=C sort
 bin/fm-test-run.sh --check-coverage
 ```
 
@@ -166,11 +202,12 @@ It verifies the real-Herdr CI shards the same way against the real-herdr-gated f
 
 ## Timing artifacts and budgets
 
-Portable shards, each portable serial shard, and each real-Herdr shard upload runner-generated timing JSON.
-`bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering.
-The runner derives generous per-script duration budgets from the same measured hints used for shard balance and from archived timing artifacts.
-An unmeasured script has no budget: local execution reports it as missing, enforced execution fails after the functional result, and the coverage guard rejects it from every required lane.
-Budget overruns warn during local runs and are enforced by required CI lanes without replacing or hiding functional failures.
+Portable shards, each portable serial shard, and each real-Herdr shard upload schema-v2 timing JSON with durable per-script diagnostics.
+`bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering and complete-evidence validation.
+The runner derives generous per-script duration budgets from the measured hints used for shard balance and archived timing artifacts.
+An unmeasured script has no budget: local execution reports it as missing, enforced execution fails, and the coverage guard rejects it from every required lane.
+Budget overruns warn during local runs and are enforced by required CI lanes without replacing the test's own exit evidence.
+The tables above remain scheduling inputs until the next green required run publishes exact final-executor measurements; only those schema-v2 artifacts may refresh them.
 `.github/workflows/ci.yml` owns the exact artifact names, enforcement wiring, and aggregation wiring.
 
 ## Local entry points
@@ -178,12 +215,16 @@ Budget overruns warn during local runs and are enforced by required CI lanes wit
 [CONTRIBUTING.md](../CONTRIBUTING.md) owns the local test policy and common entry points.
 `bin/fm-test-run.sh --help` owns exact selection flags, lane names, duration enforcement, and bounded scheduling mechanics.
 
-## Timeouts
+## Deadlines and reserves
 
-| Job | timeout-minutes | Rationale |
-|---|---:|---|
-| portable parallel 1/2 | 10 | The measured shard sums are under two minutes and the timeout is a hang tripwire. |
-| portable serial 1-10 | 30 | Each balanced shard is about 3.7 minutes, leaving a generous hang-tripwire margin. |
-| Herdr 1/2 | 30 | The longest shard is about 4.3 minutes and keeps a generous hang-tripwire margin. |
-
-Timeouts are hang tripwires rather than expected healthy durations.
+Every job in `.github/workflows/ci.yml` has `timeout-minutes: 10`.
+Behavior jobs record T0 as their first executable step, before checkout, so the absolute deadline budget also covers checkout and tool setup rather than starting the clock only once the code is present.
+Every behavior lane that invokes the executor passes that one absolute deadline set through the public runner.
+Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
+The final 120 seconds remain reserved for artifact upload and platform variance before the 600-second job ceiling.
+Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards.
+The executor publishes at most one terminal per scheduler iteration and reserves 15 seconds for every concurrently outstanding terminal, so all terminal evidence is published by T0+450.
+Per-attempt deadline enforcement therefore has jitter bounded by one terminal publication's sub-second fsync latency rather than a sub-millisecond guarantee; the required 120-second pre-ceiling margin absorbs that accepted jitter.
+The executor reserves four seconds of startup (the blocked-child readiness bound plus durable launch evidence) and four seconds of cleanup for every unstarted script, and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
+A timed-out attempt is terminal red, and later required scripts still execute exactly once when their reservations allow.
+Healthy complete CI remains targeted at roughly five to eight minutes.
