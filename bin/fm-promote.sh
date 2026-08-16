@@ -145,7 +145,7 @@ if [ "$MODE" != local-only ]; then
     echo "error: GitHub write-access verification for task $ID is indeterminate; promotion is waiting" >&2
     exit 1
   fi
-  if GH_INTAKE=$(fm_github_ctx_intake "$PROMOTE_WORKTREE" push "$GITHUB_HOST" ""); then
+  if GH_INTAKE=$(fm_github_ctx_intake "$PROMOTE_WORKTREE" push "$GITHUB_HOST" "" unknown); then
     IFS=$'\t' read -r GH_SEL_HOST GH_TARGET_KIND GH_TARGET <<EOF
 $GH_INTAKE
 EOF
@@ -163,7 +163,7 @@ EOF
     esac
   fi
   if [ "$GH_GATED" -eq 1 ]; then
-    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$PROMOTE_WORKTREE" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" push "" "$GH_VERIFIED_DEST"); then
+    if GH_VERIFIED_NEW=$(fm_github_ctx_gate "$PROMOTE_WORKTREE" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" push "" "$GH_VERIFIED_DEST" unknown); then
       GH_VERIFIED_DEST=$GH_VERIFIED_NEW
     else
       GH_GATE_RC=$?

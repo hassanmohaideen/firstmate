@@ -1272,6 +1272,31 @@ test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree() {
   pass "fm-promote refuses a non-local promotion whose recorded worktree cannot be resolved"
 }
 
+test_promotion_refuses_unknown_future_branch_push_routing() {
+  local dir id branch out rc before after
+  id=promoteroute
+  dir=$(new_case promoteroute "$id")
+  add_ship_task "$dir" "$id" claude
+  sed 's/^kind=ship$/kind=scout/' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.scout"
+  mv "$dir/home/state/$id.meta.scout" "$dir/home/state/$id.meta"
+  git -C "$dir/wt" remote set-url origin https://github.com/owner/repo.git
+  git -C "$dir/wt" remote add alternate https://gitlab.example/owner/repo.git
+  branch=$(git -C "$dir/wt" symbolic-ref --short HEAD)
+  git -C "$dir/wt" config "branch.$branch.pushRemote" alternate
+  make_permissive_gh "$dir"
+  before=$(cksum < "$dir/home/state/$id.meta")
+
+  out=$(env PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_FAKE_DIR="$dir/fake" FM_SPAWN_NO_GUARD=1 \
+    "$PROMOTE" "$id" --mode direct-PR --yolo off 2>&1); rc=$?
+  expect_code 1 "$rc" "promotion must refuse ambiguous routing for its future ship branch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "future branch routing ambiguity must be indeterminate"
+  assert_contains "$out" 'promotion is waiting' "future branch routing ambiguity must leave promotion waiting"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "a future branch routing refusal must not mutate promotion metadata"
+  [ ! -e "$dir/fake/gh.log" ] || fail "ambiguous future branch routing must block before probing"
+  pass "fm-promote refuses routing that could redirect the future ship branch"
+}
+
 # --- 6. fm-spawn --relaunch's own refusals -----------------------------------
 
 test_spawn_relaunch_refuses_a_live_agent() {
@@ -1481,24 +1506,31 @@ test_a_scout_with_a_dropped_authentication_requirement_stays_gated() {
 }
 
 test_a_gated_relaunch_refuses_corrupted_scope_identity() {
-  local dir id field value out rc before after
-  for field in kind mode; do
-    id="ghscope-$field"
-    dir=$(new_case "ghscope-$field" "$id")
+  local dir id scenario field value out rc before after
+  for scenario in kind-secondmate kind-missing mode-local mode-missing mode-arbitrary; do
+    id="ghscope-$scenario"
+    dir=$(new_case "ghscope-$scenario" "$id")
     add_ship_task "$dir" "$id" claude
     record_github_selection "$dir" "$id" github.com verified
     make_permissive_gh "$dir"
-    case "$field" in
-      kind) value=secondmate ;;
-      mode) value=local-only ;;
+    case "$scenario" in
+      kind-secondmate) field=kind; value=secondmate ;;
+      kind-missing) field=kind; value= ;;
+      mode-local) field=mode; value=local-only ;;
+      mode-missing) field=mode; value= ;;
+      mode-arbitrary) field=mode; value=arbitrary ;;
     esac
-    sed "s/^$field=.*/$field=$value/" "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.changed"
+    if [ -n "$value" ]; then
+      sed "s/^$field=.*/$field=$value/" "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.changed"
+    else
+      grep -v "^$field=" "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.changed"
+    fi
     mv "$dir/home/state/$id.meta.changed" "$dir/home/state/$id.meta"
     before=$(cksum < "$dir/home/state/$id.meta")
     : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
 
     out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
-    [ "$rc" -ne 0 ] || fail "a gated record whose $field became $value must not launch"
+    [ "$rc" -ne 0 ] || fail "a gated record with corrupted $field identity must not launch"
     assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a corrupted gated $field must be indeterminate"
     assert_contains "$out" 'worker launch is waiting' "a corrupted gated $field must leave launch waiting"
     ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a corrupted gated $field must not launch"
@@ -1506,7 +1538,7 @@ test_a_gated_relaunch_refuses_corrupted_scope_identity() {
     after=$(cksum < "$dir/home/state/$id.meta")
     [ "$after" = "$before" ] || fail "a corrupted gated $field refusal must not mutate metadata"
   done
-  pass "a gated relaunch cannot be de-gated by corrupted kind or mode identity"
+  pass "a gated relaunch cannot be de-gated by missing or corrupted kind or mode identity"
 }
 
 test_a_relaunch_gates_the_execution_worktree_destination() {
@@ -1642,6 +1674,7 @@ test_concurrent_relaunch_is_refused
 test_direct_spawn_relaunch_participates_in_the_lifecycle_lock
 test_promotion_participates_in_the_lifecycle_lock_before_metadata_resolution
 test_nonlocal_promotion_refuses_an_unresolvable_recorded_worktree
+test_promotion_refuses_unknown_future_branch_push_routing
 test_spawn_relaunch_refuses_a_live_agent
 test_spawn_relaunch_refuses_contradicting_flags
 test_spawn_relaunch_refuses_an_unrecorded_task

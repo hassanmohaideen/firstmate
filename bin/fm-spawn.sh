@@ -1156,6 +1156,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   }
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
+  RELAUNCH_RECORDED_KIND=$KIND
   [ -n "$KIND" ] || KIND=ship
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
   YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
@@ -1174,7 +1175,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   GH_REC_TARGET=$(fm_meta_get "$RELAUNCH_META" gh_target)
   GH_REC_ORG=$(fm_meta_get "$RELAUNCH_META" gh_organization)
   GH_REC_VERIFIED=$(fm_meta_get "$RELAUNCH_META" gh_verified_dest)
-  GH_LIFECYCLE_STATE=$(fm_github_ctx_lifecycle_state "$GH_REC_GATED_PRESENT" "$GH_REC_GATED" "$KIND" "$MODE" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
+  GH_LIFECYCLE_STATE=$(fm_github_ctx_lifecycle_state "$GH_REC_GATED_PRESENT" "$GH_REC_GATED" "$RELAUNCH_RECORDED_KIND" "$MODE" "$GH_REC_FORGE" "$GH_REC_HOST" "$GH_REC_TARGET_KIND" "$GH_REC_TARGET" "$GH_REC_ORG" "$GITHUB_AUTH_REQUIRED" "$GITHUB_AUTH_CAPABILITY" "$GH_REC_VERIFIED")
   case "$GH_LIFECYCLE_STATE" in
     gated) GH_RECORDED_STATE=complete ;;
     legacy|ungated) GH_RECORDED_STATE=none ;;

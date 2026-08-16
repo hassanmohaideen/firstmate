@@ -23,6 +23,18 @@ fm_github_remote_destination_url() {
         case "$routes" in *$'\n'*) return 2 ;; esac
         remote=$routes
       fi
+      if [ -z "$remote" ] && [ "$push_branch" = unknown ]; then
+        routes=$(git -C "$project" config --get-regexp '^branch\..*\.remote$' 2>/dev/null || true)
+        while IFS=' ' read -r _ route; do
+          [ -z "$route" ] || [ "$route" = origin ] || return 2
+        done <<EOF
+$routes
+EOF
+      elif [ -z "$remote" ] && [ -n "$branch" ]; then
+        routes=$(git -C "$project" config --get-all "branch.$branch.remote" 2>/dev/null || true)
+        case "$routes" in *$'\n'*) return 2 ;; esac
+        remote=$routes
+      fi
       [ -n "$remote" ] || remote=origin
       urls=$(git -C "$project" remote get-url --push --all "$remote" 2>/dev/null) || return 1
       ;;
@@ -305,11 +317,17 @@ fm_github_ctx_lifecycle_state() {
   case "$marker:$recorded_state" in
     0:none) printf 'ungated' ;;
     1:complete)
-      if fm_github_ctx_scope "$kind" "$mode" "$auth_required"; then
-        printf 'gated'
-      else
-        printf 'invalid'
-      fi
+      case "$kind:$mode" in
+        ship:no-mistakes|ship:direct-PR) printf 'gated' ;;
+        scout:*)
+          if fm_github_ctx_scope "$kind" "$mode" "$auth_required"; then
+            printf 'gated'
+          else
+            printf 'invalid'
+          fi
+          ;;
+        *) printf 'invalid' ;;
+      esac
       ;;
     *) printf 'invalid' ;;
   esac

@@ -114,6 +114,9 @@ test_recorded_context_state_distinguishes_absent_partial_and_complete_records() 
   [ "$(fm_github_ctx_lifecycle_state 1 1 ship no-mistakes '' '' '' '' '' '' '' '')" = invalid ] || fail "an erased explicitly gated context must be invalid"
   [ "$(fm_github_ctx_lifecycle_state 1 0 ship no-mistakes github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "an ungated marker with a recorded selection must be invalid"
   [ "$(fm_github_ctx_lifecycle_state 1 1 ship local-only github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "a gated ship whose immutable mode became local-only must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 ship '' github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "a gated ship whose immutable mode is missing must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 ship arbitrary github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "a gated ship whose immutable mode is unknown must be invalid"
+  [ "$(fm_github_ctx_lifecycle_state 1 1 '' no-mistakes github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "a gated ship whose immutable kind is missing must be invalid"
   [ "$(fm_github_ctx_lifecycle_state 1 1 secondmate secondmate github github.com repository owner/repo '' '' '' verified)" = invalid ] || fail "a gated task whose immutable kind became secondmate must be invalid"
   pass "recorded context state distinguishes legacy, ungated, invalid, and complete records"
 }
@@ -294,9 +297,18 @@ test_gate_observes_effective_push_routing() {
   [ "$GATE_RC" -eq 2 ] || fail "branch pushRemote must route observation away from origin and block (rc $GATE_RC)"
   [ "$GATE_PROBED" -eq 1 ] || fail "a non-origin branch push remote must block before probing the recorded origin"
 
+  proj=$(make_project gatebranchremote https://github.com/owner/repo.git)
+  git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
+  branch=$(git -C "$proj" symbolic-ref --short HEAD)
+  git -C "$proj" config "branch.$branch.remote" alternate
+  install_fake_gh "$proj"
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 2 ] || fail "branch tracking remote must route observation away from origin and block (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a non-origin branch tracking remote must block before probing the recorded origin"
+
   fm_github_ctx_intake "$proj" push '' '' unknown >/dev/null 2>&1
-  [ "$?" -eq 2 ] || fail "fresh intake with an unknown future branch must reject branch-specific push routing"
-  pass "the gate observes remote.pushDefault and branch pushRemote instead of trusting origin"
+  [ "$?" -eq 2 ] || fail "fresh intake with an unknown future branch must reject alternate branch routing"
+  pass "the gate observes push defaults, push remotes, and tracking remotes instead of trusting origin"
 }
 
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it() {
