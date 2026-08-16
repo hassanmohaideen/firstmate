@@ -932,6 +932,13 @@ SH
   manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
   FM_TEST_ENV_EXEC_EVIDENCE="$tmp/counts" make_executor_manifest "$manifest" "$artifact" "$tmp" \
     "1200:$tmp/hang.sh" "3000:$tmp/after.sh"
+  python3 - "$manifest" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+doc["duration_budget_mode"] = "enforce"
+path.write_text(json.dumps(doc))
+PY
   set +e
   FM_TEST_ENV_EXEC_EVIDENCE="$tmp/counts" python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err"
   rc=$?
@@ -946,6 +953,32 @@ assert pathlib.Path(sys.argv[2]).read_text().splitlines() == ["hang", "after"]
 PY
   rm -rf "$tmp"
   pass "timeout is terminal red and remaining coverage executes exactly once"
+}
+
+test_warn_budget_overrun_completes() {
+  local tmp manifest artifact
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-budget-warn.XXXXXX")
+  cat >"$tmp/slow.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 0.2
+echo "ok - warn budget overrun"
+SH
+  chmod +x "$tmp/slow.sh"
+  manifest="$tmp/manifest.json"; artifact="$tmp/artifact.json"
+  make_executor_manifest "$manifest" "$artifact" "$tmp" "50:$tmp/slow.sh"
+  python3 "$SUPERVISOR" execute --manifest "$manifest" >"$tmp/out" 2>"$tmp/err" \
+    || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "warn-mode budget overrun was killed"; }
+  python3 - "$artifact" <<'PY' || fail "warn-mode budget evidence is wrong"
+import json, sys
+doc = json.load(open(sys.argv[1]))
+row = doc["scripts"][0]
+assert row["terminal"]["result"] == "passed", row["terminal"]
+assert row["duration_budget_exceeded"] is True, row
+assert row["duration_ms"] >= 50, row["duration_ms"]
+assert doc["run"]["result"] == "passed", doc["run"]
+PY
+  rm -rf "$tmp"
+  pass "warn-mode budget overruns complete and remain warnings"
 }
 
 test_interruption_and_atomic_evidence() {
@@ -1513,6 +1546,7 @@ ALL_TESTS=(
   test_default_changed_and_portable_selection
   test_mixed_complete_scheduler_exact_once_and_failures
   test_timeout_then_remaining_exact_once
+  test_warn_budget_overrun_completes
   test_interruption_and_atomic_evidence
   test_uncatchable_interruption_is_incomplete_red
   test_concurrent_atomic_polling_across_parallel_transitions

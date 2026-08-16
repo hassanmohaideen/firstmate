@@ -856,7 +856,8 @@ class LaneExecutor:
         attempt = Attempt(row)
         baseline_ms = row.get("duration_baseline_ms")
         baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
-        budget_ms = row.get("duration_budget_ms") or 30000
+        budget_ms = row.get("duration_budget_ms")
+        enforce_budget = self.manifest.get("duration_budget_mode") == "enforce"
         lease: Lease | None = None
         started_committed = False
         try:
@@ -941,10 +942,12 @@ class LaneExecutor:
             attempt.started_mono = time.monotonic()
             reserved = self._remaining_schedule_reserve(row) if self.required else 0.0
             scheduling_deadline = self._execution_deadline() if self.required else self.ordinary_deadline
-            attempt.deadline_mono = min(
-                attempt.started_mono + float(budget_ms) / 1000.0,
-                scheduling_deadline - reserved,
-            )
+            attempt.deadline_mono = scheduling_deadline - reserved
+            if enforce_budget and budget_ms is not None:
+                attempt.deadline_mono = min(
+                    attempt.started_mono + float(budget_ms) / 1000.0,
+                    attempt.deadline_mono,
+                )
             if self.required and baseline_ms is not None and attempt.deadline_mono - attempt.started_mono < baseline_seconds:
                 raise ContainmentError(f"startup exceeded the reserved window for {row['path']}")
             row["attempt_count"] = 1
