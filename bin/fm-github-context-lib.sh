@@ -25,10 +25,23 @@ fm_github_remote_destination_url() {
         remote=$routes
       fi
       [ -n "$remote" ] || remote=origin
-      [ "$remote" = origin ] || return 2
       urls=$(git -C "$project" remote get-url --push --all "$remote" 2>/dev/null) || return 1
       ;;
-    fetch|api-org-membership) urls=$(git -C "$project" remote get-url --all origin 2>/dev/null) || return 1 ;;
+    fetch)
+      case "$push_branch" in
+        current)
+          branch=$(git -C "$project" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 2
+          ;;
+        unknown|'') return 2 ;;
+        *) branch=$push_branch ;;
+      esac
+      routes=$(git -C "$project" config --get-all "branch.$branch.remote" 2>/dev/null || true)
+      case "$routes" in *$'\n'*) return 2 ;; esac
+      remote=$routes
+      [ -n "$remote" ] || remote=origin
+      urls=$(git -C "$project" remote get-url --all "$remote" 2>/dev/null) || return 1
+      ;;
+    api-org-membership) urls=$(git -C "$project" remote get-url --all origin 2>/dev/null) || return 1 ;;
     *) return 1 ;;
   esac
   [ -n "$urls" ] || return 1

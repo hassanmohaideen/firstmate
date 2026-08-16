@@ -295,7 +295,7 @@ test_gate_accepts_standard_github_ssh_authorities() {
 }
 
 test_gate_observes_effective_push_routing() {
-  local proj vt branch out planned
+  local proj vt branch out planned fork_vt
   vt='github|github.com|repository|owner/repo|push'
   planned='fm/planned-task'
 
@@ -306,9 +306,23 @@ test_gate_observes_effective_push_routing() {
   [ "$out" = "$(printf 'github.com\trepository\towner/repo')" ] || fail "the planned branch must resolve the verified origin"
   git -C "$proj" config "branch.$planned.pushRemote" origin
   fm_github_ctx_intake "$proj" push '' '' "$planned" >/dev/null || fail "a planned branch explicitly routed to origin must remain verifiable"
-  git -C "$proj" config "branch.$planned.pushRemote" alternate
+  git -C "$proj" remote add fork https://github.com/fork/repo.git
+  git -C "$proj" config "branch.$planned.pushRemote" fork
+  out=$(fm_github_ctx_intake "$proj" push '' '' "$planned") || fail "a planned branch routed to a GitHub fork must resolve"
+  [ "$out" = "$(printf 'github.com\trepository\tfork/repo')" ] || fail "intake must observe the effective fork destination"
+  install_fake_gh "$proj"
+  fork_vt='github|github.com|repository|fork/repo|push'
+  run_gate "$proj" github github.com repository fork/repo push '' '' "$planned"
+  [ "$GATE_RC" -eq 0 ] || fail "the effective GitHub fork destination must verify (rc $GATE_RC)"
+  [ "$GATE_OUT" = "$fork_vt" ] || fail "the gate must return the effective fork tuple"
+  [ "$GATE_PROBED" -eq 0 ] || fail "the effective GitHub fork must be probed"
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt" "$planned"
+  [ "$GATE_RC" -eq 2 ] || fail "an effective fork that mismatches the recorded repository must block"
+  [ "$GATE_PROBED" -eq 1 ] || fail "a mismatched effective fork must block before probing"
+  git -C "$proj" remote set-url --add --push fork https://github.com/fork/repo.git
+  git -C "$proj" remote set-url --add --push fork https://github.com/other/repo.git
   fm_github_ctx_intake "$proj" push '' '' "$planned" >/dev/null 2>&1
-  [ "$?" -eq 2 ] || fail "a planned branch routed away from origin must be indeterminate"
+  [ "$?" -eq 2 ] || fail "an effective remote with multiple push destinations must be indeterminate"
 
   proj=$(make_project gatepushdefault https://github.com/owner/repo.git)
   git -C "$proj" remote add alternate https://gitlab.example/owner/repo.git
@@ -336,7 +350,14 @@ test_gate_observes_effective_push_routing() {
   [ "$GATE_RC" -eq 2 ] || fail "branch tracking remote must route observation away from origin and block (rc $GATE_RC)"
   [ "$GATE_PROBED" -eq 1 ] || fail "a non-origin branch tracking remote must block before probing the recorded origin"
 
-  pass "the gate resolves only the planned branch push route and blocks routes away from origin"
+  proj=$(make_project gatefetchroute https://github.com/owner/repo.git)
+  git -C "$proj" remote add upstream https://github.com/upstream/repo.git
+  branch=$(git -C "$proj" symbolic-ref --short HEAD)
+  git -C "$proj" config "branch.$branch.remote" upstream
+  out=$(fm_github_ctx_intake "$proj" fetch '' '') || fail "fetch intake must resolve the branch tracking remote"
+  [ "$out" = "$(printf 'github.com\trepository\tupstream/repo')" ] || fail "fetch intake must observe the effective tracking remote"
+
+  pass "the gate observes effective push and fetch remotes"
 }
 
 test_gate_blocks_a_changed_or_ambiguous_destination_without_adopting_it() {
