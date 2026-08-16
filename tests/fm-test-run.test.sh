@@ -1571,6 +1571,51 @@ PY
   pass "required non-quiescence and unreadable-probe cleanup terminalize as quarantined containment_ambiguous"
 }
 
+test_required_public_runner_leased_uid() {
+  local tmp artifact rc
+  # Proves the required credential-domain path through the PUBLIC runner: a test
+  # script is executed as a leased high UID and terminalizes passed. Self-skips
+  # when no root and no noninteractive sudo (the runner cannot self-escalate),
+  # like the other privileged fixtures; the executor-behavior CI job runs it with
+  # real privilege on both platforms. Unlike the interruption/env-isolation
+  # fixtures, this one is designed for required mode: its fixture root and script
+  # are world-traversable/readable so the leased UID can reach them.
+  if [ "$(id -u)" -ne 0 ] && ! sudo -n true >/dev/null 2>&1; then
+    printf 'skip: privileged executor unavailable; no required public-runner claim\n'
+    return 0
+  fi
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-required-runner.XXXXXX")
+  chmod 0711 "$tmp"
+  cat >"$tmp/leased.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo "runuid=$(id -u)"
+exit 0
+SH
+  chmod 0755 "$tmp/leased.test.sh"
+  artifact="$tmp/artifact.json"
+  set +e
+  FM_TEST_CONTAINMENT=required "$RUNNER" --json "$artifact" "$tmp/leased.test.sh" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "required public-runner leased-UID run should pass"; }
+  python3 - "$artifact" "$(id -u)" <<'PY' || { cat "$tmp/err"; rm -rf "$tmp"; fail "required public-runner leased-UID evidence is wrong"; }
+import json, re, sys
+doc = json.load(open(sys.argv[1]))
+caller = int(sys.argv[2])
+assert doc["containment"]["mode"] == "required" and doc["containment"]["enforcing"] is True, doc["containment"]
+assert doc["run"]["complete"] is True, doc["run"]
+row = doc["scripts"][0]
+assert row["terminal"]["result"] == "passed", row["terminal"]
+match = re.search(r"runuid=(\d+)", row.get("output_tail", ""))
+assert match, row.get("output_tail")
+runuid = int(match.group(1))
+assert runuid != caller, f"script ran as caller uid {runuid}, expected a leased identity"
+assert 61000 <= runuid <= 64999, f"script uid {runuid} outside the leased range 61000-64999"
+PY
+  rm -rf "$tmp"
+  pass "required public-runner path runs a test as a leased high UID with passed terminal"
+}
+
 ALL_TESTS=(
   test_list_all_exact_suite_coverage
   test_family_selection
@@ -1599,6 +1644,7 @@ ALL_TESTS=(
   test_concurrent_atomic_polling_across_parallel_transitions
   test_required_unsupported_refuses_before_execution
   test_required_containment_ambiguity_terminalizes
+  test_required_public_runner_leased_uid
   test_required_platform_qualification
   test_environment_isolation_in_serial_and_parallel_children
   test_duration_budget_warns_and_ci_enforces

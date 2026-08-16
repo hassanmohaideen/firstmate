@@ -80,16 +80,20 @@ jobs:
           sudo -n "$(command -v python3)" bin/fm-test-supervisor.py qualify \
             --artifact "$RUNNER_TEMP/fm-test/fm-test-containment-qualification.json"
       - name: Prove executor behavior on this platform
-        env:
-          FM_TEST_CONTAINMENT: required
         run: |
           set -eu
-          # Run the executor-behavior subset through the public runner/executor
-          # on this exact platform. The privileged non-quiescence/ambiguity case
-          # self-escalates with noninteractive sudo; the others exercise the
-          # scheduling, timeout, interruption, atomic-evidence, and environment
-          # allowlist paths of the real Darwin/Linux executor.
-          FM_TEST_RUN_ONLY="test_timeout_then_remaining_exact_once test_interruption_and_atomic_evidence test_uncatchable_interruption_is_incomplete_red test_concurrent_atomic_polling_across_parallel_transitions test_required_containment_ambiguity_terminalizes test_environment_isolation_in_serial_and_parallel_children" \
+          # Prove the REQUIRED credential-domain path through the public runner
+          # with fixtures designed for it: test_required_public_runner_leased_uid
+          # (runs a world-readable test as a leased high UID via the runner's own
+          # sudo -n self-escalation) and the privileged non-quiescence/ambiguity
+          # fixture. The interruption, atomic-evidence, env-isolation, timeout,
+          # and scheduling fixtures run developer-non-enforcing here on both
+          # platforms; they are not designed to execute under a leased UID (their
+          # scratch is runner-owned and not reachable by a dropped child), so
+          # forcing them into required mode is not how the required path is
+          # proven. The step therefore does not set FM_TEST_CONTAINMENT=required;
+          # the required fixtures self-escalate internally.
+          FM_TEST_RUN_ONLY="test_timeout_then_remaining_exact_once test_interruption_and_atomic_evidence test_uncatchable_interruption_is_incomplete_red test_concurrent_atomic_polling_across_parallel_transitions test_environment_isolation_in_serial_and_parallel_children test_required_containment_ambiguity_terminalizes test_required_public_runner_leased_uid" \
             bash tests/fm-test-run.test.sh
       - name: Upload qualification evidence
         if: always()

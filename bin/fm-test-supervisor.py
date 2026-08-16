@@ -1760,7 +1760,28 @@ def qualify(artifact: pathlib.Path) -> int:
                 errors.append(f"uid {lease.uid} quiescence probe failed: {exc}")
                 continue
             if not quiet:
-                errors.append(f"uid {lease.uid} remained non-quiescent")
+                # Bounded Darwin non-quiescence diagnostics so a post-billing CI
+                # run can distinguish zombie-reaping (pbi_status) from kill(-1)
+                # delivery scope or the setgid/setuid drop: dump each surviving
+                # member's pid, credential tuple, and zombie/exiting flags plus
+                # the credential-scoped signal-0 probe errno.
+                present, probe_errno = helper_signal(lease.uid, lease.gid, 0)
+                try:
+                    members = [
+                        {
+                            "pid": pid, "uids": item.uids, "gids": item.gids,
+                            "zombie": item.zombie,
+                            "exiting": getattr(item, "exiting", None),
+                        }
+                        for pid, item in platform.inventory().items()
+                        if lease.uid in item.uids[:3]
+                    ]
+                except InventoryError as exc:
+                    members = f"inventory unreadable: {exc}"
+                errors.append(
+                    f"uid {lease.uid} remained non-quiescent "
+                    f"(probe present={present} errno={probe_errno} members={members})"
+                )
         return errors
 
     try:
