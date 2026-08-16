@@ -432,6 +432,7 @@ portable_serial_weight_hints() {
 tests/fm-afk-inject-e2e.test.sh 35158
 tests/fm-afk-pi-herdr-return-e2e.test.sh 152
 tests/fm-afk-return.test.sh 3773
+tests/fm-auth-escalation-live-e2e.test.sh 236
 tests/fm-ask-user-authority.test.sh 206
 tests/fm-backend-cmux-smoke.test.sh 46
 tests/fm-backend-cmux.test.sh 2268
@@ -460,6 +461,7 @@ tests/fm-documentation-audiences.test.sh 693
 tests/fm-fleet-snapshot-view.test.sh 15503
 tests/fm-fleet-sync.test.sh 29043
 tests/fm-gate-refuse.test.sh 2950
+tests/fm-github-context-lib.test.sh 4594
 tests/fm-gitignore-config.test.sh 70
 tests/fm-gotmp.test.sh 709
 tests/fm-grok-continuity-live-e2e.test.sh 35
