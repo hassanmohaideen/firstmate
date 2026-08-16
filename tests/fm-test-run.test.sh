@@ -986,34 +986,24 @@ PY
 }
 
 test_interruption_and_atomic_evidence() {
-  local tmp artifact pid rc n
+  local tmp artifact pid rc
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-executor-interrupt.XXXXXX")
   chmod 0711 "$tmp"
-  mkdir "$tmp/ready"
-  chmod 0733 "$tmp/ready"
   cat >"$tmp/hang.sh" <<'SH'
 #!/usr/bin/env bash
-: >"$FM_TEST_ENV_INTERRUPT_READY"
 trap '' TERM
 while :; do sleep 1; done
 SH
   chmod 0755 "$tmp/hang.sh"
   artifact="$tmp/artifact.json"
-  FM_TEST_ENV_INTERRUPT_READY="$tmp/ready/child-started" \
-    "$RUNNER" --json "$artifact" "$tmp/hang.sh" >"$tmp/out" 2>"$tmp/err" &
+  "$RUNNER" --json "$artifact" "$tmp/hang.sh" >"$tmp/out" 2>"$tmp/err" &
   pid=$!
   wait_for_started_artifact "$artifact" \
     || { kill -KILL "$pid" 2>/dev/null || true; fail "interruption fixture never published started evidence"; }
-  # Started evidence is intentionally durable before the blocked child is
-  # released. Wait for an observable action from the test body as well, so the
-  # signal cannot race credential verification or an immediate launch failure.
-  n=0
-  while [ ! -e "$tmp/ready/child-started" ] && kill -0 "$pid" 2>/dev/null && [ "$n" -lt 500 ]; do
-    sleep 0.01
-    n=$((n + 1))
-  done
-  [ -e "$tmp/ready/child-started" ] \
-    || { wait "$pid" 2>/dev/null || true; fail "runner exited before the interruption fixture body became ready"; }
+  # The executor's durable started transition is the public proof that launch
+  # and credential verification succeeded. Interrupt at that boundary rather
+  # than adding a second filesystem handshake after the child is released;
+  # that handshake made this timing test depend on platform scheduling.
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$artifact" \
     || { kill -KILL "$pid" 2>/dev/null || true; fail "started artifact is invalid JSON"; }
   kill -TERM "$pid" 2>/dev/null \

@@ -1609,11 +1609,13 @@ def validate_artifact(path: pathlib.Path) -> tuple[bool, str]:
 
 
 def qualification_target(uid: int, gid: int, ready_fd: int, ignore_term: bool, session_escape: bool) -> None:
+    # An ignored disposition survives fork and exec.  CI launchers and sudo are
+    # allowed to ignore job-control signals, so make the fixture's TERM behavior
+    # explicit instead of accidentally inheriting the qualification caller's.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN if ignore_term else signal.SIG_DFL)
     drop_credentials(uid, gid)
     if session_escape:
         os.setsid()
-    if ignore_term:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     os.write(ready_fd, b"R")
     os.close(ready_fd)
     while True:

@@ -453,7 +453,10 @@ jobs:
       - tests-portable-parallel-2
       - tests-portable-serial
       - tests-herdr
-    if: always()
+    # Aggregate only a complete set of successful lane artifacts. The
+    # aggregator still rejects incomplete evidence when invoked; running it
+    # after a prerequisite was skipped cannot produce useful lane evidence and
+    # only creates a second, misleading failure.
     steps:
       - uses: actions/checkout@v6
       - name: Download lane timing artifacts
