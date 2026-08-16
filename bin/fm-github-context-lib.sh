@@ -309,11 +309,15 @@ fm_github_ctx_lifecycle_state() {
   local marker_present=${1:-} marker=${2:-} kind=${3:-} mode=${4:-}
   local forge=${5:-} selected_host=${6:-} target_kind=${7:-} target=${8:-} organization=${9:-}
   local auth_required=${10:-} auth_capability=${11:-} verified=${12:-} recorded_state
+  recorded_state=$(fm_github_ctx_recorded_state "$kind" "$forge" "$selected_host" "$target_kind" "$target" "$organization" "$auth_required" "$auth_capability" "$verified")
   if [ "$marker_present" != 1 ]; then
-    printf 'legacy'
+    if [ "$recorded_state" = none ]; then
+      printf 'legacy'
+    else
+      printf 'invalid'
+    fi
     return 0
   fi
-  recorded_state=$(fm_github_ctx_recorded_state "$kind" "$forge" "$selected_host" "$target_kind" "$target" "$organization" "$auth_required" "$auth_capability" "$verified")
   case "$marker:$recorded_state" in
     0:none) printf 'ungated' ;;
     1:complete)

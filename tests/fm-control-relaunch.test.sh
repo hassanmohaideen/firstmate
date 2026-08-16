@@ -1419,6 +1419,30 @@ test_a_changed_github_destination_blocks_every_relaunch_without_erasing() {
   pass "a changed GitHub destination blocks every relaunch and never erases the selection or bypasses"
 }
 
+test_a_context_with_a_dropped_classification_marker_blocks_relaunch() {
+  local dir id out rc before after
+  id=ghdroppedmarker
+  dir=$(new_case ghdroppedmarker "$id")
+  add_ship_task "$dir" "$id" claude
+  record_github_selection "$dir" "$id" github.old.example verified
+  make_permissive_gh "$dir"
+  grep -v '^gh_gated=' "$dir/home/state/$id.meta" > "$dir/home/state/$id.meta.unmarked"
+  mv "$dir/home/state/$id.meta.unmarked" "$dir/home/state/$id.meta"
+  git -C "$dir/wt" remote set-url origin https://gitlab.example/owner/repo.git
+  before=$(cksum < "$dir/home/state/$id.meta")
+  : > "$dir/fake/literal"; rm -f "$dir/fake/gh.log"; printf zsh > "$dir/fake/command"
+
+  out=$(run_spawn "$dir" "$id" --relaunch); rc=$?
+  [ "$rc" -ne 0 ] || fail "a recorded context missing only gh_gated must not launch"
+  assert_contains "$out" 'GH_AUTH_INDETERMINATE' "a dropped classification marker must report an indeterminate gate"
+  assert_contains "$out" 'worker launch is waiting' "a dropped classification marker must leave launch waiting"
+  ! grep -q 'encode launch-brief' "$dir/fake/literal" || fail "a dropped classification marker must not start the agent"
+  [ ! -e "$dir/fake/gh.log" ] || fail "a dropped classification marker must block before probing"
+  after=$(cksum < "$dir/home/state/$id.meta")
+  [ "$after" = "$before" ] || fail "a dropped classification marker refusal must not mutate metadata"
+  pass "a dropped GitHub classification marker cannot bypass the recorded gate"
+}
+
 test_a_fully_erased_gated_context_blocks_relaunch_without_mutation() {
   local dir id out rc before after
   id=gherased
@@ -1624,6 +1648,7 @@ test_an_unchanged_github_destination_reverifies_and_launches() {
 }
 
 test_a_changed_github_destination_blocks_every_relaunch_without_erasing
+test_a_context_with_a_dropped_classification_marker_blocks_relaunch
 test_a_fully_erased_gated_context_blocks_relaunch_without_mutation
 test_a_partial_github_context_blocks_every_relaunch_without_erasing
 test_a_scout_with_a_dropped_authentication_requirement_stays_gated
