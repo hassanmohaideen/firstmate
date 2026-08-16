@@ -1112,6 +1112,25 @@ PY
   pass "unsupported required containment refuses red before test execution"
 }
 
+test_privileged_artifact_rejects_intermediate_symlink() {
+  local tmp artifact rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-artifact-symlink.XXXXXX")
+  mkdir "$tmp/owned"
+  ln -s "$tmp/owned" "$tmp/linked"
+  artifact="$tmp/linked/qualification.json"
+  set +e
+  python3 "$SUPERVISOR" qualify --artifact "$artifact" >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || { rm -rf "$tmp"; fail "privileged artifact accepted an intermediate symlink"; }
+  [ ! -e "$tmp/owned/qualification.json" ] \
+    || { rm -rf "$tmp"; fail "privileged artifact wrote through an intermediate symlink"; }
+  grep -Fq 'contains a symlink' "$tmp/err" \
+    || { cat "$tmp/err"; rm -rf "$tmp"; fail "privileged artifact symlink refusal was not actionable"; }
+  rm -rf "$tmp"
+  pass "privileged artifact refuses intermediate symlink components"
+}
+
 test_required_platform_qualification() {
   local tmp rc
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-qualification.XXXXXX")
@@ -1654,6 +1673,7 @@ ALL_TESTS=(
   test_required_unsupported_refuses_before_execution
   test_required_containment_ambiguity_terminalizes
   test_required_public_runner_leased_uid
+  test_privileged_artifact_rejects_intermediate_symlink
   test_required_platform_qualification
   test_environment_isolation_in_serial_and_parallel_children
   test_duration_budget_warns_and_ci_enforces

@@ -155,14 +155,23 @@ def invoking_uid() -> int:
 
 def normalized_privileged_artifact(path: pathlib.Path | str) -> pathlib.Path:
     unresolved = pathlib.Path(os.path.abspath(path))
-    try:
-        info = os.stat(unresolved, follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    else:
+    current = pathlib.Path(unresolved.anchor)
+    components = unresolved.parts[1:]
+    for index, component in enumerate(components):
+        current /= component
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError as exc:
+            if index == len(components) - 1:
+                break
+            raise ContainmentError(
+                f"privileged artifact parent does not exist: {current}"
+            ) from exc
         if stat.S_ISLNK(info.st_mode):
-            raise ContainmentError(f"privileged artifact path is a symlink: {unresolved}")
-    return unresolved.resolve(strict=False)
+            raise ContainmentError(
+                f"privileged artifact path contains a symlink: {current}"
+            )
+    return unresolved
 
 
 def open_verified_output_directory(artifact: pathlib.Path) -> int:
