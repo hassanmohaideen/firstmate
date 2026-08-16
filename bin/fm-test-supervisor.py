@@ -399,6 +399,14 @@ def helper_signal(uid: int, gid: int, sig: int) -> tuple[bool, int]:
         try:
             drop_credentials(uid, gid)
             os.kill(-1, sig)
+            if sig == 0:
+                # kill(-1, 0) is allowed to count the caller itself.  Normalize
+                # that platform-dependent behavior inside the unprivileged
+                # helper by inspecting the same credential domain and excluding
+                # only this helper.  PIDs remain inventory diagnostics; signals
+                # are still issued solely through the kernel's UID scope.
+                members = CredentialPlatform().domain_members(uid)
+                code = 0 if any(member != os.getpid() for member in members) else errno.ESRCH
         except OSError as exc:
             code = exc.errno or errno.EIO
         except BaseException:
@@ -410,8 +418,13 @@ def helper_signal(uid: int, gid: int, sig: int) -> tuple[bool, int]:
     os.close(write_fd)
     payload = os.read(read_fd, 32)
     os.close(read_fd)
-    os.waitpid(pid, 0)
-    code = int(payload or b"5")
+    _waited, status = os.waitpid(pid, 0)
+    if not payload and sig != 0 and os.WIFSIGNALED(status) and os.WTERMSIG(status) == sig:
+        # Darwin includes the caller in kill(-1, signal).  In that case the
+        # helper's signal death is itself durable kernel evidence that the
+        # credential-scoped operation succeeded, rather than an EIO report.
+        return True, 0
+    code = int(payload or str(errno.EIO).encode("ascii"))
     return code == 0, code
 
 
