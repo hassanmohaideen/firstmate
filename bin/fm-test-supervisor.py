@@ -478,6 +478,8 @@ class Attempt:
     deadline_mono: float | None = None
     wait_status: int | None = None
     deadline_expired: bool = False
+    deadline_term_mono: float | None = None
+    deadline_kill_sent: bool = False
     cleanup_ambiguous: bool = False
     tail: bytearray = field(default_factory=bytearray)
 
@@ -930,6 +932,7 @@ class LaneExecutor:
         if attempt.deadline_expired:
             return
         attempt.deadline_expired = True
+        attempt.deadline_term_mono = time.monotonic()
         self.append(attempt, "deadline_expired")
         if self.required and attempt.lease is not None:
             try:
@@ -945,12 +948,54 @@ class LaneExecutor:
             except OSError:
                 pass
 
+    def _escalate_expired_attempt(self, attempt: Attempt, now: float, *, force: bool = False) -> None:
+        if (
+            not self.required
+            or not attempt.deadline_expired
+            or attempt.deadline_kill_sent
+            or attempt.deadline_term_mono is None
+            or (not force and now < attempt.deadline_term_mono + TERM_GRACE)
+        ):
+            return
+        assert attempt.lease is not None
+        try:
+            delivered, code = helper_signal(attempt.lease.uid, attempt.lease.gid, signal.SIGKILL)
+        except BaseException:
+            delivered, code = False, errno.EIO
+        attempt.deadline_kill_sent = True
+        if not delivered:
+            attempt.cleanup_ambiguous = True
+        attempt.row["events"].append(event("domain_signaled", signal="KILL", delivered=delivered, errno=code))
+
     def _enforce_other_deadlines(self, current: Attempt) -> None:
         now = time.monotonic()
-        for other in list(self.active.values()):
-            if other is current or other.deadline_mono is None or now < other.deadline_mono:
-                continue
-            self._expire_attempt(other)
+        others = [attempt for attempt in self.active.values() if attempt is not current]
+        for other in others:
+            if other.deadline_mono is not None and now >= other.deadline_mono:
+                self._expire_attempt(other)
+        now = time.monotonic()
+        for other in others:
+            self._escalate_expired_attempt(other, now)
+
+    def _broadcast_expired_deadlines(self) -> None:
+        if not self.required:
+            return
+        expired = [attempt for attempt in self.active.values() if attempt.deadline_expired and not attempt.deadline_kill_sent]
+        if not expired:
+            return
+        grace = min(self.terminal_deadline, time.monotonic() + TERM_GRACE)
+        while time.monotonic() < grace:
+            now = time.monotonic()
+            for attempt in list(self.active.values()):
+                if attempt.deadline_mono is not None and now >= attempt.deadline_mono:
+                    self._expire_attempt(attempt)
+                self._drain(attempt)
+                self._poll_wait(attempt)
+            time.sleep(0.02)
+        now = time.monotonic()
+        for attempt in list(self.active.values()):
+            if attempt.deadline_expired:
+                self._escalate_expired_attempt(attempt, now, force=True)
 
     def _cleanup_domain(self, attempt: Attempt, reason: str) -> tuple[bool, list[int]]:
         if not self.required:
@@ -1190,6 +1235,7 @@ class LaneExecutor:
                 and not self._poll_wait(attempt)
             ):
                 self._expire_attempt(attempt)
+        self._broadcast_expired_deadlines()
         for attempt in active:
             if attempt.pid not in self.active:
                 continue
@@ -1499,7 +1545,6 @@ def qualify(artifact: pathlib.Path) -> int:
         # The sentinel must still be exactly the same live different-UID process:
         # same numeric PID, unchanged credential tuple, not signaled.
         platform.verify_pid(other, sentinel.uid, sentinel.gid)
-        os.kill(other, 0)  # Observation only; never cleanup authority.
         result["checks"].append({
             "name": "signal-scope-stale-pid-nonauthority", "passed": True,
             "swept_uid": owned.uid, "stale_pid_diagnostic": other, "sentinel_uid": sentinel.uid,
@@ -1596,7 +1641,7 @@ def pid_reuse_fixture() -> int:
         if sentinel != target:
             raise ContainmentError(f"numeric PID was not reused: old={target} replacement={sentinel}")
         helper_signal(old.uid, old.gid, signal.SIGKILL)
-        os.kill(sentinel, 0)
+        platform.verify_pid(sentinel, other.uid, other.gid)
         helper_signal(other.uid, other.gid, signal.SIGKILL)
         os.waitpid(sentinel, 0)
         print(f"FM_TEST_PID_REUSE old_pid={target} replacement_pid={sentinel} different_uid=true survived=true")
