@@ -28,12 +28,16 @@ unset FM_HERDR_SESSION_CLEANUP_SOURCE_ONLY
 # The idle-shell proof now lives in the backend as
 # fm_backend_herdr_pane_idle_shell_pid; prove it still reads Linux argv
 # arrays (no argv0 field) and rejects malformed executable identities.
+# The proof also independently confirms, from the OS process table, that the
+# pid is currently a bare recognized shell (the process-ownership evidence that
+# refuses a stale or reused pid), so the fake ps answers `-o comm=` too.
 FAKE_PS="$TMP_ROOT/fake-ps"
 cat > "$FAKE_PS" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
   "-axo pid=,ppid=") printf '1 0\n67 1\n' ;;
   "-p 67 -o stat=") printf 'Ss\n' ;;
+  "-p 67 -o comm=") printf '/bin/sh\n' ;;
   *) exit 1 ;;
 esac
 SH

@@ -10,7 +10,10 @@
 # tests/fm-backend-herdr.test.sh's stateful fake: workspace create seeds one
 # default tab and returns its tab and root pane in the same response, closing a
 # tab's only pane closes the tab, and agent get reports agent_not_found for a
-# pane no agent has registered on.
+# pane no agent has registered on. Registered fixture agents own a synthetic
+# shell/foreground-process pair that the companion ps fixture verifies, so the
+# recovery-grade lifecycle state sees the same positive ownership evidence as
+# it does from a real Herdr pane.
 #
 # Beyond that it models the pane IO a real launch performs. A pane reports a
 # registered agent once anything has been typed into it, and submitting starts
@@ -82,7 +85,9 @@ case "${1:-} ${2:-}" in
     if [ "$(jq_state -r --arg p "$pane" '[.tabs[]|select(.pane_id==$p)]|length')" = 0 ]; then
       printf '{"error":{"code":"pane_not_found","message":"%s"}}\n' "$pane"
     else
-      printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$pane"
+      jq_state --arg p "$pane" '
+        .tabs[] | select(.pane_id==$p)
+        | {result:{pane:{pane_id:.pane_id,tab_id:.tab_id,workspace_id:.workspace_id,terminal_id:("terminal-" + .pane_id)}}}'
     fi
     ;;
   "pane close")
@@ -97,14 +102,20 @@ case "${1:-} ${2:-}" in
     [ ! -f "$SEND_FAIL" ] || exit 1
     jq_state --arg p "${3:-}" '.typed[$p] = true | .working[$p] = true' | save ;;
   "pane read") printf '\n' ;;
-  "pane process-info") printf '{"result":{"process":{"name":"codex"}}}\n' ;;
+  "pane process-info")
+    pane=${4:-}
+    printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":51001,"foreground_process_group_id":51002,"foreground_processes":[{"pid":51002,"name":"codex","argv0":"codex"}]}}}\n' "$pane"
+    ;;
   "agent get")
     pane=${3:-}
+    identity=$(jq_state -c --arg p "$pane" '
+      .tabs[] | select(.pane_id==$p)
+      | {pane_id:.pane_id,tab_id:.tab_id,workspace_id:.workspace_id,terminal_id:("terminal-" + .pane_id)}')
     if [ "$(jq_state -r --arg p "$pane" '.working[$p] // false')" = true ]; then
       jq_state --arg p "$pane" '.working |= with_entries(select(.key != $p))' | save
-      printf '{"result":{"agent":{"agent_status":"working"}}}\n'
+      printf '%s\n' "$identity" | jq -c '{result:{agent:(. + {agent_status:"working"})}}'
     elif [ "$(jq_state -r --arg p "$pane" '.typed[$p] // false')" = true ]; then
-      printf '{"result":{"agent":{"agent_status":"idle"}}}\n'
+      printf '%s\n' "$identity" | jq -c '{result:{agent:(. + {agent_status:"idle"})}}'
     else
       printf '{"error":{"code":"agent_not_found","message":"%s"}}\n' "$pane"
     fi
@@ -115,6 +126,19 @@ esac
 exit 0
 SH
   chmod +x "$script"
+  cat > "$remote_root/bin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  "-axo pid=,ppid=")
+    printf '51001 1\n51002 51001\n'
+    /bin/ps "$@" | awk '$1 != 51001 && $1 != 51002'
+    ;;
+  "-p 51002 -o comm=") printf 'codex\n' ;;
+  "-p 51002 -o pgid=") printf '51002\n' ;;
+  *) exec /bin/ps "$@" ;;
+esac
+SH
+  chmod +x "$remote_root/bin/ps"
   reset_remote_herdr_fixture "$state"
 }
 

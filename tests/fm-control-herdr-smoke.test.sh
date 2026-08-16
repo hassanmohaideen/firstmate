@@ -7,11 +7,16 @@
 # agent-state classifier the control plane is allowed to trust, so its
 # behavior is pinned here against the REAL binary rather than a stub: whether
 # an agent is running, and therefore whether a lifecycle verb may act at all,
-# comes from herdr's own agent registry.
+# comes from reconciling herdr's agent registry against the process herdr owns.
 #
-# No real agent is launched. herdr's `pane report-agent` is the same registry
-# the adapter reads, so registering and not registering an agent on a plain
-# shell pane exercises exactly the classification the control plane gates on.
+# A herdr 0.8.0 registration carries no pid, so it cannot by itself prove the
+# TUI process still runs. This test reproduces the reported defect against the
+# real binary: a registration retained after a worker's TUI exits to its task
+# shell must reconcile to dead (not alive), so exit is idempotent and never
+# types the harness exit command into the shell, while the SAME registration
+# over a genuine non-shell foreground process still reads alive. No real agent
+# is launched; `pane report-agent` and a foreground `sleep` stand in for the
+# registration and the running process the classifier must tell apart.
 #
 # Always runs on a private, named, throwaway lab session, never the default
 # one (tests/herdr-test-safety.sh; the 2026-07-02 incident). Skips cleanly
@@ -76,7 +81,7 @@ EOF
   echo "endpoint_task_id=hsmoke"
   echo "worktree=$WT"
   echo "project=$PROJ"
-  echo "harness=claude"
+  echo "harness=pi"
   echo "kind=ship"
   echo "mode=no-mistakes"
   echo "yolo=off"
@@ -113,30 +118,86 @@ case "$OUT" in
 esac
 pass "real herdr: interrupt refuses when herdr's own agent registry reports no agent"
 
-# --- a registered agent: classification flips, and the verbs follow ---------
+# --- the defect: a stale registration over an exited TUI (idle shell) --------
+#
+# The reported failure: a worker's TUI exits back to its task shell, but herdr
+# keeps the pane's agent registration. A 0.8.0 registration carries no pid, so
+# it cannot prove the TUI process still runs; reconciled against the pane's lone
+# idle task shell, the agent is gone.
 
 herdr pane report-agent "$PANE_ID" --source fm-control-smoke --agent fm-control-smoke-agent \
   --state idle --session "$SESSION" >/dev/null 2>&1 \
-  || fail "could not register a live agent on the task pane"
+  || fail "could not register a stale agent on the exited-TUI task pane"
 
 STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
-[ "$STATE" = alive ] || fail "herdr should classify a registered agent as alive, got '$STATE'"
+[ "$STATE" = dead ] \
+  || fail "a registration left over an exited TUI (idle task shell) must reconcile to dead, got '$STATE'"
+pass "real herdr: a stale registration over an exited TUI classifies dead, not alive"
 
-OUT=$(run_control hsmoke interrupt) || fail "interrupt against a registered agent should succeed: $OUT"
+# exit is therefore idempotent: it reports already-stopped and must NOT type the
+# harness exit command (/quit) into the task shell as its proof mechanism.
+OUT=$(run_control hsmoke exit) \
+  || fail "exit against an exited-TUI pane should be idempotent success: $OUT"
 case "$OUT" in
-  *"interrupt-delivered hsmoke harness=claude backend=herdr verified=agent-alive cancel=unconfirmed"*) : ;;
+  "already-stopped hsmoke"*) : ;;
+  *) fail "an exited-TUI pane should report already-stopped, got: $OUT" ;;
+esac
+PANE_AFTER=$(herdr pane read "$PANE_ID" --source recent --lines 100 --session "$SESSION" 2>/dev/null)
+case "$PANE_AFTER" in
+  *"/quit"*) fail "the idempotent exit must not type the exit command into the task shell, but the pane shows: $PANE_AFTER" ;;
+esac
+pass "real herdr: exit on an exited-TUI pane is idempotent and never types /quit into the shell"
+
+if OUT=$(run_control hsmoke interrupt 2>&1); then
+  fail "interrupt should refuse when the pane's TUI has exited, even with a stale registration: $OUT"
+fi
+case "$OUT" in
+  *"nothing to interrupt"*) : ;;
+  *) fail "the interrupt refusal should say there is no agent, got: $OUT" ;;
+esac
+pass "real herdr: a stale registration cannot authorize interrupt on an exited-TUI pane"
+
+# --- the counterfactual: the SAME registration over a running process --------
+#
+# Only the process changes. A genuine non-shell foreground process group makes
+# the exact same registration classify alive, proving the classifier keys on
+# process ownership rather than the registration herdr happened to retain.
+
+# Pi interrupts with Escape, so this non-shell child deliberately survives it.
+herdr pane run "$PANE_ID" 'sleep 300' --session "$SESSION" >/dev/null 2>&1 \
+  || fail "could not start a foreground process in the task pane"
+running=
+for _ in $(seq 1 50); do
+  info=$(herdr pane process-info --pane "$PANE_ID" --session "$SESSION" 2>/dev/null)
+  shell_pid=$(printf '%s' "$info" | jq -r '.result.process_info.shell_pid // empty')
+  fpgid=$(printf '%s' "$info" | jq -r '.result.process_info.foreground_process_group_id // empty')
+  if [ -n "$shell_pid" ] && [ -n "$fpgid" ] && [ "$shell_pid" != "$fpgid" ]; then
+    running=1; break
+  fi
+  sleep 0.1
+done
+[ -n "$running" ] || fail "the foreground process never became the pane's foreground group"
+
+STATE=$(fm_backend_agent_state herdr "$SESSION:$PANE_ID")
+[ "$STATE" = alive ] \
+  || fail "the same registration over a running foreground process must classify alive, got '$STATE'"
+pass "real herdr: the same registration over a running process classifies alive (process ownership decides)"
+
+OUT=$(run_control hsmoke interrupt) || fail "interrupt against a running agent should succeed: $OUT"
+case "$OUT" in
+  *"interrupt-delivered hsmoke harness=pi backend=herdr verified=agent-alive cancel=unconfirmed"*) : ;;
   *) fail "interrupt should report the agent-alive proof on herdr, got: $OUT" ;;
 esac
-pass "real herdr: interrupt delivers the harness's key and proves the agent survived it"
+pass "real herdr: interrupt delivers the harness's key and proves the running agent survived it"
 
 herdr pane get "$PANE_ID" --session "$SESSION" >/dev/null 2>&1 \
   || fail "the control plane must never remove the endpoint it was operating on"
 [ -d "$WT" ] || fail "the control plane must never remove the task's local copy"
 pass "real herdr: no control verb removed the endpoint or the task's local copy"
 
-# Last, because it deliberately types a harness command into a pane that hosts
-# a plain shell: the registered agent cannot actually be stopped that way, and
-# the control plane must say so rather than report a stop it did not achieve.
+# Last, because it types the harness exit command into a pane whose foreground
+# process cannot consume it: a running agent that does not actually stop must
+# fail closed rather than be reported stopped.
 if OUT=$(run_control hsmoke exit 2>&1); then
   fail "exit should fail closed when the agent does not stop: $OUT"
 fi
@@ -144,6 +205,6 @@ case "$OUT" in
   *"did not stop"*) : ;;
   *) fail "the exit failure should say the agent did not stop, got: $OUT" ;;
 esac
-pass "real herdr: an agent that does not stop fails closed instead of being reported as stopped"
+pass "real herdr: a running agent that does not stop fails closed instead of being reported as stopped"
 
 fm_backend_herdr_kill "$SESSION:$PANE_ID" 2>/dev/null || true
