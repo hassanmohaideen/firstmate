@@ -20,13 +20,13 @@ import errno
 import grp
 import hashlib
 import json
-import math
 import os
 import pathlib
 import pwd
 import selectors
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -36,9 +36,10 @@ from typing import Any
 SCHEMA_VERSION = 2
 UID_MIN = 61000
 UID_MAX = 64999
-START_RESERVE = 1.0
+READINESS_RESERVE = 5.0
 CLEANUP_RESERVE = 4.0
 TERM_GRACE = 1.0
+SHARED_LEASE_DIRECTORY = pathlib.Path("/tmp/fm-test-credential-leases")
 QUIESCE_GRACE = 3.0
 OUTPUT_TAIL_BYTES = 32768
 IMMUTABLE_PLANNED_FIELDS = (
@@ -353,11 +354,18 @@ class Lease:
 
 
 class LeasePool:
-    def __init__(self, platform: CredentialPlatform, directory: pathlib.Path, seed: str) -> None:
+    def __init__(self, platform: CredentialPlatform, seed: str) -> None:
         self.platform = platform
-        self.directory = directory
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chown(self.directory, 0, 0)
+        self.directory = SHARED_LEASE_DIRECTORY
+        try:
+            os.mkdir(self.directory, 0o700)
+        except FileExistsError:
+            metadata = self.directory.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+                raise ContainmentError("shared credential lease namespace is not root-owned")
+        metadata = self.directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+            raise ContainmentError("shared credential lease namespace is not root-owned")
         os.chmod(self.directory, 0o700)
         self.offset = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % (UID_MAX - UID_MIN + 1)
         self.allocated: set[int] = set()
@@ -371,6 +379,8 @@ class LeasePool:
             if not self.platform.credential_absent(uid, uid):
                 continue
             path = self.directory / f"uid-{uid}.lease"
+            if path.with_suffix(".quarantine").exists():
+                continue
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
@@ -408,16 +418,7 @@ class LeasePool:
             os.close(directory_fd)
 
     def finalize(self) -> None:
-        quarantines = list(self.directory.glob("*.quarantine"))
-        if quarantines:
-            # Keep quarantined identities locked for the remainder of the job.
-            # The durable JSON already carries their IDs; hidden lock bytes are
-            # not uploaded as diagnostics.
-            return
-        try:
-            self.directory.rmdir()
-        except OSError:
-            pass
+        pass
 
 
 @dataclass
@@ -543,13 +544,6 @@ class LaneExecutor:
         print(f"fm-test-supervisor: containment refused before test execution: {reason}", file=sys.stderr)
         return 2
 
-    def _script_allowance(self, row: dict[str, Any], unstarted: int, now: float) -> tuple[float, float]:
-        jobs = max(1, int(self.manifest["jobs"]))
-        budget_ms = row.get("duration_budget_ms") or 30000
-        reserve = CLEANUP_RESERVE + math.ceil(unstarted / jobs) * (START_RESERVE + CLEANUP_RESERVE)
-        allowance = min(float(budget_ms) / 1000.0, self.ordinary_deadline - now - reserve)
-        return allowance, reserve
-
     def _validate_schedule_window(self) -> None:
         jobs = max(1, int(self.manifest["jobs"]))
         pending = list(self.doc["scripts"])
@@ -565,27 +559,26 @@ class LaneExecutor:
                 if any(phase == "serial" for _, phase in active):
                     break
                 pending.pop(0)
+                projected += READINESS_RESERVE
                 baseline_ms = row["duration_baseline_ms"]
-                if baseline_ms is None:
-                    baseline_seconds = 0.0
-                else:
-                    baseline_seconds = float(baseline_ms) / 1000.0
-                    allowance, _reserve = self._script_allowance(row, len(pending), projected)
-                    if allowance < baseline_seconds:
-                        raise ContainmentError(
-                            f"manifest schedule cannot fit {row['path']}: "
-                            f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
-                            "before the ordinary deadline"
-                        )
-                active.append((projected + baseline_seconds, row["phase"]))
+                baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
+                completion = projected + baseline_seconds + CLEANUP_RESERVE
+                if baseline_ms is not None and completion > self.ordinary_deadline:
+                    allowance = self.ordinary_deadline - projected - CLEANUP_RESERVE
+                    raise ContainmentError(
+                        f"manifest schedule cannot fit {row['path']}: "
+                        f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
+                        "before the ordinary deadline"
+                    )
+                active.append((completion, row["phase"]))
                 launched = True
             if active and (not launched or len(active) >= jobs or not pending):
-                projected = min(completion for completion, _ in active)
+                projected = max(projected, min(completion for completion, _ in active))
                 active = [entry for entry in active if entry[0] > projected]
 
     def preflight(self) -> None:
-        self._validate_schedule_window()
         if not self.required:
+            self._validate_schedule_window()
             self.doc["containment"]["qualified"] = False
             self.doc["containment"]["blocker"] = "developer mode does not enforce descendant containment"
             self.publish()
@@ -594,8 +587,8 @@ class LaneExecutor:
             raise ContainmentError("required containment needs noninteractive uid 0 execution")
         self.platform = CredentialPlatform()
         self.platform.inventory()
-        lease_dir = self.artifact_path.parent / f".{self.manifest['run_id']}.uid-leases"
-        self.lease_pool = LeasePool(self.platform, lease_dir, self.manifest["run_id"])
+        self.lease_pool = LeasePool(self.platform, self.manifest["run_id"])
+        self._validate_schedule_window()
         self.doc["containment"]["qualified"] = True
         self.publish()
 
@@ -643,16 +636,11 @@ class LaneExecutor:
 
     def start(self, row: dict[str, Any], unstarted: int) -> Attempt | None:
         attempt = Attempt(row)
-        allowance, reserve = self._script_allowance(row, unstarted, time.monotonic())
         baseline_ms = row.get("duration_baseline_ms")
         baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
-        if allowance < max(START_RESERVE, baseline_seconds):
-            row["events"].append(event("deadline_unavailable", remaining_reserve_seconds=reserve))
-            row["terminal"] = event("terminal", result="deadline_unavailable", exit=125, attempted=False)
-            row["exit"] = 125
-            self.publish()
-            return None
+        budget_ms = row.get("duration_budget_ms") or 30000
         lease: Lease | None = None
+        started_committed = False
         try:
             if self.required:
                 assert self.lease_pool is not None
@@ -728,24 +716,42 @@ class LaneExecutor:
             attempt.log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             row["diagnostic_log"] = str(log_path)
             self.append(attempt, "prepared", uid=lease.uid if lease else os.getuid())
-            os.write(write_release, b"R")
-            os.close(write_release)
-            attempt.release_fd = None
             self.selector.register(read_output, selectors.EVENT_READ, attempt)
             self.active[pid] = attempt
             attempt.started_mono = time.monotonic()
-            attempt.deadline_mono = attempt.started_mono + allowance
+            if baseline_ms is not None and attempt.started_mono + baseline_seconds + CLEANUP_RESERVE > self.ordinary_deadline:
+                raise ContainmentError(f"startup exceeded the reserved window for {row['path']}")
+            attempt.deadline_mono = min(
+                attempt.started_mono + float(budget_ms) / 1000.0,
+                self.ordinary_deadline,
+            )
             row["attempt_count"] = 1
             self.doc["summary"]["attempted"] += 1
             try:
+                allowance = max(0.0, attempt.deadline_mono - attempt.started_mono)
                 self.append(attempt, "started", allowance_ms=int(allowance * 1000))
+                started_committed = True
             except BaseException:
                 row.pop("attempt_count", None)
                 row["events"] = [item for item in row["events"] if item.get("name") != "started"]
                 self.doc["summary"]["attempted"] -= 1
                 raise
+            os.write(write_release, b"R")
+            os.close(write_release)
+            attempt.release_fd = None
             return attempt
         except BaseException as exc:
+            reason = str(exc)
+            if attempt.release_fd is not None:
+                try:
+                    os.close(attempt.release_fd)
+                except OSError:
+                    pass
+                attempt.release_fd = None
+            if started_committed:
+                row["events"].append(event("containment_error", reason=reason))
+                self.finish(attempt, "startup_failure")
+                return None
             if attempt.pid is not None:
                 self.active.pop(attempt.pid, None)
             if attempt.output_fd is not None:
@@ -753,9 +759,6 @@ class LaneExecutor:
                     self.selector.unregister(attempt.output_fd)
                 except (KeyError, ValueError):
                     pass
-            if attempt.release_fd is not None:
-                os.close(attempt.release_fd)
-                attempt.release_fd = None
             reason = str(exc)
             row["events"].append(event("readiness_refused", reason=reason))
             if lease is not None:
@@ -1216,18 +1219,15 @@ def qualify(artifact: pathlib.Path) -> int:
             if not prove_domain_quiescent(lease.uid, lease.gid)
         ]
 
-    # Qualification leases live in a private temp directory, never beside the
-    # uploaded artifact, and are removed whole on exit. This keeps identity lock
-    # bytes (including any .quarantine files) out of the evidence upload and
-    # guarantees automatic cleanup even when a check raises.
-    lease_root = pathlib.Path(tempfile.mkdtemp(prefix="fm-qualification."))
     try:
         if os.geteuid() != 0:
             raise ContainmentError("platform qualification requires noninteractive uid 0")
         platform = CredentialPlatform()
-        pool = LeasePool(platform, lease_root / "leases", f"qualification-{os.getpid()}")
-        owned, sentinel = pool.acquire(), pool.acquire()
-        leases.extend((owned, sentinel))
+        pool = LeasePool(platform, f"qualification-{os.getpid()}")
+        owned = pool.acquire()
+        leases.append(owned)
+        sentinel = pool.acquire()
+        leases.append(sentinel)
         target = spawn_qualification_target(owned.uid, owned.gid, ignore_term=True, session_escape=True)
         other = spawn_qualification_target(sentinel.uid, sentinel.gid, ignore_term=True, session_escape=True)
         targets.extend(((target, owned), (other, sentinel)))
@@ -1303,7 +1303,9 @@ def qualify(artifact: pathlib.Path) -> int:
             raise ContainmentError(
                 f"qualification cleanup failed: {', '.join(cleanup_errors)}"
             )
-        shutil.rmtree(lease_root, ignore_errors=True)
+        targets.clear()
+        for lease in leases:
+            pool.retire(lease, quarantine=False)
         result["checks"].append({"name": "all-domains-quiescent-before-publish", "passed": True})
         result.update({"complete": True, "passed": True, "finished_at": iso_now()})
         atomic_json(artifact, result)
@@ -1319,19 +1321,25 @@ def qualify(artifact: pathlib.Path) -> int:
         print(f"fm-test-supervisor: platform qualification failed: {blocker}", file=sys.stderr)
         return 1
     finally:
-        if not cleanup_domains():
-            shutil.rmtree(lease_root, ignore_errors=True)
+        cleanup_errors = cleanup_domains()
+        if "pool" in locals():
+            for lease in leases:
+                if lease.path.exists() and not lease.quarantined:
+                    pool.retire(lease, quarantine=bool(cleanup_errors))
 
 
 def pid_reuse_fixture() -> int:
     if os.geteuid() != 0 or not sys.platform.startswith("linux"):
         return 2
     platform = CredentialPlatform()
-    root = pathlib.Path(tempfile.mkdtemp(prefix="fm-pid-reuse."))
-    pool = LeasePool(platform, root / "leases", f"pid-reuse-{os.getpid()}")
-    old, other = pool.acquire(), pool.acquire()
-    last_pid = pathlib.Path("/proc/sys/kernel/ns_last_pid")
+    pool = LeasePool(platform, f"pid-reuse-{os.getpid()}")
+    leases: list[Lease] = []
     try:
+        old = pool.acquire()
+        leases.append(old)
+        other = pool.acquire()
+        leases.append(other)
+        last_pid = pathlib.Path("/proc/sys/kernel/ns_last_pid")
         last_pid.write_text("4999\n", encoding="ascii")
         target = spawn_qualification_target(old.uid, old.gid)
         if target != 5000:
@@ -1352,7 +1360,10 @@ def pid_reuse_fixture() -> int:
         print(f"fm-test-supervisor: PID reuse fixture failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        shutil.rmtree(root, ignore_errors=True)
+        for lease in leases:
+            quiet = prove_domain_quiescent(lease.uid, lease.gid)
+            if lease.path.exists() and not lease.quarantined:
+                pool.retire(lease, quarantine=not quiet)
 
 
 def main() -> int:
