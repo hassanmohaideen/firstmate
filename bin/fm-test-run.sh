@@ -479,7 +479,7 @@ tests/fm-inactive-reconcile.test.sh 44132
 tests/fm-kimi-harness.test.sh 19755
 tests/fm-muse-harness.test.sh 27450
 tests/fm-muse-signals-live-e2e.test.sh 37
-tests/fm-no-mistakes-review.test.sh 21633
+tests/fm-no-mistakes-review.test.sh 23062
 tests/fm-on.test.sh 5982
 tests/fm-opencode-primary-live-e2e.test.sh 14
 tests/fm-operational-input.test.sh 144

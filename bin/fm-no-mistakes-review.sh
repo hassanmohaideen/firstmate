@@ -61,11 +61,17 @@
 # kernel lock primitive is unavailable or unsupported the command refuses with a
 # red diagnostic instead of proceeding without exclusion.
 # The internal lock-held entry point re-proves that the guard is actively locked
-# before touching the ledger by attempting a fresh non-blocking acquire: a failed
-# acquire proves an ancestor still holds the lock, while a successful acquire
-# proves the guard was free, so a caller that invoked the internal path directly
-# without the kernel lock is refused. That evidence is the live kernel-lock state
-# itself, which a direct caller cannot mint.
+# before touching the ledger by attempting a fresh non-blocking acquire: only the
+# lock primitive's documented contention status means the guard is held (proceed),
+# a successful acquire means it was free so a direct caller is refused, and any
+# other probe error refuses closed rather than assuming an active lock.
+# Because portable advisory locking cannot prove that THIS process, rather than
+# some other live holder, owns the guard, the no-duplicate-response invariant is
+# enforced directly at the side-effect boundary instead of at the lock: before the
+# underlying no-mistakes response runs, an atomic O_CREAT|O_EXCL marker is claimed
+# for the run and round, and a second claim is impossible. So even a caller that
+# slips past the probe while a legitimate owner holds the guard cannot invoke the
+# response twice -- a file cannot be atomically created twice.
 # Every ledger write is a same-directory atomic rename, so a crash mid-write
 # leaves the ledger at its prior or next complete state, never a partial one.
 # A repeated or concurrent response never invokes the underlying CLI twice:
@@ -94,6 +100,7 @@
 #   FM_NM_REVIEW_TEST_HOLD_FIFO      blocks the lock holder on a fixture FIFO.
 #   FM_NM_REVIEW_TEST_CRASH_HOLDING  kills the holder just after it takes the lock.
 #   FM_NM_REVIEW_TEST_NO_LOCKER      simulates an unavailable kernel lock primitive.
+#   FM_NM_REVIEW_TEST_INFLIGHT_FIFO  blocks a responder after it claims the in-flight marker.
 set -eu
 
 SCRIPT_NAME=${0##*/}
@@ -313,6 +320,10 @@ verify_guard_actively_locked() {
     || die "review-ledger internal entry was invoked without the kernel guard; direct reentry is refused"
   [ -f "$guard" ] && [ ! -L "$guard" ] \
     || die "review-ledger kernel guard is not a regular private file"
+  # Both probes report the documented contention status 75 when the guard is
+  # already held; every other nonzero status is an operational failure (missing
+  # or unreadable guard, permission error) and must refuse closed rather than be
+  # mistaken for an active lock.
   case "$(uname -s 2>/dev/null || true)" in
     Darwin)
       command -v lockf >/dev/null 2>&1 \
@@ -322,12 +333,15 @@ verify_guard_actively_locked() {
     Linux)
       command -v flock >/dev/null 2>&1 \
         || die "flock is required to verify crash-safe review-ledger exclusion on Linux"
-      flock -n "$guard" -c true >/dev/null 2>&1 || probe_rc=$?
+      flock -E 75 -n "$guard" -c true >/dev/null 2>&1 || probe_rc=$?
       ;;
     *) die "kernel-backed review-ledger exclusion is unsupported on this operating system" ;;
   esac
-  [ "$probe_rc" -ne 0 ] \
-    || die "review-ledger internal entry was invoked without holding the kernel guard; direct reentry is refused"
+  case "$probe_rc" in
+    75) ;;
+    0) die "review-ledger internal entry was invoked without holding the kernel guard; direct reentry is refused" ;;
+    *) die "review-ledger guard-lock probe failed (status $probe_rc); refusing internal entry rather than assuming an active lock" ;;
+  esac
   LOCK_GUARD="$guard"
 }
 
@@ -523,6 +537,28 @@ confirm_uniform_disposition() {
     || die "cannot allocate an atomic ledger work file"
 }
 
+claim_response_inflight() {
+  # The real invariant is that the underlying no-mistakes response runs at most
+  # once per run and round. Enforce it directly at the side-effect boundary with
+  # an atomic O_CREAT|O_EXCL claim (bash noclobber): exactly one caller can create
+  # the marker for a run and round, so no second process -- however it entered,
+  # whether or not it holds the guard -- can invoke the response for it. A file
+  # cannot be atomically created twice, so a duplicate response is impossible by
+  # construction, without needing to prove which process owns the kernel lock.
+  local round=$1 marker
+  case "$CAPTURE_RUN_ID" in
+    ''|*[!A-Za-z0-9._-]*) die "cannot record an in-flight response for run id '$CAPTURE_RUN_ID'" ;;
+  esac
+  marker="$STATE_DIR/.firstmate-review-inflight.$CAPTURE_RUN_ID.$round"
+  [ ! -L "$marker" ] || die "review-ledger in-flight marker must not be a symlink"
+  if ! (umask 077; set -C; : > "$marker") 2>/dev/null; then
+    die "a no-mistakes response for run $CAPTURE_RUN_ID round $round is already in flight or completed; refusing a duplicate response"
+  fi
+  if [ -n "${FM_NM_REVIEW_TEST_INFLIGHT_FIFO:-}" ]; then
+    IFS= read -r _inflight_release < "$FM_NM_REVIEW_TEST_INFLIGHT_FIFO" || true
+  fi
+}
+
 respond() {
   local fix='' approve='' reject='' instructions='' want='' kind='' raw='' selected_csv round rc modes=0
   shift
@@ -565,6 +601,7 @@ respond() {
   prepare_work_files
   sync_ledger
   round=$(current_round_number)
+  claim_response_inflight "$round"
   append_requested_dispositions "$kind" "$round"
   selected_csv=$(printf '%s' "$SELECTED_JSON" | jq -r 'join(",")')
 

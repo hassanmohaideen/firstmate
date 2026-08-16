@@ -174,6 +174,10 @@ legacy_owner_file() {
   printf '%s/.no-mistakes/firstmate-review-ledger.lock/owner.json\n' "$1"
 }
 
+inflight_marker() {
+  printf '%s/.no-mistakes/.firstmate-review-inflight.%s.%s\n' "$1" "${2:-RUN-11}" "${3:-1}"
+}
+
 new_ready_case() {
   local name=$1 d f
   d=$(new_case "$name")
@@ -767,6 +771,73 @@ test_concurrent_direct_reentry_cannot_both_bypass() {
   pass "concurrent direct internal reentry cannot both bypass the kernel guard"
 }
 
+# The guard-lock probe must refuse closed on an operational failure rather than
+# mistake it for an active lock. A direct caller who plants an unopenable guard
+# must not be granted entry.
+test_probe_operational_error_refuses_closed() {
+  local d out rc f guard
+  d=$(new_case probe-error)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  guard=$(guard_file "$d")
+  mkdir -p "$d/.no-mistakes"
+  : > "$guard"
+  chmod 000 "$guard"
+  out=$(run_driver "$d" __fm_review_lock_held respond --approve accepted 2>&1); rc=$?
+  chmod 600 "$guard" 2>/dev/null || true
+  [ "$rc" -ne 0 ] || fail "an unopenable guard was accepted as an active lock"
+  assert_contains "$out" 'probe failed' "probe operational-error refusal was not actionable"
+  [ ! -e "$(ledger "$d")" ] || fail "probe operational error still mutated the ledger"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "probe operational error still invoked no-mistakes"
+  pass "a non-contention guard-lock probe error refuses closed instead of granting entry"
+}
+
+# The real invariant - the underlying no-mistakes response runs at most once per
+# run and round - is enforced by an atomic in-flight marker. An already-claimed
+# marker makes a duplicate response impossible, whatever process attempts it.
+test_inflight_marker_blocks_duplicate_response() {
+  local d out rc f marker
+  d=$(new_case inflight-marker)
+  f=$(finding accepted ask-user)
+  set_round "$d" "$f"
+  marker=$(inflight_marker "$d")
+  mkdir -p "$d/.no-mistakes"
+  : > "$marker"
+  out=$(run_driver "$d" respond --approve accepted 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a response proceeded despite an already-claimed in-flight marker"
+  assert_contains "$out" 'already in flight' "duplicate-response refusal was not actionable"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "a duplicate response invoked no-mistakes despite the in-flight marker"
+  pass "an existing in-flight marker makes a duplicate no-mistakes response impossible"
+}
+
+# The finding-1 scenario: a direct reentry that piggybacks on an active guarded
+# response (its probe sees contention and passes) still cannot duplicate the
+# side effect, because the legitimate responder already claimed the in-flight
+# marker for the run and round.
+test_inflight_marker_prevents_duplicate_under_contention() {
+  local d f release marker p out rc spins=0
+  d=$(new_case inflight-contention)
+  f=$(finding accepted auto-fix)
+  set_round "$d" "$f"
+  set_next "$d"
+  release="$d/inflight-release"
+  marker=$(inflight_marker "$d")
+  mkfifo "$release"
+  (FM_NM_REVIEW_TEST_INFLIGHT_FIFO="$release" run_driver "$d" respond --fix accepted >"$d/legit-out" 2>&1) & p=$!
+  while [ ! -e "$marker" ]; do
+    kill -0 "$p" 2>/dev/null || fail "the legitimate responder exited before claiming the in-flight marker"
+    spins=$((spins + 1)); [ "$spins" -lt 1000000 ] || fail "the legitimate responder never claimed the in-flight marker"
+  done
+  out=$(run_driver "$d" __fm_review_lock_held respond --fix accepted 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a piggyback reentry duplicated the response under guard contention"
+  assert_contains "$out" 'already in flight' "piggyback refusal was not the in-flight guard"
+  printf 'release\n' > "$release"
+  wait "$p" || fail "the legitimate guarded responder did not finish"
+  [ "$(calls_count "$d")" -eq 1 ] \
+    || fail "the underlying response ran $(calls_count "$d") times, not exactly once"
+  pass "the atomic in-flight marker prevents a duplicate response even under guard contention"
+}
+
 test_all_findings_fixed_and_audited_ready
 test_all_approved_and_explicit_rejection
 test_pr11_partial_fix_reproduction_and_proven_path
@@ -792,3 +863,6 @@ test_old_owner_exit_never_removes_guard_lock
 test_normal_uncontended_acquire_and_release
 test_direct_internal_reentry_without_lock_is_refused
 test_concurrent_direct_reentry_cannot_both_bypass
+test_probe_operational_error_refuses_closed
+test_inflight_marker_blocks_duplicate_response
+test_inflight_marker_prevents_duplicate_under_contention
