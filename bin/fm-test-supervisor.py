@@ -647,26 +647,23 @@ class LaneExecutor:
         return projected, launches
 
     def _validate_schedule_window(self, start: float) -> None:
-        _completion, launches = self._schedule(self.schedule_waves, start)
-        for row, baseline_start, _completion in launches:
+        completion, launches = self._schedule(self.schedule_waves, start)
+        if completion <= self.ordinary_deadline:
+            return
+        for row, baseline_start, wave_completion in launches:
+            if wave_completion <= self.ordinary_deadline:
+                continue
             baseline_ms = row["duration_baseline_ms"]
             if baseline_ms is None:
                 continue
-            wave_index = self.wave_by_index[row["index"]]
-            unfinished = [
-                candidate
-                for wave in self.schedule_waves[wave_index:]
-                for candidate in wave
-                if candidate is not row
-            ]
-            allowance = self.ordinary_deadline - baseline_start - self._schedule_reserve(unfinished)
             baseline_seconds = float(baseline_ms) / 1000.0
-            if baseline_seconds > allowance:
-                raise ContainmentError(
-                    f"manifest schedule cannot fit {row['path']}: "
-                    f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
-                    "before the ordinary deadline"
-                )
+            tail_reserve = wave_completion - (baseline_start + baseline_seconds)
+            allowance = self.ordinary_deadline - baseline_start - tail_reserve
+            raise ContainmentError(
+                f"manifest schedule cannot fit {row['path']}: "
+                f"baseline {baseline_seconds:.1f}s, allowance {max(0.0, allowance):.1f}s "
+                "before the ordinary deadline"
+            )
 
     def _release_preacquired_leases(self) -> None:
         if self.lease_pool is None:
@@ -676,18 +673,18 @@ class LaneExecutor:
                 self.lease_pool.retire(lease, quarantine=False)
         self.preacquired_leases.clear()
 
-    def _schedule_reserve(self, rows: list[dict[str, Any]]) -> float:
-        if not rows:
-            return 0.0
-        completion, _launches = self._schedule(self._build_schedule_waves(rows), 0.0)
-        return completion
-
     def _remaining_schedule_reserve(self, row: dict[str, Any]) -> float:
         unfinished = [
             candidate for candidate in self.doc["scripts"]
-            if candidate is not row and candidate.get("terminal") is None
+            if candidate.get("terminal") is None
         ]
-        return self._schedule_reserve(unfinished)
+        completion, launches = self._schedule(self._build_schedule_waves(unfinished), 0.0)
+        for candidate, baseline_start, _wave_completion in launches:
+            if candidate is row:
+                baseline_ms = candidate["duration_baseline_ms"]
+                baseline_seconds = float(baseline_ms) / 1000.0 if baseline_ms is not None else 0.0
+                return max(0.0, completion - (baseline_start + baseline_seconds))
+        return completion
 
     def preflight(self) -> None:
         if not self.required:
