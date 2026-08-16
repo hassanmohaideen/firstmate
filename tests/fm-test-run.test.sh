@@ -591,6 +591,41 @@ test_real_herdr_shard_lane_refusals() {
   pass "real-Herdr shard lanes refuse mismatched, out-of-range, and countless names"
 }
 
+test_real_herdr_lane_shares_only_runner_runtime() {
+  local tmp repo shared evidence runner
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-herdr-runtime.XXXXXX")
+  repo="$tmp/repo"; shared="$tmp/runner-home"; evidence="$tmp/evidence"
+  mkdir -p "$repo/bin" "$repo/tests" "$shared/.config/herdr" "$evidence"
+  cp "$RUNNER" "$repo/bin/fm-test-run.sh"
+  cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  runner="$repo/bin/fm-test-run.sh"
+  chmod +x "$runner" "$repo/bin/fm-test-supervisor.py"
+  printf 'job-owned-runtime\n' > "$shared/.config/herdr/session-marker"
+  cat > "$repo/tests/fm-backend-herdr-presentation-e2e.test.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[ "$(cat "$HOME/.config/herdr/session-marker")" = job-owned-runtime ]
+[ ! -e "$HOME/runner-private-file" ]
+printf '%s\n' "$HOME" > "$FM_TEST_ENV_EVIDENCE"
+SH
+  chmod +x "$repo/tests/fm-backend-herdr-presentation-e2e.test.sh"
+  printf 'private\n' > "$shared/runner-private-file"
+  HOME="$shared" FM_TEST_ENV_EVIDENCE="$evidence/home" \
+    "$runner" --lane real-herdr-gated-1of2 --json "$tmp/artifact.json" \
+    >"$tmp/out" 2>"$tmp/err" \
+    || { cat "$tmp/out" "$tmp/err"; rm -rf "$tmp"; fail "real-Herdr runtime sharing fixture failed"; }
+  [ -s "$evidence/home" ] || fail "real-Herdr child did not publish its observed HOME"
+  [ "$(cat "$evidence/home")" != "$shared" ] \
+    || fail "real-Herdr lane exposed the runner's whole HOME instead of only its runtime"
+  python3 - "$tmp/artifact.json" <<'PY' || fail "real-Herdr runtime fixture did not pass"
+import json, sys
+row = json.load(open(sys.argv[1]))["scripts"][0]
+assert row["terminal"]["result"] == "passed", row["terminal"]
+PY
+  rm -rf "$tmp"
+  pass "real-Herdr lane reaches the job server without exposing the runner HOME"
+}
+
 test_jobs_requires_proven_isolated() {
   local tmp rc shard_lane
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-jobs.XXXXXX")
@@ -1756,6 +1791,7 @@ ALL_TESTS=(
   test_portable_serial_shard_lane_refusals
   test_real_herdr_shards_partition_the_family
   test_real_herdr_shard_lane_refusals
+  test_real_herdr_lane_shares_only_runner_runtime
   test_jobs_requires_proven_isolated
   test_jobs_parallel_scheduler_and_failure_propagation
   test_default_changed_and_portable_selection

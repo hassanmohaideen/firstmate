@@ -1204,6 +1204,16 @@ class LaneExecutor:
         gitconfig.write_text(f"[safe]\n\tdirectory = {self.manifest['root']}\n", encoding="utf-8")
         if lease is not None:
             os.chown(gitconfig, lease.uid, lease.gid)
+        if self.manifest.get("share_herdr_runtime"):
+            if self.required or lease is not None:
+                raise ContainmentError("Herdr runtime sharing is forbidden in required containment")
+            runner_home = pathlib.Path(os.environ.get("HOME", ""))
+            runtime = runner_home / ".config" / "herdr"
+            if not runner_home.is_absolute() or not runtime.is_dir():
+                raise ContainmentError("runner Herdr runtime directory is unavailable")
+            config = home / ".config"
+            config.mkdir(mode=0o700)
+            (config / "herdr").symlink_to(runtime)
         return root
 
     @staticmethod

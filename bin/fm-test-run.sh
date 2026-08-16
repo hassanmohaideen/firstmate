@@ -543,7 +543,7 @@ tests/fm-wake-drain-open-decisions.test.sh 6574
 tests/fm-wake-queue.test.sh 27451
 tests/fm-watch-arm.test.sh 50289
 tests/fm-watch-checkpoint.test.sh 7321
-tests/fm-watch-triage.test.sh 145269
+tests/fm-watch-triage.test.sh 212357
 tests/fm-watcher-lock.test.sh 88221
 EOF
 }
@@ -1788,6 +1788,14 @@ manifest = {
     "manifest_version": 2, "artifact": artifact, "root": root,
     "run_id": run_id, "job_scope": job_scope,
     "selection": selection, "jobs": int(jobs),
+    # Real-Herdr jobs deliberately run as the developer identity, but still use
+    # a private child HOME. Share only Herdr's runtime directory so the client
+    # can reach the job-owned server started before the lane; never serialize
+    # the runner's HOME path or expose the rest of it.
+    "share_herdr_runtime": (
+        containment == "developer-non-enforcing"
+        and selection.startswith("lane=real-herdr-gated-")
+    ),
     "containment": containment, "duration_budget_mode": budget_mode,
     "fail_on_gate_skip": fail_token, "environment": environment,
     "bash": bash_path, "scripts": scripts,

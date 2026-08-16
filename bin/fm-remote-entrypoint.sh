@@ -107,7 +107,14 @@ COMMAND_PATH="$ROOT/bin/$COMMAND"
 # own.
 INHERITED_HOME=${HOME:-}
 unset HOME
-if ! ACCOUNT_HOME=$(CDPATH='' cd ~ 2>/dev/null && pwd -P); then
+# Do not use failure of `cd ~` as the account-existence test. With HOME unset,
+# bash can treat an unresolved bare tilde as an empty cd operand and succeed in
+# the current directory for an accountless UID. Ask the credential database via
+# id first; only an identity with a name may take the ordinary account-home path.
+if id -un >/dev/null 2>&1; then
+  ACCOUNT_HOME=$(CDPATH='' cd ~ 2>/dev/null && pwd -P) \
+    || die "cannot resolve the remote account home"
+else
   [ -n "$INHERITED_HOME" ] && [ -O "$INHERITED_HOME" ] \
     || die "cannot resolve the remote account home"
   ACCOUNT_HOME=$(fm_remote_job_canonical_existing_dir "$INHERITED_HOME") \
