@@ -2840,9 +2840,12 @@ recovery_nested_shell_process_fixture() {  # <pane-id>
   printf '{"result":{"type":"pane_process_info","process_info":{"pane_id":"%s","shell_pid":222,"foreground_process_group_id":333,"foreground_processes":[{"pid":333,"name":"/bin/zsh","argv0":"-/bin/zsh"}]}}}\n' "$1"
 }
 
-make_running_recovery_ps() {  # <dir> <comm> [present]
-  local dir=$1 comm=$2 present=${3:-yes} rows='1 0\n222 1\n'
-  [ "$present" = yes ] && rows="${rows}333 222\n"
+make_running_recovery_ps() {  # <dir> <comm> [present] [foreground-parent]
+  local dir=$1 comm=$2 present=${3:-yes} parent=${4:-222} rows='1 0\n222 1\n'
+  if [ "$present" = yes ]; then
+    [ "$parent" = 222 ] || rows="${rows}${parent} 1\n"
+    rows="${rows}333 ${parent}\n"
+  fi
   cat > "$dir/ps" <<SH
 #!/usr/bin/env bash
 case "\$*" in
@@ -2927,7 +2930,7 @@ test_recovery_state_refuses_mismatched_and_foreign_identity() {
 
 test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
   local mode dir log resp fb out
-  for mode in unreadable malformed reused prompt-helper nested-shell absent-running reused-running; do
+  for mode in unreadable malformed reused prompt-helper nested-shell absent-running reused-running foreign-running; do
     dir="$TMP_ROOT/recovery-process-$mode"; mkdir -p "$dir/responses"
     log="$dir/log"; resp="$dir/responses"; : > "$log"
     recovery_pane_fixture w1:p1 > "$resp/1.out"
@@ -2955,6 +2958,10 @@ test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
         recovery_running_process_fixture w1:p1 > "$resp/3.out"
         make_running_recovery_ps "$dir" python
         ;;
+      foreign-running)
+        recovery_running_process_fixture w1:p1 > "$resp/3.out"
+        make_running_recovery_ps "$dir" node yes 999
+        ;;
     esac
     fb=$(make_herdr_fakebin "$dir")
     out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="${dir}/ps" \
@@ -2964,7 +2971,7 @@ test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity() {
   pass "herdr recovery state: unreadable, ambiguous, and identity-reused process evidence cannot authorize replacement"
 }
 
-test_recovery_state_preserves_missing_and_unregistered_contracts() {
+test_recovery_state_preserves_missing_and_strict_unregistered_contracts() {
   local dir log resp fb out
   dir="$TMP_ROOT/recovery-missing"; mkdir -p "$dir/responses"
   log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2977,10 +2984,21 @@ test_recovery_state_preserves_missing_and_unregistered_contracts() {
   : > "$log"; rm -f "$resp"/*.out "$resp/.count"
   recovery_pane_fixture w1:p1 > "$resp/1.out"
   printf '%s\n' '{"error":{"code":"agent_not_found"}}' > "$resp/2.out"
-  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+  death_process_info_fixture w1:p1 222 > "$resp/3.out"
+  make_recovery_ps "$dir" -zsh
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
-  [ "$out" = dead ] || fail "an unregistered exact pane should remain dead, got '$out'"
-  pass "herdr recovery state: missing panes and unregistered intact panes retain their established meanings"
+  [ "$out" = dead ] || fail "an unregistered lone idle-shell pane should be dead, got '$out'"
+
+  : > "$log"; rm -f "$resp"/*.out "$resp/.count"
+  recovery_pane_fixture w1:p1 > "$resp/1.out"
+  printf '%s\n' '{"error":{"code":"agent_not_found"}}' > "$resp/2.out"
+  recovery_running_process_fixture w1:p1 > "$resp/3.out"
+  make_running_recovery_ps "$dir" node
+  out=$(PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_HERDR_PS_BIN="$dir/ps" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_state fmtest:w1:p1' "$ROOT")
+  [ "$out" = unreadable ] || fail "an unregistered pane with a foreign running process should refuse, got '$out'"
+  pass "herdr recovery state: missing and unregistered panes require positive process proof"
 }
 
 # --- target parsing, key normalization ---------------------------------------
@@ -4470,7 +4488,7 @@ test_recovery_state_treats_a_stale_registration_over_exact_idle_shell_as_dead
 test_recovery_state_keeps_running_idle_done_and_blocked_agents_alive
 test_recovery_state_refuses_mismatched_and_foreign_identity
 test_recovery_state_refuses_ambiguous_unreadable_and_reused_process_identity
-test_recovery_state_preserves_missing_and_unregistered_contracts
+test_recovery_state_preserves_missing_and_strict_unregistered_contracts
 test_parse_target
 test_normalize_key
 test_capture_calls_pane_read

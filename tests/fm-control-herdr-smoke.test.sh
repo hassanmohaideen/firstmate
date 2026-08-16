@@ -163,6 +163,7 @@ pass "real herdr: a stale registration cannot authorize interrupt on an exited-T
 # the exact same registration classify alive, proving the classifier keys on
 # process ownership rather than the registration herdr happened to retain.
 
+# Pi interrupts with Escape, so this non-shell child deliberately survives it.
 herdr pane run "$PANE_ID" 'sleep 300' --session "$SESSION" >/dev/null 2>&1 \
   || fail "could not start a foreground process in the task pane"
 running=

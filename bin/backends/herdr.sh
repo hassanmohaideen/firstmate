@@ -1985,9 +1985,21 @@ fm_backend_herdr_registered_process_state() {  # <session> <pane-id>
   command -v "$ps_bin" >/dev/null 2>&1 || { printf 'unknown'; return 0; }
   rows=$("$ps_bin" -axo pid=,ppid= 2>/dev/null) \
     || { printf 'unknown'; return 0; }
-  printf '%s\n' "$rows" | awk -v pid="$process_pid" '
-    $1 == pid { found++ }
-    END { exit(found == 1 ? 0 : 1) }
+  printf '%s\n' "$rows" | awk -v pid="$process_pid" -v shell="$shell_pid" '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      count[$1]++
+      parent[$1] = $2
+    }
+    END {
+      if (count[pid] != 1 || count[shell] != 1) exit 1
+      current = pid
+      for (steps = 0; steps < 256; steps++) {
+        if (current == shell) exit 0
+        if (current <= 1 || count[current] != 1 || seen[current]++) exit 1
+        current = parent[current]
+      }
+      exit 1
+    }
   ' || { printf 'unknown'; return 0; }
   fm_backend_herdr_pid_is_bare_shell "$ps_bin" "$process_pid" \
     && { printf 'unknown'; return 0; }
@@ -2009,7 +2021,7 @@ fm_backend_herdr_registered_process_state() {  # <session> <pane-id>
 # non-shell foreground process means alive; every mismatch or unreadable
 # process shape refuses recovery as unknown.
 fm_backend_herdr_recovery_agent_state() {  # <session> <pane-id>
-  local session=$1 pane_id=$2 pane_out agent_out code pane_identity agent_identity status process_state
+  local session=$1 pane_id=$2 pane_out agent_out code pane_identity agent_identity status process_state info
   pane_out=$(fm_backend_herdr_cli "$session" pane get "$pane_id" 2>&1)
   code=$(printf '%s' "$pane_out" | jq -r '.error.code // empty' 2>/dev/null)
   if [ -n "$code" ]; then
@@ -2027,7 +2039,14 @@ fm_backend_herdr_recovery_agent_state() {  # <session> <pane-id>
   agent_out=$(fm_backend_herdr_cli "$session" agent get "$pane_id" 2>&1)
   code=$(printf '%s' "$agent_out" | jq -r '.error.code // empty' 2>/dev/null)
   if [ -n "$code" ]; then
-    [ "$code" = agent_not_found ] && printf 'dead' || printf 'unknown'
+    if [ "$code" = agent_not_found ]; then
+      info=$(fm_backend_herdr_cli "$session" pane process-info --pane "$pane_id" 2>/dev/null) \
+        || { printf 'unknown'; return 0; }
+      fm_backend_herdr_process_info_idle_shell_pid "$info" "$pane_id" >/dev/null 2>&1 \
+        && printf 'dead' || printf 'unknown'
+    else
+      printf 'unknown'
+    fi
     return 0
   fi
   agent_identity=$(printf '%s' "$agent_out" | jq -er '
