@@ -29,8 +29,24 @@ REAL_TMUX=$(command -v tmux)
 SOCKET="fm-liveness-$$"
 LAB=$(mktemp -d "${TMPDIR:-/tmp}/fm-liveness.XXXXXX")
 SESSION=liveness
+bg_pid=
 
 cleanup_all() {
+  # The background-process case deliberately creates a separate process group,
+  # so killing the tmux server does not reap it. Stop it explicitly before the
+  # test exits; otherwise the CI process-domain supervisor correctly reports a
+  # containment failure even though every assertion passed.
+  if [ -n "${bg_pid:-}" ] && kill -0 "$bg_pid" 2>/dev/null; then
+    kill "$bg_pid" 2>/dev/null || true
+    cleanup_try=0
+    while kill -0 "$bg_pid" 2>/dev/null && [ "$cleanup_try" -lt 20 ]; do
+      sleep 0.05
+      cleanup_try=$((cleanup_try + 1))
+    done
+    if kill -0 "$bg_pid" 2>/dev/null; then
+      kill -KILL "$bg_pid" 2>/dev/null || true
+    fi
+  fi
   "$REAL_TMUX" -L "$SOCKET" kill-server >/dev/null 2>&1 || true
   [ -n "${LAB:-}" ] && rm -rf "$LAB"
 }
@@ -229,7 +245,6 @@ pass "tmux liveness: an idle shell pane classifies dead"
 # interactive shell does for a job an exited agent left behind.
 
 new_window background bash -c "set -m; '$LAB/bin/claude-link' 900 & printf '%s\n' \"\$!\" > '$LAB/bg.pid'; exec /bin/sh"
-bg_pid=
 for _ in $(seq 1 100); do
   [ -s "$LAB/bg.pid" ] && bg_pid=$(cat "$LAB/bg.pid") && break
   sleep 0.1
