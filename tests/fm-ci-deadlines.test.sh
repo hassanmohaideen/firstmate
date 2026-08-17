@@ -12,7 +12,7 @@ SCRIPT="$ROOT/bin/fm-ci-deadlines.sh"
 
 # --- sourced contract: defines constants and a function, emits nothing --------
 
-# shellcheck source=bin/fm-ci-deadlines.sh
+# shellcheck disable=SC1090
 sourced_output=$(. "$SCRIPT")
 [ -z "$sourced_output" ] || fail "sourcing must define only and print nothing, got: $sourced_output"
 
