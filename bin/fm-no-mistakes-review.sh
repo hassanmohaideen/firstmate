@@ -78,9 +78,15 @@
 # a successful acquire means it was free so a direct caller is refused, and any
 # other probe error refuses closed rather than assuming an active lock.
 # The response boundary is governed by a durable response receipt per run and
-# round, a same-directory atomic-rename JSON file recording the exact action and
-# findings and a phase of attempting, landed, or failed. It is written attempting
-# BEFORE the underlying no-mistakes response runs and landed or failed after it
+# round at:
+#   <project-worktree>/.no-mistakes/.firstmate-review-receipt.<run-id>.<round>.json
+# The guard writes this exact shape by same-directory atomic rename:
+#   {"run":"<run-id>","branch":"<branch>","round":<integer>,
+#   "action":"fix"|"approve"|"reject","findings":["<id>",...],
+#   "attempt":<integer>,"head":"<commit>",
+#   "phase":"attempting"|"landed"|"failed"}
+# It records the exact action and findings in phase attempting BEFORE the
+# underlying no-mistakes response runs, then records landed or failed after it
 # returns, so a crash at any point leaves a reconcilable record rather than a
 # silently accepted or permanently stranded finding.
 # A fresh invocation reconciles outstanding receipts across every public round
@@ -116,10 +122,11 @@
 # path never reaches it -- it is fully serialized by the kernel guard, and any
 # actor that could reach it already has write access to this state directory.
 #
-# audit-ready refreshes the append-only public review history, reconciles
-# outstanding response receipts across all rounds read-only -- finalizing only a
-# landed fix from action-specific evidence and refusing every unlanded or
-# indeterminate attempt -- then refuses
+# audit-ready refreshes the append-only public review history, then reconciles
+# outstanding response receipts across all rounds without invoking a response.
+# It fills only a missing finalization for a landed action, requires
+# action-specific public evidence for a detached fix, and refuses every unlanded
+# or indeterminate attempt. It then refuses
 # for missing or rewritten history, stale run/branch/head context, malformed or
 # duplicate findings, missing/duplicate/contradictory dispositions, requested
 # but unconfirmed fixes, unchanged surviving fixes, or absent public PR/green-CI
