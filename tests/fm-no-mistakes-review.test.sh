@@ -175,7 +175,13 @@ legacy_owner_file() {
 }
 
 inflight_marker() {
-  printf '%s/.no-mistakes/.firstmate-review-inflight.%s.%s\n' "$1" "${2:-RUN-11}" "${3:-1}"
+  printf '%s/.no-mistakes/.firstmate-review-inflight.%s.%s.%s\n' \
+    "$1" "${2:-RUN-11}" "${3:-1}" "${4:-1}"
+}
+
+receipt_file() {
+  printf '%s/.no-mistakes/.firstmate-review-receipt.%s.%s.json\n' \
+    "$1" "${2:-RUN-11}" "${3:-1}"
 }
 
 new_ready_case() {
@@ -487,19 +493,28 @@ test_run_and_head_mismatch_are_refused() {
   pass "run and head mismatches refuse readiness before synchronization"
 }
 
-test_duplicate_replay_and_underlying_failure() {
-  local d out f before after
+test_idempotent_replay_does_not_reinvoke() {
+  local d out f before after rc
   d=$(new_case replay)
   f=$(finding replay ask-user)
   set_round "$d" "$f"
   run_driver "$d" respond --approve replay >/dev/null 2>&1 || fail "initial replay fixture response failed"
   before=$(shasum -a 256 "$(ledger "$d")" | awk '{print $1}')
   out=$(run_driver "$d" respond --approve replay 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "duplicate response replay succeeded"
-  [ "$(calls_count "$d")" -eq 1 ] || fail "duplicate response replay invoked the CLI twice"
+  [ "$rc" -eq 0 ] || fail "an idempotent replay of a landed response was refused: $out"
+  assert_contains "$out" 'action=approve findings=replay' "replay did not re-report the recorded disposition"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "an idempotent replay invoked the CLI a second time"
   after=$(shasum -a 256 "$(ledger "$d")" | awk '{print $1}')
-  [ "$before" = "$after" ] || fail "duplicate response replay changed the ledger"
+  [ "$before" = "$after" ] || fail "an idempotent replay changed the ledger"
+  pass "replaying a landed response is idempotent and never re-invokes the CLI"
+}
 
+# The tripwire finding failed-response-remains-permanently-requested: a nonzero
+# axi respond used to strand the finding as "requested" with no way to retry. The
+# redesign records the attempt as failed, leaves no disposition, refuses readiness,
+# and lets a later invocation retry to completion.
+test_transient_failure_is_recoverable() {
+  local d out f rc
   d=$(new_case underlying-failure)
   f=$(finding failure auto-fix)
   set_round "$d" "$f"
@@ -508,12 +523,23 @@ test_duplicate_replay_and_underlying_failure() {
   out=$(run_driver "$d" respond --fix failure 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "underlying CLI failure was hidden"
   assert_contains "$out" 'exit 23' "underlying failure exit was not surfaced"
-  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = requested ] \
-    || fail "underlying failure was silently confirmed or dropped"
+  assert_contains "$out" 'safely retried' "failed response did not advertise a recovery path"
+  [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "a failed response left a disposition that could be mistaken for a decision"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = failed ] \
+    || fail "a failed response did not record a durable failed receipt"
   out=$(run_driver "$d" audit-ready 2>&1); rc=$?
-  [ "$rc" -ne 0 ] || fail "readiness accepted a requested-only failed response"
-  assert_contains "$out" 'merely requested' "failed-response readiness lacked requested-only diagnostic"
-  pass "duplicate replay is idempotent and underlying failure remains unconfirmed"
+  [ "$rc" -ne 0 ] || fail "readiness accepted a run with an unresolved failed response"
+  assert_contains "$out" 'failed response attempt' "failed-response readiness lacked its diagnostic"
+
+  rm -f "$d/fake-state/respond-fail"
+  out=$(run_driver "$d" respond --fix failure 2>&1) \
+    || fail "a transient failure could not be retried: $out"
+  [ "$(calls_count "$d")" -eq 2 ] || fail "the retry did not invoke the CLI exactly once more"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = fixed_and_confirmed ] \
+    || fail "the retried fix was not confirmed"
+  run_driver "$d" audit-ready >/dev/null 2>&1 || fail "the recovered run did not audit ready"
+  pass "a transiently failed response records failed and is safely retryable"
 }
 
 test_concurrent_writers_are_serial_and_atomic() {
@@ -830,7 +856,7 @@ test_inflight_marker_prevents_duplicate_under_contention() {
   done
   out=$(run_driver "$d" __fm_review_lock_held respond --fix accepted 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "a piggyback reentry duplicated the response under guard contention"
-  assert_contains "$out" 'already in flight' "piggyback refusal was not the in-flight guard"
+  assert_contains "$out" 'may still be in flight' "piggyback refusal was not the in-flight guard"
   printf 'release\n' > "$release"
   wait "$p" || fail "the legitimate guarded responder did not finish"
   [ "$(calls_count "$d")" -eq 1 ] \
@@ -869,8 +895,150 @@ test_stale_ledger_commit_cannot_clobber_concurrent_append() {
   pass "an optimistic-concurrency commit recomputes instead of clobbering a concurrent ledger append"
 }
 
+# The worktree-isolation gap: the pipeline validates in a per-run bare repo, so the
+# authoritative head can be a fix commit this worktree never fetched. The guard must
+# resolve it by importing objects READ-ONLY from that store, with no manual fetch.
+test_isolated_pipeline_head_is_imported() {
+  local d f store bare tree h0 h1 h2 out rc
+  d=$(new_case iso)
+  f=$(finding iso ask-user)
+  set_round "$d" "$f"
+  store="$d/nm-repos"
+  bare="$store/2f00d15ea5ed.git"
+  mkdir -p "$store"
+  git clone --bare -q "$d" "$bare"
+  git -C "$bare" config user.name fixture
+  git -C "$bare" config user.email fixture@example.test
+  tree=$(git -C "$d" rev-parse 'HEAD^{tree}')
+  h0=$(git -C "$d" rev-parse HEAD)
+  # The authoritative head h1 is a fix commit, and CI then advanced the branch tip
+  # past it to h2 -- so h1 is a non-tip ancestor that only an exact-object import
+  # (not a branch-tip fetch) can bind. Neither exists in the worktree.
+  h1=$(git -C "$bare" commit-tree "$tree" -p "$h0" -m 'isolated pipeline fix')
+  h2=$(git -C "$bare" commit-tree "$tree" -p "$h1" -m 'later CI fix')
+  git -C "$bare" update-ref "refs/heads/fm/iso" "$h2"
+  printf '%s\n' "$h1" > "$d/fake-state/status-head"
+
+  # The isolated head is genuinely absent from the worktree before the guard runs.
+  git -C "$d" rev-parse --verify --quiet "${h1}^{commit}" >/dev/null 2>&1 \
+    && fail "the isolated pipeline head was unexpectedly already present in the worktree"
+
+  out=$(cd "$d" && FM_FAKE_NM_STATE="$d/fake-state" FM_NM_REPOS_DIR="$store" \
+    PATH="$d/fakebin:$PATH" "$DRIVER" respond --approve iso 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "the isolated pipeline head was not resolved for the response: $out"
+  git -C "$d" rev-parse --verify --quiet "${h1}^{commit}" >/dev/null 2>&1 \
+    || fail "the guard did not import the isolated pipeline head into the worktree"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].head' "$(ledger "$d")")" = "$h1" ] \
+    || fail "the disposition was not bound to the authoritative isolated head"
+  out=$(cd "$d" && FM_FAKE_NM_STATE="$d/fake-state" FM_NM_REPOS_DIR="$store" \
+    PATH="$d/fakebin:$PATH" "$DRIVER" audit-ready 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "readiness could not resolve the isolated pipeline head: $out"
+  assert_contains "$out" "head=$h1" "readiness did not report the authoritative isolated head"
+  pass "an isolated pipeline head is imported read-only and resolves across worktree isolation"
+}
+
+test_isolated_head_absent_everywhere_refuses() {
+  local d f store out rc missing
+  d=$(new_case iso-missing)
+  f=$(finding gone ask-user)
+  set_round "$d" "$f"
+  store="$d/nm-repos-empty"
+  mkdir -p "$store"
+  # A head that exists in neither the worktree nor any per-run store.
+  missing=0000000000000000000000000000000000000001
+  printf '%s\n' "$missing" > "$d/fake-state/status-head"
+  out=$(cd "$d" && FM_FAKE_NM_STATE="$d/fake-state" FM_NM_REPOS_DIR="$store" \
+    PATH="$d/fakebin:$PATH" "$DRIVER" respond --approve gone 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unresolvable head was accepted"
+  assert_contains "$out" 'cannot resolve public validation head' "unresolvable-head refusal was not actionable"
+  [ ! -e "$(ledger "$d")" ] || fail "an unresolvable head still mutated the ledger"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "an unresolvable head still invoked no-mistakes"
+  pass "a head absent from the worktree and every per-run store refuses closed"
+}
+
+# A crash after the attempting receipt but before the CLI leaves no attempt marker,
+# proving the response never ran; the next invocation retries it to completion.
+test_crash_before_respond_is_retryable() {
+  local d f out rc
+  d=$(new_case crash-before)
+  f=$(finding cb auto-fix)
+  set_round "$d" "$f"
+  set_next "$d"
+  FM_NM_REVIEW_TEST_CRASH_BEFORE_RESPOND=1 run_driver "$d" respond --fix cb >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "the crash-before-respond fixture unexpectedly completed"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = attempting ] \
+    && [ "$(calls_count "$d")" -eq 0 ] \
+    || fail "the crash-before-respond fixture did not leave an untried attempting receipt"
+  [ ! -e "$(inflight_marker "$d")" ] \
+    || fail "an attempt that never ran the CLI still left an attempt marker"
+  out=$(run_driver "$d" respond --fix cb 2>&1) \
+    || fail "an unstarted attempt could not be retried: $out"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "the retry did not run the CLI exactly once"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = fixed_and_confirmed ] \
+    || fail "the retried response was not confirmed"
+  run_driver "$d" audit-ready >/dev/null 2>&1 || fail "the recovered run did not audit ready"
+  pass "a crash before the CLI leaves no marker and is retried to completion"
+}
+
+# A crash after the CLI landed but before the receipt is marked landed leaves an
+# attempting receipt WITH its marker; recovery reconciles it from public evidence
+# (the gate closed) and finalizes without re-invoking the CLI.
+test_crash_after_respond_reconciles_landed() {
+  local d f out rc
+  d=$(new_case crash-after)
+  f=$(finding ca ask-user)
+  set_round "$d" "$f"
+  FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND=1 run_driver "$d" respond --approve ca >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "the crash-after-respond fixture unexpectedly completed"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = attempting ] \
+    || fail "the crash-after-respond fixture did not leave an attempting receipt"
+  [ -e "$(inflight_marker "$d")" ] || fail "a landed CLI attempt left no attempt marker"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "the crashed attempt did not land its single CLI call"
+  [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "the crash finalized a disposition before recovery"
+  out=$(run_driver "$d" respond --approve ca 2>&1) \
+    || fail "recovery could not reconcile a landed-but-unfinalized response: $out"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "recovery re-invoked the CLI for an already-landed response"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = approved_as_is ] \
+    || fail "recovery did not finalize the landed approval"
+  run_driver "$d" audit-ready >/dev/null 2>&1 || fail "the recovered run did not audit ready"
+  pass "a crash between a landed CLI and its receipt is reconciled without a duplicate response"
+}
+
+# The tripwire finding completed-status-does-not-prove-response-action: a failed
+# approve must never be recorded as landed just because the review later completes
+# by some other means. The failed receipt keeps readiness fail-closed.
+test_failed_action_not_finalized_from_generic_completion() {
+  local d f out rc
+  d=$(new_case failed-then-complete)
+  f=$(finding fc ask-user)
+  set_round "$d" "$f"
+  : > "$d/fake-state/respond-fail"
+  run_driver "$d" respond --approve fc >/dev/null 2>&1 \
+    && fail "a failing approve unexpectedly succeeded"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = failed ] \
+    && [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "a failed approve left a disposition or non-failed receipt"
+  # The review completes out-of-band (e.g. a direct skip), so a generic completed
+  # status now holds even though OUR approve never landed.
+  printf '1\n' > "$d/fake-state/phase"
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "readiness accepted a failed approve masked by a later completion"
+  assert_contains "$out" 'failed response attempt' "failed-approve readiness lacked its diagnostic"
+  [ "$(jq '[.runs[0].rounds[0].dispositions[] | select(.state == "approved_as_is")] | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "a failed approve was recorded as approved from a generic completion"
+  pass "a failed action is never finalized from a generic later completion"
+}
+
 test_all_findings_fixed_and_audited_ready
 test_all_approved_and_explicit_rejection
+test_isolated_pipeline_head_is_imported
+test_isolated_head_absent_everywhere_refuses
+test_crash_before_respond_is_retryable
+test_crash_after_respond_reconciles_landed
+test_failed_action_not_finalized_from_generic_completion
 test_pr11_partial_fix_reproduction_and_proven_path
 test_mixed_choices_are_unrepresentable
 test_multiple_fix_rounds_preserve_history
@@ -882,7 +1050,8 @@ test_post_review_pipeline_commit_refuses_readiness
 test_no_ci_checks_refuses_readiness
 test_terminal_outcomes_reject_stale_green_ci
 test_run_and_head_mismatch_are_refused
-test_duplicate_replay_and_underlying_failure
+test_idempotent_replay_does_not_reinvoke
+test_transient_failure_is_recoverable
 test_concurrent_writers_are_serial_and_atomic
 test_matching_live_owner_refuses
 test_dead_owner_recovers_and_audit_is_idempotent
