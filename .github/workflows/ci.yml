@@ -59,19 +59,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      # T0 is the first executable behavior step, before checkout, so the
-      # absolute deadline budget covers checkout and tool setup too.
-      - name: Record absolute test deadlines
-        run: |
-          set -eu
-          t0=$(date +%s)
-          {
-            echo "FM_TEST_JOB_T0_EPOCH=$t0"
-            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
-            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
-            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
-            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
-          } >> "$GITHUB_ENV"
+      # This job qualifies the kernel primitive and drives the executor fixtures,
+      # which each embed their own fixture deadlines; it consumes none of the
+      # job deadline budget, so it relies only on the timeout-minutes ceiling.
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -117,24 +107,17 @@ jobs:
     # a hang tripwire with margin, not the expected healthy end of the lane.
     timeout-minutes: 10
     steps:
-      # T0 is the first executable behavior step, before checkout, so the
-      # absolute deadline budget covers checkout and tool setup too. Recording
-      # it after checkout would leave that time unaccounted against the ceiling.
-      - name: Record absolute test deadlines
-        run: |
-          set -eu
-          t0=$(date +%s)
-          {
-            echo "FM_TEST_JOB_T0_EPOCH=$t0"
-            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
-            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
-            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
-            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
-          } >> "$GITHUB_ENV"
+      # Anchor T0 before checkout so the deadline budget (single owner:
+      # bin/fm-ci-deadlines.sh, expanded right after checkout) covers checkout
+      # and tool setup, not only the test run itself.
+      - name: Anchor test-deadline T0
+        run: echo "FM_TEST_JOB_T0_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Expand test-deadline budget
+        run: bin/fm-ci-deadlines.sh >> "$GITHUB_ENV"
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -168,24 +151,17 @@ jobs:
     env:
       FM_TEST_CONTAINMENT: required
     steps:
-      # T0 is the first executable behavior step, before checkout, so the
-      # absolute deadline budget covers checkout and tool setup too. Recording
-      # it after checkout would leave that time unaccounted against the ceiling.
-      - name: Record absolute test deadlines
-        run: |
-          set -eu
-          t0=$(date +%s)
-          {
-            echo "FM_TEST_JOB_T0_EPOCH=$t0"
-            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
-            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
-            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
-            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
-          } >> "$GITHUB_ENV"
+      # Anchor T0 before checkout so the deadline budget (single owner:
+      # bin/fm-ci-deadlines.sh, expanded right after checkout) covers checkout
+      # and tool setup, not only the test run itself.
+      - name: Anchor test-deadline T0
+        run: echo "FM_TEST_JOB_T0_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Expand test-deadline budget
+        run: bin/fm-ci-deadlines.sh >> "$GITHUB_ENV"
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -233,24 +209,17 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
-      # T0 is the first executable behavior step, before checkout, so the
-      # absolute deadline budget covers checkout and tool setup too. Recording
-      # it after checkout would leave that time unaccounted against the ceiling.
-      - name: Record absolute test deadlines
-        run: |
-          set -eu
-          t0=$(date +%s)
-          {
-            echo "FM_TEST_JOB_T0_EPOCH=$t0"
-            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
-            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
-            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
-            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
-          } >> "$GITHUB_ENV"
+      # Anchor T0 before checkout so the deadline budget (single owner:
+      # bin/fm-ci-deadlines.sh, expanded right after checkout) covers checkout
+      # and tool setup, not only the test run itself.
+      - name: Anchor test-deadline T0
+        run: echo "FM_TEST_JOB_T0_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Expand test-deadline budget
+        run: bin/fm-ci-deadlines.sh >> "$GITHUB_ENV"
       - name: Install pinned ShellCheck
         run: |
           set -eu
@@ -314,23 +283,16 @@ jobs:
       matrix:
         shard: [1, 2]
     steps:
-      # T0 is the first executable behavior step, before checkout, so the
-      # absolute deadline budget covers checkout and tool setup too. Recording
-      # it after checkout would leave that time unaccounted against the ceiling.
-      - name: Record absolute test deadlines
-        run: |
-          set -eu
-          t0=$(date +%s)
-          {
-            echo "FM_TEST_JOB_T0_EPOCH=$t0"
-            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
-            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
-            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
-            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
-          } >> "$GITHUB_ENV"
+      # Anchor T0 before checkout so the deadline budget (single owner:
+      # bin/fm-ci-deadlines.sh, expanded right after checkout) covers checkout
+      # and tool setup, not only the test run itself.
+      - name: Anchor test-deadline T0
+        run: echo "FM_TEST_JOB_T0_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Expand test-deadline budget
+        run: bin/fm-ci-deadlines.sh >> "$GITHUB_ENV"
       - name: Require tools for real Herdr
         run: |
           set -eu
@@ -474,18 +436,10 @@ jobs:
     # aggregator still rejects incomplete evidence when invoked; running it
     # after a prerequisite was skipped cannot produce useful lane evidence and
     # only creates a second, misleading failure.
+    # No deadline budget: this job only aggregates lane timing JSON and consumes
+    # none of the FM_TEST_*_EPOCH values, so the timeout-minutes ceiling is the
+    # only time bound it needs.
     steps:
-      - name: Record absolute test deadlines
-        run: |
-          set -eu
-          t0=$(date +%s)
-          {
-            echo "FM_TEST_JOB_T0_EPOCH=$t0"
-            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
-            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
-            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
-            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
-          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
       - name: Download lane timing artifacts
         uses: actions/download-artifact@v4
@@ -525,18 +479,10 @@ jobs:
     name: Stock macOS Bash snapshot compatibility
     runs-on: macos-latest
     timeout-minutes: 10
+    # No deadline budget: this job parses scripts and runs the snapshot/Bearings
+    # suites directly with stock Bash and consumes none of the FM_TEST_*_EPOCH
+    # values, so the timeout-minutes ceiling is the only time bound it needs.
     steps:
-      - name: Record absolute test deadlines
-        run: |
-          set -eu
-          t0=$(date +%s)
-          {
-            echo "FM_TEST_JOB_T0_EPOCH=$t0"
-            echo "FM_TEST_ORDINARY_DEADLINE_EPOCH=$((t0 + 430))"
-            echo "FM_TEST_TERMINAL_DEADLINE_EPOCH=$((t0 + 450))"
-            echo "FM_TEST_CLEANUP_DEADLINE_EPOCH=$((t0 + 480))"
-            echo "FM_TEST_CEILING_DEADLINE_EPOCH=$((t0 + 600))"
-          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
       - name: Run snapshot consumers with stock Bash
         shell: /bin/bash {0}

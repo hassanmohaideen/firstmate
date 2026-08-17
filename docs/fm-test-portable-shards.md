@@ -90,7 +90,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 150-script inventory leaves 113 scripts in the portable serial remainder.
+The current 152-script inventory leaves 115 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 
@@ -99,6 +99,7 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
 The retained per-script measurements come primarily from green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), with `fm-watch-triage.test.sh` refreshed to its 212357 ms local measurement after the credential-domain CI lane exposed its stale 145269 ms scheduling reservation and the new `fm-no-mistakes-review.test.sh` using its 30943 ms focused-run measurement until the next green-CI refresh.
+The `fm-ci-deadlines.test.sh` (145 ms) and `fm-timeout-lib.test.sh` (5101 ms) tests added with the single-owner CI deadline budget likewise use their focused-run measurements until the next green-CI refresh; the shard table below still reflects the referenced run before they landed.
 A script added since that run or otherwise lacking a hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
