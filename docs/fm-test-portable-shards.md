@@ -218,14 +218,11 @@ The tables above remain scheduling inputs until the next green required run publ
 
 ## Deadlines and reserves
 
-Every job in `.github/workflows/ci.yml` has `timeout-minutes: 10`.
-Behavior jobs record T0 as their first executable step, before checkout, so the absolute deadline budget also covers checkout and tool setup rather than starting the clock only once the code is present.
-Every behavior lane that invokes the executor passes that one absolute deadline set through the public runner.
-Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
-The final 120 seconds remain reserved for artifact upload and platform variance before the 600-second job ceiling.
-Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards.
-The executor publishes at most one terminal per scheduler iteration and reserves 15 seconds for every concurrently outstanding terminal, so all terminal evidence is published by T0+450.
-Per-attempt deadline enforcement therefore has jitter bounded by one terminal publication's sub-second fsync latency rather than a sub-millisecond guarantee; the required 120-second pre-ceiling margin absorbs that accepted jitter.
-The executor reserves four seconds of startup (the blocked-child readiness bound plus durable launch evidence) and four seconds of cleanup for every unstarted script, and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
+Every job in `.github/workflows/ci.yml` has `timeout-minutes: 10` as an outer ceiling that fails an overrun rather than passing incomplete work.
+The portable parallel, portable serial, and real-Herdr jobs anchor T0 before checkout so their interior budget covers checkout and tool setup, then expand that budget immediately after checkout.
+The containment qualification fixtures carry their own deadlines, while timing aggregation and stock-Bash snapshot execution do not consume the test deadline environment, so those jobs rely only on the outer ceiling.
+`bin/fm-ci-deadlines.sh` is the single owner of the exact interior schedule, its reserve boundaries, and its sourced and executed interfaces.
+`bin/fm-test-supervisor.py` owns per-attempt deadline enforcement, terminal publication, manifest feasibility, and cleanup reservations.
 A timed-out attempt is terminal red, and later required scripts still execute exactly once when their reservations allow.
+The executor refuses an impossible manifest instead of retrying, skipping, shortening, or truncating coverage.
 Healthy complete CI remains targeted at roughly five to eight minutes.

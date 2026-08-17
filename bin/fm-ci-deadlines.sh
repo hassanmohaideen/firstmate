@@ -4,10 +4,10 @@
 # Both sourced and executed.
 #
 # Executed:  bin/fm-ci-deadlines.sh [t0_epoch] >> "$GITHUB_ENV"
-#     Prints the five FM_TEST_*_EPOCH assignments a test job exports so
-#     bin/fm-test-run.sh and the credential-domain executor share one absolute
-#     schedule. With no argument it reads FM_TEST_JOB_T0_EPOCH (the T0 a job
-#     anchors before checkout) and falls back to the current second.
+#     Prints the five FM_TEST_*_EPOCH assignments a deadline-consuming test job
+#     exports so bin/fm-test-run.sh and the credential-domain executor share one
+#     absolute schedule. With no argument it reads FM_TEST_JOB_T0_EPOCH (the T0
+#     a job anchors before checkout) and falls back to the current second.
 #
 # Sourced:   defines FM_CI_DEADLINE_OFFSET_{ORDINARY,TERMINAL,CLEANUP,CEILING}
 #     and fm_ci_deadline_env, so bin/fm-test-run.sh derives its local-run
@@ -15,7 +15,7 @@
 #     tests can assert the schedule without scraping this file.
 #
 # The schedule sits under the GitHub `timeout-minutes: 10` hard ceiling that
-# every test job declares. timeout-minutes is the outer guillotine: it fails a
+# every CI job declares. timeout-minutes is the outer guillotine: it fails a
 # hung job RED, but it kills mid-step and loses cleanup and evidence. These
 # interior deadlines are the graceful inner bounds - the executor terminalizes a
 # hung test as a RED incomplete result at its own per-test deadline, and these
@@ -29,9 +29,9 @@
 #
 # A single hung test therefore cannot wedge the whole job: it is bounded and
 # terminalized RED at its own deadline, and these job deadlines plus
-# timeout-minutes are the backstops if an entire lane overruns. Anchor T0 as the
-# first step of a job, before checkout, so the budget covers checkout and tool
-# setup and not only the test run itself.
+# timeout-minutes are the backstops if an entire lane overruns. A consuming job
+# anchors T0 as its first step, before checkout, so the budget covers checkout
+# and tool setup and not only the test run itself.
 
 FM_CI_DEADLINE_OFFSET_ORDINARY=430
 FM_CI_DEADLINE_OFFSET_TERMINAL=450

@@ -1551,8 +1551,9 @@ class LaneExecutor:
         # threads would make fork-time library locks unsafe. Deadline enforcement
         # therefore has jitter bounded by one terminal fsync publication, not a
         # sub-millisecond bound. The scaled publication reserve lands all terminal
-        # evidence by T0+450, and the mandated 120-second job margin absorbs this
-        # accepted sub-second enforcement jitter before the T0+600 ceiling.
+        # evidence by the terminal deadline, and the remaining margin before the
+        # ceiling absorbs this accepted sub-second enforcement jitter. The exact
+        # CI schedule is owned by bin/fm-ci-deadlines.sh.
         self._terminalize_attempt(attempt)
 
     def _terminalize_attempt(self, attempt: Attempt) -> None:
