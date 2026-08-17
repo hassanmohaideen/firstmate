@@ -97,6 +97,12 @@ set -eu
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
+# Single owner of the CI deadline budget. Sourced here so the local-run defaults
+# below derive from the same FM_CI_DEADLINE_OFFSET_* constants CI emits, instead
+# of hardcoding the schedule a second time (bin/fm-ci-deadlines.sh).
+# shellcheck source=bin/fm-ci-deadlines.sh
+. "$ROOT/bin/fm-ci-deadlines.sh"
+
 MODE=
 LIST_ONLY=0
 LIST_FAMILIES=0
@@ -168,7 +174,7 @@ family_for_basename_into() {
     fm-arm-pretool-check.test.sh|fm-ask-user-authority.test.sh|\
     fm-brief.test.sh|fm-vendor-auth-probe.test.sh|\
     fm-calm-pi-extension.test.sh|fm-cd-pretool-check.test.sh|\
-    fm-classify-decision-key.test.sh|\
+    fm-ci-deadlines.test.sh|fm-classify-decision-key.test.sh|\
     fm-composer-ghost.test.sh|fm-composer-lib.test.sh|\
     fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-documentation-audiences.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
@@ -178,7 +184,8 @@ family_for_basename_into() {
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-task-delivery.test.sh|\
-    fm-tmux-submit-busy.test.sh|fm-trace-context-lib.test.sh|\
+    fm-timeout-lib.test.sh|fm-tmux-submit-busy.test.sh|\
+    fm-trace-context-lib.test.sh|\
     fm-transition-lib.test.sh|\
     fm-test-run.test.sh|fm-test-isolation-proof.test.sh)
       FAMILY_FOR_BASENAME=pure-contract-unit
@@ -452,6 +459,7 @@ tests/fm-bootstrap.test.sh 24895
 tests/fm-busy-adapter-wiring.test.sh 14845
 tests/fm-busy-state.test.sh 1482
 tests/fm-calm-pi-extension.test.sh 166
+tests/fm-ci-deadlines.test.sh 145
 tests/fm-classify-decision-key.test.sh 560
 tests/fm-claude-stop-autoarm-live-e2e.test.sh 39
 tests/fm-claude-stop-autoarm.test.sh 60609
@@ -533,6 +541,7 @@ tests/fm-teardown-endpoint-safety.test.sh 3297
 tests/fm-teardown.test.sh 73107
 tests/fm-test-fixture-cleanup.test.sh 563
 tests/fm-test-isolation-proof.test.sh 299
+tests/fm-timeout-lib.test.sh 5101
 tests/fm-tmux-agent-liveness.test.sh 1039
 tests/fm-trace-context-lib.test.sh 224
 tests/fm-trace-context-spawn.test.sh 42180
@@ -1742,11 +1751,13 @@ mkdir -p "$(dirname "$JSON_PATH")"
 JSON_PATH=$(python3 -c 'import os,sys; p=os.path.abspath(sys.argv[1]); p="/private"+p if sys.platform=="darwin" and p.startswith("/var/") and os.path.realpath("/var")=="/private/var" else p; print(p)' "$JSON_PATH")
 RUN_STARTED_MS=$(now_ms)
 RUN_ID="fm-test-run-${RUN_STARTED_MS}-$$"
+# CI exports these (bin/fm-ci-deadlines.sh). A local run without them falls back
+# to the same schedule anchored at the current second, one owner for the offsets.
 T0=${FM_TEST_JOB_T0_EPOCH:-$(date +%s)}
-ORDINARY_DEADLINE=${FM_TEST_ORDINARY_DEADLINE_EPOCH:-$((T0 + 430))}
-TERMINAL_DEADLINE=${FM_TEST_TERMINAL_DEADLINE_EPOCH:-$((T0 + 450))}
-CLEANUP_DEADLINE=${FM_TEST_CLEANUP_DEADLINE_EPOCH:-$((T0 + 480))}
-CEILING_DEADLINE=${FM_TEST_CEILING_DEADLINE_EPOCH:-$((T0 + 600))}
+ORDINARY_DEADLINE=${FM_TEST_ORDINARY_DEADLINE_EPOCH:-$((T0 + FM_CI_DEADLINE_OFFSET_ORDINARY))}
+TERMINAL_DEADLINE=${FM_TEST_TERMINAL_DEADLINE_EPOCH:-$((T0 + FM_CI_DEADLINE_OFFSET_TERMINAL))}
+CLEANUP_DEADLINE=${FM_TEST_CLEANUP_DEADLINE_EPOCH:-$((T0 + FM_CI_DEADLINE_OFFSET_CLEANUP))}
+CEILING_DEADLINE=${FM_TEST_CEILING_DEADLINE_EPOCH:-$((T0 + FM_CI_DEADLINE_OFFSET_CEILING))}
 
 python3 - "$MANIFEST" "$ROWS" "$JSON_PATH" "$ROOT" "$RUN_ID" \
   "$SELECTION_DESC" "$JOBS" "$CONTAINMENT_MODE" "$DURATION_BUDGET_MODE" \

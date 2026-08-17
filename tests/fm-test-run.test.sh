@@ -12,11 +12,16 @@ set -u
 
 RUNNER="$ROOT/bin/fm-test-run.sh"
 SUPERVISOR="$ROOT/bin/fm-test-supervisor.py"
+# The runner sources this deadline-budget lib at startup, so every fixture that
+# copies the runner into a scratch repo must copy the lib beside it, exactly as
+# it must copy the supervisor (bin/fm-ci-deadlines.sh).
+DEADLINES_LIB="$ROOT/bin/fm-ci-deadlines.sh"
 
 assert_present "$SUPERVISOR" "bin/fm-test-supervisor.py is missing"
 [ -x "$SUPERVISOR" ] || fail "bin/fm-test-supervisor.py must be executable"
 assert_present "$RUNNER" "bin/fm-test-run.sh is missing"
 [ -x "$RUNNER" ] || fail "bin/fm-test-run.sh must be executable"
+assert_present "$DEADLINES_LIB" "bin/fm-ci-deadlines.sh is missing"
 
 test_list_all_exact_suite_coverage() {
   local listed expected missing extra f
@@ -96,6 +101,7 @@ init_changed_fixture_repo() {
   mkdir -p "$repo/bin" "$repo/tests"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
   cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  cp "$DEADLINES_LIB" "$repo/bin/fm-ci-deadlines.sh"
   chmod +x "$repo/bin/fm-test-supervisor.py"
   chmod +x "$repo/bin/fm-test-run.sh"
   for script in \
@@ -405,6 +411,7 @@ test_portable_shard_union_and_coverage_guard() {
   mkdir -p "$tmp/repo/bin" "$tmp/repo/tests"
   cp "$RUNNER" "$tmp/repo/bin/fm-test-run.sh"
   cp "$SUPERVISOR" "$tmp/repo/bin/fm-test-supervisor.py"
+  cp "$DEADLINES_LIB" "$tmp/repo/bin/fm-ci-deadlines.sh"
   chmod +x "$tmp/repo/bin/fm-test-supervisor.py"
   cp "$ROOT"/tests/*.test.sh "$tmp/repo/tests/"
   cat >"$tmp/repo/tests/fm-new-required.test.sh" <<'SH'
@@ -598,6 +605,7 @@ test_real_herdr_lane_shares_only_runner_runtime() {
   mkdir -p "$repo/bin" "$repo/tests" "$shared/.config/herdr" "$evidence"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
   cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  cp "$DEADLINES_LIB" "$repo/bin/fm-ci-deadlines.sh"
   runner="$repo/bin/fm-test-run.sh"
   chmod +x "$runner" "$repo/bin/fm-test-supervisor.py"
   printf 'job-owned-runtime\n' > "$shared/.config/herdr/session-marker"
@@ -668,6 +676,7 @@ test_jobs_parallel_scheduler_and_failure_propagation() {
   mkdir -p "$repo/bin" "$repo/tests" "$evidence" "$fake_bin"
   cp "$RUNNER" "$runner"
   cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  cp "$DEADLINES_LIB" "$repo/bin/fm-ci-deadlines.sh"
   chmod +x "$repo/bin/fm-test-supervisor.py"
   cat >"$fake_bin/stat" <<'SH'
 #!/usr/bin/env bash
@@ -817,6 +826,7 @@ make_mixed_runner_fixture() { # <repo> <evidence>
   mkdir -p "$repo/bin" "$repo/tests" "$evidence"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
   cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  cp "$DEADLINES_LIB" "$repo/bin/fm-ci-deadlines.sh"
   chmod +x "$repo/bin/fm-test-supervisor.py"
   chmod +x "$repo/bin/fm-test-run.sh"
   for script in fm-brief.test.sh fm-composer-lib.test.sh; do
@@ -1220,6 +1230,7 @@ test_environment_isolation_in_serial_and_parallel_children() {
   mkdir -p "$repo/bin" "$repo/tests" "$evidence" "$fakebin"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
   cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  cp "$DEADLINES_LIB" "$repo/bin/fm-ci-deadlines.sh"
   chmod +x "$repo/bin/fm-test-supervisor.py"
   cp "$ROOT/bin/fm-backend.sh" "$repo/bin/fm-backend.sh"
   runner="$repo/bin/fm-test-run.sh"; chmod +x "$runner"
@@ -1299,6 +1310,7 @@ test_duration_budget_warns_and_ci_enforces() {
   repo="$tmp/repo"; mkdir -p "$repo/bin" "$repo/tests"
   cp "$RUNNER" "$repo/bin/fm-test-run.sh"
   cp "$SUPERVISOR" "$repo/bin/fm-test-supervisor.py"
+  cp "$DEADLINES_LIB" "$repo/bin/fm-ci-deadlines.sh"
   runner="$repo/bin/fm-test-run.sh"
   chmod +x "$runner" "$repo/bin/fm-test-supervisor.py"
   cat >"$repo/tests/fm-backend-herdr.test.sh" <<'SH'
@@ -1706,8 +1718,8 @@ test_required_public_runner_leased_uid() {
   # the current runner and supervisor from a minimal world-traversable fixture
   # root rather than accidentally testing the host checkout's parent modes.
   mkdir -p "$tmp/repo/bin" "$tmp/repo/.git"
-  cp "$RUNNER" "$SUPERVISOR" "$tmp/repo/bin/"
-  chmod 0755 "$tmp/repo" "$tmp/repo/bin" "$tmp/repo/bin/fm-test-run.sh"
+  cp "$RUNNER" "$SUPERVISOR" "$DEADLINES_LIB" "$tmp/repo/bin/"
+  chmod 0755 "$tmp/repo" "$tmp/repo/bin" "$tmp/repo/bin/fm-test-run.sh" "$tmp/repo/bin/fm-ci-deadlines.sh"
   chmod 0700 "$tmp/repo/bin/fm-test-supervisor.py"
   printf 'checkout_readable=true\n' >"$tmp/repo/support.sh"
   chmod 0600 "$tmp/repo/support.sh"

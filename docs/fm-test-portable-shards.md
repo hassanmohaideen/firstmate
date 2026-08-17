@@ -90,7 +90,7 @@ Membership is derived rather than enumerated, so a newly added test lands here b
 
 ## Portable serial CI shards
 
-The current 150-script inventory leaves 113 scripts in the portable serial remainder.
+The current 152-script inventory leaves 115 scripts in the portable serial remainder.
 `portable-serial-<k>of<n>` splits it across `n` separate CI runners.
 Each shard is still strictly serial in itself, and separate runners mean no two of these stateful scripts ever share a machine, so the split needs no concurrency isolation proof.
 
@@ -99,6 +99,7 @@ Each shard is still strictly serial in itself, and separate runners mean no two 
 
 Assignment is longest-processing-time bin packing over per-script duration hints embedded in `bin/fm-test-run.sh`.
 The retained per-script measurements come primarily from green CI run [`31670936022`](https://github.com/hassanmohaideen/firstmate/actions/runs/31670936022) (2026-08-13), with `fm-watch-triage.test.sh` refreshed to its 212357 ms local measurement after the credential-domain CI lane exposed its stale 145269 ms scheduling reservation and the new `fm-no-mistakes-review.test.sh` using its 30943 ms focused-run measurement until the next green-CI refresh.
+The `fm-ci-deadlines.test.sh` (145 ms) and `fm-timeout-lib.test.sh` (5101 ms) tests added with the single-owner CI deadline budget likewise use their focused-run measurements until the next green-CI refresh; the shard table below still reflects the referenced run before they landed.
 A script added since that run or otherwise lacking a hint gets the conservative `PORTABLE_SERIAL_DEFAULT_WEIGHT_MS` default.
 Hints only affect balance: the coverage guard keeps the partition complete and disjoint whatever they say, so a stale hint costs a slower shard rather than lost coverage.
 
@@ -217,14 +218,11 @@ The tables above remain scheduling inputs until the next green required run publ
 
 ## Deadlines and reserves
 
-Every job in `.github/workflows/ci.yml` has `timeout-minutes: 10`.
-Behavior jobs record T0 as their first executable step, before checkout, so the absolute deadline budget also covers checkout and tool setup rather than starting the clock only once the code is present.
-Every behavior lane that invokes the executor passes that one absolute deadline set through the public runner.
-Ordinary test allowances end by T0+430 seconds, process diagnostics and terminal evidence end by T0+450 seconds, and job-owned service cleanup ends by T0+480 seconds.
-The final 120 seconds remain reserved for artifact upload and platform variance before the 600-second job ceiling.
-Terminal publication remains synchronous on the single scheduler thread because adding an I/O thread to a privileged executor that repeatedly forks would introduce fork-time lock hazards.
-The executor publishes at most one terminal per scheduler iteration and reserves 15 seconds for every concurrently outstanding terminal, so all terminal evidence is published by T0+450.
-Per-attempt deadline enforcement therefore has jitter bounded by one terminal publication's sub-second fsync latency rather than a sub-millisecond guarantee; the required 120-second pre-ceiling margin absorbs that accepted jitter.
-The executor reserves four seconds of startup (the blocked-child readiness bound plus durable launch evidence) and four seconds of cleanup for every unstarted script, and refuses an impossible manifest before execution instead of retrying, skipping, shortening, or truncating coverage.
+Every job in `.github/workflows/ci.yml` has `timeout-minutes: 10` as an outer ceiling that fails an overrun rather than passing incomplete work.
+The portable parallel, portable serial, and real-Herdr jobs anchor T0 before checkout so their interior budget covers checkout and tool setup, then expand that budget immediately after checkout.
+The containment qualification fixtures carry their own deadlines, while timing aggregation and stock-Bash snapshot execution do not consume the test deadline environment, so those jobs rely only on the outer ceiling.
+`bin/fm-ci-deadlines.sh` is the single owner of the exact interior schedule, its reserve boundaries, and its sourced and executed interfaces.
+`bin/fm-test-supervisor.py` owns per-attempt deadline enforcement, terminal publication, manifest feasibility, and cleanup reservations.
 A timed-out attempt is terminal red, and later required scripts still execute exactly once when their reservations allow.
+The executor refuses an impossible manifest instead of retrying, skipping, shortening, or truncating coverage.
 Healthy complete CI remains targeted at roughly five to eight minutes.
