@@ -57,6 +57,12 @@ FM_REMOTE_JOB_TIMEOUT=${FM_REMOTE_JOB_TIMEOUT:-360}
 FM_REMOTE_JOB_WAIT_GRACE=${FM_REMOTE_JOB_WAIT_GRACE:-30}
 FM_REMOTE_JOB_POLL_SECONDS=${FM_REMOTE_JOB_POLL_SECONDS:-0.05}
 FM_REMOTE_JOB_REAP_SECONDS=${FM_REMOTE_JOB_REAP_SECONDS:-3600}
+# How many times the Linux recovery re-runs the idempotent worker start (each
+# followed by a full wait_for_probe window) before ensure reports a startup
+# failure. A replaced supervisor can lose its ownership handoff, or a
+# KILL-forced quarantine recovery can stall, leaving no worker running rather
+# than a merely slow one; a bounded restart loop lets that converge under load.
+FM_REMOTE_JOB_STARTUP_RETRIES=${FM_REMOTE_JOB_STARTUP_RETRIES:-4}
 FM_REMOTE_JOB_OPERATOR_PATH=
 FM_REMOTE_JOB_CHILD_PATH=
 FM_REMOTE_JOB_STATE=
@@ -968,7 +974,9 @@ fm_remote_job_start_linux_worker() { # <remote-root> <account-home>
 }
 
 fm_remote_job_ensure_worker() { # <remote-root> <account-home>
-  local root=$1 account_home=$2 platform uid identity_matches=0
+  local root=$1 account_home=$2 platform uid identity_matches=0 attempt=0
+  local startup_retries=${FM_REMOTE_JOB_STARTUP_RETRIES:-4}
+  case "$startup_retries" in ''|*[!0-9]*) startup_retries=4 ;; esac
   FM_REMOTE_JOB_ERROR=
   FM_REMOTE_JOB_REPAIRED=0
   root=$(fm_remote_job_canonical_existing_dir "$root") || {
@@ -1011,13 +1019,21 @@ fm_remote_job_ensure_worker() { # <remote-root> <account-home>
     FM_REMOTE_JOB_REPAIRED=1
     fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
   else
-    # A replaced Linux supervisor can lose its first ownership race while the
-    # prior supervisor finishes releasing the shared worker lock. Retry the
-    # idempotent start once, matching the bounded recovery already used above
-    # for launchd, before reporting a startup failure.
-    fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
-    FM_REMOTE_JOB_REPAIRED=1
-    fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
+    # A replaced Linux supervisor can lose its ownership race while the prior
+    # supervisor finishes releasing the shared worker lock, and heavy load can
+    # stretch that handoff - or a KILL-forced quarantine recovery - across more
+    # than one probe window. wait_for_probe already scales with load because it
+    # counts probe attempts rather than wall-clock, so a handoff that never
+    # converges means no worker is running rather than a merely slow one. Re-run
+    # the idempotent start and wait a bounded number of times, matching the
+    # bounded recovery already used above for launchd, before reporting a
+    # startup failure.
+    while [ "$attempt" -lt "$startup_retries" ]; do
+      attempt=$((attempt + 1))
+      fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
+      FM_REMOTE_JOB_REPAIRED=1
+      fm_remote_job_wait_for_probe "$root" "$account_home" && return 0
+    done
   fi
   # shellcheck disable=SC2034 # Sourceable API consumed by the entrypoint and remote doctor.
   FM_REMOTE_JOB_ERROR="remote job worker did not report ready after startup"

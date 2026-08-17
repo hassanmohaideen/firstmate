@@ -554,7 +554,7 @@ tests/fm-wake-drain-open-decisions.test.sh 6574
 tests/fm-wake-queue.test.sh 27451
 tests/fm-watch-arm.test.sh 50289
 tests/fm-watch-checkpoint.test.sh 7321
-tests/fm-watch-triage.test.sh 212357
+tests/fm-watch-triage.test.sh 329726
 tests/fm-watcher-lock.test.sh 88221
 EOF
 }
