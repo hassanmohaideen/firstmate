@@ -651,9 +651,19 @@ pass "quarantine clears only after recorded execution has stopped"
   [ "$(start_attempts)" -eq 5 ] \
     || fail "ensure did not bound recovery to one start plus its configured retries (saw $(start_attempts))"
 
+  # A malformed override must fail safe to the default retry budget rather than
+  # bypassing recovery through an invalid integer comparison.
+  : > "$START_COUNT_FILE"
+  export FM_REMOTE_JOB_STARTUP_RETRIES=abc
+  fm_remote_job_ensure_worker "$REMOTE_ROOT" "$ENSURE_ACCOUNT" \
+    && fail "ensure reported ready with a malformed retry override"
+  [ "$(start_attempts)" -eq 5 ] \
+    || fail "ensure did not use the default retries for a malformed override (saw $(start_attempts))"
+
   # The handoff converges on a later attempt: ensure must keep restarting past
   # the first retry and stop the moment the worker probes ready.
   : > "$START_COUNT_FILE"
+  export FM_REMOTE_JOB_STARTUP_RETRIES=4
   fm_remote_job_wait_for_probe() { [ "$(start_attempts)" -ge 3 ]; }
   fm_remote_job_ensure_worker "$REMOTE_ROOT" "$ENSURE_ACCOUNT" \
     || fail "ensure gave up before a delayed ownership handoff converged"

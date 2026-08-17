@@ -975,6 +975,8 @@ fm_remote_job_start_linux_worker() { # <remote-root> <account-home>
 
 fm_remote_job_ensure_worker() { # <remote-root> <account-home>
   local root=$1 account_home=$2 platform uid identity_matches=0 attempt=0
+  local startup_retries=${FM_REMOTE_JOB_STARTUP_RETRIES:-4}
+  case "$startup_retries" in ''|*[!0-9]*) startup_retries=4 ;; esac
   FM_REMOTE_JOB_ERROR=
   FM_REMOTE_JOB_REPAIRED=0
   root=$(fm_remote_job_canonical_existing_dir "$root") || {
@@ -1026,7 +1028,7 @@ fm_remote_job_ensure_worker() { # <remote-root> <account-home>
     # the idempotent start and wait a bounded number of times, matching the
     # bounded recovery already used above for launchd, before reporting a
     # startup failure.
-    while [ "$attempt" -lt "$FM_REMOTE_JOB_STARTUP_RETRIES" ]; do
+    while [ "$attempt" -lt "$startup_retries" ]; do
       attempt=$((attempt + 1))
       fm_remote_job_start_linux_worker "$root" "$account_home" || return 1
       FM_REMOTE_JOB_REPAIRED=1
