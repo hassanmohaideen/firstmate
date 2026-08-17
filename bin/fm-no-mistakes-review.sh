@@ -83,18 +83,15 @@
 # BEFORE the underlying no-mistakes response runs and landed or failed after it
 # returns, so a crash at any point leaves a reconcilable record rather than a
 # silently accepted or permanently stranded finding.
-# A fresh invocation for a run and round reconciles any existing receipt before
-# acting, from authoritative public evidence bound to that exact round and action
-# -- never a generic completed status, which cannot distinguish approve from skip:
-#   - landed: the response already succeeded; the disposition is finalized (or
-#     re-finalized idempotently) WITHOUT invoking the CLI again.
-#   - attempting, evidence shows the review gate for the round has closed: the
-#     response landed before the crash; finalize as landed, no re-invocation.
-#   - attempting or failed, evidence shows the gate is still open at the same
-#     head: the response did not land; retry safely under the next attempt number.
-#   - failed, evidence shows the gate has since closed by other means: the failed
-#     action cannot be claimed as landed; refuse closed.
-#   - any other indeterminate state: refuse closed rather than guess.
+# A fresh invocation reconciles outstanding receipts across every public round
+# before acting, from authoritative evidence bound to the exact round and action.
+# An in-process landed receipt directly proves the CLI returned zero and may be
+# finalized idempotently. An attempting fix may be inferred landed only when a
+# later authoritative review result and that round's committed-agent-fix marker
+# both exist. Approve/reject are NEVER inferred landed from generic review, CI,
+# or outcome completion because those cannot distinguish the recorded action from
+# an out-of-band skip. A proven-unstarted or failed attempt may be retried while
+# its gate remains open; every indeterminate or possibly in-flight state refuses.
 # So a transient failure has a real recovery path (retry), while an unresolved
 # finding is never finalized without evidence that this exact action landed.
 # At most one invocation runs per attempt: each attempt claims an atomic
@@ -119,9 +116,10 @@
 # path never reaches it -- it is fully serialized by the kernel guard, and any
 # actor that could reach it already has write access to this state directory.
 #
-# audit-ready refreshes the append-only public review history, reconciles any
-# latest-round response receipt read-only -- finalizing a landed attempt from
-# public evidence and refusing on an unlanded or indeterminate one -- then refuses
+# audit-ready refreshes the append-only public review history, reconciles
+# outstanding response receipts across all rounds read-only -- finalizing only a
+# landed fix from action-specific evidence and refusing every unlanded or
+# indeterminate attempt -- then refuses
 # for missing or rewritten history, stale run/branch/head context, malformed or
 # duplicate findings, missing/duplicate/contradictory dispositions, requested
 # but unconfirmed fixes, unchanged surviving fixes, or absent public PR/green-CI
@@ -664,38 +662,26 @@ review_step_status() {
 }
 
 response_landed_evidence() {  # <round> <kind>; prints landed | unlanded | ambiguous
-  # Reconcile a response outcome ONLY from authoritative public evidence bound to
-  # this exact round: a fresh read of the run's review history and status. A fix
-  # that landed produces a later authoritative review result; an approve or skip
-  # that landed closes the review gate, so the run advances past review. The gate
-  # still awaiting a response at the same round means the response did not land.
-  # Anything else is ambiguous and reconciliation refuses closed on it, so a
-  # recovery never finalizes or retries without decisive evidence.
-  local round=$1 kind=$2 fresh_rounds rstatus
+  # Only a fix has public action-specific evidence: its round's committed-fix
+  # marker followed by a later authoritative review result. Generic completion
+  # can never prove that this process's approve/reject, rather than a skip, landed.
+  local round=$1 kind=$2 fresh_rounds rstatus fix_marker
   capture_public_history
   validate_capture_context
   fresh_rounds=$(printf '%s' "$CAPTURE_MODEL" | jq '.rounds | length')
   rstatus=$(review_step_status)
   if [ "$kind" = fix ]; then
-    # A landed fix always yields a later authoritative review result.
-    if [ "$fresh_rounds" -gt "$round" ]; then printf landed; return 0; fi
-    case "$rstatus" in
-      awaiting_approval|fix_review|blocked|parked|awaiting_agent) printf unlanded ;;
-      *) printf ambiguous ;;
-    esac
-    return 0
+    fix_marker=$(printf '%s' "$CAPTURE_MODEL" | jq -r --argjson round "$round" \
+      '.rounds[$round - 1].fix_completed_after // false')
+    if [ "$fresh_rounds" -gt "$round" ] && [ "$fix_marker" = true ]; then
+      printf landed
+      return 0
+    fi
   fi
-  # approve/skip landed once the run leaves the review gate: the review step
-  # resolved, or the run advanced to CI, or it reached a terminal outcome.
-  if [ -n "$CAPTURE_OUTCOME" ]; then printf landed; return 0; fi
   case "$rstatus" in
-    completed|passed|skipped) printf landed; return 0 ;;
     awaiting_approval|fix_review|blocked|parked|awaiting_agent) printf unlanded; return 0 ;;
   esac
-  case "$CAPTURE_STATUS_VALUE" in
-    ci) printf landed; return 0 ;;
-    review) printf unlanded; return 0 ;;
-  esac
+  [ "$CAPTURE_STATUS_VALUE" != review ] || { printf unlanded; return 0; }
   printf ambiguous
   return 0
 }
@@ -849,39 +835,42 @@ round_dispositions_count() {  # <round>
   ' "$LEDGER"
 }
 
-reconcile_latest_receipt_readonly() {
-  # audit-ready reconciliation: fill in a landed attempt's missing finalization
-  # from public evidence and refuse on any unlanded or indeterminate one, without
-  # ever invoking the CLI. It only completes a finalization the crash window left
-  # missing; an already-recorded disposition is left for the audit to validate,
-  # so this pass never rewrites (and so never masks) a tampered disposition.
-  local round existing r_action r_findings r_phase r_attempt ev
-  round=$(current_round_number)
-  existing=$(read_receipt "$round")
-  [ -n "$existing" ] || return 0
-  r_action=$(printf '%s' "$existing" | jq -r '.action // ""')
-  r_findings=$(printf '%s' "$existing" | jq -r '.findings // [] | join(",")')
-  r_phase=$(printf '%s' "$existing" | jq -r '.phase // ""')
-  r_attempt=$(printf '%s' "$existing" | jq -r '.attempt // 0')
-  case "$r_phase" in
-    landed)
-      [ "$(round_dispositions_count "$round")" -gt 0 ] || finalize_from_receipt "$round" "$r_action"
-      ;;
-    attempting)
-      ev=$(response_landed_evidence "$round" "$r_action")
-      case "$ev" in
+reconcile_receipts_readonly() {  # <last-round>
+  # Fill only missing finalizations and never invoke the CLI. Scanning every round
+  # prevents a fix that advanced N to N+1 before crashing from being stranded.
+  local last_round=$1 round=1 existing r_action r_findings r_phase r_attempt r_head ev
+  while [ "$round" -le "$last_round" ]; do
+    existing=$(read_receipt "$round")
+    if [ -n "$existing" ]; then
+      r_action=$(printf '%s' "$existing" | jq -r '.action // ""')
+      r_findings=$(printf '%s' "$existing" | jq -r '.findings // [] | join(",")')
+      r_phase=$(printf '%s' "$existing" | jq -r '.phase // ""')
+      r_attempt=$(printf '%s' "$existing" | jq -r '.attempt // 0')
+      r_head=$(printf '%s' "$existing" | jq -r '.head // ""')
+      case "$r_phase" in
         landed)
-          write_receipt "$round" landed "$r_action" "$r_findings" "$r_attempt" "$CAPTURE_HEAD"
-          [ "$(round_dispositions_count "$round")" -gt 0 ] || finalize_from_receipt "$round" "$r_action"
+          [ "$(round_dispositions_count "$round")" -gt 0 ] \
+            || finalize_from_receipt "$round" "$r_action"
           ;;
-        *) die "an unconfirmed response attempt for run $CAPTURE_RUN_ID round $round is not landed; complete or retry it through the guarded response path before readiness" ;;
+        attempting)
+          ev=$(response_landed_evidence "$round" "$r_action")
+          case "$ev" in
+            landed)
+              write_receipt "$round" landed "$r_action" "$r_findings" "$r_attempt" "$r_head"
+              [ "$(round_dispositions_count "$round")" -gt 0 ] \
+                || finalize_from_receipt "$round" "$r_action"
+              ;;
+            *) die "an unconfirmed response attempt for run $CAPTURE_RUN_ID round $round is not landed; complete or retry it through the guarded response path before readiness" ;;
+          esac
+          ;;
+        failed)
+          die "a failed response attempt for run $CAPTURE_RUN_ID round $round has no confirmed disposition; retry it through the guarded response path before readiness"
+          ;;
+        *) die "response receipt for run $CAPTURE_RUN_ID round $round has an unrecognized phase '$r_phase'" ;;
       esac
-      ;;
-    failed)
-      die "a failed response attempt for run $CAPTURE_RUN_ID round $round has no confirmed disposition; retry it through the guarded response path before readiness"
-      ;;
-    *) die "response receipt for run $CAPTURE_RUN_ID round $round has an unrecognized phase '$r_phase'" ;;
-  esac
+    fi
+    round=$((round + 1))
+  done
 }
 
 respond() {
@@ -932,8 +921,9 @@ respond() {
   [ "$head_ok" = 1 ] || die "current review round has no exact head context"
   selected_csv=$(printf '%s' "$SELECTED_JSON" | jq -r 'join(",")')
 
-  # Reconcile any prior receipt for this run and round first: replay a landed
-  # response without re-invoking, or take the next attempt number for a retry.
+  # Resolve every older outstanding receipt before accepting a new round, then
+  # reconcile this round for replay or a safe next attempt.
+  [ "$round" -le 1 ] || reconcile_receipts_readonly "$((round - 1))"
   reconcile_response "$kind" "$round" "$selected_csv"
   if [ "$RESPONSE_DECISION" = replay ]; then
     printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
@@ -978,7 +968,7 @@ audit_ready() {
   validate_capture_context
   prepare_work_files
   sync_ledger
-  reconcile_latest_receipt_readonly
+  reconcile_receipts_readonly "$(current_round_number)"
 
   errors=$(jq -r --arg run "$CAPTURE_RUN_ID" --arg branch "$CAPTURE_BRANCH" '
     (.runs | map(select(.id == $run))) as $matches

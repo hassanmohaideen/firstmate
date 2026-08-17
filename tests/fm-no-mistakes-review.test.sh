@@ -981,30 +981,70 @@ test_crash_before_respond_is_retryable() {
   pass "a crash before the CLI leaves no marker and is retried to completion"
 }
 
-# A crash after the CLI landed but before the receipt is marked landed leaves an
-# attempting receipt WITH its marker; recovery reconciles it from public evidence
-# (the gate closed) and finalizes without re-invoking the CLI.
-test_crash_after_respond_reconciles_landed() {
-  local d f out rc
-  d=$(new_case crash-after)
-  f=$(finding ca ask-user)
+# A crashed fix has action-specific evidence: its committed-fix marker and the
+# next authoritative result. Readiness reconciles the now-prior receipt without a
+# duplicate invocation.
+test_crash_after_fix_reconciles_across_rounds() {
+  local d f rc
+  d=$(new_case crash-after-fix)
+  f=$(finding ca auto-fix)
   set_round "$d" "$f"
-  FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND=1 run_driver "$d" respond --approve ca >/dev/null 2>&1
+  set_next "$d"
+  FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND=1 run_driver "$d" respond --fix ca >/dev/null 2>&1
   rc=$?
-  [ "$rc" -ne 0 ] || fail "the crash-after-respond fixture unexpectedly completed"
+  [ "$rc" -ne 0 ] || fail "the crash-after-fix fixture unexpectedly completed"
   [ "$(jq -r '.phase' "$(receipt_file "$d")")" = attempting ] \
-    || fail "the crash-after-respond fixture did not leave an attempting receipt"
-  [ -e "$(inflight_marker "$d")" ] || fail "a landed CLI attempt left no attempt marker"
-  [ "$(calls_count "$d")" -eq 1 ] || fail "the crashed attempt did not land its single CLI call"
-  [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
-    || fail "the crash finalized a disposition before recovery"
-  out=$(run_driver "$d" respond --approve ca 2>&1) \
-    || fail "recovery could not reconcile a landed-but-unfinalized response: $out"
-  [ "$(calls_count "$d")" -eq 1 ] || fail "recovery re-invoked the CLI for an already-landed response"
-  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = approved_as_is ] \
-    || fail "recovery did not finalize the landed approval"
-  run_driver "$d" audit-ready >/dev/null 2>&1 || fail "the recovered run did not audit ready"
-  pass "a crash between a landed CLI and its receipt is reconciled without a duplicate response"
+    || fail "the crash-after-fix fixture did not leave an attempting receipt"
+  [ "$(jq 'length' "$d/fake-state/rounds")" -eq 2 ] \
+    || fail "the landed fix did not advance public history"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "the crashed fix did not land exactly once"
+  run_driver "$d" audit-ready >/dev/null 2>&1 \
+    || fail "readiness did not reconcile the prior-round landed fix"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "readiness duplicated the landed fix"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = fixed_and_confirmed ] \
+    || fail "the prior-round fix was not finalized from its action-specific evidence"
+  pass "a crashed fix is reconciled across rounds without duplication"
+}
+
+# Responding to the next round also reconciles an outstanding prior fix first.
+test_new_response_reconciles_prior_fix() {
+  local d first second rc
+  d=$(new_case prior-fix)
+  first=$(finding old auto-fix)
+  second=$(finding new ask-user)
+  set_round "$d" "$first"
+  set_next "$d" "$second"
+  FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND=1 run_driver "$d" respond --fix old >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "the prior-fix fixture unexpectedly completed"
+  run_driver "$d" respond --approve new >/dev/null 2>&1 \
+    || fail "a new response could not reconcile the outstanding prior fix"
+  [ "$(calls_count "$d")" -eq 2 ] || fail "prior reconciliation duplicated or omitted a response"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = fixed_and_confirmed ] \
+    && [ "$(jq -r '.runs[0].rounds[1].dispositions[0].state' "$(ledger "$d")")" = approved_as_is ] \
+    || fail "cross-round response reconciliation did not finalize both rounds"
+  run_driver "$d" audit-ready >/dev/null 2>&1 || fail "the cross-round response did not audit ready"
+  pass "a new response reconciles an outstanding prior-round fix"
+}
+
+# Generic completion cannot identify whether our crashed approve/reject landed.
+test_attempting_decision_not_finalized_from_generic_completion() {
+  local kind action d f out rc
+  for kind in approve reject; do
+    d=$(new_case "attempting-$kind")
+    f=$(finding generic ask-user)
+    set_round "$d" "$f"
+    action=--$kind
+    FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND=1 run_driver "$d" respond "$action" generic >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -ne 0 ] || fail "the crashed $kind fixture unexpectedly completed"
+    out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "generic completion finalized a crashed $kind"
+    assert_contains "$out" 'not landed' "crashed-$kind refusal lacked its diagnostic"
+    [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
+      || fail "generic completion created a final $kind disposition"
+  done
+  pass "generic completion never finalizes an attempting approve or reject"
 }
 
 # The tripwire finding completed-status-does-not-prove-response-action: a failed
@@ -1037,7 +1077,9 @@ test_all_approved_and_explicit_rejection
 test_isolated_pipeline_head_is_imported
 test_isolated_head_absent_everywhere_refuses
 test_crash_before_respond_is_retryable
-test_crash_after_respond_reconciles_landed
+test_crash_after_fix_reconciles_across_rounds
+test_new_response_reconciles_prior_fix
+test_attempting_decision_not_finalized_from_generic_completion
 test_failed_action_not_finalized_from_generic_completion
 test_pr11_partial_fix_reproduction_and_proven_path
 test_mixed_choices_are_unrepresentable
