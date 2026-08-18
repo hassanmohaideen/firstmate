@@ -57,8 +57,9 @@
 #      as fm_backend_cmux_target_ready's liveness probe (the design sketch's
 #      original suggestion): the very first send on a freshly created task
 #      would fail its own pre-flight readiness check. `list-panes` has no such
-#      gap and is used instead (fm_backend_cmux_surface_exists), mirroring
-#      zellij's own structural pane_exists check.
+#      content-read gap and is used instead (fm_backend_cmux_surface_exists),
+#      mirroring zellij's own structural pane_exists check. Its endpoint can
+#      still take a bounded settle period to appear immediately after creation.
 #   4. Closing a workspace's LAST surface is a THIRD shape, matching neither
 #      herdr (auto-closes the workspace) nor zellij (leaves a ghost tab):
 #      `close-surface` REFUSES outright with a typed error
@@ -127,14 +128,14 @@ FM_BACKEND_CMUX_MIN_MINOR=64
 # Endpoint-discovery retry budget for fm_backend_cmux_create_task. `new-workspace`
 # creates the task's workspace (and its default surface), but the SEPARATE
 # `workspace list`/`list-panes` queries that resolve the workspace id and its
-# surface id are eventually consistent and can briefly report the just-created
-# workspace with no surface yet. Both resolutions are re-queried up to this many
-# extra times, each after a short settle, so a transient miss on the id captured
-# at partial-creation no longer discards an otherwise-usable workspace; only a
-# resolution that STILL comes up empty after the budget falls through to the
-# fail-closed teardown. Overridable via the environment so the unit tests drive
-# both the recovers-on-retry and the genuinely-exhausted paths without real
-# sleeps.
+# surface id are eventually consistent and can briefly omit the just-created
+# workspace or report it with no surface yet. Both resolutions are re-queried up
+# to this many extra times, each after a short settle, so a transient miss no
+# longer discards an otherwise-usable workspace. Exhausting workspace-id lookup
+# refuses before persistence; exhausting surface lookup from a captured
+# workspace id falls through to fail-closed teardown. Overridable via the
+# environment so the unit tests drive both the recovers-on-retry and the
+# genuinely-exhausted paths without real sleeps.
 FM_BACKEND_CMUX_ENDPOINT_RETRIES="${FM_BACKEND_CMUX_ENDPOINT_RETRIES:-8}"
 FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP="${FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP:-0.25}"
 
@@ -357,9 +358,9 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 
 # fm_backend_cmux_create_task: create the task's workspace (one surface),
 # refusing an existing live <label> (finding #6: cmux enforces no uniqueness
-# itself). Resolves the fresh workspace's default surface via one list-panes
-# call (finding: a freshly created workspace already has exactly one surface,
-# so no separate new-surface call is needed). --focus false is passed for
+# itself). Resolves the fresh workspace id by scoped title and its default
+# surface through bounded re-queries (a fresh workspace already owns one
+# surface, so no separate new-surface call is needed). --focus false is passed for
 # defense in depth though verified to already be the default (finding:
 # workspace/surface/pane create all default focus to false) - no
 # focus-restore dance is needed, unlike zellij. Echoes "<workspace_id>
@@ -436,9 +437,10 @@ fm_backend_cmux_parse_target() {  # <target>
 # would make read-screen unusable as fm_backend_cmux_target_ready's liveness
 # probe: the very first send_literal on a freshly created task's surface
 # would fail its own readiness pre-check before ever getting to write
-# anything. list-panes has no such gap (verified: correct, immediate output
-# on a completely untouched fresh surface), so it is the liveness primitive
-# instead - mirroring zellij's own pane_exists check
+# anything. list-panes does not depend on prior surface content, although a
+# just-created endpoint can take a bounded settle period to materialize; task
+# creation absorbs that delay before publishing metadata. It is therefore the
+# post-creation liveness primitive, mirroring zellij's own pane_exists check
 # (fm_backend_zellij_pane_exists) rather than the design sketch's original
 # read-screen-based suggestion.
 fm_backend_cmux_surface_exists() {  # <workspace_id> <surface_id>

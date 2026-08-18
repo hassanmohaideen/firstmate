@@ -85,6 +85,8 @@ Workspace UUIDs are not stable across an app relaunch, so recovery searches by t
 
 A genuinely fresh surface returns an internal error from `read-screen` until something has been written.
 Target readiness therefore uses the structural `list-panes` response instead of a content read.
+Workspace and surface discovery can briefly lag creation, so the adapter retries resolution by the home-scoped title and then the captured workspace id before publishing complete metadata.
+If the complete endpoint does not resolve, the spawn fails closed without persisting an unusable record and attempts exact workspace cleanup whenever its id is known.
 Capture remains bounded and locally trimmed after `read-screen` becomes available.
 
 `current_directory` follows a top-level shell `cd` but not the foreground subshell opened by `treehouse get`.

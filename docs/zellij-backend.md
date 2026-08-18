@@ -62,6 +62,8 @@ An explicit raw `session:pane` target remains a pane-existence-only operator esc
 
 Zellij's CLI action commands return exit 0 even for missing sessions or panes.
 The adapter therefore verifies session, terminal pane, and expected title before an operation and validates JSON or integer response shapes afterward.
+After `new-tab`, it tolerates a bounded materialization delay by resolving the terminal pane repeatedly from the returned tab id and publishes metadata only for the complete pair.
+If no pane resolves, the spawn fails closed without persisting an unusable endpoint and attempts to remove the exact partial tab.
 A pane can still disappear between verification and the operation; downstream submit, worktree-discovery, and stale detection report that narrow race rather than treating exit 0 as success.
 
 Every pane operation passes an explicit `--pane-id` because a new session can focus its release-notes plugin pane, whose numeric plugin id is in a separate namespace from terminal pane ids.
