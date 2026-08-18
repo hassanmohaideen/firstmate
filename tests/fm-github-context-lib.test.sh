@@ -7,7 +7,8 @@
 #     ambiguous, malformed, or missing destination blocks and a dropped verified
 #     record can only re-probe (fail-closed), never bypass;
 #   - the verified tuple is written only by a successful probe of the selected
-#     destination, and a matching tuple is trusted without re-probing.
+#     destination, and even a matching tuple is re-probed under the current
+#     account before launch.
 set -u
 
 # shellcheck source=tests/lib.sh

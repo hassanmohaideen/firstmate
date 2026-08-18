@@ -248,13 +248,13 @@ fm_github_auth_probe() {
 # a per-driver re-implementation produced cannot recur.
 #
 # The gate keys on IMMUTABLE task scope (kind/mode for a push, the recorded
-# authentication requirement for a scout read) plus an AFFIRMATIVE verified
-# destination tuple that must byte-equal the currently observed destination. A
-# missing, dropped, partial, or mismatched field can only move the gate toward
-# BLOCK; erasure is never a bypass. The verified tuple is written only by a
-# successful probe of the selected destination. A legacy record or a complete
-# selection without a matching tuple re-probes, while an incomplete or
-# inconsistent recorded context blocks (fail-closed migration).
+# authentication requirement for a scout read) plus the recorded authoritative
+# selection. It always re-observes that destination and probes the current active
+# gh account; a successful probe emits the canonical verified tuple that anchors
+# the launch worktree comparison, never a shortcut around a later probe. A
+# missing or dropped tuple therefore still re-probes, while a partial or
+# inconsistent recorded selection blocks (fail-closed migration); erasure is
+# never a bypass.
 # ---------------------------------------------------------------------------
 
 # A push (ship) task is in gated scope from its immutable kind/mode; a scout is
