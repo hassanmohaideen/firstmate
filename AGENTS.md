@@ -177,7 +177,8 @@ When that section reports its checks still in progress it names exactly what is 
    The closing reminder points back to the emitted supervision block and preserves only the lock, afk, Relay, and read-once reminders.
 
 Bootstrap detects first, asks for consent, and installs only after the captain approves in the current session.
-Do not dispatch until the required tools are present and GitHub authentication is good.
+Do not dispatch until the required tools are present.
+GitHub authentication gates only GitHub-needing dispatch, not all dispatch: a session-start `NEEDS_GH_AUTH` blocks work that actually needs GitHub - a ship pushing to GitHub or an authenticated GitHub read - while non-GitHub work such as a local-only ship or a plain scout is never held on GitHub login, and a dispatch whose GitHub need is uncertain is treated as needing GitHub (`fm_github_dispatch_requires_auth` in `bin/fm-github-context-lib.sh` owns that decision, and the spawn gate enforces it).
 Use `gh-axi` for GitHub, `chrome-devtools-axi` for browser work, and `lavish-axi` for structured decisions or reports; consult current help rather than memorizing flags.
 A silent bootstrap section needs no action; for any printed actionable diagnostic line, load `bootstrap-diagnostics` and follow its owner procedure.
 `BOOTSTRAP_INFO:` lines are completed no-action facts and do not require loading a skill.

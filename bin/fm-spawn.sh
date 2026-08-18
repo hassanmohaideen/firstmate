@@ -1807,7 +1807,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   GH_GATE_PROJECT=$RELAUNCH_WT
   GH_PUSH_BRANCH=current
 fi
-if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_github_ctx_scope "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; }; then
+if [ "$KIND" != secondmate ] && { [ "$GH_RECORDED_STATE" = complete ] || fm_github_dispatch_requires_auth "$KIND" "$MODE" "$GITHUB_AUTH_REQUIRED"; }; then
   GH_CAPABILITY=$(fm_github_ctx_capability "$KIND" "$GITHUB_AUTH_CAPABILITY") || {
     echo "GH_AUTH_INDETERMINATE: task $ID has no resolvable GitHub authentication capability" >&2
     echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
