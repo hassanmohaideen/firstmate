@@ -700,6 +700,55 @@ SH
   pass "fm-spawn.sh --backend orca: preserves gated context when abort cleanup fails"
 }
 
+test_spawn_reobserves_orca_worktree_against_verified_destination() {
+  local proj wt data state config id out status
+  id="orcareobservez0"
+  proj="$TMP_ROOT/reobserve-project"
+  # A fresh Orca worktree whose GitHub destination does NOT match the verified
+  # primary destination: the gate verified owner/repo (from the project remote),
+  # but the launch worktree resolves owner/other. The pooled path already
+  # re-observes its allocated worktree before launch; the Orca fresh-spawn path
+  # must do the same so the cross-backend guarantee is uniform.
+  wt="$TMP_ROOT/reobserve-wt"
+  data="$TMP_ROOT/reobserve-data"
+  state="$TMP_ROOT/reobserve-state"
+  config="$TMP_ROOT/reobserve-config"
+  fm_git_worktree "$proj" "$TMP_ROOT/reobserve-proj-wt" "fm/seed-$id"
+  git -C "$proj" remote set-url origin https://github.com/owner/repo.git
+  # The Orca-returned worktree is an isolated repo pointing at a different repo.
+  git init -q "$wt"
+  git -C "$wt" remote add origin https://github.com/owner/other.git
+  mkdir -p "$data/$id" "$state" "$config"
+  printf 'brief\n' > "$data/$id/brief.md"
+  touch "$state/.last-watcher-beat"
+  orca_case reobserve
+  cat > "$FB/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"auth status --help"*) printf '  --active, --hostname\n' ;;
+  *"repos/"*) printf 'true\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$FB/gh"
+  printf '1\n' > "$RESP/1.exit"
+  printf '{"ok":true,"result":{"repo":{"id":"repo-reobserve"}}}\n' > "$RESP/2.out"
+  printf '{"ok":true,"result":{"worktree":{"id":"wt-reobserve","path":"%s"}}}\n' "$wt" > "$RESP/3.out"
+  out=$( PATH="$FB:$PATH" FM_ORCA_LOG="$LOG" FM_ORCA_RESPONSES="$RESP" \
+    FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude --mode no-mistakes --yolo off --backend orca 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "Orca spawn must refuse a worktree whose destination does not match the verified primary destination"$'\n'"$out"
+  assert_contains "$out" "the orca worktree destination does not match the verified primary destination" \
+    "Orca re-observe mismatch must emit its indeterminate destination diagnostic"
+  assert_not_contains "$(cat "$LOG")" "claude --dangerously-skip-permissions" \
+    "Orca spawn must not launch the harness once the worktree fails re-observation"
+  assert_contains "$(cat "$LOG")" $'orca\x1f''worktree'$'\x1f''rm'$'\x1f''--worktree'$'\x1f''id:wt-reobserve' \
+    "a blocked Orca re-observation must clean up the created worktree"
+  pass "fm-spawn.sh --backend orca: re-observes the fresh worktree against the verified destination and blocks a mismatch"
+}
+
 test_spawn_releases_orca_resources_when_metadata_write_fails() {
   local proj wt data state config id out status
   id="orcametafailz9"
@@ -1348,6 +1397,7 @@ test_spawn_refuses_orca_when_runtime_not_ready
 test_spawn_refuses_orca_nonisolated_worktree
 test_spawn_removes_orca_worktree_when_terminal_create_fails
 test_spawn_preserves_orca_metadata_when_abort_cleanup_fails
+test_spawn_reobserves_orca_worktree_against_verified_destination
 test_spawn_releases_orca_resources_when_metadata_write_fails
 test_peek_send_and_crew_state_route_through_orca_meta
 test_peek_and_crew_state_fail_closed_on_orca_error_json

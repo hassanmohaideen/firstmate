@@ -260,15 +260,39 @@ test_gate_verifies_a_fresh_matching_destination() {
   pass "the gate probes and verifies a fresh matching destination, returning its tuple"
 }
 
-test_gate_trusts_a_matching_verified_tuple_without_probing() {
+test_gate_reprobes_even_when_the_recorded_tuple_matches() {
   local proj vt
-  proj=$(make_project gatefast https://github.com/owner/repo.git)
+  proj=$(make_project gatereprobe https://github.com/owner/repo.git)
   install_fake_gh "$proj"
   vt='github|github.com|repository|owner/repo|push'
+  # A recorded tuple that byte-equals the observed destination is NOT trusted as
+  # a probe shortcut: the gate always re-probes the current account so an
+  # account switch on an unchanged destination is caught here, not at push time.
   run_gate "$proj" github github.com repository owner/repo push '' "$vt"
-  [ "$GATE_RC" -eq 0 ] || fail "a recorded tuple matching the observed destination must be trusted (rc $GATE_RC)"
-  [ "$GATE_PROBED" -eq 1 ] || fail "a matching verified tuple must NOT re-probe"
-  pass "the gate trusts a verified tuple that matches the current destination without re-probing"
+  [ "$GATE_RC" -eq 0 ] || fail "a recorded tuple matching a currently-authorized destination must still verify (rc $GATE_RC)"
+  [ "$GATE_OUT" = "$vt" ] || fail "the gate must return the verified tuple, got '$GATE_OUT'"
+  [ "$GATE_PROBED" -eq 0 ] || fail "the gate must re-probe even when the recorded tuple matches"
+  pass "the gate re-probes a matching recorded tuple rather than trusting it as a shortcut"
+}
+
+test_gate_catches_an_account_switch_on_an_unchanged_destination() {
+  local proj vt
+  proj=$(make_project gateacctswitch https://github.com/owner/repo.git)
+  install_fake_gh "$proj"
+  vt='github|github.com|repository|owner/repo|push'
+  # The destination is unchanged and its recorded tuple matches, but the active
+  # gh account has been switched to one that lacks push access to the target.
+  # Because the gate re-probes under the CURRENT account, this is caught at the
+  # gate (a concrete access failure, rc 1) instead of failing later at git push.
+  set_fake_gh "$proj" active=1 auth=ok push=false
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 1 ] || fail "an account switch that loses push access must block at the gate as a concrete access failure (rc $GATE_RC)"
+  [ "$GATE_PROBED" -eq 0 ] || fail "catching the account switch requires re-probing the matching tuple"
+  # A signed-out active account on an otherwise-matching tuple is likewise caught.
+  set_fake_gh "$proj" active=1 auth=notlogged
+  run_gate "$proj" github github.com repository owner/repo push '' "$vt"
+  [ "$GATE_RC" -eq 1 ] || fail "a signed-out account on a matching tuple must block at the gate (rc $GATE_RC)"
+  pass "an account switch on an unchanged destination is caught at the gate, not at push time"
 }
 
 test_gate_blocks_unverifiable_transports_before_fast_path() {
@@ -518,7 +542,8 @@ test_intake_blocks_unrecognized_remote_transports
 test_intake_rejects_unverifiable_http_transports
 test_intake_resolves_org_membership_selection
 test_gate_verifies_a_fresh_matching_destination
-test_gate_trusts_a_matching_verified_tuple_without_probing
+test_gate_reprobes_even_when_the_recorded_tuple_matches
+test_gate_catches_an_account_switch_on_an_unchanged_destination
 test_gate_blocks_unverifiable_transports_before_fast_path
 test_gate_accepts_standard_github_ssh_authorities
 test_gate_observes_effective_push_routing
