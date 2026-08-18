@@ -57,8 +57,9 @@
 #      as fm_backend_cmux_target_ready's liveness probe (the design sketch's
 #      original suggestion): the very first send on a freshly created task
 #      would fail its own pre-flight readiness check. `list-panes` has no such
-#      gap and is used instead (fm_backend_cmux_surface_exists), mirroring
-#      zellij's own structural pane_exists check.
+#      content-read gap and is used instead (fm_backend_cmux_surface_exists),
+#      mirroring zellij's own structural pane_exists check. Its endpoint can
+#      still take a bounded settle period to appear immediately after creation.
 #   4. Closing a workspace's LAST surface is a THIRD shape, matching neither
 #      herdr (auto-closes the workspace) nor zellij (leaves a ghost tab):
 #      `close-surface` REFUSES outright with a typed error
@@ -123,6 +124,20 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # Verified minimum: the version the live pass ran against (docs/cmux-backend.md).
 FM_BACKEND_CMUX_MIN_MAJOR=0
 FM_BACKEND_CMUX_MIN_MINOR=64
+
+# Endpoint-discovery retry budget for fm_backend_cmux_create_task. `new-workspace`
+# creates the task's workspace (and its default surface), but the SEPARATE
+# `workspace list`/`list-panes` queries that resolve the workspace id and its
+# surface id are eventually consistent and can briefly omit the just-created
+# workspace or report it with no surface yet. Both resolutions are re-queried up
+# to this many extra times, each after a short settle, so a transient miss no
+# longer discards an otherwise-usable workspace. Exhausting workspace-id lookup
+# refuses before persistence; exhausting surface lookup from a captured
+# workspace id falls through to fail-closed teardown. Overridable via the
+# environment so the unit tests drive both the recovers-on-retry and the
+# genuinely-exhausted paths without real sleeps.
+FM_BACKEND_CMUX_ENDPOINT_RETRIES="${FM_BACKEND_CMUX_ENDPOINT_RETRIES:-8}"
+FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP="${FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP:-0.25}"
 
 # fm_backend_cmux_bin: resolve the cmux CLI binary. cmux does not reliably
 # land on PATH after a plain app install - it ships an OPTIONAL "install CLI"
@@ -343,15 +358,15 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 
 # fm_backend_cmux_create_task: create the task's workspace (one surface),
 # refusing an existing live <label> (finding #6: cmux enforces no uniqueness
-# itself). Resolves the fresh workspace's default surface via one list-panes
-# call (finding: a freshly created workspace already has exactly one surface,
-# so no separate new-surface call is needed). --focus false is passed for
+# itself). Resolves the fresh workspace id by scoped title and its default
+# surface through bounded re-queries (a fresh workspace already owns one
+# surface, so no separate new-surface call is needed). --focus false is passed for
 # defense in depth though verified to already be the default (finding:
 # workspace/surface/pane create all default focus to false) - no
 # focus-restore dance is needed, unlike zellij. Echoes "<workspace_id>
 # <surface_id>" on success.
 fm_backend_cmux_create_task() {  # <label> <cwd>
-  local label=$1 cwd=$2 title dup out wsid sfid
+  local label=$1 cwd=$2 title dup out wsid sfid attempt
   title=$(fm_backend_cmux_scoped_title "$label")
   dup=$(fm_backend_cmux_workspace_id_for_label "$title")
   if [ -n "$dup" ]; then
@@ -362,11 +377,31 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     echo "error: cmux new-workspace failed for '$title': $out" >&2
     return 1
   }
+  # Resolve the created workspace id by its scoped title, re-querying a bounded
+  # number of times so an eventually-consistent list miss right after creation
+  # does not orphan the new workspace (see the retry-budget constants above).
   wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
+  attempt=0
+  while [ -z "$wsid" ] && [ "$attempt" -lt "$FM_BACKEND_CMUX_ENDPOINT_RETRIES" ]; do
+    sleep "$FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP" 2>/dev/null || true
+    wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
+    attempt=$((attempt + 1))
+  done
   [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; return 1; }
+  # Resolve the workspace's default surface from the captured workspace id, again
+  # with a bounded retry: a surface found on any attempt yields a complete,
+  # persistable recovery target; only a captured workspace id that STILL yields no
+  # surface after the budget falls through to the fail-closed teardown below.
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
+  attempt=0
+  while [ -z "$sfid" ] && [ "$attempt" -lt "$FM_BACKEND_CMUX_ENDPOINT_RETRIES" ]; do
+    sleep "$FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP" 2>/dev/null || true
+    sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
+    attempt=$((attempt + 1))
+  done
   if [ -z "$sfid" ]; then
-    # Exact partial-endpoint recovery for cmux is deferred to the backend-integration follow-up.
+    # The captured workspace id genuinely yields no surface: fail closed with a
+    # best-effort teardown, never persisting an unusable record.
     fm_backend_cmux_kill "$wsid:partial" >/dev/null 2>&1 || true
     if out=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) \
       && printf '%s' "$out" | jq -e --arg id "$wsid" '[.workspaces[]? | select(.id == $id)] | length == 0' >/dev/null 2>&1; then
@@ -402,9 +437,10 @@ fm_backend_cmux_parse_target() {  # <target>
 # would make read-screen unusable as fm_backend_cmux_target_ready's liveness
 # probe: the very first send_literal on a freshly created task's surface
 # would fail its own readiness pre-check before ever getting to write
-# anything. list-panes has no such gap (verified: correct, immediate output
-# on a completely untouched fresh surface), so it is the liveness primitive
-# instead - mirroring zellij's own pane_exists check
+# anything. list-panes does not depend on prior surface content, although a
+# just-created endpoint can take a bounded settle period to materialize; task
+# creation absorbs that delay before publishing metadata. It is therefore the
+# post-creation liveness primitive, mirroring zellij's own pane_exists check
 # (fm_backend_zellij_pane_exists) rather than the design sketch's original
 # read-screen-based suggestion.
 fm_backend_cmux_surface_exists() {  # <workspace_id> <surface_id>
