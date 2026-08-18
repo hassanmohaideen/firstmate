@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Duration-bounded watcher triage shard: pause-state behavior.
+set -u
+# shellcheck source=tests/fm-watch-triage-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/fm-watch-triage-lib.sh"
+
+test_nonterminal_stale_paused_absorbed_then_resurfaced
+test_exited_declared_pause_is_bounded_but_live_gate_surfaces
+test_secondmate_paused_resurfaces_in_normal_mode
+test_secondmate_nonpaused_stale_remains_suppressed
+test_secondmate_unpause_clears_pause_tracking
+test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash
+test_nonterminal_paused_rechecks_authoritative_state
+test_paused_authoritative_working_preserves_wedge_timer
+test_nonterminal_stale_repairs_missing_or_corrupt_timer
+test_triage_log_size_cap_accepts_spaced_wc_counts

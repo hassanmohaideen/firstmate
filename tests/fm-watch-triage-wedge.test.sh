@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Duration-bounded watcher triage shard: stale and wedge behavior.
+set -u
+# shellcheck source=tests/fm-watch-triage-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/fm-watch-triage-lib.sh"
+
+test_nonterminal_stale_provably_working_absorbed_then_escalated
+test_wedge_escalation_marks_demand_deep_inspection_after_threshold
+test_wedge_escalation_resets_when_pane_becomes_active
+test_busy_pane_below_turn_age_bound_is_absorbed
+test_busy_pane_stable_hash_escalates_past_turn_age_bound
+test_busy_pane_changing_hash_escalates_past_turn_age_bound
+test_busy_pane_turn_end_touch_resets_age
+test_busy_pane_repeated_escalation_reaches_demand_deep_inspection
+test_busy_pane_default_turn_age_bound_is_3600s
+test_nonterminal_stale_not_working_surfaced

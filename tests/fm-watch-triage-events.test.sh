@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Duration-bounded watcher triage shard: event, heartbeat, and AFK behavior.
+set -u
+# shellcheck source=tests/fm-watch-triage-lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/fm-watch-triage-lib.sh"
+
+test_procevent_captured_result_surfaces_proactively
+test_procevent_unacknowledged_result_redrains_until_handled
+test_procevent_marker_keys_are_injective
+test_procevent_surface_serializes_with_drain
+test_procevent_surface_crash_boundaries
+test_procevent_marker_failure_exits_and_replays
+test_heartbeat_no_change_absorbed
+test_heartbeat_backstop_surfaces_unsurfaced_status
+test_beacon_stays_fresh_while_absorbing
+test_afk_present_reverts_watcher_to_one_shot
+test_afk_paused_changed_pane_hands_off_plain_stale

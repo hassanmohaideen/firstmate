@@ -193,7 +193,7 @@ family_for_basename_into() {
     fm-daemon.test.sh|fm-discord-bot.test.sh|fm-guard-stale-banner.test.sh|fm-pi-watch-extension.test.sh|\
     fm-session-lock-ancestry.test.sh|\
     fm-supervision-events.test.sh|fm-turnend-guard.test.sh|fm-wake-daemon-lifecycle-e2e.test.sh|\
-    fm-wake-queue.test.sh|fm-watch-arm.test.sh|fm-watch-checkpoint.test.sh|fm-watch-triage.test.sh|\
+    fm-wake-queue.test.sh|fm-watch-arm.test.sh|fm-watch-checkpoint.test.sh|fm-watch-triage*.test.sh|\
     fm-watcher-lock.test.sh|fm-inactive-reconcile.test.sh)
       FAMILY_FOR_BASENAME=watcher-wake-lock
       ;;
@@ -554,7 +554,10 @@ tests/fm-wake-drain-open-decisions.test.sh 6574
 tests/fm-wake-queue.test.sh 27451
 tests/fm-watch-arm.test.sh 50289
 tests/fm-watch-checkpoint.test.sh 7321
-tests/fm-watch-triage.test.sh 329726
+tests/fm-watch-triage-events.test.sh 125000
+tests/fm-watch-triage-pause.test.sh 125000
+tests/fm-watch-triage-wedge.test.sh 125000
+tests/fm-watch-triage.test.sh 125000
 tests/fm-watcher-lock.test.sh 88221
 EOF
 }
