@@ -248,13 +248,13 @@ fm_github_auth_probe() {
 # a per-driver re-implementation produced cannot recur.
 #
 # The gate keys on IMMUTABLE task scope (kind/mode for a push, the recorded
-# authentication requirement for a scout read) plus an AFFIRMATIVE verified
-# destination tuple that must byte-equal the currently observed destination. A
-# missing, dropped, partial, or mismatched field can only move the gate toward
-# BLOCK; erasure is never a bypass. The verified tuple is written only by a
-# successful probe of the selected destination. A legacy record or a complete
-# selection without a matching tuple re-probes, while an incomplete or
-# inconsistent recorded context blocks (fail-closed migration).
+# authentication requirement for a scout read) plus the recorded authoritative
+# selection. It always re-observes that destination and probes the current active
+# gh account; a successful probe emits the canonical verified tuple that anchors
+# the launch worktree comparison, never a shortcut around a later probe. A
+# missing or dropped tuple therefore still re-probes, while a partial or
+# inconsistent recorded selection blocks (fail-closed migration); erasure is
+# never a bypass.
 # ---------------------------------------------------------------------------
 
 # A push (ship) task is in gated scope from its immutable kind/mode; a scout is
@@ -438,11 +438,12 @@ fm_github_ctx_intake() {
   fi
 }
 
-# The launch gate. Given a resolved selection and the recorded verified tuple,
-# decide whether the worker may launch against the CURRENT destination.
+# The launch gate. Given a resolved selection, decide whether the worker may
+# launch against the CURRENT destination.
 #   ALLOW: prints the verified destination tuple to stdout, returns 0. The caller
-#          persists that tuple so a later relaunch of the unchanged destination is
-#          trusted without re-probing.
+#          persists that tuple as the verified destination record (which the
+#          worktree-settle re-observation asserts against), but the gate never
+#          trusts a persisted tuple as a substitute for probing (see below).
 #   BLOCK: prints a diagnostic to stderr, returns 1 (concrete auth/access failure)
 #          or 2 (indeterminate/retryable). The caller must not launch.
 # The gate probes the SELECTED host only; a changed observed host is never
@@ -492,13 +493,18 @@ fm_github_ctx_observe() {
 }
 
 fm_github_ctx_gate() {
-  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} recorded=${8:-} push_branch=${9:-current}
+  # $8 is a previously recorded verified destination tuple. It is intentionally
+  # NOT consulted as a trust shortcut: the gate ALWAYS re-probes the selected
+  # destination. The verified tuple keys only on the destination (forge, host,
+  # target, capability), not on the gh account that was active when the probe
+  # ran, so trusting a matching tuple would let an account switch on an
+  # otherwise-unchanged destination pass the gate and fail later at git push
+  # time. Re-probing re-runs `gh auth status --active` and the access check
+  # under the CURRENT account, so an account that lost push access is caught
+  # here (fail-closed) rather than after a wasted spawn.
+  local project=$1 forge=$2 selected_host=$3 target_kind=$4 target=$5 capability=$6 organization=${7:-} push_branch=${9:-current}
   local obs_tuple probe_target probe_out st
   obs_tuple=$(fm_github_ctx_observe "$project" "$forge" "$selected_host" "$target_kind" "$target" "$capability" "$organization" "$push_branch") || return $?
-  if [ -n "$recorded" ] && [ "$recorded" = "$obs_tuple" ]; then
-    printf '%s' "$obs_tuple"
-    return 0
-  fi
   if [ "$target_kind" = repository ]; then
     probe_target=$target
   else

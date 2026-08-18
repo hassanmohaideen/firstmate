@@ -17,9 +17,13 @@
 #   selection is persisted verbatim (gh_forge, gh_selected_host, gh_target_kind,
 #   gh_target, gh_auth_required, gh_auth_capability, gh_organization) and is never a
 #   function of a probe outcome; gh_verified_dest, the one field a probe transitions,
-#   is written only on a successful verification and its absence re-probes on the
-#   next relaunch (fail-closed). A changed, mixed, missing, or malformed destination
-#   stays indeterminate and cannot launch.
+#   is written only on a successful verification and anchors the pre-launch worktree
+#   re-observation (the launch worktree must resolve that exact destination). The
+#   gate itself ALWAYS re-probes the selected destination at launch and never trusts
+#   gh_verified_dest as a probe shortcut, so an account switch on an otherwise
+#   unchanged destination is caught here rather than at push time (fail-closed). A
+#   changed, mixed, missing, or malformed destination stays indeterminate and cannot
+#   launch.
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
@@ -1997,7 +2001,7 @@ herdr_projection_meta_field_exact() {  # <meta> <key>
 }
 
 reset_gated_pool_destination() {  # <worktree>
-  local worktree=$1 observed rc routes key
+  local worktree=$1 rc routes key
   if [ "$(git -C "$worktree" config --bool extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
     for key in remote.origin.url remote.origin.pushurl; do
       if git -C "$worktree" config --worktree --unset-all "$key" 2>/dev/null; then
@@ -2026,6 +2030,18 @@ reset_gated_pool_destination() {  # <worktree>
 $routes
 EOF
   fi
+  assert_gated_worktree_matches_verified "$worktree"
+}
+
+# Re-observe a gated task's own launch worktree and confirm it still resolves the
+# exact destination the gate verified. Every backend that creates or adopts a
+# fresh worktree runs this before launch so the cross-backend guarantee is
+# uniform: the pooled path calls it after resetting any leftover worktree-scoped
+# remote overrides, and the Orca fresh-spawn path calls it directly (an Orca
+# worktree is fresh and inherits the repo remotes, so it needs no reset, but
+# re-observing keeps the guarantee identical rather than backend-specific).
+assert_gated_worktree_matches_verified() {  # <worktree>
+  local worktree=$1 observed
   observed=$(fm_github_ctx_observe "$worktree" "$GH_FORGE" "$GH_SEL_HOST" "$GH_TARGET_KIND" "$GH_TARGET" "$GH_CAPABILITY" "$GH_ORG" "$GH_PUSH_BRANCH") || return 1
   [ "$observed" = "$GH_VERIFIED_DEST" ]
 }
@@ -2410,6 +2426,11 @@ EOF
       exit 1
     fi
     validate_spawn_worktree "orca worktree create" "$W"
+    if [ "$GH_GATED" -eq 1 ] && ! assert_gated_worktree_matches_verified "$WT"; then
+      echo "GH_AUTH_INDETERMINATE: the orca worktree destination does not match the verified primary destination" >&2
+      echo "GitHub access verification for task $ID is indeterminate; worker launch is waiting" >&2
+      exit 1
+    fi
     if [ -z "$ORCA_TERMINAL" ]; then
       ORCA_TERMINAL=$(fm_backend_orca_terminal_create "$ORCA_WORKTREE_ID" "$W") || exit 1
     fi
