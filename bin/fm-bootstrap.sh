@@ -19,6 +19,12 @@
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed after <cause>: <reason>",
 #                 "SECONDMATE_HANDOFF: secondmate <id>: pending delivery: <n> item(s)",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#          NEEDS_GH_AUTH is a readiness fact reported when no GitHub session is
+#          available; it gates only GitHub-needing dispatch (a ship pushing to
+#          GitHub, an authenticated GitHub read), not local-only or other
+#          non-GitHub work. The per-dispatch authority is
+#          fm_github_dispatch_requires_auth in bin/fm-github-context-lib.sh, and
+#          bootstrap-diagnostics owns the conditional handling.
 #          When a RUNNING local secondmate worktree is fast-forwarded to
 #          firstmate's own current default-branch commit, that update is a
 #          purely local fast-forward and never an origin fetch. Remote routes
@@ -1208,6 +1214,12 @@ detect_local_config() {
 # fleet_sync and others assign plain names like `start` without `local`, and
 # bash's dynamic scoping would let them overwrite a stamp held by a caller.
 local_phase && detect_local_tools
+# NEEDS_GH_AUTH is a readiness fact, not a universal dispatch halt: session start
+# has no task in hand, so it reports that no GitHub session is available and lets
+# the per-dispatch decision (fm_github_dispatch_requires_auth, enforced by the
+# spawn gate) block only GitHub-needing work. Non-GitHub work - a local-only
+# ship, a plain scout - is never held on GitHub login. bootstrap-diagnostics and
+# AGENTS.md section 3 own that conditional handling.
 if network_phase; then
   __fm_timing_stamp=$(fm_timing_now_ms)
   gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"

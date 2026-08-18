@@ -2,6 +2,8 @@
 # bin/fm-github-context-lib.sh is the single owner of the GitHub launch-verification
 # decision. These tests pin its contract through the public functions:
 #   - scope and capability come from immutable task identity;
+#   - the pre-dispatch requirement decision is conditional on real GitHub need
+#     and fails closed when a dispatch cannot be classified as non-GitHub work;
 #   - intake resolves an authoritative selection or refuses to infer one;
 #   - the gate keys on an affirmative verified-destination tuple, so a changed,
 #     ambiguous, malformed, or missing destination blocks and a dropped verified
@@ -91,6 +93,22 @@ test_scope_comes_from_immutable_task_identity() {
   # a ship with an unknown/empty mode fails closed into scope
   fm_github_ctx_scope ship '' || fail "a ship with an unresolved mode must fail closed into scope"
   pass "scope is derived from immutable kind/mode and the recorded scout requirement"
+}
+
+test_dispatch_requires_auth_is_conditional_and_fails_closed() {
+  # A GitHub-needing task is still gated on good GitHub auth.
+  fm_github_dispatch_requires_auth ship no-mistakes || fail "a no-mistakes ship push still requires GitHub auth"
+  fm_github_dispatch_requires_auth ship direct-PR || fail "a direct-PR ship push still requires GitHub auth"
+  fm_github_dispatch_requires_auth scout '' 1 || fail "an authenticated GitHub read scout still requires GitHub auth"
+  # Non-GitHub work is NOT gated: it must dispatch even while signed out.
+  ! fm_github_dispatch_requires_auth ship local-only || fail "a local-only ship must not require GitHub auth"
+  ! fm_github_dispatch_requires_auth scout '' '' || fail "a plain scout with no authentication requirement must not require GitHub auth"
+  ! fm_github_dispatch_requires_auth scout '' 0 || fail "a scout whose recorded requirement is 0 must not require GitHub auth"
+  # An uncertain dispatch is treated as GitHub-needing (fail-closed).
+  fm_github_dispatch_requires_auth ship '' || fail "a ship with an unresolved mode must fail closed and require GitHub auth"
+  fm_github_dispatch_requires_auth '' '' || fail "a dispatch with no resolvable kind must fail closed and require GitHub auth"
+  fm_github_dispatch_requires_auth mystery '' || fail "a dispatch of an unclassifiable kind must fail closed and require GitHub auth"
+  pass "the pre-dispatch GitHub-auth requirement is conditional on real GitHub need and fails closed when uncertain"
 }
 
 test_capability_maps_kind_and_requirement() {
@@ -508,6 +526,7 @@ test_gate_keeps_organization_404_indeterminate() {
 }
 
 test_scope_comes_from_immutable_task_identity
+test_dispatch_requires_auth_is_conditional_and_fails_closed
 test_capability_maps_kind_and_requirement
 test_recorded_context_state_distinguishes_absent_partial_and_complete_records
 test_dest_tuple_is_a_stable_delimited_join

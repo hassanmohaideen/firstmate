@@ -269,6 +269,27 @@ fm_github_ctx_scope() {
   esac
 }
 
+# The single runtime authority for "does dispatching this work require good
+# GitHub auth?", answered from the same immutable task identity the spawn gate
+# keys on. A missing GitHub session blocks a dispatch only when this returns
+# true, so non-GitHub work - a local-only ship, a plain scout with no recorded
+# authentication requirement - is never held on a GitHub login. Recognized work
+# kinds delegate to fm_github_ctx_scope so this never restates that classifier,
+# and an unresolved ship mode already fails closed there. It diverges from scope
+# only in its DEFAULT: scope must leave a secondmate (and any non-work kind)
+# ungated, whereas a dispatch whose kind cannot be confidently classified as
+# non-GitHub work is treated as GitHub-needing and required (fail-closed). Only
+# spawn-time callers pass a validated ship/scout/secondmate kind; secondmate is
+# not dispatched as backlog work and is excluded by its callers before this
+# point.
+fm_github_dispatch_requires_auth() {
+  local kind=$1 mode=${2:-} auth_required=${3:-}
+  case "$kind" in
+    ship|scout) fm_github_ctx_scope "$kind" "$mode" "$auth_required" ;;
+    *) return 0 ;;
+  esac
+}
+
 # The probe capability for a gated task.
 fm_github_ctx_capability() {
   local kind=$1 auth_capability=${2:-}
