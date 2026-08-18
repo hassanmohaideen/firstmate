@@ -496,6 +496,133 @@ test_create_task_creates_and_parses_ids() {
   pass "fm_backend_cmux_create_task: creates a workspace and parses workspace_id/surface_id from list responses"
 }
 
+test_create_task_recovers_workspace_id_on_retry() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-wsid-retry"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-retry)
+  # 1: workspace list (dup check) -> none
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  # 2: new-workspace (silent)
+  # 3: workspace list (post-create wsid resolve) -> transient empty miss
+  printf '{"workspaces":[]}' > "$dir/responses/3.out"
+  # 4: workspace list (retry) -> the workspace appears
+  cmux_workspace_list_response "$dir" 4 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  # 5: list-panes -> default surface resolves on the first try
+  cmux_panes_response "$dir" 5 "cccccccc-2222-2222-2222-222222222222"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    FM_BACKEND_CMUX_ENDPOINT_RETRIES=5 FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP=0 \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-retry /tmp/proj' "$ROOT" )
+  status=$?
+  expect_code 0 "$status" "a workspace id that appears on retry should produce a normal success"
+  [ "$out" = "bbbbbbbb-1111-1111-1111-111111111111 cccccccc-2222-2222-2222-222222222222" ] \
+    || fail "create_task should echo '<workspace_id> <surface_id>' once the workspace resolves on retry, got '$out'"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-workspace' \
+    "create_task must NOT tear down a workspace that resolves on retry"
+  pass "fm_backend_cmux_create_task: resolves the workspace id on retry instead of orphaning the new workspace"
+}
+
+test_create_task_recovers_surface_on_retry() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-surface-retry"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-retry)
+  # 1: workspace list (dup check) -> none
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  # 2: new-workspace (silent)
+  # 3: workspace list (wsid resolve) -> match
+  cmux_workspace_list_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  # 4: list-panes (first surface lookup) -> transient empty miss
+  cmux_panes_empty_response "$dir" 4
+  # 5: list-panes (retry from the captured workspace id) -> the surface appears
+  cmux_panes_response "$dir" 5 "dddddddd-3333-3333-3333-333333333333"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    FM_BACKEND_CMUX_ENDPOINT_RETRIES=5 FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP=0 \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-retry /tmp/proj' "$ROOT" )
+  status=$?
+  expect_code 0 "$status" "a surface that appears on retry should produce a normal success, not a partial teardown"
+  [ "$out" = "bbbbbbbb-1111-1111-1111-111111111111 dddddddd-3333-3333-3333-333333333333" ] \
+    || fail "create_task should echo '<workspace_id> <surface_id>' once the surface is resolved on retry, got '$out'"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-workspace' \
+    "create_task must NOT tear down the workspace when the surface is recoverable from the captured workspace id"
+  pass "fm_backend_cmux_create_task: resolves the surface from the captured workspace id on retry instead of failing closed"
+}
+
+test_create_task_cleans_partial_workspace_when_surface_discovery_fails() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-partial-cleanup"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-partial)
+  # 1: workspace list (dup check) -> none
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  # 2: new-workspace (silent)
+  # 3: workspace list (wsid resolve) -> match
+  cmux_workspace_list_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  # 4: list-panes (surface lookup, no retries) -> empty; the endpoint is unrecoverable
+  cmux_panes_empty_response "$dir" 4
+  # 5: list-windows (kill -> window_of_workspace) -> no window found
+  printf '[]' > "$dir/responses/5.out"
+  # 6: close-workspace (teardown, silent)
+  # 7: workspace list (cleanup confirm) -> the workspace is gone
+  printf '{"workspaces":[]}' > "$dir/responses/7.out"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    FM_BACKEND_CMUX_ENDPOINT_RETRIES=0 FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP=0 \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-partial /tmp/pooled-lease' "$ROOT" 2>&1 )
+  status=$?
+  expect_code 2 "$status" "a confirmed partial-workspace cleanup should return the dedicated cleaned status"
+  assert_contains "$out" "partial workspace was removed" "partial-workspace cleanup was not reported"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f''bbbbbbbb-1111-1111-1111-111111111111' \
+    "partial-workspace cleanup did not close the exact created workspace"
+  assert_not_contains "$out" "needs manual attention" "confirmed cleanup incorrectly reported an orphan"
+  pass "fm_backend_cmux_create_task: removes a partial workspace after surface discovery fails"
+}
+
+test_create_task_reports_unconfirmed_partial_workspace_without_recovery_identity() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-partial-unconfirmed"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-partial)
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  cmux_workspace_list_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  cmux_panes_empty_response "$dir" 4
+  printf '[]' > "$dir/responses/5.out"
+  # 7: workspace list (cleanup confirm) -> the workspace is STILL present
+  cmux_workspace_list_response "$dir" 7 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    FM_BACKEND_CMUX_ENDPOINT_RETRIES=0 FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP=0 \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-partial /tmp/pooled-lease' "$ROOT" 2>&1 )
+  status=$?
+  expect_code 3 "$status" "an unconfirmed partial-workspace cleanup should return the retained-lease status"
+  assert_contains "$out" "may have left partial workspace" "the possible orphan was not named"
+  assert_contains "$out" "worktree '/tmp/pooled-lease' needs manual attention" "the affected worktree was not reported"
+  pass "fm_backend_cmux_create_task: reports an unconfirmed partial endpoint without inventing recovery identity"
+}
+
+test_create_task_fails_closed_after_surface_retries_exhausted() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-surface-retry-exhausted"; mkdir -p "$dir/responses"
+  title=$(cmux_expected_scoped_title fm-partial)
+  printf '{"workspaces":[]}' > "$dir/responses/1.out"
+  cmux_workspace_list_response "$dir" 3 "bbbbbbbb-1111-1111-1111-111111111111" "$title"
+  # 4,5,6: list-panes (initial + 2 retries) -> all empty misses
+  cmux_panes_empty_response "$dir" 4
+  cmux_panes_empty_response "$dir" 5
+  cmux_panes_empty_response "$dir" 6
+  # 7: list-windows (kill) -> none ; 8: close-workspace ; 9: workspace list confirm -> gone
+  printf '[]' > "$dir/responses/7.out"
+  printf '{"workspaces":[]}' > "$dir/responses/9.out"
+  fb=$(make_cmux_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    FM_BACKEND_CMUX_ENDPOINT_RETRIES=2 FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP=0 \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_create_task fm-partial /tmp/pooled-lease' "$ROOT" 2>&1 )
+  status=$?
+  expect_code 2 "$status" "an exhausted surface retry budget should still fail closed with the confirmed-cleanup status"
+  assert_contains "$out" "partial workspace was removed" "the fail-closed teardown was not reported after retries were exhausted"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-workspace'$'\x1f''--workspace'$'\x1f''bbbbbbbb-1111-1111-1111-111111111111' \
+    "the exact created workspace was not torn down after retries were exhausted"
+  pass "fm_backend_cmux_create_task: still fails closed after the surface retry budget is exhausted"
+}
+
 # --- target_ready / capture ---------------------------------------------------
 
 test_target_ready_fails_when_target_absent() {
@@ -1130,6 +1257,11 @@ test_ensure_running_fails_fast_on_denied_without_launching
 test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
+test_create_task_recovers_workspace_id_on_retry
+test_create_task_recovers_surface_on_retry
+test_create_task_cleans_partial_workspace_when_surface_discovery_fails
+test_create_task_reports_unconfirmed_partial_workspace_without_recovery_identity
+test_create_task_fails_closed_after_surface_retries_exhausted
 test_target_ready_fails_when_target_absent
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch

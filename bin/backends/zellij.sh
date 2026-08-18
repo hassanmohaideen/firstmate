@@ -130,6 +130,19 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 FM_BACKEND_ZELLIJ_MIN_MAJOR=0
 FM_BACKEND_ZELLIJ_MIN_MINOR=44
 
+# Endpoint-discovery retry budget for fm_backend_zellij_create_task. `new-tab`
+# returns the created tab id synchronously (the durable endpoint identity
+# captured at partial-creation time), but the SEPARATE list-panes query that
+# resolves the tab's terminal pane is eventually consistent and can briefly
+# report the just-created tab with no terminal pane yet (the unconditional-exit-0
+# CLI quirk in the file header). The captured tab id is re-queried for its pane
+# up to this many extra times, each after a short settle, before the partial
+# endpoint is declared unrecoverable and torn down. Overridable via the
+# environment so the unit tests drive both the recovers-on-retry and the
+# genuinely-exhausted paths without real sleeps.
+FM_BACKEND_ZELLIJ_PANE_RETRIES="${FM_BACKEND_ZELLIJ_PANE_RETRIES:-8}"
+FM_BACKEND_ZELLIJ_PANE_RETRY_SLEEP="${FM_BACKEND_ZELLIJ_PANE_RETRY_SLEEP:-0.25}"
+
 # fm_backend_zellij_session: the session name this spawn/op uses.
 # FM_ZELLIJ_SESSION mirrors herdr's HERDR_SESSION ambient-selection knob: an
 # operator (or firstmate's own isolated test harness) sets it explicitly;
@@ -331,7 +344,7 @@ fm_backend_zellij_tab_matches_label() {  # <session> <tab_id> <label>
 #
 # Echoes "<tab_id> <pane_id>" on success.
 fm_backend_zellij_create_task() {  # <session> <label> <cwd>
-  local session=$1 label=$2 cwd=$3 title tabs dup prev_active tab_id pane_id
+  local session=$1 label=$2 cwd=$3 title tabs dup prev_active tab_id pane_id attempt
   fm_backend_zellij_session_exists "$session" || { echo "error: zellij session '$session' does not exist; run container_ensure first" >&2; return 1; }
   title=$(fm_backend_zellij_scoped_title "$label")
   tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null)
@@ -348,9 +361,23 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
       return 1
       ;;
   esac
+  # Resolve the tab's terminal pane from the captured tab id. The first
+  # list-panes can transiently miss the just-created pane (see the retry-budget
+  # constants above), so re-query from that same durable tab id a bounded number
+  # of times before concluding the endpoint is unrecoverable. A pane found on any
+  # attempt yields a complete, persistable recovery target; only a captured tab
+  # id that STILL yields no terminal pane after the budget falls through to the
+  # fail-closed cleanup below.
   pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
+  attempt=0
+  while [ -z "$pane_id" ] && [ "$attempt" -lt "$FM_BACKEND_ZELLIJ_PANE_RETRIES" ]; do
+    sleep "$FM_BACKEND_ZELLIJ_PANE_RETRY_SLEEP" 2>/dev/null || true
+    pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")
+    attempt=$((attempt + 1))
+  done
   if [ -z "$pane_id" ]; then
-    # Exact partial-endpoint recovery for Zellij is deferred to the backend-integration follow-up.
+    # The captured tab id genuinely yields no terminal pane: fail closed with a
+    # best-effort teardown, never persisting an unusable record.
     fm_backend_zellij_cli "$session" action close-tab-by-id "$tab_id" >/dev/null 2>&1 || true
     if tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null) \
       && printf '%s' "$tabs" | jq -e --arg id "$tab_id" '[.[]? | select((.tab_id | tostring) == $id)] | length == 0' >/dev/null 2>&1; then

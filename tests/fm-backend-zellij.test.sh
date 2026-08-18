@@ -514,6 +514,7 @@ test_create_task_cleans_partial_tab_when_pane_discovery_fails() {
 
   out=$(FM_HOME="$dir/home" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST=firstmate PATH="$fb:$PATH" \
+    FM_BACKEND_ZELLIJ_PANE_RETRIES=0 FM_BACKEND_ZELLIJ_PANE_RETRY_SLEEP=0 \
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-partial /tmp/pooled-lease' "$ROOT" 2>&1)
   status=$?
 
@@ -535,6 +536,7 @@ test_create_task_reports_unconfirmed_partial_tab_without_recovery_identity() {
 
   out=$(FM_HOME="$dir/home" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
     FM_ZELLIJ_SESSION_LIST=firstmate PATH="$fb:$PATH" \
+    FM_BACKEND_ZELLIJ_PANE_RETRIES=0 FM_BACKEND_ZELLIJ_PANE_RETRY_SLEEP=0 \
     bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-partial /tmp/pooled-lease' "$ROOT" 2>&1)
   status=$?
 
@@ -542,6 +544,59 @@ test_create_task_reports_unconfirmed_partial_tab_without_recovery_identity() {
   assert_contains "$out" "zellij may have left partial tab 9" "the possible orphan was not named"
   assert_contains "$out" "worktree '/tmp/pooled-lease' needs manual attention" "the affected worktree was not reported"
   pass "fm_backend_zellij_create_task: reports an unconfirmed partial endpoint without inventing recovery identity"
+}
+
+test_create_task_recovers_pane_on_retry() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-pane-retry"; mkdir -p "$dir/responses" "$dir/home"
+  fb=$(make_zellij_fakebin "$dir")
+  # 1: list-tabs --json (dup/active check) -> none
+  printf '[]\n' > "$dir/responses/1.out"
+  # 2: new-tab -> the captured tab id
+  printf '4\n' > "$dir/responses/2.out"
+  # 3: list-panes --json (first pane lookup) -> transient empty miss
+  printf '[]\n' > "$dir/responses/3.out"
+  # 4: list-panes --json (retry from the captured tab id) -> the pane appears
+  zellij_pane_response "$dir" 4 12 4
+
+  out=$(FM_HOME="$dir/home" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate PATH="$fb:$PATH" \
+    FM_BACKEND_ZELLIJ_PANE_RETRIES=5 FM_BACKEND_ZELLIJ_PANE_RETRY_SLEEP=0 \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-retry /tmp/pooled-lease' "$ROOT")
+  status=$?
+
+  expect_code 0 "$status" "a pane that appears on retry should produce a normal success, not a partial teardown"
+  [ "$out" = "4 12" ] || fail "create_task should echo '<tab_id> <pane_id>' once the pane is resolved on retry, got '$out'"
+  assert_not_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id' \
+    "create_task must NOT tear down the tab when the pane is recoverable from the captured tab id"
+  pass "fm_backend_zellij_create_task: resolves the pane from the captured tab id on retry instead of failing closed"
+}
+
+test_create_task_fails_closed_after_pane_retries_exhausted() {
+  local dir fb out status
+  dir="$TMP_ROOT/create-pane-retry-exhausted"; mkdir -p "$dir/responses" "$dir/home"
+  fb=$(make_zellij_fakebin "$dir")
+  # 1: list-tabs (dup/active check) -> none
+  printf '[]\n' > "$dir/responses/1.out"
+  # 2: new-tab -> captured tab id 15
+  printf '15\n' > "$dir/responses/2.out"
+  # 3,4,5: list-panes (initial + 2 retries) -> all empty misses
+  printf '[]\n' > "$dir/responses/3.out"
+  printf '[]\n' > "$dir/responses/4.out"
+  printf '[]\n' > "$dir/responses/5.out"
+  # 6: close-tab-by-id (teardown, silent) ; 7: list-tabs (cleanup verify) -> gone
+  printf '[]\n' > "$dir/responses/7.out"
+
+  out=$(FM_HOME="$dir/home" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST=firstmate PATH="$fb:$PATH" \
+    FM_BACKEND_ZELLIJ_PANE_RETRIES=2 FM_BACKEND_ZELLIJ_PANE_RETRY_SLEEP=0 \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-partial /tmp/pooled-lease' "$ROOT" 2>&1)
+  status=$?
+
+  expect_code 2 "$status" "an exhausted pane retry budget should still fail closed with the confirmed-cleanup status"
+  assert_contains "$out" "partial tab was removed" "the fail-closed teardown was not reported after retries were exhausted"
+  assert_contains "$(cat "$dir/log")" $'\x1f''close-tab-by-id'$'\x1f''15' "the exact created tab was not torn down after retries were exhausted"
+  pass "fm_backend_zellij_create_task: still fails closed after the pane retry budget is exhausted"
 }
 
 test_create_task_no_restore_when_new_tab_was_already_active() {
@@ -1363,6 +1418,8 @@ test_create_task_creates_and_parses_ids
 test_create_task_restores_previously_active_tab
 test_create_task_cleans_partial_tab_when_pane_discovery_fails
 test_create_task_reports_unconfirmed_partial_tab_without_recovery_identity
+test_create_task_recovers_pane_on_retry
+test_create_task_fails_closed_after_pane_retries_exhausted
 test_create_task_no_restore_when_new_tab_was_already_active
 test_capture_small_reads_use_viewport_and_trim
 test_capture_large_reads_use_full_scrollback_and_trim

@@ -124,6 +124,20 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 FM_BACKEND_CMUX_MIN_MAJOR=0
 FM_BACKEND_CMUX_MIN_MINOR=64
 
+# Endpoint-discovery retry budget for fm_backend_cmux_create_task. `new-workspace`
+# creates the task's workspace (and its default surface), but the SEPARATE
+# `workspace list`/`list-panes` queries that resolve the workspace id and its
+# surface id are eventually consistent and can briefly report the just-created
+# workspace with no surface yet. Both resolutions are re-queried up to this many
+# extra times, each after a short settle, so a transient miss on the id captured
+# at partial-creation no longer discards an otherwise-usable workspace; only a
+# resolution that STILL comes up empty after the budget falls through to the
+# fail-closed teardown. Overridable via the environment so the unit tests drive
+# both the recovers-on-retry and the genuinely-exhausted paths without real
+# sleeps.
+FM_BACKEND_CMUX_ENDPOINT_RETRIES="${FM_BACKEND_CMUX_ENDPOINT_RETRIES:-8}"
+FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP="${FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP:-0.25}"
+
 # fm_backend_cmux_bin: resolve the cmux CLI binary. cmux does not reliably
 # land on PATH after a plain app install - it ships an OPTIONAL "install CLI"
 # action (`Sources/App/CmuxCLIPathInstaller.swift`, symlinking
@@ -351,7 +365,7 @@ fm_backend_cmux_surface_id_for_workspace() {  # <workspace_id>
 # focus-restore dance is needed, unlike zellij. Echoes "<workspace_id>
 # <surface_id>" on success.
 fm_backend_cmux_create_task() {  # <label> <cwd>
-  local label=$1 cwd=$2 title dup out wsid sfid
+  local label=$1 cwd=$2 title dup out wsid sfid attempt
   title=$(fm_backend_cmux_scoped_title "$label")
   dup=$(fm_backend_cmux_workspace_id_for_label "$title")
   if [ -n "$dup" ]; then
@@ -362,11 +376,31 @@ fm_backend_cmux_create_task() {  # <label> <cwd>
     echo "error: cmux new-workspace failed for '$title': $out" >&2
     return 1
   }
+  # Resolve the created workspace id by its scoped title, re-querying a bounded
+  # number of times so an eventually-consistent list miss right after creation
+  # does not orphan the new workspace (see the retry-budget constants above).
   wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
+  attempt=0
+  while [ -z "$wsid" ] && [ "$attempt" -lt "$FM_BACKEND_CMUX_ENDPOINT_RETRIES" ]; do
+    sleep "$FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP" 2>/dev/null || true
+    wsid=$(fm_backend_cmux_workspace_id_for_label "$title")
+    attempt=$((attempt + 1))
+  done
   [ -n "$wsid" ] || { echo "error: could not resolve a cmux workspace id for '$title' after creation" >&2; return 1; }
+  # Resolve the workspace's default surface from the captured workspace id, again
+  # with a bounded retry: a surface found on any attempt yields a complete,
+  # persistable recovery target; only a captured workspace id that STILL yields no
+  # surface after the budget falls through to the fail-closed teardown below.
   sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
+  attempt=0
+  while [ -z "$sfid" ] && [ "$attempt" -lt "$FM_BACKEND_CMUX_ENDPOINT_RETRIES" ]; do
+    sleep "$FM_BACKEND_CMUX_ENDPOINT_RETRY_SLEEP" 2>/dev/null || true
+    sfid=$(fm_backend_cmux_surface_id_for_workspace "$wsid")
+    attempt=$((attempt + 1))
+  done
   if [ -z "$sfid" ]; then
-    # Exact partial-endpoint recovery for cmux is deferred to the backend-integration follow-up.
+    # The captured workspace id genuinely yields no surface: fail closed with a
+    # best-effort teardown, never persisting an unusable record.
     fm_backend_cmux_kill "$wsid:partial" >/dev/null 2>&1 || true
     if out=$(fm_backend_cmux_cli workspace list --json --id-format uuids 2>/dev/null) \
       && printf '%s' "$out" | jq -e --arg id "$wsid" '[.workspaces[]? | select(.id == $id)] | length == 0' >/dev/null 2>&1; then
