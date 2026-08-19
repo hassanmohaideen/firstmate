@@ -34,6 +34,30 @@ shift || true
 branch=$(git symbolic-ref --quiet --short HEAD)
 head=$(git rev-parse --short HEAD)
 phase=$(cat "$state/phase")
+agent=$(cat "$state/agent" 2>/dev/null || echo pi)
+
+# Rebuild the fake no-mistakes state store from the fixture's review rounds. This
+# mirrors what no-mistakes records internally for a prose-log agent (e.g. claude),
+# whose review log carries no per-round JSON object: one step_results row for the
+# review step plus one step_rounds row per round, round 1 "initial" and every later
+# round a fix-triggered "auto_fix". The guard reads this store READ-ONLY.
+build_review_db() {
+  local status=${1:-completed} db="$state/state.sqlite" n i obj trig esc
+  rm -f "$db" "$db-wal" "$db-shm"
+  sqlite3 "$db" 'CREATE TABLE step_results(id TEXT PRIMARY KEY, run_id TEXT, step_name TEXT, status TEXT); CREATE TABLE step_rounds(id TEXT, step_result_id TEXT, round INTEGER, trigger_type TEXT, findings_json TEXT);'
+  sqlite3 "$db" "INSERT INTO step_results VALUES('srid-review','RUN-11','review','$status');"
+  n=$(jq 'length' "$state/rounds")
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    obj=$(jq -c ".[$i]" "$state/rounds")
+    esc=$(printf '%s' "$obj" | sed "s/'/''/g")
+    if [ "$i" -eq 0 ]; then trig=initial; else trig=auto_fix; fi
+    sqlite3 "$db" "INSERT INTO step_rounds(id,step_result_id,round,trigger_type,findings_json) VALUES('rd-$i','srid-review',$((i + 1)),'$trig','$esc');"
+    i=$((i + 1))
+  done
+}
+
+if [ "$cmd" = __build_db ]; then build_review_db "${1:-completed}"; exit 0; fi
 
 append_call() {
   local tmp="$state/calls.tmp.$$"
@@ -70,6 +94,20 @@ EOF
 
 emit_review_logs() {
   local count i result quoted marker
+  if [ "$agent" = claude ]; then
+    # A prose-log agent narrates the review and echoes NO per-round JSON object.
+    cat <<'PROSE'
+step: review
+run: "RUN-11"
+lines: 4 total
+log[4]{line}:
+  reviewing changes...
+  claude started pid=4242
+  "I reviewed the diff in prose. The review is complete; no structured findings object is emitted to this log."
+  claude exited pid=4242 status=success
+PROSE
+    return
+  fi
   count=$(jq 'length' "$state/rounds")
   marker_count=$(jq '[.[] | select(. == true)] | length' "$state/markers")
   total=$((count + marker_count))
@@ -123,6 +161,10 @@ case "$cmd ${1:-}" in
       mv "$tmp" "$state/markers"
     fi
     printf '1\n' > "$state/phase"
+    # A prose-log agent's structured result lives in the state store, so keep it in
+    # sync with the (possibly fix-extended) rounds; the review has advanced past its
+    # gate, so the review step is now completed.
+    if [ "$agent" = claude ]; then build_review_db completed; fi
     ;;
   *) exit 2 ;;
 esac
@@ -155,7 +197,34 @@ set_next() {
 run_driver() {
   local dir=$1
   shift
-  (cd "$dir" && FM_FAKE_NM_STATE="$dir/fake-state" PATH="$dir/fakebin:$PATH" "$DRIVER" "$@")
+  # Bind FM_NM_STATE_DB to the fixture's own store so no case can ever read the
+  # host's real ~/.no-mistakes/state.sqlite. Structured-log (pi) cases never read
+  # it; prose-log (claude) cases build it explicitly.
+  (cd "$dir" && FM_FAKE_NM_STATE="$dir/fake-state" FM_NM_STATE_DB="$dir/fake-state/state.sqlite" \
+    PATH="$dir/fakebin:$PATH" "$DRIVER" "$@")
+}
+
+# Turn a fixture into a prose-log (claude) case: the review log carries no
+# structured findings object, so the guard must source the round model from the
+# state store. The caller sets the rounds, then calls build_review_db.
+claude_case() {
+  local name=$1 d
+  d=$(new_case "$name")
+  printf 'claude\n' > "$d/fake-state/agent"
+  printf '%s\n' "$d"
+}
+
+build_review_db() {  # <dir> <review-status>
+  local d=$1 status=${2:-completed}
+  (cd "$d" && FM_FAKE_NM_STATE="$d/fake-state" PATH="$d/fakebin:$PATH" \
+    no-mistakes __build_db "$status")
+}
+
+set_clean_round() {  # <dir>: a completed review with zero findings
+  local d=$1
+  printf '%s\n' '{"findings":[],"tested":[],"testing_summary":"clean","risk_level":"low","risk_rationale":"clean","risk_scope":"source"}' \
+    | jq -s . > "$d/fake-state/rounds"
+  printf '[]\n' > "$d/fake-state/markers"
 }
 
 ledger() {
@@ -1072,8 +1141,134 @@ test_failed_action_not_finalized_from_generic_completion() {
   pass "a failed action is never finalized from a generic later completion"
 }
 
+# A prose-log agent (claude) emits no structured findings object to the review log.
+# A clean review with zero findings must be recognized as a COMPLETE review result
+# (empty finding set) and reach readiness, not refused as "no structured result".
+test_claude_clean_zero_findings_is_ready() {
+  local d out
+  d=$(claude_case claude-clean)
+  set_clean_round "$d"
+  build_review_db "$d" completed
+  printf '1\n' > "$d/fake-state/phase"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "a clean zero-findings claude review was refused readiness: $out"
+  assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' \
+    "clean claude review did not reach public readiness"
+  [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "a zero-findings review invented dispositions"
+  pass "a clean zero-findings claude review is a complete result and reaches readiness"
+}
+
+# Informational (no-op) findings never gate a review and require no disposition, so
+# a claude review whose only findings are informational auto-passes to readiness.
+test_claude_info_only_is_ready() {
+  local d out note1 note2
+  d=$(claude_case claude-info)
+  note1=$(finding note-1 no-op 'informational note')
+  note2=$(finding note-2 no-op 'another informational note')
+  set_round "$d" "$note1" "$note2"
+  build_review_db "$d" completed
+  printf '1\n' > "$d/fake-state/phase"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "an info-only claude review was refused readiness: $out"
+  assert_contains "$out" 'ready:' "info-only claude review did not reach readiness"
+  [ "$(jq '.runs[0].rounds[0].result.findings | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "informational no-op findings were treated as disposition-requiring"
+  pass "an informational-only claude review requires no disposition and reaches readiness"
+}
+
+# A claude review WITH an actionable finding must be parsed from the state store so
+# the finding is accounted: a partial response is refused, and an approval that
+# accounts for every actionable finding records durably and reaches readiness. The
+# co-present informational finding is not part of the disposition-requiring set.
+test_claude_with_findings_respond_and_audit() {
+  local d out blocking info
+  d=$(claude_case claude-findings)
+  blocking=$(finding review-1 auto-fix 'actionable installer footgun')
+  info=$(finding review-2 no-op 'informational note')
+  set_round "$d" "$blocking" "$info"
+  build_review_db "$d" awaiting_approval
+
+  # A response that omits the actionable finding is refused before any state change.
+  out=$(run_driver "$d" respond --approve review-2 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an approval naming only an informational finding was accepted"
+  assert_contains "$out" 'unknown finding: review-2' "no-op finding was wrongly treated as actionable"
+  [ ! -e "$(ledger "$d")" ] || fail "a refused claude response changed ledger state"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "a refused claude response invoked the underlying response"
+
+  out=$(run_driver "$d" respond --approve review-1 2>&1) \
+    || fail "an approval accounting for every actionable claude finding failed: $out"
+  assert_contains "$out" 'action=approve findings=review-1' "claude approval did not report its accounted set"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = approved_as_is ] \
+    || fail "the claude approval was not durably recorded"
+  out=$(run_driver "$d" audit-ready 2>&1) || fail "the accounted claude review did not audit ready: $out"
+  assert_contains "$out" 'ready:' "the accounted claude review did not reach readiness"
+  pass "a claude review with findings is parsed, accounted, and reaches readiness"
+}
+
+# A claude fix round is confirmed across rounds from the state store exactly as a
+# structured-log fix is confirmed from the review log.
+test_claude_fix_round_confirms_across_rounds() {
+  local d out finding_obj
+  d=$(claude_case claude-fix)
+  finding_obj=$(finding review-1 auto-fix 'mechanical fix')
+  set_round "$d" "$finding_obj"
+  set_next "$d"
+  build_review_db "$d" awaiting_approval
+  out=$(run_driver "$d" respond --fix review-1 --instructions 'fix it' 2>&1) \
+    || fail "a claude fix response failed: $out"
+  [ "$(jq '.runs[0].rounds | length' "$(ledger "$d")")" -eq 2 ] \
+    || fail "the claude fix round did not extend the run history"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = fixed_and_confirmed ] \
+    || fail "the claude fix was not confirmed from the next-round state-store result"
+  run_driver "$d" audit-ready >/dev/null 2>&1 || fail "the fixed claude review did not audit ready"
+  pass "a claude fix round is confirmed across rounds from the state store"
+}
+
+# The state-store fallback must still refuse a genuinely incomplete review rather
+# than mistake it for a clean pass: an in-progress review record is refused.
+test_claude_incomplete_review_refuses() {
+  local d out f
+  d=$(claude_case claude-incomplete)
+  f=$(finding review-1 ask-user 'pending')
+  set_round "$d" "$f"
+  build_review_db "$d" running
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an in-progress claude review was accepted as complete"
+  assert_contains "$out" 'has not produced a complete result' "in-progress refusal was not actionable"
+  assert_not_contains "$out" 'ready:' "an incomplete claude review was reported ready"
+  pass "an in-progress claude review record is refused, not mistaken for a clean pass"
+}
+
+# A prose review log with no readable state store cannot invent a clean pass.
+test_claude_missing_state_store_refuses() {
+  local d out
+  d=$(claude_case claude-no-store)
+  set_clean_round "$d"
+  # Deliberately do NOT build the state store; the prose log carries no result.
+  printf '1\n' > "$d/fake-state/phase"
+  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a prose review with no state store was accepted"
+  assert_contains "$out" 'no-mistakes review record store is absent' "missing-store refusal was not actionable"
+  assert_not_contains "$out" 'ready:' "a resultless claude review was reported ready"
+  pass "a prose review log with no readable state store refuses closed"
+}
+
 test_all_findings_fixed_and_audited_ready
 test_all_approved_and_explicit_rejection
+# The prose-log (claude) coverage builds a fixture no-mistakes state store, which
+# needs sqlite3. It is present on every supported target (macOS, Linux CI, and any
+# host running no-mistakes, itself a sqlite app); note an honest skip otherwise.
+if command -v sqlite3 >/dev/null 2>&1; then
+  test_claude_clean_zero_findings_is_ready
+  test_claude_info_only_is_ready
+  test_claude_with_findings_respond_and_audit
+  test_claude_fix_round_confirms_across_rounds
+  test_claude_incomplete_review_refuses
+  test_claude_missing_state_store_refuses
+else
+  pass "claude prose-log state-store tests skipped: sqlite3 unavailable"
+fi
 test_isolated_pipeline_head_is_imported
 test_isolated_head_absent_everywhere_refuses
 test_crash_before_respond_is_retryable

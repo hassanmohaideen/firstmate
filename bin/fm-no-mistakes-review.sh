@@ -19,10 +19,27 @@
 # --instructions passes fix instructions verbatim and is valid only with --fix.
 #
 # Run it from the project worktree whose no-mistakes validation is being driven.
-# It reads only documented public command output:
+# It reads documented public command output:
 #   no-mistakes axi status
 #   no-mistakes axi logs --run <run-id> --step review --full
 #   no-mistakes axi logs --run <run-id> --step ci
+# The per-round structured review result comes from one of two shapes, because
+# review agents differ in what they echo to the review log:
+#   - Structured-log agents (e.g. codex/gpt/pi) emit one JSON review object per
+#     round into the review log; the guard reconstructs the round model from the
+#     log, exactly as before.
+#   - Prose-log agents (e.g. claude) narrate the review in prose and echo NO
+#     per-round JSON object to the log. no-mistakes still records the authoritative
+#     structured per-round result in its own durable state store, so when the
+#     review log carries no structured object the guard sources the identical round
+#     model READ-ONLY from that store's review rounds (~/.no-mistakes/state.sqlite,
+#     overridable with FM_NM_STATE_DB). This read never writes to that store.
+# Both shapes produce the same round model, so every disposition, ledger, and
+# readiness check below applies uniformly regardless of the review agent. A review
+# whose result is genuinely missing, truncated, or not yet produced still refuses.
+# Informational findings (action "no-op") never gate a review and require no
+# disposition, so they are excluded from the disposition-requiring finding set of
+# each round; every actionable finding (any other action) must still be accounted.
 # The pipeline validates in an isolated per-run repository, so the authoritative
 # head reported by axi status can be a fix commit this worktree never fetched.
 # Before verifying run context, the guard makes that head resolvable locally by
@@ -144,6 +161,10 @@
 #   FM_NM_REPOS_DIR                  overrides the no-mistakes per-run object-store
 #                                    root used to import an isolated pipeline head
 #                                    (default: ~/.no-mistakes/repos).
+#   FM_NM_STATE_DB                   overrides the no-mistakes state store read
+#                                    READ-ONLY for the structured review rounds when
+#                                    the review log carries no per-round JSON object
+#                                    (default: ~/.no-mistakes/state.sqlite).
 # Environment used by hermetic tests only:
 #   FM_NM_REVIEW_STATE_DIR           overrides the ledger directory.
 #   FM_NM_REVIEW_TEST_ACQUIRED       appends this PID once the kernel lock is held.
@@ -268,13 +289,16 @@ capture_public_history() {
         elif type == "string" then (try fromjson catch null)
         else null
         end;
+      # Informational findings (action "no-op") never gate a review and require no
+      # disposition; drop them so a round holds only actionable findings.
+      def actionable: .findings = [(.findings // [])[] | select(.action != "no-op")];
       (split("\n") | map(outer_decode)) as $lines
       | ([range(0; $lines | length) as $i
           | ($lines[$i] | review_object) as $candidate
           | select(($candidate | type) == "object"
                    and ($candidate | has("findings"))
                    and (($candidate.findings | type) == "array"))
-          | {line: $i, result: $candidate}]) as $events
+          | {line: $i, result: ($candidate | actionable)}]) as $events
       | {
           run: {id: $id, branch: $branch, head: $head},
           rounds: [range(0; $events | length) as $n
@@ -291,13 +315,77 @@ capture_public_history() {
         }
     ') || die "public review log for run $CAPTURE_RUN_ID is not parseable structured output"
 
+  # A prose review log (e.g. claude) echoes no per-round JSON object, so the log
+  # parser yields no rounds. Source the identical round model from no-mistakes'
+  # durable state store instead. A structured-log agent never reaches this branch.
+  if [ "$(printf '%s' "$CAPTURE_MODEL" | jq '.rounds | length')" -eq 0 ]; then
+    capture_review_model_from_state_store
+  fi
+
   printf '%s' "$CAPTURE_MODEL" | jq -e '
     (.rounds | length) > 0
     and all(.rounds[];
       (.result.findings | type) == "array"
       and all(.result.findings[];
         type == "object" and (.id | type) == "string" and (.id | length) > 0))
-  ' >/dev/null 2>&1 || die "public review log for run $CAPTURE_RUN_ID contains no complete structured review result or has malformed findings"
+  ' >/dev/null 2>&1 || die "review result for run $CAPTURE_RUN_ID contains no complete structured review result or has malformed findings"
+}
+
+capture_review_model_from_state_store() {
+  # Prose-log fallback source for the structured per-round review model. no-mistakes
+  # records every review round's authoritative structured result (the same JSON
+  # object a structured-log agent echoes to the review log) in its own state store,
+  # so when the review log carries no per-round object the guard reads the identical
+  # round model from that store. The read is strictly READ-ONLY (sqlite3 -readonly):
+  # it never writes to, checkpoints, or otherwise mutates no-mistakes' state, and it
+  # never contacts the network. It refuses closed when the tool, store, or a
+  # completed review record is genuinely absent, so a missing or in-progress review
+  # is never mistaken for a clean pass.
+  local srid rstatus rounds_json
+  command -v sqlite3 >/dev/null 2>&1 \
+    || die "review log for run $CAPTURE_RUN_ID carries no structured result and sqlite3 is unavailable to read the authoritative review record"
+  [ -f "$NM_STATE_DB" ] \
+    || die "review log for run $CAPTURE_RUN_ID carries no structured result and the no-mistakes review record store is absent at $NM_STATE_DB"
+  case "$CAPTURE_RUN_ID" in
+    ''|*[!A-Za-z0-9._-]*) die "cannot read the review record for run id '$CAPTURE_RUN_ID'" ;;
+  esac
+  # A brief busy timeout tolerates a transient lock from a concurrent writer rather
+  # than refusing spuriously; the store is WAL, so read-only readers do not block.
+  srid=$(sqlite3 -readonly -cmd '.timeout 2000' "$NM_STATE_DB" \
+    "SELECT id FROM step_results WHERE run_id='$CAPTURE_RUN_ID' AND step_name='review' ORDER BY rowid DESC LIMIT 1;" 2>/dev/null) \
+    || die "cannot read the review record for run $CAPTURE_RUN_ID from the no-mistakes state store"
+  [ -n "$srid" ] \
+    || die "the no-mistakes state store has no review step for run $CAPTURE_RUN_ID; the review result is missing"
+  rstatus=$(sqlite3 -readonly -cmd '.timeout 2000' "$NM_STATE_DB" \
+    "SELECT status FROM step_results WHERE id='$srid';" 2>/dev/null) \
+    || die "cannot read the review status for run $CAPTURE_RUN_ID from the no-mistakes state store"
+  case "$rstatus" in
+    completed|awaiting_approval) ;;
+    *) die "review step for run $CAPTURE_RUN_ID has not produced a complete result (state: ${rstatus:-unknown}); refusing an incomplete or in-progress review" ;;
+  esac
+  rounds_json=$(sqlite3 -readonly -cmd '.timeout 2000' -json "$NM_STATE_DB" \
+    "SELECT round, trigger_type, findings_json FROM step_rounds WHERE step_result_id='$srid' ORDER BY round;" 2>/dev/null) \
+    || die "cannot read the review rounds for run $CAPTURE_RUN_ID from the no-mistakes state store"
+  [ -n "$rounds_json" ] && [ "$rounds_json" != "[]" ] \
+    || die "the no-mistakes state store has no recorded review rounds for run $CAPTURE_RUN_ID; the review result is missing or incomplete"
+  # Build the identical round model the structured-log path produces: one round per
+  # recorded review round, actionable findings only, and fix_completed_after true
+  # when the next round was triggered by a committed fix.
+  CAPTURE_MODEL=$(printf '%s' "$rounds_json" | jq -c \
+    --arg id "$CAPTURE_RUN_ID" --arg branch "$CAPTURE_BRANCH" --arg head "$CAPTURE_HEAD" '
+      def actionable: .findings = [(.findings // [])[] | select(.action != "no-op")];
+      . as $rows
+      | {
+          run: {id: $id, branch: $branch, head: $head},
+          rounds: [range(0; $rows | length) as $i
+            | ($rows[$i].findings_json | fromjson | actionable) as $result
+            | {
+                result: $result,
+                fix_completed_after: (($i + 1) < ($rows | length)
+                  and ((["auto_fix", "user_fix"] | index($rows[$i + 1].trigger_type)) != null))
+              }]
+        }') \
+    || die "the recorded review result for run $CAPTURE_RUN_ID is not parseable structured output"
 }
 
 import_public_head() {
@@ -1086,6 +1174,7 @@ STATE_DIR=${FM_NM_REVIEW_STATE_DIR:-$PROJECT_ROOT/.no-mistakes}
   || die "review state path is not a directory: $STATE_DIR"
 LEDGER="$STATE_DIR/firstmate-review-ledger.json"
 NM_REPOS_DIR=${FM_NM_REPOS_DIR:-${HOME:-}/.no-mistakes/repos}
+NM_STATE_DB=${FM_NM_STATE_DB:-${HOME:-}/.no-mistakes/state.sqlite}
 
 case "${1:-}" in
   respond|audit-ready)
