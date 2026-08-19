@@ -317,7 +317,10 @@ capture_public_history() {
 
   # A prose review log (e.g. claude) echoes no per-round JSON object, so the log
   # parser yields no rounds. Source the identical round model from no-mistakes'
-  # durable state store instead. A structured-log agent never reaches this branch.
+  # durable state store instead. A structured-log review whose per-round JSON
+  # object is absent (e.g. truncation that still passes the line-count checks)
+  # also lands here; the store is authoritative and fails closed on a missing or
+  # incomplete record.
   if [ "$(printf '%s' "$CAPTURE_MODEL" | jq '.rounds | length')" -eq 0 ]; then
     capture_review_model_from_state_store
   fi
@@ -638,6 +641,10 @@ sync_ledger() {
 _sync_ledger_apply() {
   local errors
   errors=$(jq -r --slurpfile model "$MODEL_FILE" '
+    # Ledgers written before informational filtering preserved rounds WITH no-op
+    # findings; compare both sides in actionable form so such a round stays
+    # consistent with its no-op-filtered rebuild.
+    def actionable: .findings = [(.findings // [])[] | select(.action != "no-op")];
     ($model[0]) as $m
     | (.runs | map(select(.id == $m.run.id))) as $matches
     | if ($matches | length) > 1 then "duplicate run records for \($m.run.id)"
@@ -646,7 +653,7 @@ _sync_ledger_apply() {
       elif ($matches | length) == 1 and ($matches[0].rounds | length) > ($m.rounds | length) then
         "public review history lost prior rounds for run \($m.run.id)"
       elif ($matches | length) == 1 and ([range(0; $matches[0].rounds | length) as $i
-        | select($matches[0].rounds[$i].result != $m.rounds[$i].result)] | length) > 0 then
+        | select(($matches[0].rounds[$i].result | actionable) != ($m.rounds[$i].result | actionable))] | length) > 0 then
         "public review history contradicts a preserved round for run \($m.run.id)"
       elif ($matches | length) == 1 and ([range(0; $matches[0].rounds | length) as $i
         | select($matches[0].rounds[$i].fix_completed_after == true
@@ -701,7 +708,7 @@ _sync_ledger_apply() {
         | .key as $i
         | .value
         | if .fix_completed_after == true and ($i + 1) < ($rounds | length) then
-            ($rounds[$i + 1].result.findings) as $next_findings
+            ([($rounds[$i + 1].result.findings // [])[] | select(.action != "no-op")]) as $next_findings
             | .dispositions = [.dispositions[]
                 | . as $d
                 | if .kind == "fix" and .state == "requested" then

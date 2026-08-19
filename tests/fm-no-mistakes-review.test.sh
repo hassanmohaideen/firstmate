@@ -1240,6 +1240,37 @@ test_claude_incomplete_review_refuses() {
   pass "an in-progress claude review record is refused, not mistaken for a clean pass"
 }
 
+# A ledger written by a pre-filter guard version preserved rounds WITH informational
+# no-op findings (and their dispositions). Such a preserved round must compare equal
+# to its no-op-filtered rebuild during sync, not hard-die as a contradiction and
+# wedge the run.
+test_legacy_noop_preserved_round_does_not_contradict() {
+  local d out blocking info L tmp
+  d=$(claude_case legacy-noop)
+  blocking=$(finding review-1 ask-user 'actionable finding')
+  info=$(finding review-2 no-op 'informational note')
+  set_round "$d" "$blocking" "$info"
+  build_review_db "$d" awaiting_approval
+  out=$(run_driver "$d" respond --approve review-1 2>&1) \
+    || fail "approval on the legacy-noop fixture failed: $out"
+  L=$(ledger "$d")
+  tmp="$L.tmp"
+  jq --argjson info "$info" '
+    .runs[0].rounds[0] |= (
+      .result.findings += [$info]
+      | .dispositions += [{finding_id: $info.id, finding: $info, kind: "approve",
+          state: "approved_as_is", run_id: .dispositions[0].run_id,
+          branch: .dispositions[0].branch, head: .head}])
+  ' "$L" > "$tmp" && mv "$tmp" "$L" \
+    || fail "could not rewrite the fixture ledger into its legacy form"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "a preserved round carrying a legacy no-op finding was refused: $out"
+  assert_contains "$out" 'ready:' "the legacy no-op-bearing run did not reach readiness"
+  assert_not_contains "$out" 'contradicts a preserved round' \
+    "the legacy no-op-bearing round was reported as a contradiction"
+  pass "a preserved round with a legacy no-op finding matches its filtered rebuild"
+}
+
 # A prose review log with no readable state store cannot invent a clean pass.
 test_claude_missing_state_store_refuses() {
   local d out
@@ -1265,6 +1296,7 @@ if command -v sqlite3 >/dev/null 2>&1; then
   test_claude_with_findings_respond_and_audit
   test_claude_fix_round_confirms_across_rounds
   test_claude_incomplete_review_refuses
+  test_legacy_noop_preserved_round_does_not_contradict
   test_claude_missing_state_store_refuses
 else
   pass "claude prose-log state-store tests skipped: sqlite3 unavailable"
