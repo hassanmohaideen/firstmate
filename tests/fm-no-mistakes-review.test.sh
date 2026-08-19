@@ -1261,7 +1261,9 @@ test_legacy_noop_preserved_round_does_not_contradict() {
       | .dispositions += [{finding_id: $info.id, finding: $info, kind: "approve",
           state: "approved_as_is", run_id: .dispositions[0].run_id,
           branch: .dispositions[0].branch, head: .head}])
-  ' "$L" > "$tmp" && mv "$tmp" "$L" \
+  ' "$L" > "$tmp" \
+    || fail "could not rewrite the fixture ledger into its legacy form"
+  mv "$tmp" "$L" \
     || fail "could not rewrite the fixture ledger into its legacy form"
   out=$(run_driver "$d" audit-ready 2>&1) \
     || fail "a preserved round carrying a legacy no-op finding was refused: $out"
