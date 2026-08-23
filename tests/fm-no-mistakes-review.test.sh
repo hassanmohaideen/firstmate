@@ -151,20 +151,30 @@ case "$cmd ${1:-}" in
       if [ "$1" = --action ]; then action=$2; break; fi
       shift
     done
-    if [ "$action" = fix ]; then
-      git commit --allow-empty -qm 'fake no-mistakes fix'
-      tmp="$state/rounds.tmp.$$"
-      jq --slurpfile next "$state/next-result" '. + [$next[0]]' "$state/rounds" > "$tmp"
-      mv "$tmp" "$state/rounds"
-      tmp="$state/markers.tmp.$$"
-      jq '. + [false] | .[-2] = true' "$state/markers" > "$tmp"
-      mv "$tmp" "$state/markers"
+    # respond-nogate models a daemon that never leaves the review gate (the IPC did
+    # not land), so skip every gate-advancing state change. Absent, the fast IPC
+    # lands and the gate advances exactly as before.
+    if [ ! -f "$state/respond-nogate" ]; then
+      if [ "$action" = fix ]; then
+        git commit --allow-empty -qm 'fake no-mistakes fix'
+        tmp="$state/rounds.tmp.$$"
+        jq --slurpfile next "$state/next-result" '. + [$next[0]]' "$state/rounds" > "$tmp"
+        mv "$tmp" "$state/rounds"
+        tmp="$state/markers.tmp.$$"
+        jq '. + [false] | .[-2] = true' "$state/markers" > "$tmp"
+        mv "$tmp" "$state/markers"
+      fi
+      printf '1\n' > "$state/phase"
+      # A prose-log agent's structured result lives in the state store, so keep it in
+      # sync with the (possibly fix-extended) rounds; the review has advanced past its
+      # gate, so the review step is now completed.
+      if [ "$agent" = claude ]; then build_review_db completed; fi
     fi
-    printf '1\n' > "$state/phase"
-    # A prose-log agent's structured result lives in the state store, so keep it in
-    # sync with the (possibly fix-extended) rounds; the review has advanced past its
-    # gate, so the review step is now completed.
-    if [ "$agent" = claude ]; then build_review_db completed; fi
+    # respond-sleep models no-mistakes' foreground CI-monitoring drive: the fast IPC
+    # has already landed (gate advanced above), and the client now blocks with no
+    # client-side timeout until killed. exec so the killed client leaves no orphaned
+    # sleep. Absent, the client returns immediately.
+    if [ -f "$state/respond-sleep" ]; then exec sleep "$(cat "$state/respond-sleep")"; fi
     ;;
   *) exit 2 ;;
 esac
@@ -611,6 +621,82 @@ test_transient_failure_is_recoverable() {
   pass "a transiently failed response records failed and is safely retryable"
 }
 
+# The ledger lock must be held only for the fast respond IPC-landing window, never
+# across no-mistakes' long foreground push/PR/CI drive. A fix whose drive blocks
+# after the gate leaves returns promptly (the client is stopped once the IPC has
+# landed), records the fix request durably, and is confirmed later by audit-ready.
+test_fix_drive_landed_releases_lock_and_defers_confirmation() {
+  local d f start elapsed out
+  d=$(new_case drive-landed-fix)
+  f=$(finding scope auto-fix)
+  set_round "$d" "$f"
+  set_next "$d"
+  printf '8\n' > "$d/fake-state/respond-sleep"
+  start=$(date +%s)
+  out=$(run_driver "$d" respond --fix scope 2>&1) || fail "landed fix response failed: $out"
+  elapsed=$(( $(date +%s) - start ))
+  [ "$elapsed" -lt 8 ] \
+    || fail "respond held the caller ${elapsed}s across the CI drive instead of releasing after the IPC landed"
+  assert_contains "$out" 'action=fix findings=scope' "landed fix did not report its recorded response"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = landed ] \
+    || fail "landed fix did not record a landed receipt"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = requested ] \
+    || fail "landed fix confirmation was not deferred to audit-ready"
+  out=$(run_driver "$d" audit-ready 2>&1) || fail "deferred fix did not reach readiness via audit-ready: $out"
+  assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' "deferred fix audit did not confirm readiness"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = fixed_and_confirmed ] \
+    || fail "audit-ready did not confirm the deferred fix from the next review round"
+  pass "a fix whose drive blocks releases the lock after the IPC lands and is confirmed by audit-ready"
+}
+
+# A decision needs no CI, so once its gate is consumed it finalizes immediately even
+# while the client is still driving CI in the background. The gate-left state is
+# specific proof this exact action landed (a rejected IPC would have returned fast).
+test_decision_drive_landed_finalizes_immediately() {
+  local d f start elapsed out
+  d=$(new_case drive-landed-approve)
+  f=$(finding decided ask-user)
+  set_round "$d" "$f"
+  printf '8\n' > "$d/fake-state/respond-sleep"
+  start=$(date +%s)
+  out=$(run_driver "$d" respond --approve decided 2>&1) || fail "landed approve response failed: $out"
+  elapsed=$(( $(date +%s) - start ))
+  [ "$elapsed" -lt 8 ] || fail "approve held the caller ${elapsed}s across the CI drive"
+  assert_contains "$out" 'action=approve findings=decided' "landed approve did not report its recorded response"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = landed ] || fail "landed approve did not record a landed receipt"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = approved_as_is ] \
+    || fail "a landed approve was not finalized immediately once its gate was consumed"
+  out=$(run_driver "$d" audit-ready 2>&1) || fail "landed approve did not reach readiness: $out"
+  assert_contains "$out" 'ready:' "landed approve audit did not confirm readiness"
+  pass "a decision lands and finalizes the moment its gate is consumed, without awaiting CI"
+}
+
+# When the gate never leaves within the bounded budget the IPC landing is
+# unconfirmed, so the guard refuses closed, leaves a reconcilable attempting receipt
+# and its attempt marker, records no unproven disposition, and does not blindly
+# retry an attempt that may still be in flight.
+test_gate_never_leaves_times_out_fail_closed_and_stays_reconcilable() {
+  local d f out rc
+  d=$(new_case drive-timeout)
+  f=$(finding stuck auto-fix)
+  set_round "$d" "$f"
+  set_next "$d"
+  printf '1\n' > "$d/fake-state/respond-nogate"
+  printf '10\n' > "$d/fake-state/respond-sleep"
+  out=$(FM_NM_REVIEW_IPC_BUDGET=2 run_driver "$d" respond --fix stuck 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a response whose gate never left was accepted as landed"
+  assert_contains "$out" 'review gate did not leave' "gate-stuck timeout refusal was not actionable"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = attempting ] \
+    || fail "a timed-out response did not leave a reconcilable attempting receipt"
+  [ -e "$(inflight_marker "$d")" ] || fail "a timed-out response did not preserve its attempt marker"
+  [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "a timed-out response recorded an unproven disposition"
+  out=$(FM_NM_REVIEW_IPC_BUDGET=2 run_driver "$d" respond --fix stuck 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unconfirmed in-flight response was blindly retried"
+  assert_contains "$out" 'in flight' "in-flight retry refusal was not fail-closed"
+  pass "a response whose gate never leaves times out fail-closed and stays reconcilable"
+}
+
 test_concurrent_writers_are_serial_and_atomic() {
   local d f p1 p2 r1 r2 count ledger_path winner_fifo marker spins=0
   d=$(new_case concurrent)
@@ -1025,6 +1111,44 @@ test_isolated_head_absent_everywhere_refuses() {
   pass "a head absent from the worktree and every per-run store refuses closed"
 }
 
+# Base-advance during a run buries the authoritative head below the run branch tip:
+# the pipeline validated at h1 (a fix commit) and CI then advanced the branch two
+# further commits, so h1 is a non-tip ancestor present only in the per-run store.
+# Both respond and audit-ready must import and resolve it, and bind the disposition
+# to the authoritative buried head, not to any tip.
+test_isolated_head_resolves_under_deep_base_advance() {
+  local d f store bare tree h0 h1 h2 h3 out rc
+  d=$(new_case iso-deep)
+  f=$(finding deep ask-user)
+  set_round "$d" "$f"
+  store="$d/nm-repos"
+  bare="$store/deadbeefcafe.git"
+  mkdir -p "$store"
+  git clone --bare -q "$d" "$bare"
+  git -C "$bare" config user.name fixture
+  git -C "$bare" config user.email fixture@example.test
+  tree=$(git -C "$d" rev-parse 'HEAD^{tree}')
+  h0=$(git -C "$d" rev-parse HEAD)
+  h1=$(git -C "$bare" commit-tree "$tree" -p "$h0" -m 'isolated fix')
+  h2=$(git -C "$bare" commit-tree "$tree" -p "$h1" -m 'later CI fix')
+  h3=$(git -C "$bare" commit-tree "$tree" -p "$h2" -m 'even later CI fix')
+  git -C "$bare" update-ref "refs/heads/fm/iso-deep" "$h3"
+  printf '%s\n' "$h1" > "$d/fake-state/status-head"
+  git -C "$d" rev-parse --verify --quiet "${h1}^{commit}" >/dev/null 2>&1 \
+    && fail "the buried isolated head was unexpectedly already present in the worktree"
+
+  out=$(cd "$d" && FM_FAKE_NM_STATE="$d/fake-state" FM_NM_REPOS_DIR="$store" \
+    PATH="$d/fakebin:$PATH" "$DRIVER" respond --approve deep 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "a head buried under a deep base advance was not resolved for the response: $out"
+  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].head' "$(ledger "$d")")" = "$h1" ] \
+    || fail "the disposition was not bound to the authoritative buried head"
+  out=$(cd "$d" && FM_FAKE_NM_STATE="$d/fake-state" FM_NM_REPOS_DIR="$store" \
+    PATH="$d/fakebin:$PATH" "$DRIVER" audit-ready 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || fail "audit-ready could not resolve the buried isolated head: $out"
+  assert_contains "$out" "head=$h1" "readiness did not report the authoritative buried head"
+  pass "a validation head buried under a deep base advance resolves from the per-run store"
+}
+
 # A crash after the attempting receipt but before the CLI leaves no attempt marker,
 # proving the response never ran; the next invocation retries it to completion.
 test_crash_before_respond_is_retryable() {
@@ -1305,6 +1429,7 @@ else
 fi
 test_isolated_pipeline_head_is_imported
 test_isolated_head_absent_everywhere_refuses
+test_isolated_head_resolves_under_deep_base_advance
 test_crash_before_respond_is_retryable
 test_crash_after_fix_reconciles_across_rounds
 test_new_response_reconciles_prior_fix
@@ -1323,6 +1448,9 @@ test_terminal_outcomes_reject_stale_green_ci
 test_run_and_head_mismatch_are_refused
 test_idempotent_replay_does_not_reinvoke
 test_transient_failure_is_recoverable
+test_fix_drive_landed_releases_lock_and_defers_confirmation
+test_decision_drive_landed_finalizes_immediately
+test_gate_never_leaves_times_out_fail_closed_and_stays_reconcilable
 test_concurrent_writers_are_serial_and_atomic
 test_matching_live_owner_refuses
 test_dead_owner_recovers_and_audit_is_idempotent
