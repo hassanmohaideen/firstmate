@@ -57,6 +57,25 @@
 # A partial set, duplicate ID, unknown ID, or mixed choice is refused before the
 # underlying response command and before any ledger write.
 #
+# no-mistakes axi respond sends a fast (~millisecond) response IPC and then
+# FOREGROUND-DRIVES the run through push, PR, and GitHub CI with no client-side
+# timeout, so the guard must never block on that whole drive while it holds the
+# ledger lock. It backgrounds the respond client, waits only until the review gate
+# leaves (proof the IPC has landed) or the bounded FM_NM_REVIEW_IPC_BUDGET elapses,
+# then stops the client so the ledger lock is released promptly. Stopping the
+# client only tears down the run observer; it never cancels the daemon's run
+# (cancellation is a separate axi abort path), so the pipeline keeps driving CI in
+# the background. A decision (approve/reject) is finalized the moment its gate is
+# consumed, since it needs no CI; a fix leaves its durable attempting receipt in
+# place (no premature landed-but-unconfirmed state) and is confirmed later by
+# audit-ready or a later response through the same attempting->landed reconciliation
+# the guard already applies to a crashed drive, from the next authoritative review
+# result. If the client returns before the budget, the whole drive finished
+# in-band and the response is finalized exactly as before. This narrows only how
+# long the ledger lock is held (the fast IPC-landing window, never the CI drive);
+# it does not weaken single-owner exclusion, receipt reconciliation, or the
+# never-infer-a-decision-from-generic-completion guarantees below.
+#
 # The ledger is JSON at:
 #   <project-worktree>/.no-mistakes/firstmate-review-ledger.json
 # Its exact version-1 record shape is:
@@ -165,6 +184,11 @@
 #                                    READ-ONLY for the structured review rounds when
 #                                    the review log carries no per-round JSON object
 #                                    (default: ~/.no-mistakes/state.sqlite).
+#   FM_NM_REVIEW_IPC_BUDGET          maximum whole seconds to wait under the ledger
+#                                    lock for the review gate to leave (the response
+#                                    IPC to land) before refusing closed; the long
+#                                    push/PR/CI drive is never awaited under the lock
+#                                    (default: 60).
 # Environment used by hermetic tests only:
 #   FM_NM_REVIEW_STATE_DIR           overrides the ledger directory.
 #   FM_NM_REVIEW_TEST_ACQUIRED       appends this PID once the kernel lock is held.
@@ -185,6 +209,10 @@ LOCK_GUARD=
 LEDGER_COMMIT_HOOK_FIRED=0
 WORK_FILE=
 MODEL_FILE=
+DRIVE_LOG=
+RESP_PID=
+DRIVE_RESULT=
+DRIVE_RC=0
 CAPTURE_STATUS=
 CAPTURE_LOGS=
 CAPTURE_MODEL=
@@ -217,8 +245,15 @@ cleanup() {
   # so cleanup only removes this invocation's private temporary work files. It
   # never touches the shared guard file or any ownership artifact, so an exiting
   # or crashing owner can never remove a successor's lock.
+  # A backgrounded response client is stopped too, so an interrupted guard never
+  # leaves the run observer running; stopping it never cancels the daemon's run.
+  if [ -n "$RESP_PID" ]; then
+    kill -TERM "$RESP_PID" 2>/dev/null || true
+    RESP_PID=
+  fi
   [ -z "$WORK_FILE" ] || rm -f "$WORK_FILE"
   [ -z "$MODEL_FILE" ] || rm -f "$MODEL_FILE"
+  [ -z "$DRIVE_LOG" ] || rm -f "$DRIVE_LOG"
   return 0
 }
 
@@ -975,8 +1010,104 @@ reconcile_receipts_readonly() {  # <last-round>
   done
 }
 
+review_gate_open_fresh() {
+  # 0 (true) while the review step is still awaiting a response (the gate is open);
+  # 1 (false) once the gate has left, i.e. the response IPC has landed and the run
+  # advanced past the review step. It reads a fresh READ-ONLY axi status into
+  # locals and never mutates the CAPTURE_* context the ledger finalize relies on.
+  # An unavailable or unreadable status is treated as still-open so the caller
+  # keeps waiting (up to its bounded budget) rather than declaring a premature land.
+  local st rstatus topstatus
+  st=$("$NM" axi status 2>/dev/null) || return 0
+  rstatus=$(printf '%s\n' "$st" | sed -n 's/^[[:space:]]*review,\([^,]*\),.*/\1/p' | head -1)
+  topstatus=$(printf '%s\n' "$st" | sed -n 's/^[[:space:]]*status:[[:space:]]*\(.*\)/\1/p' | head -1)
+  topstatus=$(strip_value "$topstatus")
+  case "$rstatus" in
+    ''|awaiting_approval|fix_review|blocked|parked|awaiting_agent) return 0 ;;
+  esac
+  [ "$topstatus" = review ] && return 0
+  return 1
+}
+
+launch_review_drive() {  # <kind> <selected-csv> <instructions>
+  # Background the response client. It lands the fast IPC and then foreground-
+  # drives push/PR/CI; we never await that drive under the ledger lock. Its
+  # progress output goes to a private log, so it never pollutes the recorded line.
+  local kind=$1 selected_csv=$2 instructions=$3
+  case "$kind" in
+    fix)
+      if [ -n "$instructions" ]; then
+        "$NM" axi respond --step review --action fix --findings "$selected_csv" --instructions "$instructions" >"$DRIVE_LOG" 2>&1 &
+      else
+        "$NM" axi respond --step review --action fix --findings "$selected_csv" >"$DRIVE_LOG" 2>&1 &
+      fi
+      ;;
+    approve) "$NM" axi respond --step review --action approve >"$DRIVE_LOG" 2>&1 & ;;
+    reject) "$NM" axi respond --step review --action skip >"$DRIVE_LOG" 2>&1 & ;;
+    *) die "internal drive error for $kind" ;;
+  esac
+  RESP_PID=$!
+}
+
+stop_review_drive() {
+  # Stop the backgrounded client so the ledger lock releases promptly. A killed
+  # client only tears down the observer; the daemon's run keeps driving CI.
+  [ -n "$RESP_PID" ] || return 0
+  if kill -0 "$RESP_PID" 2>/dev/null; then
+    kill -TERM "$RESP_PID" 2>/dev/null || true
+    local spins=0
+    while kill -0 "$RESP_PID" 2>/dev/null; do
+      spins=$((spins + 1))
+      if [ "$spins" -ge 25 ]; then kill -KILL "$RESP_PID" 2>/dev/null || true; break; fi
+      sleep 0.2
+    done
+  fi
+  wait "$RESP_PID" 2>/dev/null || true
+  RESP_PID=
+}
+
+settle_review_drive() {
+  # Wait only until the response IPC has landed (the review gate leaves) or the
+  # bounded budget elapses, then stop the drive. Sets DRIVE_RESULT to:
+  #   complete - the client returned 0 before the budget (whole drive finished);
+  #   failed   - the client returned nonzero fast (IPC rejected), see DRIVE_RC;
+  #   landed   - the gate left, proving the IPC landed, with the drive still going;
+  #   timeout  - the gate never left within the budget (cannot confirm landing).
+  # A client that lands the response and then returns almost immediately (the whole
+  # drive was cheap, e.g. CI already green) races the gate-left observation, so once
+  # the gate has left we grant a short grace for the client to exit naturally and
+  # report complete/failed before concluding it is genuinely still driving CI.
+  local waited=0 max_polls cli_rc=0 gate_left=0 grace=0 grace_max=10
+  max_polls=$((IPC_BUDGET * 5))
+  [ "$max_polls" -ge 1 ] || max_polls=1
+  DRIVE_RESULT=
+  DRIVE_RC=0
+  while :; do
+    if ! kill -0 "$RESP_PID" 2>/dev/null; then
+      cli_rc=0
+      wait "$RESP_PID" || cli_rc=$?
+      RESP_PID=
+      if [ "$cli_rc" -eq 0 ]; then DRIVE_RESULT=complete; else DRIVE_RESULT=failed; DRIVE_RC=$cli_rc; fi
+      return 0
+    fi
+    if [ "$gate_left" -eq 0 ] && ! review_gate_open_fresh; then
+      gate_left=1
+    fi
+    if [ "$gate_left" -eq 1 ]; then
+      grace=$((grace + 1))
+      if [ "$grace" -ge "$grace_max" ]; then DRIVE_RESULT=landed; break; fi
+    else
+      waited=$((waited + 1))
+      if [ "$waited" -ge "$max_polls" ]; then DRIVE_RESULT=timeout; break; fi
+    fi
+    sleep 0.2
+  done
+  stop_review_drive
+  return 0
+}
+
 respond() {
-  local fix='' approve='' reject='' instructions='' want='' kind='' raw='' selected_csv round rc head_ok modes=0
+  local fix='' approve='' reject='' instructions='' want='' kind='' raw='' selected_csv round head_ok modes=0 drive_tail=''
   shift
   while [ "$#" -gt 0 ]; do
     if [ -n "$want" ]; then
@@ -1039,27 +1170,80 @@ respond() {
   [ "${FM_NM_REVIEW_TEST_CRASH_BEFORE_RESPOND:-}" != 1 ] || kill -KILL "$$"
   claim_attempt_marker "$round" "$RESPONSE_ATTEMPT"
 
-  rc=0
-  case "$kind" in
-    fix)
-      if [ -n "$instructions" ]; then
-        "$NM" axi respond --step review --action fix --findings "$selected_csv" --instructions "$instructions" || rc=$?
-      else
-        "$NM" axi respond --step review --action fix --findings "$selected_csv" || rc=$?
+  # Land the response without ever awaiting the long push/PR/CI drive under the
+  # ledger lock: background the client, wait only until the gate leaves or the
+  # bounded budget elapses, then stop it (see settle_review_drive).
+  DRIVE_LOG=$(mktemp "$STATE_DIR/.firstmate-review-drive.XXXXXX") \
+    || die "cannot allocate a response drive log"
+  launch_review_drive "$kind" "$selected_csv" "$instructions"
+  settle_review_drive
+
+  case "$DRIVE_RESULT" in
+    failed)
+      write_receipt "$round" failed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
+      # Surface the backgrounded client's own diagnostic explaining WHY the IPC was
+      # rejected before cleanup removes DRIVE_LOG. The pre-bounded foreground path
+      # let that output reach the operator directly; backgrounding it must not
+      # silently swallow it.
+      drive_tail=$(tail -n 20 "$DRIVE_LOG" 2>/dev/null || true)
+      if [ -n "$drive_tail" ]; then
+        die "underlying no-mistakes response failed with exit $DRIVE_RC; the attempt is recorded as unlanded and can be safely retried. Client output (last 20 lines):
+$drive_tail"
       fi
+      die "underlying no-mistakes response failed with exit $DRIVE_RC; the attempt is recorded as unlanded and can be safely retried"
       ;;
-    approve) "$NM" axi respond --step review --action approve || rc=$? ;;
-    reject) "$NM" axi respond --step review --action skip || rc=$? ;;
+    complete)
+      # The client returned before the budget, so the whole drive finished in-band
+      # (e.g. CI was already green). Finalize exactly as the pre-bounded path did.
+      [ "${FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND:-}" != 1 ] || kill -KILL "$$"
+      write_receipt "$round" landed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
+      finalize_from_receipt "$round" "$kind"
+      printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
+        "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
+      ;;
+    landed)
+      # The review gate left, proving THIS invocation's IPC landed, while the CI
+      # drive is still going in the background.
+      case "$kind" in
+        approve|reject)
+          # A decision finalizes the moment its gate is consumed; it needs no CI.
+          # The gate left immediately after THIS invocation sent this exact action
+          # under the exclusive ledger lock and attempt marker, and a rejected IPC
+          # returns fast (nonzero) rather than leaving the gate, so gate-left is
+          # specific proof this action -- not an out-of-band skip -- landed. Record
+          # the landed receipt and finalize now.
+          write_receipt "$round" landed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
+          finalize_from_receipt "$round" "$kind"
+          printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
+            "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
+          ;;
+        fix)
+          # A fix cannot be confirmed until the next authoritative review result
+          # shows the finding did not survive, which the daemon produces later in
+          # the background drive. Rather than record a premature landed receipt
+          # whose dispositions are still unconfirmed, leave the durable attempting
+          # receipt (and its attempt marker) exactly as written before launch: the
+          # same attempting->landed reconciliation the guard already applies to a
+          # crashed drive confirms it from that public evidence, run by audit-ready
+          # or a later response. This preserves the invariant that a landed fix
+          # receipt always has confirmed dispositions, so no landed-but-unconfirmed
+          # intermediate state is ever created.
+          printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
+            "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
+          printf '%s: the fix response landed; the pipeline is driving CI in the background. Confirm readiness with audit-ready.\n' \
+            "$SCRIPT_NAME" >&2
+          ;;
+      esac
+      ;;
+    timeout)
+      # The gate never left within the budget, so the IPC landing is unconfirmed.
+      # Leave the attempting receipt and its attempt marker in place so a later
+      # response or audit-ready reconciles from authoritative evidence rather than
+      # recording an unproven landing.
+      die "the no-mistakes response was sent but the review gate did not leave within ${IPC_BUDGET}s; a detached response may still be in flight -- resolve the pipeline state and retry"
+      ;;
+    *) die "internal drive-settle error: ${DRIVE_RESULT:-unknown}" ;;
   esac
-  if [ "$rc" -ne 0 ]; then
-    write_receipt "$round" failed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
-    die "underlying no-mistakes response failed with exit $rc; the attempt is recorded as unlanded and can be safely retried"
-  fi
-  [ "${FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND:-}" != 1 ] || kill -KILL "$$"
-  write_receipt "$round" landed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
-  finalize_from_receipt "$round" "$kind"
-  printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
-    "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
 }
 
 audit_ready() {
@@ -1182,6 +1366,11 @@ STATE_DIR=${FM_NM_REVIEW_STATE_DIR:-$PROJECT_ROOT/.no-mistakes}
 LEDGER="$STATE_DIR/firstmate-review-ledger.json"
 NM_REPOS_DIR=${FM_NM_REPOS_DIR:-${HOME:-}/.no-mistakes/repos}
 NM_STATE_DB=${FM_NM_STATE_DB:-${HOME:-}/.no-mistakes/state.sqlite}
+IPC_BUDGET=${FM_NM_REVIEW_IPC_BUDGET:-60}
+case "$IPC_BUDGET" in
+  ''|*[!0-9]*) die "FM_NM_REVIEW_IPC_BUDGET must be a whole number of seconds" ;;
+esac
+[ "$IPC_BUDGET" -ge 1 ] || die "FM_NM_REVIEW_IPC_BUDGET must be at least 1 second"
 
 case "${1:-}" in
   respond|audit-ready)
