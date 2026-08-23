@@ -1107,7 +1107,7 @@ settle_review_drive() {
 }
 
 respond() {
-  local fix='' approve='' reject='' instructions='' want='' kind='' raw='' selected_csv round head_ok modes=0
+  local fix='' approve='' reject='' instructions='' want='' kind='' raw='' selected_csv round head_ok modes=0 drive_tail=''
   shift
   while [ "$#" -gt 0 ]; do
     if [ -n "$want" ]; then
@@ -1181,6 +1181,15 @@ respond() {
   case "$DRIVE_RESULT" in
     failed)
       write_receipt "$round" failed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
+      # Surface the backgrounded client's own diagnostic explaining WHY the IPC was
+      # rejected before cleanup removes DRIVE_LOG. The pre-bounded foreground path
+      # let that output reach the operator directly; backgrounding it must not
+      # silently swallow it.
+      drive_tail=$(tail -n 20 "$DRIVE_LOG" 2>/dev/null || true)
+      if [ -n "$drive_tail" ]; then
+        die "underlying no-mistakes response failed with exit $DRIVE_RC; the attempt is recorded as unlanded and can be safely retried. Client output (last 20 lines):
+$drive_tail"
+      fi
       die "underlying no-mistakes response failed with exit $DRIVE_RC; the attempt is recorded as unlanded and can be safely retried"
       ;;
     complete)

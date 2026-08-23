@@ -145,7 +145,13 @@ case "$cmd ${1:-}" in
     ;;
   "axi respond")
     append_call "$*"
-    [ ! -f "$state/respond-fail" ] || exit 23
+    # respond-fail models the underlying client rejecting the IPC: it prints its own
+    # diagnostic (which the driver redirects to DRIVE_LOG) and exits nonzero before
+    # any gate-advancing state change, so the gate never leaves.
+    if [ -f "$state/respond-fail" ]; then
+      printf 'fake no-mistakes: review response rejected: bad findings selection\n' >&2
+      exit 23
+    fi
     action=
     while [ "$#" -gt 0 ]; do
       if [ "$1" = --action ]; then action=$2; break; fi
@@ -603,6 +609,7 @@ test_transient_failure_is_recoverable() {
   [ "$rc" -ne 0 ] || fail "underlying CLI failure was hidden"
   assert_contains "$out" 'exit 23' "underlying failure exit was not surfaced"
   assert_contains "$out" 'safely retried' "failed response did not advertise a recovery path"
+  assert_contains "$out" 'review response rejected' "failed response swallowed the client's own diagnostic from the drive log"
   [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
     || fail "a failed response left a disposition that could be mistaken for a decision"
   [ "$(jq -r '.phase' "$(receipt_file "$d")")" = failed ] \
