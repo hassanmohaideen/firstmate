@@ -624,7 +624,10 @@ test_transient_failure_is_recoverable() {
 # The ledger lock must be held only for the fast respond IPC-landing window, never
 # across no-mistakes' long foreground push/PR/CI drive. A fix whose drive blocks
 # after the gate leaves returns promptly (the client is stopped once the IPC has
-# landed), records the fix request durably, and is confirmed later by audit-ready.
+# landed) and leaves its durable attempting receipt in place with NO premature
+# landed-but-unconfirmed state and NO disposition recorded yet; audit-ready then
+# confirms it from the next review round through the same attempting->landed
+# reconciliation the guard applies to a crashed drive.
 test_fix_drive_landed_releases_lock_and_defers_confirmation() {
   local d f start elapsed out
   d=$(new_case drive-landed-fix)
@@ -638,10 +641,12 @@ test_fix_drive_landed_releases_lock_and_defers_confirmation() {
   [ "$elapsed" -lt 8 ] \
     || fail "respond held the caller ${elapsed}s across the CI drive instead of releasing after the IPC landed"
   assert_contains "$out" 'action=fix findings=scope' "landed fix did not report its recorded response"
-  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = landed ] \
-    || fail "landed fix did not record a landed receipt"
-  [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = requested ] \
-    || fail "landed fix confirmation was not deferred to audit-ready"
+  [ "$(jq -r '.phase' "$(receipt_file "$d")")" = attempting ] \
+    || fail "a landed fix drive must leave the durable attempting receipt, not a premature landed one"
+  [ -e "$(inflight_marker "$d")" ] \
+    || fail "a landed fix drive did not preserve its attempt marker for reconciliation"
+  [ "$(jq '.runs[0].rounds[0].dispositions | length' "$(ledger "$d")")" -eq 0 ] \
+    || fail "a landed fix drive recorded a disposition before the next review round confirmed it"
   out=$(run_driver "$d" audit-ready 2>&1) || fail "deferred fix did not reach readiness via audit-ready: $out"
   assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' "deferred fix audit did not confirm readiness"
   [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = fixed_and_confirmed ] \

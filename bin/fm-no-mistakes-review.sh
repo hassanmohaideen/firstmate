@@ -66,9 +66,11 @@
 # client only tears down the run observer; it never cancels the daemon's run
 # (cancellation is a separate axi abort path), so the pipeline keeps driving CI in
 # the background. A decision (approve/reject) is finalized the moment its gate is
-# consumed, since it needs no CI; a fix records its landed response and requested
-# disposition now and is confirmed later by audit-ready from the next authoritative
-# review result. If the client returns before the budget, the whole drive finished
+# consumed, since it needs no CI; a fix leaves its durable attempting receipt in
+# place (no premature landed-but-unconfirmed state) and is confirmed later by
+# audit-ready or a later response through the same attempting->landed reconciliation
+# the guard already applies to a crashed drive, from the next authoritative review
+# result. If the client returns before the budget, the whole drive finished
 # in-band and the response is finalized exactly as before. This narrows only how
 # long the ledger lock is held (the fast IPC-landing window, never the CI drive);
 # it does not weaken single-owner exclusion, receipt reconciliation, or the
@@ -1192,25 +1194,31 @@ respond() {
       ;;
     landed)
       # The review gate left, proving THIS invocation's IPC landed, while the CI
-      # drive is still going in the background. Record the landed receipt now.
-      write_receipt "$round" landed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
+      # drive is still going in the background.
       case "$kind" in
         approve|reject)
           # A decision finalizes the moment its gate is consumed; it needs no CI.
           # The gate left immediately after THIS invocation sent this exact action
           # under the exclusive ledger lock and attempt marker, and a rejected IPC
           # returns fast (nonzero) rather than leaving the gate, so gate-left is
-          # specific proof this action -- not an out-of-band skip -- landed.
+          # specific proof this action -- not an out-of-band skip -- landed. Record
+          # the landed receipt and finalize now.
+          write_receipt "$round" landed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
           finalize_from_receipt "$round" "$kind"
           printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
             "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
           ;;
         fix)
-          # A fix is confirmed only once the next authoritative review result shows
-          # the finding did not survive, which the daemon produces later in the
-          # drive. Record the request durably now; audit-ready (or a later
-          # response) confirms it from that public evidence.
-          init_fix_dispositions "$round"
+          # A fix cannot be confirmed until the next authoritative review result
+          # shows the finding did not survive, which the daemon produces later in
+          # the background drive. Rather than record a premature landed receipt
+          # whose dispositions are still unconfirmed, leave the durable attempting
+          # receipt (and its attempt marker) exactly as written before launch: the
+          # same attempting->landed reconciliation the guard already applies to a
+          # crashed drive confirms it from that public evidence, run by audit-ready
+          # or a later response. This preserves the invariant that a landed fix
+          # receipt always has confirmed dispositions, so no landed-but-unconfirmed
+          # intermediate state is ever created.
           printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
             "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
           printf '%s: the fix response landed; the pipeline is driving CI in the background. Confirm readiness with audit-ready.\n' \
