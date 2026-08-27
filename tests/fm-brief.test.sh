@@ -769,6 +769,58 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
+# Every ship and scout crewmate brief carries the context-hygiene nudge: compact
+# at a clean phase seam, only where progress is durably recorded, using the
+# harness's own native command when it has one (a no-op otherwise). It is a
+# per-task worker contract, so a persistent secondmate charter must NOT carry it.
+test_ship_and_scout_briefs_carry_context_hygiene() {
+  local home id brief
+  home="$TMP_ROOT/context-hygiene-home"
+  mkdir -p "$home/data"
+
+  for id_kind in \
+    "ctxh-ship-nomistakes:ship:no-mistakes" \
+    "ctxh-ship-directpr:ship:direct-PR" \
+    "ctxh-ship-localonly:ship:local-only" \
+    "ctxh-scout:scout:"; do
+    id=${id_kind%%:*}
+    local rest=${id_kind#*:}
+    local kind=${rest%%:*}
+    local mode=${rest#*:}
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1 \
+        || fail "$id: scout brief did not scaffold"
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1 \
+        || fail "$id: ship brief did not scaffold"
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$id: brief was not scaffolded"
+    assert_grep "# Context hygiene" "$brief" \
+      "$id: brief missing the context-hygiene section"
+    assert_grep "compact your own context at a clean phase seam" "$brief" \
+      "$id: context-hygiene nudge lost its clean-phase-seam guidance"
+    # shellcheck disable=SC2016 # Literal backticks/braces are part of the generated brief text.
+    assert_grep "already durably recorded (a commit and/or a status line), never mid-edit or mid-tool-call" "$brief" \
+      "$id: context-hygiene nudge lost the durable-seam safety rule"
+    assert_grep "Use your harness's own native context-compaction command when it has one" "$brief" \
+      "$id: context-hygiene nudge lost the harness-native command instruction"
+    assert_grep "it is simply a no-op for that harness" "$brief" \
+      "$id: context-hygiene nudge lost the safe no-op for harnesses without compaction"
+    assert_grep "This is a judgement nudge, not a required step" "$brief" \
+      "$id: context-hygiene nudge lost its soft-nudge framing"
+  done
+
+  # A persistent secondmate charter is not a per-task worker brief, so it must not
+  # carry the context-hygiene nudge.
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='Supervise the beta domain.' \
+    "$ROOT/bin/fm-brief.sh" ctxh-secondmate --secondmate --no-projects >/dev/null 2>&1 \
+    || fail "secondmate charter did not scaffold"
+  assert_no_grep "# Context hygiene" "$home/data/ctxh-secondmate/brief.md" \
+    "secondmate charter must not carry the per-task context-hygiene nudge"
+  pass "fm-brief.sh: ship and scout briefs carry the context-hygiene nudge; secondmate charters do not"
+}
+
 # Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
@@ -809,4 +861,5 @@ test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_rtk_compact_is_explicit_for_ordinary_tasks_only
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
+test_ship_and_scout_briefs_carry_context_hygiene
 test_scout_and_secondmate_scaffold
