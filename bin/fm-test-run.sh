@@ -455,7 +455,7 @@ tests/fm-backend-zellij.test.sh 8436
 tests/fm-backend.test.sh 17423
 tests/fm-backlog-handoff.test.sh 3272
 tests/fm-bearings-snapshot.test.sh 57310
-tests/fm-bootstrap.test.sh 24895
+tests/fm-bootstrap.test.sh 120000
 tests/fm-busy-adapter-wiring.test.sh 14845
 tests/fm-busy-state.test.sh 1482
 tests/fm-calm-pi-extension.test.sh 166
@@ -469,7 +469,7 @@ tests/fm-composer-matrix-live-e2e.test.sh 38
 tests/fm-control-relaunch.test.sh 29506
 tests/fm-control.test.sh 34081
 tests/fm-daemon.test.sh 14894
-tests/fm-discord-bot.test.sh 46859
+tests/fm-discord-bot.test.sh 100000
 tests/fm-documentation-audiences.test.sh 693
 tests/fm-fleet-snapshot-view.test.sh 15503
 tests/fm-fleet-sync.test.sh 29043
