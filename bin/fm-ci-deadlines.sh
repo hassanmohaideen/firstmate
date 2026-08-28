@@ -22,10 +22,21 @@
 # job deadlines reserve time to finish publications, drop credentials, and
 # upload evidence before the guillotine falls:
 #
-#     ordinary  T0+430s (7:10)  stop scheduling / running ordinary test work
-#     terminal  T0+450s (7:30)  finish terminal publications
-#     cleanup   T0+480s (8:00)  credential and process cleanup must be done
+#     ordinary  T0+480s (8:00)  stop scheduling / running ordinary test work
+#     terminal  T0+500s (8:20)  finish terminal publications
+#     cleanup   T0+530s (8:50)  credential and process cleanup must be done
 #     ceiling   T0+600s (10:00) matches the job's own timeout-minutes hard cap
+#
+# The ordinary bound sets each required serial test's per-test kill deadline
+# (execution_deadline minus the time reserved for the tests still queued behind
+# it). The heaviest test in a balanced serial shard runs first with its whole
+# tail reserved, so it gets the least allowance of any test in the shard; that
+# allowance must stay comfortably above the test's own duration budget (2x its
+# measured baseline) or ordinary CI runner variance terminalizes a non-regressed
+# test RED. As the serial lane grew, the ordinary bound at T0+430s left the
+# heaviest-first tests only ~58s of margin over baseline - below their 2x
+# budgets - so a slow-but-healthy runner killed them. T0+480s restores that
+# margin for every shard at once without reshuffling the balanced packing.
 #
 # A single hung test therefore cannot wedge the whole job: it is bounded and
 # terminalized RED at its own deadline, and these job deadlines plus
@@ -33,9 +44,9 @@
 # anchors T0 as its first step, before checkout, so the budget covers checkout
 # and tool setup and not only the test run itself.
 
-FM_CI_DEADLINE_OFFSET_ORDINARY=430
-FM_CI_DEADLINE_OFFSET_TERMINAL=450
-FM_CI_DEADLINE_OFFSET_CLEANUP=480
+FM_CI_DEADLINE_OFFSET_ORDINARY=480
+FM_CI_DEADLINE_OFFSET_TERMINAL=500
+FM_CI_DEADLINE_OFFSET_CLEANUP=530
 FM_CI_DEADLINE_OFFSET_CEILING=600
 
 # fm_ci_deadline_env <t0_epoch>
