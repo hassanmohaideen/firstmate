@@ -169,6 +169,26 @@ A send or key action reporting success is not proof that the intended action hap
 OpenCode can accept and queue an Enter while leaving text visible, Grok can consume Enter in its slash popup without submitting, and Kimi can silently drop a message sent before readiness even though the send returns success.
 The shared symptom is a healthy-looking pane with no work in progress, so each adapter must verify the observable postcondition that is specific to its TUI.
 
+## Context compaction
+
+A long-running crewmate should proactively compact its own context at a clean task-phase seam - after investigation and before implementation, before a validation run, or when moving to a distinct new subsystem - rather than relying only on the harness's automatic mid-thought compaction.
+`bin/fm-brief.sh` carries that behavioral nudge (when and why to compact) in every ship and scout brief; this section is the single owner of the per-harness manual command (which command) that satisfies it, so the scaffold does not restate it per harness.
+The nudge is safe by construction: it is a "compact when it helps" judgement call, so a harness with no verified manual compaction command simply no-ops it rather than working around the gap.
+Automatic in-run compaction, which several adapters' busy-state rows already note, is not a substitute, because a proactive at-a-seam compaction needs a command the worker can invoke.
+
+Record only a manually verified command here, following this skill's verified-versus-unknown discipline; never guess one, because a fabricated command wastes a worker turn and can land as unintended composer text.
+These commands are interactive TUI slash commands rather than `--help` subcommands, so verifying an unconfirmed one means driving the real harness in a live session, the same bar the harness-dependent-checks rule sets.
+
+| Harness | Manual compaction command | Status |
+|---|---|---|
+| claude | `/compact` (optionally `/compact <instructions>`) | Verified: claude is firstmate's own reference harness and exposes the native manual compaction slash command. |
+| grok | `/compact` (argument-taking, so a genuine second Enter submits it) | Verified live - the same command is recorded in grok's Skill invocation row below (`/compact` expands to `/compact compaction instructions`). |
+| codex | Not verified here | No manually verified command yet; the nudge no-ops on codex until a live session confirms one. |
+| opencode | Not verified here | No manually verified command yet; the nudge no-ops on opencode until a live session confirms one. |
+| pi / pi-signed | Not verified here | Pi performs automatic in-run compaction (busy-state row and the `session_compact` reason in `docs/sessionstart-nudge.md`), but no manual worker command is verified; the nudge no-ops until a live session confirms one. |
+| kimi | Not verified here | No manually verified command yet; the nudge no-ops on kimi until a live session confirms one. |
+| muse | Not verified here | No manually verified command yet; the nudge no-ops on muse until a live session confirms one. |
+
 ## claude (VERIFIED; busy-state hooks live-verified 2026-07-28 on Claude Code 2.1.220)
 
 When concrete evidence proves the selected Claude credential unusable, ask the captain to complete the safe interactive `claude auth login` flow and verify it with `claude auth status` before resuming; do not route the task around its selected Claude profile.

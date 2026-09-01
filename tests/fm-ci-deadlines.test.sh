@@ -19,9 +19,9 @@ sourced_output=$(. "$SCRIPT")
 # shellcheck source=bin/fm-ci-deadlines.sh
 . "$SCRIPT"
 
-[ "$FM_CI_DEADLINE_OFFSET_ORDINARY" -eq 430 ] || fail "ordinary offset must be 430"
-[ "$FM_CI_DEADLINE_OFFSET_TERMINAL" -eq 450 ] || fail "terminal offset must be 450"
-[ "$FM_CI_DEADLINE_OFFSET_CLEANUP" -eq 480 ] || fail "cleanup offset must be 480"
+[ "$FM_CI_DEADLINE_OFFSET_ORDINARY" -eq 480 ] || fail "ordinary offset must be 480"
+[ "$FM_CI_DEADLINE_OFFSET_TERMINAL" -eq 500 ] || fail "terminal offset must be 500"
+[ "$FM_CI_DEADLINE_OFFSET_CLEANUP" -eq 530 ] || fail "cleanup offset must be 530"
 [ "$FM_CI_DEADLINE_OFFSET_CEILING" -eq 600 ] || fail "ceiling offset must be 600"
 pass "sourcing defines the four deadline offsets and prints nothing"
 
@@ -41,9 +41,9 @@ pass "deadline offsets are strictly increasing and the ceiling matches the 10-mi
 expected_env() { # <t0>
   local t0=$1
   printf 'FM_TEST_JOB_T0_EPOCH=%s\n' "$t0"
-  printf 'FM_TEST_ORDINARY_DEADLINE_EPOCH=%s\n' "$((t0 + 430))"
-  printf 'FM_TEST_TERMINAL_DEADLINE_EPOCH=%s\n' "$((t0 + 450))"
-  printf 'FM_TEST_CLEANUP_DEADLINE_EPOCH=%s\n' "$((t0 + 480))"
+  printf 'FM_TEST_ORDINARY_DEADLINE_EPOCH=%s\n' "$((t0 + 480))"
+  printf 'FM_TEST_TERMINAL_DEADLINE_EPOCH=%s\n' "$((t0 + 500))"
+  printf 'FM_TEST_CLEANUP_DEADLINE_EPOCH=%s\n' "$((t0 + 530))"
   printf 'FM_TEST_CEILING_DEADLINE_EPOCH=%s\n' "$((t0 + 600))"
 }
 

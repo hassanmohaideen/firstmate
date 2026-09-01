@@ -334,6 +334,21 @@ EOF
   RTK_SECTION=$'\n\n'$RTK_BODY
 fi
 
+# Context-hygiene nudge shared by ship and scout briefs. It is a worker-facing
+# behavioral instruction (WHEN and WHY to compact at a clean phase seam); the
+# per-harness command that satisfies it (WHICH command) lives in the
+# harness-adapters skill's "Context compaction" section, its single owner, so it
+# is not restated per harness here. Safe by construction: a "compact when it
+# helps" judgement call that no-ops on any harness without a native command.
+IFS= read -r -d '' CONTEXT_HYGIENE <<'EOF' || true
+# Context hygiene
+On a long task, try to compact your own context at a clean phase seam - for example after you finish investigation and before you start implementing, before you start a validation run, or when you move on to a distinct new subsystem - instead of relying only on your harness's automatic mid-thought compaction.
+Only compact at a seam where your progress is already durably recorded (a commit and/or a status line), never mid-edit or mid-tool-call.
+Use your harness's own native context-compaction command when it has one; if it has none, skip this - it is simply a no-op for that harness, not something to work around or fake.
+This is a judgement nudge, not a required step: compact when it clearly helps, and only you can see the seam.
+EOF
+CONTEXT_HYGIENE=${CONTEXT_HYGIENE%$'\n'}
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -371,6 +386,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+${CONTEXT_HYGIENE}
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -492,6 +509,8 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+
+${CONTEXT_HYGIENE}
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
