@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--github-host <canonical-host>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--github-host <canonical-host>] [--github-auth-required[=<private-repository-read|organization-membership-read>]] [--github-organization <organization>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--github-host <canonical-host>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--advisor <model>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--github-host <canonical-host>] [--github-auth-required[=<private-repository-read|organization-membership-read>]] [--github-organization <organization>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--advisor <model>] [--backend <name>]
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--advisor <model>] [--backend <name>] --secondmate
 #   GitHub authentication-context gate (bin/fm-github-context-lib.sh owns the
 #   decision). A ship push and an authentication scout verify their exact
 #   destination BEFORE any worktree, window, or endpoint is created, and refuse to
@@ -36,7 +36,7 @@
 #   loud one-line deviation notice is printed and the spawn continues.
 #   no-mistakes-prod-only is a registry policy rather than a task mode and is
 #   refused as a flag value.
-#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
+#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>] [--advisor <model>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded endpoint and worktree instead of creating either. It is
 #   the launch half of the control plane (bin/fm-control.sh relaunch), which
@@ -46,8 +46,8 @@
 #   backend, kind, project or home, worktree, endpoint - comes from the task's
 #   validated state/<id>.meta, so --backend, --scout, --secondmate, a project
 #   positional, and batch pairs are all refused alongside it; only harness,
-#   model, and effort may change, which is what makes a harness switch one
-#   ordinary relaunch. It refuses unless the recorded endpoint is positively
+#   model, effort, and advisor may change, which is what makes a harness switch
+#   one ordinary relaunch. It refuses unless the recorded endpoint is positively
 #   agent-free on a backend with a recovery-grade agent-state classifier (tmux
 #   or herdr), refuses unless the endpoint's shell is sitting in the recorded
 #   worktree, and clears the previous harness's per-task wiring before arming
@@ -58,6 +58,13 @@
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
 #   from that harness's launch rather than guessed.
+#   --advisor <model> attaches Claude Code's advisor tool for a claude spawn,
+#   pairing the main model with a stronger advisor model Claude consults at
+#   decision points. It is claude-only: passing it with any other harness is a
+#   refusal (the advisor tool is not valid for codex/opencode/pi/grok/kimi/muse).
+#   The value may be an alias (fable, opus, sonnet) or a full claude model id and
+#   is passed through verbatim - Claude Code drops an ineligible advisor at launch
+#   without erroring in a background session, so the pairing is not validated here.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -162,7 +169,7 @@
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
-#   source of truth; shared --scout/--harness/--model/--effort/--backend/--mode/--yolo
+#   source of truth; shared --scout/--harness/--model/--effort/--advisor/--backend/--mode/--yolo
 #   applies to every pair. A ship batch therefore carries one delivery contract, and each
 #   pair still checks it against its own brief; a batch spanning modes is two invocations.
 #   If a local or tracked crew-dispatch profile is effective, shared --harness is
@@ -285,6 +292,7 @@ KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
+ADVISOR=
 BACKEND_ARG=
 MODE=
 YOLO=
@@ -292,6 +300,7 @@ TRACEPARENT_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
+ADVISOR_SET=0
 BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
@@ -319,6 +328,7 @@ for a in "$@"; do
       harness) HARNESS_ARG=$a; HARNESS_SET=1 ;;
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
+      advisor) ADVISOR=$a; ADVISOR_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
@@ -340,6 +350,8 @@ for a in "$@"; do
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
+    --advisor) want_value=advisor ;;
+    --advisor=*) ADVISOR=${a#--advisor=}; ADVISOR_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
     --mode) want_value=mode ;;
@@ -361,6 +373,7 @@ done
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
+[ "$ADVISOR_SET" -eq 0 ] || [ -n "$ADVISOR" ] || { echo "error: --advisor requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
@@ -799,6 +812,7 @@ persist_gated_pool_recovery() {
     echo "tasktmp=${TASK_TMP:-}"
     echo "model=${MODEL:-default}"
     echo "effort=${EFFORT:-default}"
+    echo "advisor=${ADVISOR:-default}"
     echo "backend=$BACKEND"
   } > "$recovery_tmp" 2>/dev/null; then
     rm -f "$recovery_tmp" 2>/dev/null || true
@@ -903,6 +917,7 @@ spawn_abort_cleanup() {
             echo "tasktmp=${TASK_TMP:-}"
             echo "model=${MODEL:-default}"
             echo "effort=${EFFORT:-default}"
+            echo "advisor=${ADVISOR:-default}"
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
@@ -1013,6 +1028,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
+  [ -z "$ADVISOR" ] || shared_args+=(--advisor "$ADVISOR")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
@@ -1288,7 +1304,7 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG____ADVISORFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
@@ -1396,6 +1412,18 @@ case "$HARNESS" in
     LAUNCH="FM_PI_HARNESS=$HARNESS $LAUNCH"
     ;;
 esac
+
+# The advisor tool is a claude-only Claude Code feature; it is not valid for any
+# other adapter. Refuse an --advisor paired with a non-claude harness here rather
+# than silently dropping it. This is caller misuse, distinct from Claude Code's
+# own safe runtime degradation when the advisor model is ineligible for the main
+# model (there the background session simply starts with no advisor). The
+# capability pairing itself is deliberately not validated (aliases and full model
+# ids make it loose, and Claude Code degrades safely at launch).
+if [ "$ADVISOR_SET" -eq 1 ] && [ "$HARNESS" != claude ]; then
+  echo "error: --advisor is only supported on the claude harness (got '$HARNESS'); the advisor tool is claude-only" >&2
+  exit 1
+fi
 
 # muse is verified as a CREWMATE/SCOUT adapter only. A secondmate is a firstmate
 # instance, so it needs a primary supervision protocol; muse has none, and its
@@ -1569,6 +1597,22 @@ effort_flag_for_harness() {
     # to a different, non-interactive launch mode, so fm-spawn does not pass it.
     # kimi likewise has no reasoning-effort flag; the requested axis stays in
     # task metadata but never reaches the launch command.
+  esac
+}
+
+advisor_flag_for_harness() {
+  local harness=$1 advisor=$2
+  [ -n "$advisor" ] && [ "$advisor" != default ] || return 0
+  # The advisor tool is claude-only. Every other adapter is refused at intake
+  # (the claude-only guard above), so nothing but claude ever reaches this emit;
+  # non-claude harnesses print nothing. The value may be an alias (fable, opus,
+  # sonnet) or a full claude model id, so it is passed through verbatim rather
+  # than closed-set validated - Claude Code drops an ineligible advisor at launch
+  # without erroring in a background session.
+  case "$harness" in
+    claude)
+      printf -- '--advisor %s ' "$(shell_quote "$advisor")"
+      ;;
   esac
 }
 
@@ -2958,7 +3002,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo gh_gated gh_forge gh_selected_host gh_target_kind gh_target gh_auth_required gh_auth_capability gh_organization gh_verified_dest tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo gh_gated gh_forge gh_selected_host gh_target_kind gh_target gh_auth_required gh_auth_capability gh_organization gh_verified_dest tasktmp model effort advisor busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2980,6 +3024,7 @@ preserve_relaunch_meta() {
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  echo "advisor=${ADVISOR:-default}"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
   # Default-off writes no traceparent= line.
@@ -3044,8 +3089,10 @@ sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
+ADVISORFLAG=$(advisor_flag_for_harness "$HARNESS" "$ADVISOR")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
+LAUNCH=${LAUNCH//__ADVISORFLAG__/$ADVISORFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}

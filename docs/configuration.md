@@ -270,7 +270,7 @@ An optional repository-owned tracked `defaults/crew-dispatch.json` supplies stan
 Firstmate considers rules from both files as one best-fit set: an explicit per-task captain instruction remains highest, the most specific matching rule wins regardless of file, and an equally fitting local rule wins over a tracked rule.
 When no rule matches, the local `default` wins over the tracked `default`, then dispatch falls back to `config/crew-harness`.
 This lets a repository-specific tracked rule beat a generic local implementation or design default while future local configuration can override it with an equally or more specific rule.
-The shell scripts discover and validate both files but do not match their natural-language rules; firstmate chooses the best matching rule with judgment, resolves its profile object or array under the operating contract in `AGENTS.md` section 4 and `quota-array-dispatch`, and passes only concrete `--harness`, `--model`, and `--effort` flags to `fm-spawn.sh`.
+The shell scripts discover and validate both files but do not match their natural-language rules; firstmate chooses the best matching rule with judgment, resolves its profile object or array under the operating contract in `AGENTS.md` section 4 and `quota-array-dispatch`, and passes only concrete `--harness`, `--model`, `--effort`, and (for a claude profile) `--advisor` flags to `fm-spawn.sh`.
 When either file is effective, `fm-spawn.sh` enforces that contract by refusing crewmate and scout spawns that lack an explicit harness (`--harness`, a positional adapter, or a raw launch command).
 Batch spawns satisfy the same requirement with a shared `--harness`.
 Secondmate spawns are exempt and still resolve through `config/secondmate-harness` and its optional model and effort tokens.
@@ -283,13 +283,13 @@ This section is the single owner of the canonical schema and its per-field seman
     {
       "when": "<natural-language condition describing a kind of task>",
       "use": [
-        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>" }
+        { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>", "advisor": "<optional claude advisor model, claude harness only>" }
       ],
       "why": "<optional rationale that helps firstmate choose>"
     }
   ],
   "default": [
-    { "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>" }
+    { "harness": "<adapter>", "model": "<optional model>", "effort": "<optional effort>", "advisor": "<optional claude advisor model>" }
   ]
 }
 ```
@@ -297,15 +297,24 @@ This section is the single owner of the canonical schema and its per-field seman
 Per rule, `when` and `use` are required.
 Both `use` and the optional top-level `default` accept either one profile object or a non-empty array of profile objects.
 The single-object form stays fully backward-compatible, and every profile needs `harness`.
-Profile `model` and `effort` fields and rule `why` are optional.
+Profile `model`, `effort`, and `advisor` fields and rule `why` are optional.
 An omitted model uses the selected harness's default model; an omitted effort uses the generic effort fallback owned by `harness-adapters`.
 Every profile array is an implicit quota-aware choice resolved through `quota-array-dispatch`.
+
+The optional `advisor` field attaches Claude Code's advisor tool to a `claude` spawn, pairing the profile's main model with a stronger advisor model that Claude consults at decision points before committing to an approach, on recurring errors, and before declaring work done.
+It maps to Claude Code's `--advisor` launch flag, so a tier can run a cheaper main model with a stronger advisor as a safety net.
+The value is either an alias (`fable`, `opus`, `sonnet`) or a full claude model id (for example `claude-opus-4-8`), passed through verbatim.
+`advisor` is claude-only: it is rejected on any non-`claude` profile because the advisor tool is not valid for the codex, opencode, pi, pi-signed, grok, kimi, or muse adapters.
+The feature is experimental and Anthropic-API-only; advisor consultation consumes tokens at the advisor model's own rate and counts toward usage limits.
+The advisor must be at least as capable as the main model or Claude Code drops it, so a mis-paired or unavailable advisor degrades to no advisor at launch without erroring in a background session; the pairing itself is therefore not validated in configuration.
+Using Fable as the advisor may require a one-time usage-credit consent before it attaches.
 If no dispatch rule fits, firstmate resolves `default` through the same object-or-array path before falling back to `config/crew-harness`.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
+An `advisor` on a non-`claude` profile is a hard error: bootstrap reports it as a `CREW_DISPATCH` diagnostic, and `fm-spawn.sh` refuses an `--advisor` paired with any non-`claude` harness.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.
 Bootstrap validates every present dispatch file with `jq`.
 Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstrap names each active local or tracked file, emits one `BOOTSTRAP_INFO:` fact per rule, and emits one fact for each optional default profile set.
-Malformed JSON, an empty or malformed rule/default array, an unverified harness, or an effort value unsupported by that harness is reported against its file as `CREW_DISPATCH: invalid <path> - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
+Malformed JSON, an empty or malformed rule/default array, an unverified harness, an effort value unsupported by that harness, or an `advisor` on a non-`claude` profile is reported against its file as `CREW_DISPATCH: invalid <path> - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
 While either file is effective, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration in either layer must be reported and corrected rather than selected around.
 Secondmate homes inherit the primary's local file when one exists, while their synced repository copy supplies the same tracked layer.
 
