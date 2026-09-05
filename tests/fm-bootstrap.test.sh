@@ -1183,13 +1183,19 @@ default array is accepted^{"default":[{"harness":"pi","model":"anthropic/claude-
 one-element default array is accepted^{"default":[{"harness":"codex"}]}^empty^
 empty array use is flagged^{"rules":[{"when":"big feature","use":[]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each rule needs at least one use profile
 array profile without harness is flagged^{"rules":[{"when":"big feature","use":[{"model":"gpt-5.5"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each use profile needs harness
-array profile with malformed model is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","model":5}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model and effort must be non-empty strings when present
+array profile with malformed model is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","model":5}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model, effort, and advisor must be non-empty strings when present
 unknown select is flagged^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}],"select":"mystery"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - unknown select: mystery
 array profile unsupported effort is flagged^{"rules":[{"when":"big feature","use":[{"harness":"codex","effort":"max"}]}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: codex:max
 empty default array is flagged^{"default":[]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - default needs at least one profile
 non-object default array entry is flagged^{"default":["codex"]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each default profile must be an object
 default array profile without harness is flagged^{"default":[{"model":"gpt-5.5"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each default profile needs harness
-default array malformed effort is flagged^{"default":[{"harness":"codex","effort":3}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - default profile model and effort must be non-empty strings when present
+default array malformed effort is flagged^{"default":[{"harness":"codex","effort":3}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - default profile model, effort, and advisor must be non-empty strings when present
+claude advisor profile is accepted^{"rules":[{"when":"cheap main with strong advisor","use":{"harness":"claude","model":"sonnet","effort":"high","advisor":"opus"}}]}^empty^
+claude full-model-id advisor is accepted^{"default":{"harness":"claude","advisor":"claude-opus-4-8"}}^empty^
+advisor on a non-claude harness is flagged^{"rules":[{"when":"codex with advisor","use":{"harness":"codex","model":"gpt-5","advisor":"opus"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - advisor is only supported on the claude harness: codex:opus
+advisor on a default non-claude profile is flagged^{"default":[{"harness":"grok","advisor":"opus"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - advisor is only supported on the claude harness: grok:opus
+empty advisor string is flagged^{"rules":[{"when":"claude empty advisor","use":{"harness":"claude","advisor":""}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model, effort, and advisor must be non-empty strings when present
+non-string advisor is flagged^{"rules":[{"when":"claude bad advisor","use":{"harness":"claude","advisor":5}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model, effort, and advisor must be non-empty strings when present
 ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
