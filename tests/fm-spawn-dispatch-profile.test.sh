@@ -420,6 +420,71 @@ test_claude_threads_model_and_effort() {
   pass "claude receives --model and --effort profile flags"
 }
 
+test_claude_threads_advisor() {
+  local rec id out status launch
+  id=profile-claude-advisor-z2a
+  rec=$(make_spawn_case profile-claude-advisor claude "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort high --advisor opus)
+  status=$?
+  expect_code 0 "$status" "claude spawn with an advisor should succeed"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" claude sonnet high
+  assert_grep "advisor=opus" "$HOME_DIR/state/$id.meta" "meta missing advisor=opus"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "claude --dangerously-skip-permissions --model 'sonnet' --effort 'high' --advisor 'opus'" \
+    "claude launch did not thread the advisor flag after model and effort"
+  pass "claude receives a correctly-quoted --advisor flag after --model and --effort"
+}
+
+test_claude_advisor_without_model_or_effort() {
+  local rec id out status launch
+  id=profile-claude-advisor-only-z2b
+  rec=$(make_spawn_case profile-claude-advisor-only claude "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --advisor claude-opus-4-8)
+  status=$?
+  expect_code 0 "$status" "claude spawn with an advisor and no model/effort should succeed"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
+  assert_grep "advisor=claude-opus-4-8" "$HOME_DIR/state/$id.meta" "meta missing full-model-id advisor"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "claude --dangerously-skip-permissions --advisor 'claude-opus-4-8'" \
+    "claude launch did not thread a full-model-id advisor when model and effort were omitted"
+  pass "claude threads a full-model-id advisor even without model or effort flags"
+}
+
+test_claude_without_advisor_omits_flag_and_records_default() {
+  local rec id out status launch
+  id=profile-claude-noadvisor-z2c
+  rec=$(make_spawn_case profile-claude-noadvisor claude "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "claude spawn without an advisor should succeed"
+  assert_grep "advisor=default" "$HOME_DIR/state/$id.meta" "meta missing advisor=default marker"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "--advisor" "claude launch must not add an advisor flag when none was requested"
+  pass "claude omits --advisor and records the default marker when no advisor is requested"
+}
+
+test_advisor_refused_on_non_claude_harness() {
+  local rec id out status
+  id=profile-codex-advisor-z2d
+  rec=$(make_spawn_case profile-codex-advisor codex "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model gpt-5 --advisor opus)
+  status=$?
+  expect_code 1 "$status" "an advisor paired with a non-claude harness should refuse the spawn"
+  assert_contains "$out" "--advisor is only supported on the claude harness" \
+    "non-claude advisor refusal did not name the claude-only requirement"
+  assert_absent "$HOME_DIR/state/$id.meta" "non-claude advisor refusal wrote task metadata"
+  [ ! -s "$LAUNCH_LOG" ] || fail "non-claude advisor refusal typed a launch command"
+  pass "an advisor is refused on a non-claude harness before any endpoint or metadata"
+}
+
 test_codex_threads_model_and_effort() {
   local rec id out status launch
   id=profile-codex-z3
@@ -741,6 +806,25 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+test_advisor_refused_on_secondmate_spawn() {
+  local rec id sm out status
+  id=profile-secondmate-advisor-z17
+  rec=$(make_spawn_case profile-secondmate-advisor claude "$id")
+  read_case_record "$rec"
+  printf '%s\n' claude > "$HOME_DIR/config/secondmate-harness"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate --advisor opus)
+  status=$?
+  expect_code 1 "$status" "an advisor paired with a secondmate spawn should refuse the spawn"
+  assert_contains "$out" "--advisor is not supported for secondmate spawns" \
+    "secondmate advisor refusal did not name the crewmate/scout-only requirement"
+  assert_absent "$HOME_DIR/state/$id.meta" "secondmate advisor refusal wrote task metadata"
+  [ ! -s "$LAUNCH_LOG" ] || fail "secondmate advisor refusal typed a launch command"
+  pass "an advisor is refused on a secondmate spawn before any endpoint or metadata"
+}
+
 test_no_profile_keeps_claude_profile_defaults
 test_relative_home_overrides_launch_with_absolute_cross_process_paths
 test_home_defaults_preserve_absolute_or_resolve_relative_paths
@@ -753,6 +837,10 @@ test_active_dispatch_profile_allows_explicit_harness
 test_active_dispatch_profile_allows_positional_harness
 test_active_dispatch_profile_allows_raw_launch_command
 test_claude_threads_model_and_effort
+test_claude_threads_advisor
+test_claude_advisor_without_model_or_effort
+test_claude_without_advisor_omits_flag_and_records_default
+test_advisor_refused_on_non_claude_harness
 test_codex_threads_model_and_effort
 test_codex_omits_invalid_max_effort
 test_grok_threads_model_and_reasoning_effort
@@ -769,5 +857,6 @@ test_claude_forwards_firstmate_config_dir_when_set
 test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
 test_active_dispatch_profile_does_not_block_secondmate_launch
+test_advisor_refused_on_secondmate_spawn
 
 echo "# all fm-spawn-dispatch-profile tests passed"
