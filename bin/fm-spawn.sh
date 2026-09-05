@@ -3,7 +3,7 @@
 # secondmate in its isolated firstmate home.
 # Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--github-host <canonical-host>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--advisor <model>] [--backend <name>]
 #        fm-spawn.sh <task-id> <project-dir> --scout [--github-host <canonical-host>] [--github-auth-required[=<private-repository-read|organization-membership-read>]] [--github-organization <organization>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--advisor <model>] [--backend <name>]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--advisor <model>] [--backend <name>] --secondmate
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   GitHub authentication-context gate (bin/fm-github-context-lib.sh owns the
 #   decision). A ship push and an authentication scout verify their exact
 #   destination BEFORE any worktree, window, or endpoint is created, and refuse to
@@ -65,6 +65,8 @@
 #   The value may be an alias (fable, opus, sonnet) or a full claude model id and
 #   is passed through verbatim - Claude Code drops an ineligible advisor at launch
 #   without erroring in a background session, so the pairing is not validated here.
+#   It is a crewmate/scout dispatch axis only: it is accepted on ship, scout, and
+#   their relaunch, and refused on every --secondmate spawn (fresh or relaunch).
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -374,6 +376,18 @@ done
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$ADVISOR_SET" -eq 0 ] || [ -n "$ADVISOR" ] || { echo "error: --advisor requires a non-empty value" >&2; exit 1; }
+# The advisor tool is a crewmate/scout dispatch axis only. A secondmate is a
+# firstmate instance whose harness/model/effort resolve through the secondmate
+# wire protocol, which carries no advisor, so a secondmate spawn silently
+# dropping --advisor would contradict the fail-closed contract. Reject it here
+# for every fresh secondmate spawn (local and remote alike), before the remote
+# secondmate branch returns ahead of the claude-only advisor guard. A relaunch
+# whose recorded kind is secondmate is rejected separately once that kind is
+# read from the task record.
+if [ "$ADVISOR_SET" -eq 1 ] && [ "$RELAUNCH" -eq 0 ] && [ "$KIND" = secondmate ]; then
+  echo "error: --advisor is not supported for secondmate spawns; it is a crewmate/scout dispatch axis" >&2
+  exit 1
+fi
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
@@ -1178,6 +1192,13 @@ if [ "$RELAUNCH" -eq 1 ]; then
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   RELAUNCH_RECORDED_KIND=$KIND
   [ -n "$KIND" ] || KIND=ship
+  # --advisor is a crewmate/scout dispatch axis only; a secondmate relaunch that
+  # carries it is refused just as a fresh secondmate spawn is, now that the
+  # recorded kind is known.
+  if [ "$ADVISOR_SET" -eq 1 ] && [ "$KIND" = secondmate ]; then
+    echo "error: --advisor is not supported for secondmate spawns; it is a crewmate/scout dispatch axis" >&2
+    exit 1
+  fi
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
   YOLO=$(fm_meta_get "$RELAUNCH_META" yolo)
   # The recorded GitHub selection is authoritative and immutable across a

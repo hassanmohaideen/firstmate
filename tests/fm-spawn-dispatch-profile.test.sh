@@ -806,6 +806,25 @@ test_active_dispatch_profile_does_not_block_secondmate_launch() {
   pass "active crew-dispatch profile does not block secondmate launches"
 }
 
+test_advisor_refused_on_secondmate_spawn() {
+  local rec id sm out status
+  id=profile-secondmate-advisor-z17
+  rec=$(make_spawn_case profile-secondmate-advisor claude "$id")
+  read_case_record "$rec"
+  printf '%s\n' claude > "$HOME_DIR/config/secondmate-harness"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate --advisor opus)
+  status=$?
+  expect_code 1 "$status" "an advisor paired with a secondmate spawn should refuse the spawn"
+  assert_contains "$out" "--advisor is not supported for secondmate spawns" \
+    "secondmate advisor refusal did not name the crewmate/scout-only requirement"
+  assert_absent "$HOME_DIR/state/$id.meta" "secondmate advisor refusal wrote task metadata"
+  [ ! -s "$LAUNCH_LOG" ] || fail "secondmate advisor refusal typed a launch command"
+  pass "an advisor is refused on a secondmate spawn before any endpoint or metadata"
+}
+
 test_no_profile_keeps_claude_profile_defaults
 test_relative_home_overrides_launch_with_absolute_cross_process_paths
 test_home_defaults_preserve_absolute_or_resolve_relative_paths
@@ -838,5 +857,6 @@ test_claude_forwards_firstmate_config_dir_when_set
 test_claude_omits_config_dir_prefix_when_unset
 test_non_claude_harness_ignores_config_dir
 test_active_dispatch_profile_does_not_block_secondmate_launch
+test_advisor_refused_on_secondmate_spawn
 
 echo "# all fm-spawn-dispatch-profile tests passed"
