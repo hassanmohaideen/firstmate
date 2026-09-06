@@ -75,6 +75,9 @@ emit_status() {
   if [ -f "$state/status-head" ]; then head=$(cat "$state/status-head"); fi
   if [ -f "$state/status-branch" ]; then branch=$(cat "$state/status-branch"); fi
   if [ -f "$state/status-outcome" ]; then outcome=$(cat "$state/status-outcome"); fi
+  # status-value overrides the run status the CI monitor reports (e.g. "running",
+  # the v1.60.2+ TOON format, versus the pre-v1.60.2 "ci").
+  if [ -f "$state/status-value" ]; then status=$(cat "$state/status-value"); fi
   cat <<EOF
 run:
   id: "RUN-11"
@@ -314,6 +317,26 @@ test_all_findings_fixed_and_audited_ready() {
   out=$(run_driver "$d" audit-ready 2>&1) || fail "successful audited readiness failed: $out"
   assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' "audited readiness omitted the PR"
   pass "guarded all-findings fix reaches audited readiness"
+}
+
+test_audit_ready_accepts_running_ci_monitor_status() {
+  # v1.60.2+ no-mistakes reports the run status as "running" while the CI monitor
+  # is active, whereas pre-v1.60.2 reported "ci". audit_ready must accept both, so
+  # a green public CI reaches readiness regardless of which format the run emits.
+  local d out first second
+  d=$(new_case running-status)
+  first=$(finding mechanical auto-fix 'mechanical correction')
+  second=$(finding decision ask-user 'captain decision')
+  set_round "$d" "$first" "$second"
+  set_next "$d"
+  out=$(run_driver "$d" respond --fix mechanical,decision --instructions 'fix both' 2>&1) \
+    || fail "all-findings fix failed: $out"
+  printf 'running\n' > "$d/fake-state/status-value"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "audit-ready refused the running CI-monitor status: $out"
+  assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' \
+    "audited readiness under the running status omitted the PR"
+  pass "audit-ready accepts the v1.60.2+ running CI-monitor status, not just ci"
 }
 
 test_all_approved_and_explicit_rejection() {
@@ -1424,6 +1447,7 @@ test_claude_missing_state_store_refuses() {
 }
 
 test_all_findings_fixed_and_audited_ready
+test_audit_ready_accepts_running_ci_monitor_status
 test_all_approved_and_explicit_rejection
 # The prose-log (claude) coverage builds a fixture no-mistakes state store, which
 # needs sqlite3. It is present on every supported target (macOS, Linux CI, and any

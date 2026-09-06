@@ -1336,7 +1336,9 @@ audit_ready() {
       die "authoritative validation run outcome is passed; the PR is no longer awaiting readiness"
       ;;
     "")
-      [ "$CAPTURE_STATUS_VALUE" = ci ] \
+      # Accept both "ci" (pre-v1.60.2 no-mistakes TOON format) and "running"
+      # (v1.60.2+ format, where the run status stays "running" during CI monitoring).
+      [ "$CAPTURE_STATUS_VALUE" = ci ] || [ "$CAPTURE_STATUS_VALUE" = running ] \
         || die "authoritative validation run is not in the active CI monitor: ${CAPTURE_STATUS_VALUE:-unknown}"
       if ! ci_logs=$("$NM" axi logs --run "$CAPTURE_RUN_ID" --step ci); then
         die "public CI log is unavailable for run $CAPTURE_RUN_ID"
