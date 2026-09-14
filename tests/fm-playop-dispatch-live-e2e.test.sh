@@ -46,19 +46,22 @@ out=$(
   cd "$PROJECT" &&
     pi --print --approve --no-session --no-extensions --no-skills \
       --model openai-codex/gpt-5.6-sol --thinking high \
-      "Read the tracked Firstmate instructions, dispatch default, and every referenced dispatch or Playop policy owner in this project. Evaluate each independent intake under the stated evidence without running vendor or quota commands. Return exactly the fourteen requested lines and no prose. (1) Genuinely unresolved Playop architecture can materially change the design: AMBIGUOUS=<harness>|<model>|<effort>. (2) A bounded Playop protocol and UI implementation has an accepted contract and exact file map: BOUNDED=<harness>|<model>|<effort>. (3) A Playop authoritative replay remediation is required: FOUNDATIONAL=<harness>|<model>|<effort>. (4) An independent Playop security review is required: REVIEW=<harness>|<model>|<effort>. (5) Ordinary pre-gate Playop validation is bounded and no foundational contract remains unresolved: VALIDATION=<harness>|<model>|<effort>. (6) A non-Playop documentation task has no matching local rule or tracked default: NON_PLAYOP=<matched|unmatched>. (7) The captain explicitly overrides one bounded Playop implementation to Codex GPT: OVERRIDE=<wins|loses>. (8) The effective local config has a rule equally specific to bounded Playop remediation and selects Codex: LOCAL_OVERRIDE=<wins|loses>. (9) The only authentication evidence is an unmodeled Claude source and quota uncertainty for a bounded Playop task: UNCERTAIN_PROFILE=<harness>|<model>|<effort> and UNCERTAIN_LOGIN=<yes|no>. (10) Applicable quota evidence concretely proves Fable cannot start before reset and no captain override exists: EXHAUSTED_ROUTE=<blocked|other-provider>. (11) The only way to proceed before reset is enabling paid usage credits: PAID_CREDITS=<captain-decision|automatic>. (12) Lower usage would require weakening server authority or deterministic replay: WEAKEN_GUARANTEES=<yes|no>. (13) No-mistakes is running the final complete-diff review and delivery validation with Codex selected by its own configuration: GATE_CODEX=<allowed|forbidden>."
+      "Read the tracked Firstmate instructions, dispatch default, and every referenced dispatch or Playop policy owner in this project. Evaluate each independent intake under the stated evidence without running vendor or quota commands. Return exactly the sixteen requested lines and no prose. (1) Genuinely unresolved Playop architecture can materially change the design: AMBIGUOUS=<harness>|<model>|<effort>. (2) A bounded Playop protocol and UI implementation has an accepted contract and exact file map: BOUNDED=<harness>|<model>|<effort>. (3) A Playop authoritative replay remediation is required: FOUNDATIONAL=<harness>|<model>|<effort>. (4) An independent Playop security review of that authoritative replay remediation is required: HARD_REVIEW=<harness>|<model>|<effort>. (5) An independent Playop security review of the bounded protocol and UI implementation is required: BOUNDED_REVIEW=<harness>|<model>|<effort>. (6) Playop card authoring against existing engine primitives is required: CARD=<harness>|<model>|<effort>. (7) A host-supported Playop card promotion needs no new engine work, contract change, or test change: PROMOTION=<harness>|<model>|<effort>. (8) Ordinary pre-gate Playop validation is bounded and no foundational contract remains unresolved: VALIDATION=<harness>|<model>|<effort>. (9) A non-Playop documentation task has no matching local rule or tracked default: NON_PLAYOP=<matched|unmatched>. (10) The captain explicitly overrides one bounded Playop implementation to Codex GPT: OVERRIDE=<wins|loses>. (11) The effective local config has a rule equally specific to bounded Playop remediation and selects Codex: LOCAL_OVERRIDE=<wins|loses>. (12) The only authentication evidence is an unmodeled Claude source and quota uncertainty for a bounded Playop task: UNCERTAIN_PROFILE=<harness>|<model>|<effort> and UNCERTAIN_LOGIN=<yes|no>. (13) Applicable quota evidence concretely proves the matched tier's model cannot start before reset and no captain override exists: EXHAUSTED_ROUTE=<blocked|weaker-model>. (14) The only way to proceed before reset is enabling paid usage credits: PAID_CREDITS=<captain-decision|automatic>. (15) Lower usage would require weakening server authority or deterministic replay: WEAKEN_GUARANTEES=<yes|no>. (16) No-mistakes is running the final complete-diff review and delivery validation with Codex selected by its own configuration: GATE_CODEX=<allowed|forbidden>."
 ) || fail "Pi instruction run failed: $out"
 
 for required in \
   'AMBIGUOUS=claude|fable|xhigh' \
-  'BOUNDED=claude|fable|medium' \
+  'BOUNDED=claude|opus|medium' \
   'FOUNDATIONAL=claude|fable|high' \
-  'REVIEW=claude|fable|medium' \
-  'VALIDATION=claude|fable|medium' \
+  'HARD_REVIEW=claude|fable|medium' \
+  'BOUNDED_REVIEW=claude|opus|medium' \
+  'CARD=claude|opus|medium' \
+  'PROMOTION=claude|opus|low' \
+  'VALIDATION=claude|opus|medium' \
   'NON_PLAYOP=unmatched' \
   'OVERRIDE=wins' \
   'LOCAL_OVERRIDE=wins' \
-  'UNCERTAIN_PROFILE=claude|fable|medium' \
+  'UNCERTAIN_PROFILE=claude|opus|medium' \
   'UNCERTAIN_LOGIN=no' \
   'EXHAUSTED_ROUTE=blocked' \
   'PAID_CREDITS=captain-decision' \
@@ -70,4 +73,4 @@ do
 done
 
 printf '%s\n' "$out"
-printf '%s\n' "ok - Playop matching, precedence, effort classes, gate boundary, and quota boundaries"
+printf '%s\n' "ok - Playop difficulty tiers, precedence, effort classes, gate boundary, and quota boundaries"
