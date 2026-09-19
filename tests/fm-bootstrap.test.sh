@@ -1108,13 +1108,25 @@ test_tracked_crew_dispatch_defaults_and_local_precedence() {
   assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active defaults/crew-dispatch.json" \
     "tracked dispatch default was not selected when local config was absent"
   assert_contains "$out" "-> claude/fable/xhigh" \
-    "tracked ambiguous Playop profile lost Claude/Fable xhigh axes"
-  assert_contains "$out" "The task is an independent Playop domain, security, or coverage review. -> claude/fable/medium" \
-    "tracked independent Playop review profile lost Claude/Fable medium axes"
+    "tracked unresolved-architecture Playop profile lost Claude/Fable xhigh axes"
   assert_contains "$out" "source-side privacy, persistence, authorization, replay, or authoritative undo. -> claude/fable/high" \
     "tracked foundational Playop profile lost Claude/Fable high axes"
-  assert_contains "$out" "any other Playop implementation, architecture, investigation, remediation, validation, bounded contract, protocol, UI, fixture, documentation, or test work. -> claude/fable/medium" \
-    "tracked bounded Playop profile lost Claude/Fable medium axes"
+  assert_contains "$out" "unresolved-architecture tier or the foundational privacy, persistence, authorization, replay, or authoritative-undo tier. -> claude/fable/medium" \
+    "tracked hard-class Playop review profile lost Claude/Fable medium axes"
+  assert_contains "$out" "reviewing a change that belongs to a bounded or promotion-only tier. -> claude/opus/medium" \
+    "tracked ordinary Playop review profile lost Claude/Opus medium axes"
+  assert_contains "$out" "changes no engine behavior, contract, or test. -> claude/opus/low" \
+    "tracked promotion-only Playop profile lost Claude/Opus low axes"
+  assert_contains "$out" "which no harder tier above matches. -> claude/opus/medium" \
+    "tracked bounded Playop profile lost Claude/Opus medium axes"
+  case "$out" in
+    *"authoritative-undo tier. -> claude/fable/medium"*"bounded or promotion-only tier. -> claude/opus/medium"*) : ;;
+    *) fail "tracked Playop rules must order the Fable hard-class review before the Opus ordinary review" ;;
+  esac
+  case "$out" in
+    *"contract, or test. -> claude/opus/low"*"no harder tier above matches. -> claude/opus/medium"*) : ;;
+    *) fail "tracked Playop rules must order the promotion-only tier before the bounded catch-all tier" ;;
+  esac
 
   printf '%s\n' '{"rules":[{"when":"local override","use":{"harness":"codex","model":"gpt-local","effort":"low"}}]}' \
     > "$case_dir/home/config/crew-dispatch.json"

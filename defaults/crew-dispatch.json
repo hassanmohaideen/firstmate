@@ -3,22 +3,32 @@
     {
       "when": "The task is genuinely unresolved Playop architecture, design, migration, or investigation whose outcome can materially change the design, excluding an independent domain, security, or coverage review.",
       "use": { "harness": "claude", "model": "fable", "effort": "xhigh" },
-      "why": "Use Claude Code with Fable at xhigh only for genuinely unresolved Playop architecture."
-    },
-    {
-      "when": "The task is an independent Playop domain, security, or coverage review.",
-      "use": { "harness": "claude", "model": "fable", "effort": "medium" },
-      "why": "Keep every required independent Playop review on Claude Code with Fable at medium effort."
+      "why": "Hardest Playop tier: reserve Claude Code with Fable at xhigh for unresolved design whose answer changes what gets built."
     },
     {
       "when": "The Playop task is battle resolution or implementation, architecture, investigation, remediation, or validation whose accepted scope involves source-side privacy, persistence, authorization, replay, or authoritative undo.",
       "use": { "harness": "claude", "model": "fable", "effort": "high" },
-      "why": "Use Claude Code with Fable at high effort for foundational Playop authority and state contracts."
+      "why": "Hard Playop tier: reserve Claude Code with Fable at high effort for foundational authority and state contracts where a subtle error is expensive."
     },
     {
-      "when": "The task is any other Playop implementation, architecture, investigation, remediation, validation, bounded contract, protocol, UI, fixture, documentation, or test work.",
+      "when": "The task is an independent Playop domain, security, or coverage review of a change that itself belongs to the unresolved-architecture tier or the foundational privacy, persistence, authorization, replay, or authoritative-undo tier.",
       "use": { "harness": "claude", "model": "fable", "effort": "medium" },
-      "why": "Use Claude Code with Fable at medium effort for bounded Playop work."
+      "why": "Hard-review tier: a review is only as strong as the model reading it, so reviews of the hard classes stay on Claude Code with Fable at medium effort."
+    },
+    {
+      "when": "The task is any other independent Playop domain, security, or coverage review, reviewing a change that belongs to a bounded or promotion-only tier.",
+      "use": { "harness": "claude", "model": "opus", "effort": "medium" },
+      "why": "Ordinary-review tier: reviewing bounded Playop work is well-scoped reasoning, so Claude Code with Opus at medium effort is the right difficulty match."
+    },
+    {
+      "when": "The Playop task is promotion-only or host-supported card promotion with no new engine work, or is UI-copy-only or documentation-only work that changes no engine behavior, contract, or test.",
+      "use": { "harness": "claude", "model": "opus", "effort": "low" },
+      "why": "Easiest Playop tier: mechanical promotion, copy, and documentation-only edits need Claude Code with Opus at low effort, not a deeper model or a deeper effort class."
+    },
+    {
+      "when": "The task is Playop card authoring against existing engine primitives, bounded contract, protocol, UI, fixture, documentation, or test work that accompanies engine behavior, straightforward remediation, or any other bounded Playop implementation, architecture, investigation, or validation whose approach is already settled and which no harder tier above matches.",
+      "use": { "harness": "claude", "model": "opus", "effort": "medium" },
+      "why": "Bounded Playop tier: work with a settled approach and an exact file map is real engineering depth without unresolved design, so Claude Code with Opus at medium effort fits it."
     }
   ]
 }
