@@ -172,7 +172,7 @@ now_ms() {
 family_for_basename_into() {
   case "$1" in
     fm-arm-pretool-check.test.sh|fm-ask-user-authority.test.sh|\
-    fm-brief.test.sh|fm-vendor-auth-probe.test.sh|\
+    fm-brief.test.sh|fm-vendor-auth-probe.test.sh|fm-jev.test.sh|\
     fm-calm-pi-extension.test.sh|fm-cd-pretool-check.test.sh|\
     fm-ci-deadlines.test.sh|fm-classify-decision-key.test.sh|\
     fm-composer-ghost.test.sh|fm-composer-lib.test.sh|\
@@ -475,6 +475,7 @@ tests/fm-fleet-snapshot-view.test.sh 15503
 tests/fm-fleet-sync.test.sh 29043
 tests/fm-gate-refuse.test.sh 2950
 tests/fm-github-context-lib.test.sh 4594
+tests/fm-jev.test.sh 3400
 tests/fm-gitignore-config.test.sh 70
 tests/fm-gotmp.test.sh 709
 tests/fm-grok-continuity-live-e2e.test.sh 35

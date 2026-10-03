@@ -80,6 +80,7 @@ config/startup-memory-budget     primary-authoritative per-home startup-memory b
 config/herdr-presentation-spaces  optional "off" opt-out from, or "on" opt-in to, Herdr's default-on disposable single-task visual projection, which is unconfigured-default-on only at or above a Herdr version floor; LOCAL, gitignored; inherited by secondmate homes; see docs/herdr-backend.md "Presentation spaces"
 config/trace-context  optional presence flag enabling default-off native W3C trace-context propagation to spawned agents; LOCAL, gitignored; inherited by secondmate homes; see docs/configuration.md "Trace context propagation" and docs/trace-context.md
 config/discord-bot.env  optional private owner/guild/channel-bound self-hosted Discord bot configuration; LOCAL, gitignored, mode 0600, and not inherited; see docs/discord-bot.md
+config/typesafe.env  optional TypeSafe Jev dispatch-advisory key; LOCAL, gitignored, mode 0600, and not inherited; see docs/configuration.md "TypeSafe Jev dispatch advisory"
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated Relay watcher cadence; LOCAL, gitignored; source before arming watcher when present

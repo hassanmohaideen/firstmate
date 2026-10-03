@@ -106,6 +106,7 @@ When changing any primary watcher adapter, update `docs/supervision-protocols/`,
 
 `bin/fm-spawn.sh` accepts concrete `--harness`, `--model`, and `--effort` values chosen by firstmate at intake.
 Do not make the shell scripts parse or match natural-language dispatch rules.
+The one exception is the optional Jev second opinion below, which forwards rule text to an external advisory and prints data but never selects a rule or effort.
 
 Effort precedence is an explicit per-task captain instruction first, then any applicable standing dispatch profile or secondmate pin, then the generic fallback below.
 Never replace an effort value supplied by either higher-precedence source.
@@ -150,6 +151,21 @@ A discovery surface you could not reach establishes nothing; report that as unce
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
+
+## Optional Jev dispatch second opinion
+
+When `bin/fm-jev.sh status` reports a configured key, firstmate MAY consult `bin/fm-jev.sh dispatch-tier --task-file <task text> --task-id <id>` at crewmate or scout intake as a second opinion on the dispatch rule and effort; `effort` rates ambiguity alone when no rule question is open.
+`docs/configuration.md` "TypeSafe Jev dispatch advisory" owns the key file, data egress, audit log, and hard exclusions, and the script header owns its mechanics.
+
+1. Decide first: settle your own rule and effort choice before consulting, so the advice cannot anchor it.
+2. On `JEV_UNAVAILABLE` or a disabled key, proceed with your choice unchanged; never retry, wait, or escalate for it.
+3. When Jev agrees, or its confidence is low, proceed.
+4. When Jev confidently favors a different tier or effort, re-read both rule texts against the task once, then keep or switch with judgment; your final choice stands and nothing switches automatically.
+5. After every consult, record the actual choice and whether you followed the advice with `bin/fm-jev.sh record --task-id <id> --tier <label|none> --effort <effort> --followed yes|no|partial --reason <short why>`, so `bin/fm-jev.sh report` can judge Jev's value through use.
+
+The advice ranks rules, never a profile array's candidates: a matched array still goes through `quota-array-dispatch`, and the strongest-reasoning-class and effort precedence rules in "Launch profile axes" are untouched.
+Never consult Jev for merge approval or PR readiness, ask-user dispositions, destructive, irreversible, or security-sensitive determinations, quota-array profile selection, or any watcher, away-mode, supervision, or startup path.
+Treat its output as internal evidence and never relay it verbatim to the captain.
 
 ## no-mistakes skill invocation
 
