@@ -93,6 +93,9 @@ run:
     pr,$([ "$phase" -gt 0 ] && printf completed || printf pending),0,0
     ci,$([ "$phase" -gt 0 ] && printf running || printf pending),0,0
 EOF
+  # branch-sync, when present, is the verbatim nested branch_sync object that
+  # current-branch axi status prints after the run block.
+  if [ -f "$state/branch-sync" ]; then cat "$state/branch-sync"; fi
 }
 
 emit_review_logs() {
@@ -515,6 +518,114 @@ test_pipeline_descendant_head_is_accepted() {
   run_driver "$d" audit-ready >/dev/null 2>&1 \
     || fail "pipeline descendant validation head was refused during audit"
   pass "pipeline fix commits may advance the run head beyond local HEAD"
+}
+
+# Write the nested branch_sync object current-branch axi status reports while the
+# pipeline owns the branch. Arguments override one field each, as key=value.
+write_branch_sync() {  # <dir> <submitted> <current> [state=..] [run=..] [clean=..] [local_head=..]
+  local d=$1 submitted=$2 current=$3 state=pipeline_owned run=RUN-11 clean=true local_head kv
+  local_head=$(git -C "$d" rev-parse HEAD)
+  shift 3
+  for kv in "$@"; do
+    case "$kv" in
+      state=*) state=${kv#state=} ;;
+      run=*) run=${kv#run=} ;;
+      clean=*) clean=${kv#clean=} ;;
+      local_head=*) local_head=${kv#local_head=} ;;
+    esac
+  done
+  cat > "$d/fake-state/branch-sync" <<EOF
+branch_sync:
+  state: $state
+  changed: false
+  local:
+    branch: $(git -C "$d" symbolic-ref --short HEAD)
+    head: $local_head
+    clean: $clean
+  pipeline:
+    run: "$run"
+    status: running
+    phase: pre_push
+    submitted_head: $submitted
+    current_head: $current
+    pushed_head: ""
+  relation: diverged
+  safety: blocked_pipeline_owned
+  next_action:
+    code: continue_active_run
+    command: no-mistakes axi status
+EOF
+}
+
+# A pipeline-owned rebase that rewrote history: a new base commit plus the run's
+# change replayed on it, so the rebased head does not descend from local HEAD.
+rebased_pipeline_head() {  # <dir>
+  local d=$1 base tree newbase
+  base=$(git -C "$d" rev-parse HEAD^)
+  tree=$(git -C "$d" rev-parse 'HEAD^{tree}')
+  newbase=$(printf 'upstream advance\n' | git -C "$d" commit-tree "$(git -C "$d" rev-parse "$base^{tree}")" -p "$base")
+  printf 'rebased change\n' | git -C "$d" commit-tree "$tree" -p "$newbase"
+}
+
+new_rebased_case() {  # <name>; prints "<dir> <local-head> <rebased-head>"
+  local d f local_head rebased
+  d=$(new_case "$1")
+  f=$(finding rebased ask-user)
+  set_round "$d" "$f"
+  git -C "$d" commit --allow-empty -qm 'run change'
+  local_head=$(git -C "$d" rev-parse HEAD)
+  rebased=$(rebased_pipeline_head "$d")
+  git -C "$d" merge-base --is-ancestor "$local_head" "$rebased" \
+    && fail "fixture rebased head unexpectedly descends from local HEAD"
+  printf '%s\n' "$rebased" > "$d/fake-state/status-head"
+  printf '%s %s %s\n' "$d" "$local_head" "$rebased"
+}
+
+test_pipeline_owned_rebased_head_is_accepted() {
+  local d local_head rebased out
+  read -r d local_head rebased <<<"$(new_rebased_case pipeline-owned-rebase)"
+  write_branch_sync "$d" "$local_head" "$rebased"
+
+  out=$(run_driver "$d" respond --approve rebased 2>&1) \
+    || fail "pipeline-owned rebased head was refused: $out"
+  [ "$(calls_count "$d")" -eq 1 ] || fail "accepted pipeline-owned rebase did not invoke the response"
+  [ "$(jq -r '.runs[0].rounds[0].head' "$(ledger "$d")")" = "$rebased" ] \
+    || fail "pipeline-owned rebased head was not attached to the disposition"
+  out=$(run_driver "$d" audit-ready 2>&1) \
+    || fail "pipeline-owned rebased head was refused during audit: $out"
+  assert_contains "$out" "head=$rebased" "readiness did not report the pipeline-owned rebased head"
+  pass "a pipeline-owned pre-push rebase head is accepted when local HEAD is the submitted head"
+}
+
+test_pipeline_owned_rebase_refusals_are_preserved() {
+  local d local_head rebased out rc label other
+  for label in no-sync not-owned other-run dirty local-advanced current-mismatch reported-local-mismatch; do
+    read -r d local_head rebased <<<"$(new_rebased_case "owned-refuse-$label")"
+    case "$label" in
+      no-sync) ;;
+      not-owned) write_branch_sync "$d" "$local_head" "$rebased" state=custody_returned ;;
+      other-run) write_branch_sync "$d" "$local_head" "$rebased" run=RUN-OTHER ;;
+      dirty) write_branch_sync "$d" "$local_head" "$rebased" clean=false ;;
+      local-advanced)
+        write_branch_sync "$d" "$local_head" "$rebased"
+        git -C "$d" commit --allow-empty -qm 'local work outside the run'
+        write_branch_sync "$d" "$local_head" "$rebased"
+        ;;
+      current-mismatch)
+        other=$(printf 'unrelated\n' | git -C "$d" commit-tree "$(git -C "$d" rev-parse 'HEAD^{tree}')")
+        write_branch_sync "$d" "$local_head" "$other"
+        ;;
+      reported-local-mismatch)
+        write_branch_sync "$d" "$local_head" "$rebased" local_head="$rebased"
+        ;;
+    esac
+    out=$(run_driver "$d" respond --approve rebased 2>&1); rc=$?
+    [ "$rc" -ne 0 ] || fail "$label: an unbound head move was accepted for response"
+    assert_contains "$out" 'stale-head mismatch' "$label: refusal was not a stale-head mismatch"
+    [ "$(calls_count "$d")" -eq 0 ] || fail "$label: refusal invoked the underlying response"
+    [ ! -e "$(ledger "$d")" ] || fail "$label: refusal changed ledger state"
+  done
+  pass "head moves not bound to this run's pipeline-owned custody still refuse as stale"
 }
 
 test_post_review_pipeline_commit_refuses_readiness() {
@@ -1478,6 +1589,8 @@ test_surviving_finding_refuses_readiness
 test_clean_current_status_cannot_erase_unresolved_history
 test_response_refuses_fallback_branch_and_stale_head_without_state_changes
 test_pipeline_descendant_head_is_accepted
+test_pipeline_owned_rebased_head_is_accepted
+test_pipeline_owned_rebase_refusals_are_preserved
 test_post_review_pipeline_commit_refuses_readiness
 test_no_ci_checks_refuses_readiness
 test_terminal_outcomes_reject_stale_green_ci
