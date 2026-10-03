@@ -17,18 +17,18 @@
     },
     {
       "when": "The task is any other independent Playop domain, security, or coverage review, reviewing a change that belongs to a bounded or promotion-only tier.",
-      "use": { "harness": "claude", "model": "opus", "effort": "medium" },
-      "why": "Ordinary-review tier: reviewing bounded Playop work is well-scoped reasoning, so Claude Code with Opus at medium effort is the right difficulty match."
+      "use": { "harness": "claude", "model": "claude-opus-5-5", "effort": "medium" },
+      "why": "Ordinary-review tier: reviewing bounded Playop work is well-scoped reasoning, so Claude Code with Opus 5.5 at medium effort is the right difficulty match."
     },
     {
       "when": "The Playop task is promotion-only or host-supported card promotion with no new engine work, or is UI-copy-only or documentation-only work that changes no engine behavior, contract, or test.",
-      "use": { "harness": "claude", "model": "opus", "effort": "low" },
-      "why": "Easiest Playop tier: mechanical promotion, copy, and documentation-only edits need Claude Code with Opus at low effort, not a deeper model or a deeper effort class."
+      "use": { "harness": "claude", "model": "claude-opus-5-5", "effort": "low" },
+      "why": "Easiest Playop tier: mechanical promotion, copy, and documentation-only edits need Claude Code with Opus 5.5 at low effort, not a deeper effort class."
     },
     {
       "when": "The task is Playop card authoring against existing engine primitives, bounded contract, protocol, UI, fixture, documentation, or test work that accompanies engine behavior, straightforward remediation, or any other bounded Playop implementation, architecture, investigation, or validation whose approach is already settled and which no harder tier above matches.",
-      "use": { "harness": "claude", "model": "opus", "effort": "medium" },
-      "why": "Bounded Playop tier: work with a settled approach and an exact file map is real engineering depth without unresolved design, so Claude Code with Opus at medium effort fits it."
+      "use": { "harness": "claude", "model": "claude-opus-5-5", "effort": "medium" },
+      "why": "Bounded Playop tier: work with a settled approach and an exact file map is real engineering depth without unresolved design, so Claude Code with Opus 5.5 at medium effort fits it."
     }
   ]
 }

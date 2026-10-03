@@ -443,13 +443,13 @@ test_claude_advisor_without_model_or_effort() {
   rec=$(make_spawn_case profile-claude-advisor-only claude "$id")
   read_case_record "$rec"
 
-  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --advisor claude-opus-4-8)
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --advisor claude-opus-5-5)
   status=$?
   expect_code 0 "$status" "claude spawn with an advisor and no model/effort should succeed"
   assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
-  assert_grep "advisor=claude-opus-4-8" "$HOME_DIR/state/$id.meta" "meta missing full-model-id advisor"
+  assert_grep "advisor=claude-opus-5-5" "$HOME_DIR/state/$id.meta" "meta missing full-model-id advisor"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "claude --dangerously-skip-permissions --advisor 'claude-opus-4-8'" \
+  assert_contains "$launch" "claude --dangerously-skip-permissions --advisor 'claude-opus-5-5'" \
     "claude launch did not thread a full-model-id advisor when model and effort were omitted"
   pass "claude threads a full-model-id advisor even without model or effort flags"
 }

@@ -4,7 +4,7 @@ The files and environment variables you set to operate firstmate.
 
 ## Orchestrator behavior (AGENTS.md)
 
-The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it like any prompt when the fleet is empty, or dispatch shared-repo edits to a crewmate while tasks are in flight.
+The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - dispatch every shared-repo edit to a crewmate, as section 1 requires.
 
 ## Operational home layout and state
 
@@ -299,11 +299,12 @@ Both `use` and the optional top-level `default` accept either one profile object
 The single-object form stays fully backward-compatible, and every profile needs `harness`.
 Profile `model`, `effort`, and `advisor` fields and rule `why` are optional.
 An omitted model uses the selected harness's default model; an omitted effort uses the generic effort fallback owned by `harness-adapters`.
+The tracked defaults route Claude work to Opus 5.5 (`claude-opus-5-5`), which needs Claude Code 2.1.280 or newer.
 Every profile array is an implicit quota-aware choice resolved through `quota-array-dispatch`.
 
 The optional `advisor` field attaches Claude Code's advisor tool to a `claude` spawn, pairing the profile's main model with a stronger advisor model that Claude consults at decision points before committing to an approach, on recurring errors, and before declaring work done.
 It maps to Claude Code's `--advisor` launch flag, so a tier can run a cheaper main model with a stronger advisor as a safety net.
-The value is either an alias (`fable`, `opus`, `sonnet`) or a full claude model id (for example `claude-opus-4-8`), passed through verbatim.
+The value is either an alias (`fable`, `opus`, `sonnet`) or a full claude model id (for example `claude-opus-5-5`), passed through verbatim.
 `advisor` is claude-only: it is rejected on any non-`claude` profile because the advisor tool is not valid for the codex, opencode, pi, pi-signed, grok, kimi, or muse adapters.
 The feature is experimental and Anthropic-API-only; advisor consultation consumes tokens at the advisor model's own rate and counts toward usage limits.
 The advisor must be at least as capable as the main model or Claude Code drops it, so a mis-paired or unavailable advisor degrades to no advisor at launch without erroring in a background session; the pairing itself is therefore not validated in configuration.
