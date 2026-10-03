@@ -66,7 +66,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _common(self):
         mode = self._mode()
         if mode == 'timeout':
-            time.sleep(4)
+            time.sleep(30)
         if mode == '401':
             self._reply(401, '{"error":"bad key"}')
             return None
@@ -304,7 +304,9 @@ test_failure_modes_fail_open() {
   elapsed=$(($(date +%s) - start))
   expect_code 0 "$RC" "timeout"
   assert_contains "$OUT" "JEV_UNAVAILABLE: timeout after 1s" "timeout is reported"
-  [ "$elapsed" -le 3 ] || fail "timeout must be bounded (took ${elapsed}s)"
+  # The stub stalls 30s; a generous bound proves the 1s timeout without
+  # flaking when the host is loaded.
+  [ "$elapsed" -le 15 ] || fail "timeout must be bounded (took ${elapsed}s)"
 
   set_mode malformed
   run_jev "$home" dispatch-tier --task-file "$home/task.md"
