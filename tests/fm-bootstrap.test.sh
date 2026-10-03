@@ -1107,12 +1107,12 @@ test_tracked_crew_dispatch_defaults_and_local_precedence() {
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active defaults/crew-dispatch.json" \
     "tracked dispatch default was not selected when local config was absent"
-  assert_contains "$out" "-> claude/fable/xhigh" \
-    "tracked unresolved-architecture Playop profile lost Claude/Fable xhigh axes"
-  assert_contains "$out" "source-side privacy, persistence, authorization, replay, or authoritative undo. -> claude/fable/high" \
-    "tracked foundational Playop profile lost Claude/Fable high axes"
-  assert_contains "$out" "unresolved-architecture tier or the foundational privacy, persistence, authorization, replay, or authoritative-undo tier. -> claude/fable/medium" \
-    "tracked hard-class Playop review profile lost Claude/Fable medium axes"
+  assert_contains "$out" "-> claude/claude-opus-5-5/xhigh" \
+    "tracked unresolved-architecture Playop profile lost Claude/Opus 5.5 xhigh axes"
+  assert_contains "$out" "source-side privacy, persistence, authorization, replay, or authoritative undo. -> claude/claude-opus-5-5/high" \
+    "tracked foundational Playop profile lost Claude/Opus 5.5 high axes"
+  assert_contains "$out" "unresolved-architecture tier or the foundational privacy, persistence, authorization, replay, or authoritative-undo tier. -> claude/claude-opus-5-5/medium" \
+    "tracked hard-class Playop review profile lost Claude/Opus 5.5 medium axes"
   assert_contains "$out" "reviewing a change that belongs to a bounded or promotion-only tier. -> claude/opus/medium" \
     "tracked ordinary Playop review profile lost Claude/Opus medium axes"
   assert_contains "$out" "changes no engine behavior, contract, or test. -> claude/opus/low" \
@@ -1120,8 +1120,8 @@ test_tracked_crew_dispatch_defaults_and_local_precedence() {
   assert_contains "$out" "which no harder tier above matches. -> claude/opus/medium" \
     "tracked bounded Playop profile lost Claude/Opus medium axes"
   case "$out" in
-    *"authoritative-undo tier. -> claude/fable/medium"*"bounded or promotion-only tier. -> claude/opus/medium"*) : ;;
-    *) fail "tracked Playop rules must order the Fable hard-class review before the Opus ordinary review" ;;
+    *"authoritative-undo tier. -> claude/claude-opus-5-5/medium"*"bounded or promotion-only tier. -> claude/opus/medium"*) : ;;
+    *) fail "tracked Playop rules must order the Opus 5.5 hard-class review before the ordinary Opus review" ;;
   esac
   case "$out" in
     *"contract, or test. -> claude/opus/low"*"no harder tier above matches. -> claude/opus/medium"*) : ;;
@@ -1139,7 +1139,7 @@ test_tracked_crew_dispatch_defaults_and_local_precedence() {
     "local override profile was not validated as the effective configuration"
   assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active defaults/crew-dispatch.json" \
     "tracked dispatch layer disappeared when local configuration was present"
-  assert_contains "$out" "-> claude/fable/xhigh" \
+  assert_contains "$out" "-> claude/claude-opus-5-5/xhigh" \
     "tracked Playop rule was not validated alongside local configuration"
 
   rm -f "$case_dir/home/config/crew-dispatch.json"

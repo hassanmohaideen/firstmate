@@ -12,7 +12,8 @@ metadata:
 # playop-fable-policy
 
 This skill is the single full owner of Firstmate's project-scoped Playop execution policy, including its difficulty-tiered model routing.
-Its name is retained for stability because `AGENTS.md` section 13 carries the load trigger by that name; it no longer means every Playop task runs on Fable.
+Its name is retained for stability because `AGENTS.md` section 13 carries the load trigger by that name; it no longer means any Playop task runs on Fable.
+The captain moved the hard-tier model from Fable to Opus 5.5 on 2026-10-03, so `claude-opus-5-5` is now the top tier this policy routes to.
 The tracked rules in `defaults/crew-dispatch.json` make its worker profile portable, while `AGENTS.md` carries only the load trigger.
 Apply the generic intake, delivery, approval, and supervision contracts in `AGENTS.md` except where this policy deliberately makes a stricter Playop choice.
 
@@ -21,14 +22,14 @@ Apply the generic intake, delivery, approval, and supervision contracts in `AGEN
 Keep every Playop implementation, architecture, investigation, remediation, independent domain review, independent security review, coverage review, and pre-gate validation task on Claude Code, and route it by difficulty rather than pinning one model to the whole project.
 Apply the concrete model and effort class selected by the best-fit tracked Playop dispatch rule in `defaults/crew-dispatch.json`, which encodes the tiers below most-specific-first.
 
-- Genuinely unresolved architecture, design, migration, or investigation whose outcome can materially change the design uses Fable at `xhigh`.
-- Battle resolution, and implementation, architecture, investigation, remediation, or validation whose accepted scope involves source-side privacy, persistence, authorization, replay, or authoritative undo, uses Fable at `high`.
-- An independent domain, security, or coverage review of a change in either tier above uses Fable at `medium`.
-- Any other independent domain, security, or coverage review uses Opus at `medium`.
-- Promotion-only or host-supported card promotion with no new engine work, and UI-copy-only or documentation-only work that changes no engine behavior, contract, or test, uses Opus at `low`.
-- Card authoring against existing engine primitives, bounded contract, protocol, UI, fixture, documentation, or test work, straightforward remediation, and any other bounded Playop work whose approach is already settled, uses Opus at `medium`.
+- Genuinely unresolved architecture, design, migration, or investigation whose outcome can materially change the design uses Opus 5.5 (`claude-opus-5-5`) at `xhigh`.
+- Battle resolution, and implementation, architecture, investigation, remediation, or validation whose accepted scope involves source-side privacy, persistence, authorization, replay, or authoritative undo, uses Opus 5.5 at `high`.
+- An independent domain, security, or coverage review of a change in either tier above uses Opus 5.5 at `medium`.
+- Any other independent domain, security, or coverage review uses the default `opus` alias at `medium`.
+- Promotion-only or host-supported card promotion with no new engine work, and UI-copy-only or documentation-only work that changes no engine behavior, contract, or test, uses the default `opus` alias at `low`.
+- Card authoring against existing engine primitives, bounded contract, protocol, UI, fixture, documentation, or test work, straightforward remediation, and any other bounded Playop work whose approach is already settled, uses the default `opus` alias at `medium`.
 
-Fable is reserved for the hard classes and for reviewing them; everything bounded or mechanical belongs on Opus.
+Opus 5.5 is reserved for the hard classes and for reviewing them; everything bounded or mechanical belongs on the default `opus` alias.
 Classify by the difficulty of the accepted scope, not by the subsystem's reputation, and escalate a tier only when unresolved design or a foundational authority contract is genuinely in scope.
 This worker route does not govern no-mistakes gate agents.
 An explicit current captain override still has the precedence defined by `AGENTS.md` and `docs/configuration.md`.

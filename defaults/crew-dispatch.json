@@ -2,18 +2,18 @@
   "rules": [
     {
       "when": "The task is genuinely unresolved Playop architecture, design, migration, or investigation whose outcome can materially change the design, excluding an independent domain, security, or coverage review.",
-      "use": { "harness": "claude", "model": "fable", "effort": "xhigh" },
-      "why": "Hardest Playop tier: reserve Claude Code with Fable at xhigh for unresolved design whose answer changes what gets built."
+      "use": { "harness": "claude", "model": "claude-opus-5-5", "effort": "xhigh" },
+      "why": "Hardest Playop tier: reserve Claude Code with Opus 5.5, the top model tier, at xhigh for unresolved design whose answer changes what gets built."
     },
     {
       "when": "The Playop task is battle resolution or implementation, architecture, investigation, remediation, or validation whose accepted scope involves source-side privacy, persistence, authorization, replay, or authoritative undo.",
-      "use": { "harness": "claude", "model": "fable", "effort": "high" },
-      "why": "Hard Playop tier: reserve Claude Code with Fable at high effort for foundational authority and state contracts where a subtle error is expensive."
+      "use": { "harness": "claude", "model": "claude-opus-5-5", "effort": "high" },
+      "why": "Hard Playop tier: reserve Claude Code with Opus 5.5, the top model tier, at high effort for foundational authority and state contracts where a subtle error is expensive."
     },
     {
       "when": "The task is an independent Playop domain, security, or coverage review of a change that itself belongs to the unresolved-architecture tier or the foundational privacy, persistence, authorization, replay, or authoritative-undo tier.",
-      "use": { "harness": "claude", "model": "fable", "effort": "medium" },
-      "why": "Hard-review tier: a review is only as strong as the model reading it, so reviews of the hard classes stay on Claude Code with Fable at medium effort."
+      "use": { "harness": "claude", "model": "claude-opus-5-5", "effort": "medium" },
+      "why": "Hard-review tier: a review is only as strong as the model reading it, so reviews of the hard classes stay on Claude Code with Opus 5.5 at medium effort."
     },
     {
       "when": "The task is any other independent Playop domain, security, or coverage review, reviewing a change that belongs to a bounded or promotion-only tier.",

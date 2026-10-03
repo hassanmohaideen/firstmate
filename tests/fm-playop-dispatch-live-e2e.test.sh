@@ -50,10 +50,10 @@ out=$(
 ) || fail "Pi instruction run failed: $out"
 
 for required in \
-  'AMBIGUOUS=claude|fable|xhigh' \
+  'AMBIGUOUS=claude|claude-opus-5-5|xhigh' \
   'BOUNDED=claude|opus|medium' \
-  'FOUNDATIONAL=claude|fable|high' \
-  'HARD_REVIEW=claude|fable|medium' \
+  'FOUNDATIONAL=claude|claude-opus-5-5|high' \
+  'HARD_REVIEW=claude|claude-opus-5-5|medium' \
   'BOUNDED_REVIEW=claude|opus|medium' \
   'CARD=claude|opus|medium' \
   'PROMOTION=claude|opus|low' \
