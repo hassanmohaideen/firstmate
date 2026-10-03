@@ -371,7 +371,7 @@ test_log_format_and_report() {
 
   log="$home/state/jev-advice.jsonl"
   assert_present "$log" "the audit log exists"
-  [ "$(stat -f %Lp "$log" 2>/dev/null || stat -c %a "$log")" = 600 ] || fail "the audit log is mode 0600"
+  [ "$(if [ "$(uname)" = Darwin ]; then stat -f %Lp "$log"; else stat -c %a "$log"; fi)" = 600 ] || fail "the audit log is mode 0600"
   assert_no_grep "$SECRET_KEY" "$log" "the log never contains the key"
   assert_no_grep "TASK-TEXT-SENTINEL" "$log" "the log never contains the task text"
   jq -e 'select(.task_id == "t-agree" and .kind == "advice")
