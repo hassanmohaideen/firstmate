@@ -49,6 +49,16 @@
 # local branch, and never contacts the network; if the head cannot be resolved
 # from the worktree or that store the command refuses closed. This removes the
 # manual per-round bare-repo fetch the worktree-isolation gap used to require.
+# The local branch must be the public head or an ancestor of it, with one bound
+# exception: a pre-push pipeline-owned head move (the rebase step or a
+# pipeline-owned rebase-conflict resolution rewrites history). It is accepted only
+# when axi status branch_sync reports state pipeline_owned for this exact run, a
+# clean local branch still at the run's submitted_head, and a pipeline
+# current_head equal to the public head; any other head refuses as stale.
+# Responses are accepted while the review step is parked at either its
+# awaiting_approval or its post-fix fix_review gate.
+# Only review-step findings are mapped; a finding from another step (e.g. ci) is
+# refused as an unknown finding.
 # It invokes the underlying whole-step response only after every finding in the
 # current review result has one explicit, uniform choice:
 #   --fix     -> no-mistakes axi respond --step review --action fix --findings ...
@@ -397,8 +407,11 @@ capture_review_model_from_state_store() {
   rstatus=$(sqlite3 -readonly -cmd '.timeout 2000' "$NM_STATE_DB" \
     "SELECT status FROM step_results WHERE id='$srid';" 2>/dev/null) \
     || die "cannot read the review status for run $CAPTURE_RUN_ID from the no-mistakes state store"
+  # fix_review is the gate no-mistakes parks at after a fix round's re-check; like
+  # awaiting_approval it accepts the same approve/fix/skip response, and its latest
+  # round already carries the re-checked structured result.
   case "$rstatus" in
-    completed|awaiting_approval) ;;
+    completed|awaiting_approval|fix_review) ;;
     *) die "review step for run $CAPTURE_RUN_ID has not produced a complete result (state: ${rstatus:-unknown}); refusing an incomplete or in-progress review" ;;
   esac
   rounds_json=$(sqlite3 -readonly -cmd '.timeout 2000' -json "$NM_STATE_DB" \

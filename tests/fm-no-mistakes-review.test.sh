@@ -72,6 +72,9 @@ emit_status() {
     status=ci
     pr=$(cat "$state/pr")
   fi
+  # review-status overrides the parked review gate state (e.g. fix_review) until the
+  # response advances the run.
+  if [ "$phase" -eq 0 ] && [ -f "$state/review-status" ]; then review_status=$(cat "$state/review-status"); fi
   if [ -f "$state/status-head" ]; then head=$(cat "$state/status-head"); fi
   if [ -f "$state/status-branch" ]; then branch=$(cat "$state/status-branch"); fi
   if [ -f "$state/status-outcome" ]; then outcome=$(cat "$state/status-outcome"); fi
@@ -1510,6 +1513,40 @@ test_claude_incomplete_review_refuses() {
   pass "an in-progress claude review record is refused, not mistaken for a clean pass"
 }
 
+test_fix_review_gate_accepts_responses() {
+  local d out f agent
+  for agent in pi claude; do
+    if [ "$agent" = claude ]; then d=$(claude_case "fix-review-$agent"); else d=$(new_case "fix-review-$agent"); fi
+    f=$(finding fr-1 ask-user 'survived the fix re-check')
+    set_round "$d" "$f"
+    printf 'fix_review\n' > "$d/fake-state/review-status"
+    [ "$agent" != claude ] || build_review_db "$d" fix_review
+    out=$(run_driver "$d" respond --approve fr-1 2>&1) \
+      || fail "$agent: a response at the fix_review gate was refused: $out"
+    assert_contains "$out" 'recorded: run=RUN-11 round=1 action=approve findings=fr-1' \
+      "$agent: fix_review response was not recorded"
+    [ "$(calls_count "$d")" -eq 1 ] || fail "$agent: fix_review response did not invoke no-mistakes exactly once"
+    [ "$(jq -r '.runs[0].rounds[0].dispositions[0].state' "$(ledger "$d")")" = approved_as_is ] \
+      || fail "$agent: fix_review approval was not finalized in the ledger"
+  done
+  pass "the fix_review gate accepts the same guarded responses as awaiting_approval"
+}
+
+test_claude_fixing_review_still_refuses() {
+  local d out f
+  d=$(claude_case claude-fixing)
+  f=$(finding review-1 ask-user 'mid-fix')
+  set_round "$d" "$f"
+  printf 'fixing\n' > "$d/fake-state/review-status"
+  build_review_db "$d" fixing
+  out=$(run_driver "$d" respond --approve review-1 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "a claude review still applying a fix was accepted for response"
+  assert_contains "$out" 'has not produced a complete result' "mid-fix refusal was not actionable"
+  [ "$(calls_count "$d")" -eq 0 ] || fail "mid-fix refusal invoked the underlying response"
+  [ ! -e "$(ledger "$d")" ] || fail "mid-fix refusal changed ledger state"
+  pass "a review still applying a fix is refused rather than answered"
+}
+
 # A ledger written by a pre-filter guard version preserved rounds WITH informational
 # no-op findings (and their dispositions). Such a preserved round must compare equal
 # to its no-op-filtered rebuild during sync, not hard-die as a contradiction and
@@ -1591,6 +1628,8 @@ test_response_refuses_fallback_branch_and_stale_head_without_state_changes
 test_pipeline_descendant_head_is_accepted
 test_pipeline_owned_rebased_head_is_accepted
 test_pipeline_owned_rebase_refusals_are_preserved
+test_fix_review_gate_accepts_responses
+test_claude_fixing_review_still_refuses
 test_post_review_pipeline_commit_refuses_readiness
 test_no_ci_checks_refuses_readiness
 test_terminal_outcomes_reject_stale_green_ci
