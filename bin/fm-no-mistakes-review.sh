@@ -49,6 +49,16 @@
 # local branch, and never contacts the network; if the head cannot be resolved
 # from the worktree or that store the command refuses closed. This removes the
 # manual per-round bare-repo fetch the worktree-isolation gap used to require.
+# The local branch must be the public head or an ancestor of it, with one bound
+# exception: a pre-push pipeline-owned head move (the rebase step or a
+# pipeline-owned rebase-conflict resolution rewrites history). It is accepted only
+# when axi status branch_sync reports state pipeline_owned for this exact run, a
+# clean local branch still at the run's submitted_head, and a pipeline
+# current_head equal to the public head; any other head refuses as stale.
+# Responses are accepted while the review step is parked at either its
+# awaiting_approval or its post-fix fix_review gate.
+# Only review-step findings are mapped; a finding from another step (e.g. ci) is
+# refused as an unknown finding.
 # It invokes the underlying whole-step response only after every finding in the
 # current review result has one explicit, uniform choice:
 #   --fix     -> no-mistakes axi respond --step review --action fix --findings ...
@@ -397,8 +407,11 @@ capture_review_model_from_state_store() {
   rstatus=$(sqlite3 -readonly -cmd '.timeout 2000' "$NM_STATE_DB" \
     "SELECT status FROM step_results WHERE id='$srid';" 2>/dev/null) \
     || die "cannot read the review status for run $CAPTURE_RUN_ID from the no-mistakes state store"
+  # fix_review is the gate no-mistakes parks at after a fix round's re-check; like
+  # awaiting_approval it accepts the same approve/fix/skip response, and its latest
+  # round already carries the re-checked structured result.
   case "$rstatus" in
-    completed|awaiting_approval) ;;
+    completed|awaiting_approval|fix_review) ;;
     *) die "review step for run $CAPTURE_RUN_ID has not produced a complete result (state: ${rstatus:-unknown}); refusing an incomplete or in-progress review" ;;
   esac
   rounds_json=$(sqlite3 -readonly -cmd '.timeout 2000' -json "$NM_STATE_DB" \
@@ -470,8 +483,59 @@ validate_capture_context() {
     || die "cannot resolve public validation head $CAPTURE_HEAD after import"
   [ "$local_branch" = "$CAPTURE_BRANCH" ] \
     || die "stale-run branch mismatch: local=$local_branch public=$CAPTURE_BRANCH"
-  fm_nm_head_matches_worktree "$PROJECT_ROOT" "$CAPTURE_HEAD" \
-    || die "stale-head mismatch: local=$local_head public=$public_head"
+  fm_nm_head_matches_worktree "$PROJECT_ROOT" "$CAPTURE_HEAD" && return 0
+  pipeline_owned_head_move "$local_branch" "$local_head" "$public_head" && return 0
+  die "stale-head mismatch: local=$local_head public=$public_head"
+}
+
+branch_sync_field() {  # <section> <key>; section "" reads a direct branch_sync child
+  # Reads one scalar from the nested branch_sync object of the captured axi status.
+  local section=$1 key=$2 value
+  value=$(printf '%s\n' "$CAPTURE_STATUS" | awk -v section="$section" -v key="$key" '
+    /^branch_sync:[[:space:]]*$/ { inside = 1; current = ""; next }
+    inside && /^[^[:space:]]/ { exit }
+    !inside { next }
+    {
+      match($0, /^ */)
+      indent = RLENGTH
+      line = substr($0, indent + 1)
+      if (indent == 2 && line ~ /^[A-Za-z_]+:[[:space:]]*$/) {
+        current = line
+        sub(/:.*/, "", current)
+        next
+      }
+      if (indent == 2) current = ""
+      want = (section == "") ? 2 : 4
+      if (indent == want && current == section && index(line, key ":") == 1) {
+        print substr(line, length(key) + 2)
+        exit
+      }
+    }')
+  strip_value "$value"
+}
+
+pipeline_owned_head_move() {  # <local-branch> <local-head> <public-head>
+  # 0 when the public head moved away from the local branch ONLY because this run's
+  # pipeline moved it before push (its rebase step, a pipeline-owned rebase-conflict
+  # resolution, or a pipeline fix on top of either). A rebase rewrites history, so
+  # the local ref need not be an ancestor of the public head; the binding instead is
+  # no-mistakes' own structured branch_sync custody record: the branch is
+  # pipeline_owned by this exact run, the local branch is clean and still exactly the
+  # head this run was submitted from, and the pipeline's current head is exactly the
+  # public head. Any local advance, other run, returned custody, dirty tree, or
+  # unrelated head fails this check and stays a stale-head refusal.
+  local local_branch=$1 local_head=$2 public_head=$3 current submitted
+  [ "$(branch_sync_field '' state)" = pipeline_owned ] || return 1
+  [ "$(branch_sync_field pipeline run)" = "$CAPTURE_RUN_ID" ] || return 1
+  [ "$(branch_sync_field local branch)" = "$local_branch" ] || return 1
+  [ "$(branch_sync_field local clean)" = true ] || return 1
+  [ "$(branch_sync_field local head)" = "$local_head" ] || return 1
+  submitted=$(branch_sync_field pipeline submitted_head)
+  [ -n "$submitted" ] && [ "$submitted" = "$local_head" ] || return 1
+  current=$(branch_sync_field pipeline current_head)
+  [ -n "$current" ] || return 1
+  current=$(git rev-parse --verify --quiet "${current}^{commit}" 2>/dev/null) || return 1
+  [ "$current" = "$public_head" ]
 }
 
 current_ids_json() {
