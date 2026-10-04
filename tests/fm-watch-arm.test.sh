@@ -35,7 +35,7 @@ start_seed_watcher() {  # <state> <fakebin> <watch-out>
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   SEED_PID=$!
   i=0
-  while [ "$i" -lt 60 ]; do
+  while [ "$i" -lt 300 ]; do
     [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$SEED_PID" ] \
       && [ -e "$state/.last-watcher-beat" ] && break
     sleep 0.1
@@ -52,7 +52,7 @@ start_attached_arm() {  # <state> <fakebin> <arm-out> <confirm-timeout>
     FM_ARM_CONFIRM_TIMEOUT="$confirm" "$WATCH_ARM" > "$armout" &
   ARM_PID=$!
   i=0
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 300 ]; do
     grep -qF "watcher: attached pid=$SEED_PID" "$armout" 2>/dev/null && break
     sleep 0.1
     i=$((i + 1))
@@ -135,8 +135,12 @@ start_rearm_arm() {  # <home> <state> <fakebin> <arm-out> [predecessor-arm-pid]
     FM_WATCH_PREDECESSOR_ARM_PID="$predecessor" \
     "$WATCH_ARM" --restart > "$armout" &
   ARM_PID=$!
+  # Callers read the started line (for example its watcher pid), so wait for it
+  # or for the arm to close. The loop ends as soon as either happens; the long
+  # deadline only matters on a slow host, where a 4s cap returned before the
+  # watcher had started and left callers parsing an empty line.
   i=0
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 400 ]; do
     grep -q '^watcher: started ' "$armout" 2>/dev/null && return 0
     is_live_non_zombie "$ARM_PID" || return 0
     sleep 0.05
@@ -232,7 +236,7 @@ test_attached_arm_still_fails_on_a_wake_it_did_not_deliver() {
 }
 
 test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
-  local dir home state fakebin result armout drainout status watcher_pid sequence generation decision_recovery_arm decision_successor
+  local dir home state fakebin result armout drainout status watcher_pid sequence generation decision_recovery_arm decision_successor i
   dir=$(make_case rearm-resurface)
   home="$dir/home"
   state="$dir/state"
@@ -277,7 +281,15 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
   append_wake "$state" check startup-network 'check: startup-network'
 
   start_rearm_arm "$home" "$state" "$fakebin" "$armout"
-  sleep 0.25
+  # A fixed sub-second window let a slow host fail this before the re-armed
+  # watcher finished its first cycle. Wait on the real condition - the arm
+  # closing on its own - with a deadline far longer than one poll, so a re-arm
+  # that only waits for a later status change still stays live and fails here.
+  i=0
+  while is_live_non_zombie "$ARM_PID" && [ "$i" -lt 150 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
   if is_live_non_zombie "$ARM_PID"; then
     # End the fixture through an ordinary actionable status transition so this
     # failing pre-fix path leaves no child behind.
