@@ -339,7 +339,7 @@ A missing key, unsafe key file, network failure, timeout, HTTP error, malformed 
 Each advice call sends only the bounded task text and, for `dispatch-tier`, the `when` text of every effective rule; never send captain preferences, learnings, status logs, pane text, or diffs.
 
 Every advice call and every recorded decision appends one JSON line to the home-private, mode-`0600` `state/jev-advice.jsonl`, rotated once to `state/jev-advice.jsonl.1` past its size cap.
-An advice record carries `ts`, `kind: "advice"`, `mode`, `task_id`, `outcome` (`ok` or `unavailable` with `reason`), `model`, `recommended_tier`, `tier_confidence`, `recommended_effort`, `effort_source`, `ambiguity_score`, `ambiguity_confidence`, `tier_probabilities`, `latency_ms`, `input_tokens`, `task_sha256`, and `task_chars`.
+An advice record carries `ts`, `kind: "advice"`, `mode`, `task_id`, `outcome` (`ok` or `unavailable` with `reason`), `model`, `recommended_tier`, `tier_confidence`, `recommended_effort`, `effort_source`, `ambiguity_score`, `ambiguity_confidence`, `tier_probabilities`, `latency_ms`, `input_tokens`, `task_sha256`, and `task_bytes`.
 A decision record carries `ts`, `kind: "decision"`, `task_id`, `chosen_tier`, `chosen_effort`, `followed` (`yes`, `no`, or `partial`), and a short `reason`.
 Records never contain the key or the task text, and `fm-jev.sh report` summarizes availability, latency, and agreement between the latest advice and decision per task.
 

@@ -267,6 +267,35 @@ test_array_rule_and_ambiguity_effort() {
   pass "a profile-array rule is flagged and its effort comes from the ambiguity advisory"
 }
 
+test_none_resolves_effective_default() {
+  local home
+  home=$(new_home none)
+  write_key "$home"
+  set_mode pick
+  printf 'none\n' > "$STUB_MODE.pick"
+  jq '.default = {harness: "claude", effort: "high"}' "$home/config/crew-dispatch.json" > "$home/d.json"
+  mv "$home/d.json" "$home/config/crew-dispatch.json"
+  jq '.default = [{harness: "claude"}, {harness: "codex"}]' "$home/tracked-dispatch.json" > "$home/d.json"
+  mv "$home/d.json" "$home/tracked-dispatch.json"
+  run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-none
+  expect_code 0 "$RC" "none with local default effort"
+  assert_contains "$OUT" "recommended_tier=none tier_confidence=0.74 recommended_effort=high effort_source=rule profiles=single" "local default effort wins"
+
+  jq 'del(.default)' "$home/config/crew-dispatch.json" > "$home/d.json"
+  mv "$home/d.json" "$home/config/crew-dispatch.json"
+  run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-none-array
+  expect_code 0 "$RC" "none with tracked default array"
+  assert_contains "$OUT" "recommended_tier=none tier_confidence=0.74 recommended_effort=medium effort_source=ambiguity profiles=array" "tracked default array is flagged"
+
+  jq 'del(.default)' "$home/tracked-dispatch.json" > "$home/d.json"
+  mv "$home/d.json" "$home/tracked-dispatch.json"
+  run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-none-bare
+  expect_code 0 "$RC" "none without any default"
+  assert_contains "$OUT" "recommended_tier=none tier_confidence=0.74 recommended_effort=medium effort_source=ambiguity profiles=default" "no default keeps the ambiguity effort"
+  set_mode ok
+  pass "a none recommendation resolves the effective default like dispatch precedence"
+}
+
 test_effort_advisory() {
   local home req
   home=$(new_home effort)
@@ -383,10 +412,11 @@ test_log_format_and_report() {
   [ "$(if [ "$(uname)" = Darwin ]; then stat -f %Lp "$log"; else stat -c %a "$log"; fi)" = 600 ] || fail "the audit log is mode 0600"
   assert_no_grep "$SECRET_KEY" "$log" "the log never contains the key"
   assert_no_grep "TASK-TEXT-SENTINEL" "$log" "the log never contains the task text"
-  jq -e 'select(.task_id == "t-agree" and .kind == "advice")
+  jq -e --argjson bytes "$(wc -c < "$home/task.md" | tr -d ' ')" 'select(.task_id == "t-agree" and .kind == "advice")
     | (.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")) and .outcome == "ok" and .mode == "dispatch-tier"
       and .recommended_tier == "local-2" and .tier_confidence == 0.74 and .recommended_effort == "medium"
       and (.latency_ms | type) == "number" and .model == "jev-1.13.0" and (.task_sha256 | length) == 64
+      and .task_bytes == $bytes
       and .tier_probabilities["local-2"] == 0.8' "$log" >/dev/null || fail "advice record fields"
   jq -e 'select(.kind == "decision" and .task_id == "t-disagree")
     | .chosen_tier == "local-3" and .followed == "no" and .reason == "design is still open"' "$log" >/dev/null \
@@ -439,6 +469,7 @@ test_missing_key_fails_open
 test_loose_key_file_is_not_read
 test_dispatch_tier_success
 test_array_rule_and_ambiguity_effort
+test_none_resolves_effective_default
 test_effort_advisory
 test_env_key_override
 test_failure_modes_fail_open

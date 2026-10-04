@@ -235,14 +235,14 @@ log_append() {
 
 TASK_ID=
 TASK_SHA=
-TASK_CHARS=0
+TASK_BYTES=0
 
 log_unavailable() {
   local mode=$1 reason=$2
   log_append "$(jq -cn --arg ts "$(now_iso)" --arg mode "$mode" --arg id "$TASK_ID" \
-    --arg reason "$reason" --arg sha "$TASK_SHA" --argjson chars "${TASK_CHARS:-0}" \
+    --arg reason "$reason" --arg sha "$TASK_SHA" --argjson bytes "${TASK_BYTES:-0}" \
     '{ts:$ts, kind:"advice", mode:$mode, task_id:$id, outcome:"unavailable", reason:$reason,
-      task_sha256:$sha, task_chars:$chars}')"
+      task_sha256:$sha, task_bytes:$bytes}')"
 }
 
 unavailable() {
@@ -354,7 +354,7 @@ valid_task_id() {
   [ -z "$1" ] || [[ "$1" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
 }
 
-# Reads the bounded task text into $TMP/task.txt and sets TASK_SHA/TASK_CHARS.
+# Reads the bounded task text into $TMP/task.txt and sets TASK_SHA/TASK_BYTES.
 read_task() {
   local mode=$1
   if [ "$TASK_FILE" = - ]; then
@@ -363,7 +363,7 @@ read_task() {
     [ -f "$TASK_FILE" ] && [ -r "$TASK_FILE" ] || unavailable "$mode" "task file is not a readable regular file"
     head -c "$MAX_TASK_BYTES" < "$TASK_FILE" > "$TMP/task.txt" || unavailable "$mode" "cannot read task file"
   fi
-  TASK_CHARS=$(wc -c < "$TMP/task.txt" | tr -d ' ')
+  TASK_BYTES=$(wc -c < "$TMP/task.txt" | tr -d ' ')
   if ! grep -q '[^[:space:]]' "$TMP/task.txt"; then
     unavailable "$mode" "task text is empty"
   fi
@@ -371,10 +371,12 @@ read_task() {
 }
 
 # Writes the effective rules as a JSON array to $TMP/rules.json:
-# [{label, when, effort, profiles}] with local rules first.
+# [{label, when, effort, profiles}] with local rules first, and the effective
+# top-level default as {effort, profiles} (or null) to $TMP/default.json.
 collect_rules() {
   local path label prefix
   printf '[]' > "$TMP/rules.json"
+  printf 'null' > "$TMP/default.json"
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     label=$(fm_dispatch_config_label "$path" "$CONFIG" "$FM_ROOT")
@@ -391,6 +393,12 @@ collect_rules() {
            profiles: (if (.value.use | type) == "array" then "array" else "single" end)}]
     ' "$path" > "$TMP/rules.next" 2>/dev/null || return 1
     mv -f "$TMP/rules.next" "$TMP/rules.json"
+    jq -c --slurpfile acc "$TMP/default.json" '
+      if $acc[0] != null or (has("default") | not) then $acc[0]
+      else {effort: (if (.default | type) == "object" then (.default.effort // null) else null end),
+            profiles: (if (.default | type) == "array" then "array" else "single" end)} end
+    ' "$path" > "$TMP/default.next" 2>/dev/null || return 1
+    mv -f "$TMP/default.next" "$TMP/default.json"
   done < <(fm_dispatch_config_paths "$CONFIG" "$FM_ROOT")
 }
 
@@ -431,7 +439,8 @@ build_request() {
 # Validates the response and prints the derived summary JSON, or fails.
 summarize_response() {
   local mode=$1
-  jq -ce --arg model "$MODEL" --arg mode "$mode" --slurpfile rules "$TMP/rules.json" '
+  jq -ce --arg model "$MODEL" --arg mode "$mode" --slurpfile rules "$TMP/rules.json" \
+    --slurpfile default "$TMP/default.json" '
     def num: type == "number";
     def effort_for($score): ["low", "medium", "high", "xhigh"][
       ([([($score + 0.5) | floor, 0] | max), 3] | min)];
@@ -449,7 +458,8 @@ summarize_response() {
                  and ($t.probabilities | type) == "object" and ($t.confidence | num))
         | ($rules[0]) as $r
         | select($t.choice == "none" or any($r[]; .label == $t.choice))
-        | ([$r[] | select(.label == $t.choice)][0]) as $chosen
+        | (if $t.choice == "none" then $default[0]
+           else [$r[] | select(.label == $t.choice)][0] end) as $chosen
         | {recommended_tier: $t.choice, tier_confidence: $t.confidence,
            tier_profiles: ($chosen.profiles // "default"),
            rules: [$r[] | {label, choice_p: ($t.probabilities[.label] // 0),
@@ -475,6 +485,7 @@ cmd_advice() {
     [ "$(jq 'length' "$TMP/rules.json")" -gt 0 ] || unavailable "$mode" "no dispatch rules to rank"
   else
     printf '[]' > "$TMP/rules.json"
+    printf 'null' > "$TMP/default.json"
   fi
   build_request "$mode" > "$TMP/request.json" || unavailable "$mode" "cannot build the request"
   http_call POST /v1/systemone "$TMP/request.json" "$TMP/response.json"
@@ -495,14 +506,14 @@ cmd_advice() {
     "advisory=data-only: firstmate decides; record the actual choice with fm-jev.sh record"'
 
   log_append "$(printf '%s' "$summary" | jq -c --arg ts "$(now_iso)" --arg mode "$mode" \
-    --arg id "$TASK_ID" --argjson lat "$LATENCY_MS" --arg sha "$TASK_SHA" --argjson chars "$TASK_CHARS" '
+    --arg id "$TASK_ID" --argjson lat "$LATENCY_MS" --arg sha "$TASK_SHA" --argjson bytes "$TASK_BYTES" '
     {ts: $ts, kind: "advice", mode: $mode, task_id: $id, outcome: "ok", model,
      recommended_tier: (.recommended_tier // null), tier_confidence: (.tier_confidence // null),
      recommended_effort: (.recommended_effort // .ambiguity_effort),
      effort_source: (.effort_source // "ambiguity"),
      ambiguity_score, ambiguity_confidence,
      tier_probabilities: (if .rules then ([.rules[] | {(.label): .choice_p}] | add) + {none: .none_p} else null end),
-     latency_ms: $lat, input_tokens, task_sha256: $sha, task_chars: $chars}')"
+     latency_ms: $lat, input_tokens, task_sha256: $sha, task_bytes: $bytes}')"
 }
 
 cmd_record() {
