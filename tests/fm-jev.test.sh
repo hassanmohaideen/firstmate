@@ -330,8 +330,17 @@ test_failure_modes_fail_open() {
   expect_code 0 "$RC" "connection refused"
   assert_contains "$OUT" "JEV_UNAVAILABLE: network error" "connection failure"
 
-  JEV_BASE_URL="http://example.invalid" run_jev "$home" dispatch-tier --task-file "$home/task.md"
-  assert_contains "$OUT" "JEV_UNAVAILABLE: refusing non-https API base URL" "plain http to a remote host is refused"
+  local refused before
+  before=$(request_count)
+  for refused in "http://example.invalid" "http://localhost:1@127.0.0.1:$(cat "$STUB_DIR/port")" \
+    "http://127.0.0.1@example.invalid" "https://user@example.invalid" "$STUB_URL/extra"; do
+    : > "$TMP_ROOT/curl-argv.log"
+    JEV_BASE_URL="$refused" run_jev "$home" dispatch-tier --task-file "$home/task.md"
+    expect_code 0 "$RC" "refused base URL $refused"
+    assert_contains "$OUT" "JEV_UNAVAILABLE: refusing non-https API base URL" "base URL $refused is refused"
+    [ ! -s "$TMP_ROOT/curl-argv.log" ] || fail "refused base URL $refused must not invoke curl"
+  done
+  [ "$(request_count)" = "$before" ] || fail "a refused base URL must not reach any endpoint"
   pass "timeout, malformed, wrong model, HTTP errors, and network failure all fail open"
 }
 

@@ -79,8 +79,9 @@
 #   TYPESAFE_API_KEY       key override; never printed
 #   FM_JEV_MODEL           model id, default jev-1.13.0 (pinned, never an alias)
 #   FM_JEV_TIMEOUT         whole-request bound in seconds (default 4, 1-10)
-#   FM_JEV_BASE_URL        API base, default https://api.typesafe.ai; only https
-#                          or plain http to localhost/127.0.0.1 (tests) is used
+#   FM_JEV_BASE_URL        API base, default https://api.typesafe.ai; only an
+#                          https host or plain http to localhost/127.0.0.1
+#                          (tests), each with an optional port and nothing else
 #   FM_JEV_MAX_TASK_BYTES  task text bound sent to the API (default 24000)
 #   FM_JEV_LOG_MAX_BYTES   log rotation threshold (default 1048576)
 set -u
@@ -204,12 +205,12 @@ load_key() {
   KEY=$value
 }
 
+# The authority must be a bare host with an optional numeric port: no userinfo,
+# path, query, or other characters, so `http://localhost:1@remote.example`
+# can never send the key in cleartext to a remote host.
 base_url_allowed() {
-  case "$BASE_URL" in
-    https://*) return 0 ;;
-    http://127.0.0.1|http://127.0.0.1:*|http://localhost|http://localhost:*) return 0 ;;
-    *) return 1 ;;
-  esac
+  [[ "$BASE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] \
+    || [[ "$BASE_URL" =~ ^http://(localhost|127\.0\.0\.1)(:[0-9]{1,5})?$ ]]
 }
 
 # --- logging -----------------------------------------------------------------
