@@ -155,9 +155,18 @@ reap() {
 # suppressor <stale_file> holds <hash>. 0 once absorbed, 1 if the process exited
 # first, 2 at the deadline (the caller's strict assertions then report the gap).
 wait_live_absorbed() {  # <pid> <-e|-s> <marker> [<stale_file> <hash>]
-  local pid=$1 op=$2 marker=$3 sf=${4:-} h=${5:-} i=0
+  local pid=$1 op=$2 marker=$3 sf=${4:-} h=${5:-} i=0 present
+  case "$op" in
+    -e|-s) ;;
+    *) fail "wait_live_absorbed: unsupported marker test $op" ;;
+  esac
   while [ "$i" -lt 300 ]; do
-    if [ "$op" "$marker" ] && { [ -z "$sf" ] || [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ]; }; then
+    present=0
+    case "$op" in
+      -e) [ -e "$marker" ] && present=1 ;;
+      -s) [ -s "$marker" ] && present=1 ;;
+    esac
+    if [ "$present" -eq 1 ] && { [ -z "$sf" ] || [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ]; }; then
       return 0
     fi
     kill -0 "$pid" 2>/dev/null || return 1
