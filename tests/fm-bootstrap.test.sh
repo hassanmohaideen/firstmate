@@ -1107,24 +1107,24 @@ test_tracked_crew_dispatch_defaults_and_local_precedence() {
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active defaults/crew-dispatch.json" \
     "tracked dispatch default was not selected when local config was absent"
-  assert_contains "$out" "-> claude/fable/xhigh" \
-    "tracked unresolved-architecture Playop profile lost Claude/Fable xhigh axes"
-  assert_contains "$out" "source-side privacy, persistence, authorization, replay, or authoritative undo. -> claude/fable/high" \
-    "tracked foundational Playop profile lost Claude/Fable high axes"
-  assert_contains "$out" "unresolved-architecture tier or the foundational privacy, persistence, authorization, replay, or authoritative-undo tier. -> claude/fable/medium" \
-    "tracked hard-class Playop review profile lost Claude/Fable medium axes"
-  assert_contains "$out" "reviewing a change that belongs to a bounded or promotion-only tier. -> claude/opus/medium" \
+  assert_contains "$out" "-> claude/claude-opus-5-5/xhigh" \
+    "tracked unresolved-architecture Playop profile lost Claude/Opus 5.5 xhigh axes"
+  assert_contains "$out" "source-side privacy, persistence, authorization, replay, or authoritative undo. -> claude/claude-opus-5-5/high" \
+    "tracked foundational Playop profile lost Claude/Opus 5.5 high axes"
+  assert_contains "$out" "unresolved-architecture tier or the foundational privacy, persistence, authorization, replay, or authoritative-undo tier. -> claude/claude-opus-5-5/medium" \
+    "tracked hard-class Playop review profile lost Claude/Opus 5.5 medium axes"
+  assert_contains "$out" "reviewing a change that belongs to a bounded or promotion-only tier. -> claude/claude-opus-5-5/medium" \
     "tracked ordinary Playop review profile lost Claude/Opus medium axes"
-  assert_contains "$out" "changes no engine behavior, contract, or test. -> claude/opus/low" \
+  assert_contains "$out" "changes no engine behavior, contract, or test. -> claude/claude-opus-5-5/low" \
     "tracked promotion-only Playop profile lost Claude/Opus low axes"
-  assert_contains "$out" "which no harder tier above matches. -> claude/opus/medium" \
+  assert_contains "$out" "which no harder tier above matches. -> claude/claude-opus-5-5/medium" \
     "tracked bounded Playop profile lost Claude/Opus medium axes"
   case "$out" in
-    *"authoritative-undo tier. -> claude/fable/medium"*"bounded or promotion-only tier. -> claude/opus/medium"*) : ;;
-    *) fail "tracked Playop rules must order the Fable hard-class review before the Opus ordinary review" ;;
+    *"authoritative-undo tier. -> claude/claude-opus-5-5/medium"*"bounded or promotion-only tier. -> claude/claude-opus-5-5/medium"*) : ;;
+    *) fail "tracked Playop rules must order the Opus 5.5 hard-class review before the ordinary Opus review" ;;
   esac
   case "$out" in
-    *"contract, or test. -> claude/opus/low"*"no harder tier above matches. -> claude/opus/medium"*) : ;;
+    *"contract, or test. -> claude/claude-opus-5-5/low"*"no harder tier above matches. -> claude/claude-opus-5-5/medium"*) : ;;
     *) fail "tracked Playop rules must order the promotion-only tier before the bounded catch-all tier" ;;
   esac
 
@@ -1139,7 +1139,7 @@ test_tracked_crew_dispatch_defaults_and_local_precedence() {
     "local override profile was not validated as the effective configuration"
   assert_contains "$out" "BOOTSTRAP_INFO: crew dispatch active defaults/crew-dispatch.json" \
     "tracked dispatch layer disappeared when local configuration was present"
-  assert_contains "$out" "-> claude/fable/xhigh" \
+  assert_contains "$out" "-> claude/claude-opus-5-5/xhigh" \
     "tracked Playop rule was not validated alongside local configuration"
 
   rm -f "$case_dir/home/config/crew-dispatch.json"
@@ -1203,7 +1203,7 @@ non-object default array entry is flagged^{"default":["codex"]}^exact^CREW_DISPA
 default array profile without harness is flagged^{"default":[{"model":"gpt-5.5"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - each default profile needs harness
 default array malformed effort is flagged^{"default":[{"harness":"codex","effort":3}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - default profile model, effort, and advisor must be non-empty strings when present
 claude advisor profile is accepted^{"rules":[{"when":"cheap main with strong advisor","use":{"harness":"claude","model":"sonnet","effort":"high","advisor":"opus"}}]}^empty^
-claude full-model-id advisor is accepted^{"default":{"harness":"claude","advisor":"claude-opus-4-8"}}^empty^
+claude full-model-id advisor is accepted^{"default":{"harness":"claude","advisor":"claude-opus-5-5"}}^empty^
 advisor on a non-claude harness is flagged^{"rules":[{"when":"codex with advisor","use":{"harness":"codex","model":"gpt-5","advisor":"opus"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - advisor is only supported on the claude harness: codex:opus
 advisor on a default non-claude profile is flagged^{"default":[{"harness":"grok","advisor":"opus"}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - advisor is only supported on the claude harness: grok:opus
 empty advisor string is flagged^{"rules":[{"when":"claude empty advisor","use":{"harness":"claude","advisor":""}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - use profile model, effort, and advisor must be non-empty strings when present

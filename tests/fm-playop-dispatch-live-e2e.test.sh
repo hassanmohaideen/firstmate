@@ -50,18 +50,18 @@ out=$(
 ) || fail "Pi instruction run failed: $out"
 
 for required in \
-  'AMBIGUOUS=claude|fable|xhigh' \
-  'BOUNDED=claude|opus|medium' \
-  'FOUNDATIONAL=claude|fable|high' \
-  'HARD_REVIEW=claude|fable|medium' \
-  'BOUNDED_REVIEW=claude|opus|medium' \
-  'CARD=claude|opus|medium' \
-  'PROMOTION=claude|opus|low' \
-  'VALIDATION=claude|opus|medium' \
+  'AMBIGUOUS=claude|claude-opus-5-5|xhigh' \
+  'BOUNDED=claude|claude-opus-5-5|medium' \
+  'FOUNDATIONAL=claude|claude-opus-5-5|high' \
+  'HARD_REVIEW=claude|claude-opus-5-5|medium' \
+  'BOUNDED_REVIEW=claude|claude-opus-5-5|medium' \
+  'CARD=claude|claude-opus-5-5|medium' \
+  'PROMOTION=claude|claude-opus-5-5|low' \
+  'VALIDATION=claude|claude-opus-5-5|medium' \
   'NON_PLAYOP=unmatched' \
   'OVERRIDE=wins' \
   'LOCAL_OVERRIDE=wins' \
-  'UNCERTAIN_PROFILE=claude|opus|medium' \
+  'UNCERTAIN_PROFILE=claude|claude-opus-5-5|medium' \
   'UNCERTAIN_LOGIN=no' \
   'EXHAUSTED_ROUTE=blocked' \
   'PAID_CREDITS=captain-decision' \
