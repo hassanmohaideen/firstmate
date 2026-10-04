@@ -76,6 +76,23 @@ wait_numeric_file() {
   return 1
 }
 
+# Wait up to <limit> 0.1s ticks for numeric <file> to reach <target> while <pid>
+# runs: 0 once reached, 1 if the process exited first, 2 at the deadline.
+wait_live_count() {  # <file> <target> <pid> [limit]
+  local file=$1 target=$2 pid=$3 limit=${4:-30} i=0 value
+  while [ "$i" -lt "$limit" ]; do
+    value=$(cat "$file" 2>/dev/null || true)
+    case "$value" in
+      ''|*[!0-9]*) ;;
+      *) [ "$value" -lt "$target" ] || return 0 ;;
+    esac
+    is_live_non_zombie "$pid" || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 2
+}
+
 # Portable mtime in epoch seconds. Platform-detected, never the `stat -f || stat -c`
 # fallback (which writes a partial filesystem dump on Linux; see fm-watch.sh).
 file_mtime() {
@@ -722,7 +739,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
 # must surface once, while the unchanged hash must not append the same wake on
 # every watcher re-arm.
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
-  local dir state fakebin out capture_file statusf window key pane_hash sig pid back round wakes bare
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid back round wakes bare rechecks polls
   dir=$(make_case exited-declared-pause); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/held.status"
   window="test:fm-held"
@@ -738,22 +755,46 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
 
+  # Six watcher arms, each of which must really poll the unchanged pane. Every
+  # stop - the recheck wake or the test's own TERM - is drained and acknowledged
+  # the way firstmate handles it before re-arming; otherwise each later arm would
+  # only resurface the unacknowledged downtime and exit before its pane scan.
+  # Rounds sync on completed polls with a bounded deadline, never a fixed window,
+  # so a slow host cannot kill a watcher before it has polled.
+  wakes=0; bare=0; rechecks=0
   round=1
   while [ "$round" -le 6 ]; do
+    polls=$(cat "$state/.count-$key" 2>/dev/null || echo 0)
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_CREW_STATE='state: stopped · source: pane · bare shell' \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
-    if wait_live "$pid" 15; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
+    if [ "$round" -eq 1 ]; then
+      # The pause is already past the re-surface threshold: the first poll must
+      # surface it once as a bounded recheck.
+      wait_for_exit "$pid" 300 || fail "dead-agent declared pause did not surface its recheck: $(cat "$out")"
+    else
+      # Two more counted scans prove the first poll of this arm was fully
+      # classified and the watcher came back around without waking.
+      wait_live_count "$state/.count-$key" $((polls + 2)) "$pid" 300
+      case $? in
+        0) reap "$pid" ;;
+        1) wait "$pid" || fail "dead-agent watcher round $round failed" ;;
+        *) reap "$pid"; fail "dead-agent watcher round $round did not complete two polls" ;;
+      esac
+    fi
+    if [ -s "$state/.wake-queue" ]; then
+      wakes=$((wakes + $(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")))
+      bare=$((bare + $(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")))
+      grep -F "awaiting external" "$state/.wake-queue" >/dev/null && rechecks=$((rechecks + 1))
+    fi
+    ack_stopped_cycle "$state" || fail "could not acknowledge dead-agent watcher round $round stop"
     round=$((round + 1))
   done
-  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
-  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
   [ "$wakes" -le 1 ] || fail "dead-agent declared pause flooded $wakes stale wakes across six unchanged polls"
   [ "$bare" -eq 0 ] || fail "dead-agent declared pause surfaced as $bare bare stopped-crew wakes"
-  grep -F "awaiting external" "$state/.wake-queue" >/dev/null \
-    || fail "dead-agent declared pause did not use the bounded paused recheck"
+  [ "$rechecks" -ge 1 ] || fail "dead-agent declared pause did not use the bounded paused recheck"
 
   dir=$(make_case exited-captain-held); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/held.status"
