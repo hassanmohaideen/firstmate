@@ -150,6 +150,23 @@ reap() {
   return 0
 }
 
+# Wait up to 30s for <pid> to finish absorbing a stale pane: `test <op> <marker>`
+# holds for the marker the absorb path writes last and, when given, the
+# suppressor <stale_file> holds <hash>. 0 once absorbed, 1 if the process exited
+# first, 2 at the deadline (the caller's strict assertions then report the gap).
+wait_live_absorbed() {  # <pid> <-e|-s> <marker> [<stale_file> <hash>]
+  local pid=$1 op=$2 marker=$3 sf=${4:-} h=${5:-} i=0
+  while [ "$i" -lt 300 ]; do
+    if [ "$op" "$marker" ] && { [ -z "$sf" ] || [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ]; }; then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 2
+}
+
 # Wait up to <limit> 0.1s ticks for <file> to exist while <pid> stays alive.
 wait_live_file() {  # <file> <pid> [limit]
   local file=$1 pid=$2 limit=${3:-30} i=0
@@ -541,9 +558,12 @@ test_stale_terminal_status_overridden_by_active_run() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb) after absorbing: $(cat "$out")"; }
   [ ! -s "$out" ] || fail "the overridden stale terminal status printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "the overridden stale terminal status enqueued a wake during absorb"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
@@ -595,9 +615,12 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb) after absorbing: $(cat "$out")"; }
   [ ! -s "$out" ] || fail "fresh provably-working stale printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "fresh provably-working stale enqueued a wake during absorb"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
@@ -695,9 +718,12 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -e "$state/.paused-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb) after absorbing: $(cat "$out")"; }
   [ ! -s "$out" ] || fail "fresh paused stale printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "fresh paused stale enqueued a wake during absorb"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on paused absorb"
@@ -1106,9 +1132,12 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited on the priming round (should absorb) after absorbing: $(cat "$out")"; }
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional wedge priming stop"
 
@@ -1230,9 +1259,12 @@ test_busy_pane_stable_hash_escalates_past_turn_age_bound() {
     FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "a stable-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "a stable-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "a stable-hash busy pane past the turn-age bound escalated before the wedge threshold after absorbing: $(cat "$out")"; }
   [ -s "$state/.stale-since-$key" ] || fail "a stable-hash busy pane past the turn-age bound did not start a wedge timer"
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional stable-hash phase-A stop"
@@ -1273,9 +1305,12 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
     FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "a changing-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "a changing-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "a changing-hash busy pane past the turn-age bound escalated before the wedge threshold after absorbing: $(cat "$out")"; }
   [ -s "$state/.stale-since-$key" ] || fail "a changing-hash busy pane past the turn-age bound did not start a wedge timer"
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional changing-hash phase-A stop"
@@ -1351,9 +1386,12 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
     FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "priming round for busy turn-age escalation was not absorbed: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "priming round for busy turn-age escalation was not absorbed: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "priming round for busy turn-age escalation was not absorbed after absorbing: $(cat "$out")"; }
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional busy-wedge priming stop"
 
@@ -1417,9 +1455,12 @@ test_busy_pane_default_turn_age_bound_is_3600s() {
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "a 66-minute-old completed turn escalated before the wedge threshold under the default bound: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "a 66-minute-old completed turn escalated before the wedge threshold under the default bound: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "a 66-minute-old completed turn escalated before the wedge threshold under the default bound after absorbing: $(cat "$out")"; }
   [ -s "$state/.stale-since-$key" ] || fail "a 66-minute-old completed turn did not start a wedge timer under the default bound (default is not 3600s)"
   reap "$pid"
   pass "the production default busy-turn-age bound is 3600s (5min under does not wedge, 66min over does)"
