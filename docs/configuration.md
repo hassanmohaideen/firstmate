@@ -11,7 +11,7 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - dispatch
 This section is the single owner of the top-level operational-home layout; producer script headers and their help own exact child-file fields and mutation contracts.
 The tracked code root contains the shared instruction, skill, documentation, workflow, and `bin/` surfaces, while each effective `FM_HOME` contains private operational directories.
 `data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, and scout reports.
-`state/` holds runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, away-mode state, generated Relay artifacts, optional self-hosted Discord inbox/context/service artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
+`state/` holds runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, inactive terminal-outcome receipts under `state/terminal-outcomes/`, away-mode state, generated Relay artifacts, optional self-hosted Discord inbox/context/service artifacts, the optional Jev dispatch-advisory audit log `state/jev-advice.jsonl`, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
@@ -318,6 +318,34 @@ Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstr
 Malformed JSON, an empty or malformed rule/default array, an unverified harness, an effort value unsupported by that harness, or an `advisor` on a non-`claude` profile is reported against its file as `CREW_DISPATCH: invalid <path> - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
 While either file is effective, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration in either layer must be reported and corrected rather than selected around.
 Secondmate homes inherit the primary's local file when one exists, while their synced repository copy supplies the same tracked layer.
+Firstmate may also consult the optional Jev second opinion described in [TypeSafe Jev dispatch advisory](#typesafe-jev-dispatch-advisory-configtypesafeenv) at this intake; it never replaces this best-fit judgment.
+
+## TypeSafe Jev dispatch advisory (config/typesafe.env)
+
+[`bin/fm-jev.sh`](../bin/fm-jev.sh) is an optional second opinion from TypeSafe's Jev decision model for crewmate and scout dispatch intake.
+It ranks the effective crew-dispatch rules against the task text and rates approach ambiguity, then prints a recommended tier, effort, and confidence as data.
+It is advisory-only, fail-open, and data-only: nothing applies its output, and firstmate still chooses the rule and effort with judgment.
+It is inert until a key is configured, so a home without one behaves exactly as before.
+This section is the single owner of the key file and audit-log schema; the script header and `--help` own subcommands, flags, output, and environment tuning, and [`harness-adapters`](../.agents/skills/harness-adapters/SKILL.md#optional-jev-dispatch-second-opinion) owns the intake protocol.
+
+The key file is the gitignored regular file `$FM_HOME/config/typesafe.env`, or `$FM_CONFIG_OVERRIDE/typesafe.env` when that override is active.
+It must be non-symlinked, single-linked, and mode `0600`, or the script refuses to read it and reports the advisory unavailable.
+It holds one line, `TYPESAFE_API_KEY=<key>`, created by the captain from the TypeSafe console; blank lines and comments are ignored.
+A non-empty `TYPESAFE_API_KEY` environment variable overrides the file.
+The file is home-private and not inherited by secondmate homes, because it is absent from the inherited-config allowlist.
+The key is never printed, logged, or passed on a command line; it reaches the API only as a request header read from standard input.
+
+Calls go to the official TypeSafe REST API with a pinned model version and a bound of a few seconds.
+A missing key, unsafe key file, network failure, timeout, HTTP error, malformed response, or unexpected model prints one `JEV_UNAVAILABLE:` line and exits 0, so dispatch proceeds unchanged with no retry or wait.
+Each advice call sends only the bounded task text and, for `dispatch-tier`, the `when` text of every effective rule; never send captain preferences, learnings, status logs, pane text, or diffs.
+
+Every advice call and every recorded decision appends one JSON line to the home-private, mode-`0600` `state/jev-advice.jsonl`, rotated once to `state/jev-advice.jsonl.1` past its size cap.
+An advice record carries `ts`, `kind: "advice"`, `mode`, `task_id`, `outcome` (`ok` or `unavailable` with `reason`), `model`, `recommended_tier`, `tier_confidence`, `recommended_effort`, `effort_source`, `ambiguity_score`, `ambiguity_confidence`, `tier_probabilities`, `latency_ms`, `input_tokens`, `task_sha256`, and `task_bytes`.
+A decision record carries `ts`, `kind: "decision"`, `task_id`, `chosen_tier`, `chosen_effort`, `followed` (`yes`, `no`, or `partial`), and a short `reason`.
+Records never contain the key or the task text, and `fm-jev.sh report` summarizes availability, latency, and agreement between the latest advice and decision per task.
+
+Jev must never be consulted for merge approval or PR readiness, ask-user dispositions, destructive, irreversible, or security-sensitive determinations, quota-array profile selection, or any watcher, away-mode, supervision, wake-drain, or session-startup path.
+The script enforces that boundary by exposing only fixed advisory subcommands with code-owned questions and no generic question surface.
 
 ## Toolchain
 
@@ -618,6 +646,7 @@ FM_STARTUP_NETWORK_TIMEOUT=120   # seconds bounding the whole deferred network s
 FM_TASKS_AXI_COMPATIBLE=   # internal one-hop handoff of an already-computed tasks-axi compatibility verdict (0 or 1); consumed when bin/fm-tasks-axi-lib.sh is sourced
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically
+TYPESAFE_API_KEY=        # optional Jev dispatch-advisory key override; see "TypeSafe Jev dispatch advisory" and bin/fm-jev.sh for its FM_JEV_* tuning
 FM_POLL=15              # seconds between watcher poll cycles
 FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartbeats are absorbed while idle
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
