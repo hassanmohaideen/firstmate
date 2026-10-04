@@ -7,6 +7,8 @@
 # server, isolated on a private socket (`-L`) so it never touches the host's
 # actual sessions.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

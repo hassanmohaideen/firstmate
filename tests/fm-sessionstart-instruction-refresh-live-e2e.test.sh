@@ -23,6 +23,8 @@
 #
 # This costs real Pi model turns and requires its normal authenticated profile.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 if [ "${FM_SESSIONSTART_INSTRUCTION_REFRESH_LIVE_E2E:-0}" != 1 ]; then
   echo "skip: set FM_SESSIONSTART_INSTRUCTION_REFRESH_LIVE_E2E=1 to run the isolated real-Pi instruction-refresh regression"

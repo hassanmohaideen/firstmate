@@ -3,6 +3,8 @@
 # Run explicitly with FM_CMUX_CLAUDE_COMPOSER_LIVE=1; it creates and cleans up
 # only one exact fm-test- workspace through the normal scout lifecycle.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TASK="fm-test-cmux-claude-composer-$$"

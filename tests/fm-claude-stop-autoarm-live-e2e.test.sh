@@ -11,6 +11,8 @@
 # authentication. No live fleet home, worktree, or session is touched.
 # shellcheck disable=SC2016 # the model, not this test shell, reads the prompt text
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 if [ "${FM_CLAUDE_LIVE_E2E:-0}" != 1 ]; then
   echo "skip: set FM_CLAUDE_LIVE_E2E=1 to run the Claude Stop auto-arm regression"

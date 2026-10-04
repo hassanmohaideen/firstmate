@@ -5,6 +5,8 @@
 # tracked configuration and its policy owners. It does not parse source bytes
 # or recreate natural-language matching in shell.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 if [ "${FM_PLAYOP_DISPATCH_LIVE_E2E:-0}" != 1 ]; then
   echo "skip: set FM_PLAYOP_DISPATCH_LIVE_E2E=1 to run the credentialed Playop dispatch regression"

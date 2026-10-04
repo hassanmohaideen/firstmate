@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Strict no-emit contract check for the tracked Firstmate Pi extensions.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

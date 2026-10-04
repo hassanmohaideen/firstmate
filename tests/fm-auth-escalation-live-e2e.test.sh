@@ -5,6 +5,8 @@
 # AGENTS.md contract. It does not parse instruction source bytes or recreate the
 # policy in shell.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 if [ "${FM_AUTH_ESCALATION_LIVE_E2E:-0}" != 1 ]; then
   echo "skip: set FM_AUTH_ESCALATION_LIVE_E2E=1 to run the credentialed authentication-escalation regression"

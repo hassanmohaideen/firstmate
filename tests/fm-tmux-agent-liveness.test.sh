@@ -16,6 +16,8 @@
 # between macOS and Linux, so every case asserts only the platform-independent
 # property that the verdict itself is correct.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
