@@ -679,6 +679,40 @@ await_isolated_supervisor_exit || fail "the reclaiming worker did not stop"
 assert_absent "$STAGING_STATE/worker.lock" "the reclaiming worker did not release ownership"
 pass "stale ownership with interrupted publication staging is reclaimed"
 
+# A stop waits on the whole worker group, not the serving child it was handed.
+# The child exits on the first TERM while its supervisor is still finishing a
+# graceful shutdown; a wait that ended with the child KILLed that supervisor
+# mid-shutdown and could report the group as a survivor before it was reaped.
+STOP_FIXTURE="$TMP_ROOT/stop-group/bin"
+mkdir -p "$STOP_FIXTURE"
+cat > "$STOP_FIXTURE/fm-remote-job-worker.sh" <<'SH'
+#!/bin/bash
+trap 'sleep 1; : > "$2"; exit 0' TERM
+sleep 30 &
+printf '%s\n' "$!" > "$1"
+while :; do sleep 0.1; done
+SH
+chmod 755 "$STOP_FIXTURE/fm-remote-job-worker.sh"
+STOP_CHILD_FILE="$TMP_ROOT/stop-group/child.pid"
+STOP_GRACEFUL="$TMP_ROOT/stop-group/graceful"
+set -m
+"$STOP_FIXTURE/fm-remote-job-worker.sh" "$STOP_CHILD_FILE" "$STOP_GRACEFUL" &
+RECOVERY_WORKER_PID=$!
+set +m
+for _ in $(seq 1 100); do
+  [ -s "$STOP_CHILD_FILE" ] && break
+  sleep 0.05
+done
+STOP_CHILD_PID=$(cat "$STOP_CHILD_FILE" 2>/dev/null || true)
+[ -n "$STOP_CHILD_PID" ] || fail "the stop-group fixture did not start its serving child"
+fm_remote_job_stop_worker_tree "$STOP_CHILD_PID" \
+  || fail "stopping a worker group reported a survivor while its supervisor shut down gracefully"
+! kill -0 -- "-$RECOVERY_WORKER_PID" 2>/dev/null || fail "the stopped worker group is still alive"
+assert_present "$STOP_GRACEFUL" "the stop KILLed the supervisor before its TERM shutdown finished"
+wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
+RECOVERY_WORKER_PID=
+pass "stopping a worker tree waits for the whole group to finish its TERM shutdown"
+
 # The Linux readiness recovery must re-run the idempotent worker start more than
 # once. A replaced supervisor can lose its ownership handoff for longer than a
 # single probe window under load - or a KILL-forced quarantine recovery can

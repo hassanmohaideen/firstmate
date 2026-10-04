@@ -751,33 +751,29 @@ fm_remote_job_worker_process_group() { # <pid>
 # process otherwise. Returns non-zero when any verified worker-group member is
 # still alive afterwards.
 fm_remote_job_stop_worker_tree() { # <pid>
-  local pid=$1 pgid i=0
+  local pid=$1 pgid target
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   [ "$pid" -gt 1 ] || return 1
   pgid=$(fm_remote_job_worker_process_group "$pid" 2>/dev/null || true)
-  if [ -n "$pgid" ]; then kill -TERM -- "-$pgid" 2>/dev/null || true; else kill -TERM "$pid" 2>/dev/null || true; fi
-  while { [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null || [ -z "$pgid" ] && kill -0 "$pid" 2>/dev/null; } \
-    && [ "$i" -lt 50 ]; do
+  # Wait on the whole group whenever one is proven, never on the lone pid: the
+  # serving child usually exits before its restart supervisor, and a wait that
+  # ended on the child alone declared a still-exiting supervisor a survivor.
+  if [ -n "$pgid" ]; then target="-$pgid"; else target=$pid; fi
+  kill -TERM -- "$target" 2>/dev/null || true
+  fm_remote_job_await_gone "$target" && return 0
+  kill -KILL -- "$target" 2>/dev/null || true
+  fm_remote_job_await_gone "$target"
+}
+
+# Poll for up to five seconds until nothing answers kill -0 for <target>, a pid
+# or a negative process-group id.
+fm_remote_job_await_gone() { # <target>
+  local target=$1 i=0
+  while kill -0 -- "$target" 2>/dev/null; do
+    [ "$i" -lt 50 ] || return 1
     i=$((i + 1))
     sleep 0.1
   done
-  if [ -n "$pgid" ]; then
-    kill -0 -- "-$pgid" 2>/dev/null || return 0
-  else
-    kill -0 "$pid" 2>/dev/null || return 0
-  fi
-  if [ -n "$pgid" ]; then kill -KILL -- "-$pgid" 2>/dev/null || true; else kill -KILL "$pid" 2>/dev/null || true; fi
-  i=0
-  while { [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null || [ -z "$pgid" ] && kill -0 "$pid" 2>/dev/null; } \
-    && [ "$i" -lt 50 ]; do
-    i=$((i + 1))
-    sleep 0.1
-  done
-  if [ -n "$pgid" ]; then
-    ! kill -0 -- "-$pgid" 2>/dev/null
-  else
-    ! kill -0 "$pid" 2>/dev/null
-  fi
 }
 
 fm_remote_job_read_single_line() {
