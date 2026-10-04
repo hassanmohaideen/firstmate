@@ -121,7 +121,29 @@ record_pi_busy() {  # <state-dir> <id>
     --source pi-ext --event agent-start
 }
 
-reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+# Stop a background watcher and require it to exit within a bounded deadline, so a
+# watcher that cannot finish its stop path fails the case instead of hanging the
+# serial lane in an unbounded wait.
+reap() {
+  local status
+  kill "$1" 2>/dev/null || true
+  wait_for_exit "$1" 300
+  status=$?
+  [ "$status" -ne 124 ] || fail "watcher pid $1 did not exit within 30s of TERM"
+  return 0
+}
+
+# Wait up to <limit> 0.1s ticks for <file> to exist while <pid> stays alive.
+wait_live_file() {  # <file> <pid> [limit]
+  local file=$1 pid=$2 limit=${3:-30} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ -e "$file" ] && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
 
@@ -1402,6 +1424,67 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "corrupt stale-since repair enqueued a wake"; }
   reap "$pid"
   pass "matching non-terminal stale suppressors repair missing or corrupt stale-since timers"
+}
+
+# --- stop signal inside a locked recovery-marker transition -------------------
+# Every cycle's downtime arm check holds the queue and recovery-marker locks, and
+# the watcher's EXIT cleanup republishes downtime under that same marker lock. A
+# TERM landing inside the locked section must still let the watcher exit and
+# leave no lock behind, rather than wait on a lock it holds itself forever. The
+# cat shim parks the watcher's own pid read-back while it owns the marker lock,
+# so the stop lands deterministically mid-transition.
+install_marker_lock_cat_pause() {  # <dir>
+  local dir=$1
+  REAL_CAT=$(command -v cat)
+  export REAL_CAT
+  cat > "$dir/fakebin/cat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */.watcher-down.lock.owner.*/pid)
+    owner=${1%/pid}
+    if [ -s "${FM_LOCK_CAT_ARM:-}" ] && [ ! -e "$FM_LOCK_CAT_READY" ] \
+      && [ "$(readlink "${owner%.owner.*}" 2>/dev/null)" = "$owner" ] \
+      && [ "$("$REAL_CAT" "$1" 2>/dev/null)" = "$("$REAL_CAT" "$FM_LOCK_CAT_ARM")" ]; then
+      printf '1\n' > "$FM_LOCK_CAT_READY"
+      while [ ! -e "$FM_LOCK_CAT_RELEASE" ]; do sleep 0.02; done
+    fi
+    ;;
+esac
+exec "$REAL_CAT" "$@"
+SH
+  chmod +x "$dir/fakebin/cat"
+}
+
+test_stop_inside_marker_lock_exits_and_releases_locks() {
+  local dir state fakebin out arm ready release pid exit_status marker lock
+  dir=$(make_case stop-inside-marker-lock); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; arm="$dir/lock-cat-arm"; ready="$dir/lock-cat-ready"; release="$dir/lock-cat-release"
+  install_marker_lock_cat_pause "$dir"
+  FM_LOCK_CAT_ARM="$arm" FM_LOCK_CAT_READY="$ready" FM_LOCK_CAT_RELEASE="$release" \
+    watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  # Arm only once the supervision loop (and its stop trap) is running.
+  wait_live_file "$state/.last-watcher-beat" "$pid" 100 \
+    || { reap "$pid"; fail "the watcher never entered its supervision loop: $(cat "$out")"; }
+  printf '%s\n' "$pid" > "$arm"
+  wait_numeric_file "$ready" 100 \
+    || { touch "$release"; reap "$pid"; fail "the watcher never held its recovery-marker lock"; }
+  kill -TERM "$pid" 2>/dev/null || true
+  touch "$release"
+  wait_for_exit "$pid" 100
+  exit_status=$?
+  [ "$exit_status" -ne 124 ] \
+    || fail "a watcher stopped inside its recovery-marker lock deadlocked in its own exit cleanup"
+  for lock in .watcher-down.lock .wake-queue.lock .watch.lock; do
+    [ ! -e "$state/$lock" ] && [ ! -L "$state/$lock" ] \
+      || fail "a watcher stopped inside its recovery-marker lock left $lock held"
+  done
+  marker=$(cat "$state/.watcher-down" 2>/dev/null || true)
+  case "$marker" in
+    pending:downtime:*) ;;
+    *) fail "the stopped watcher did not publish its downtime marker: '$marker'" ;;
+  esac
+  pass "a stop inside the recovery-marker lock exits, publishes downtime, and releases every lock"
 }
 
 # --- triage debug log stays size capped -------------------------------------
