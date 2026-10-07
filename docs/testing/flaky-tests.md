@@ -111,6 +111,7 @@ Against the real watcher on a busy-pane fixture, 1000 randomly timed single TERM
    Reproduced in the Linux container (the 22-minute live hang above, in `test_delivery_gap_wake_is_recovered_once`).
 3. **Fix options:** bound the test waits only (leaves production arms hanging); fix the arm's stop.
    Done: the arm stops its child through `fm_stop_trapping_process` (15s, then KILL), and every test stop goes through `fm_test_stop_pid`.
+   Two test races surfaced once stops became reliable: the marker-publication-failure case now holds the wake-queue lock so a watcher cycle cannot quarantine its planted marker before the stop lands, and every arm-exit wait uses the suite's 30s deadline instead of 8s.
 4. **Delete?** No; it is the only end-to-end coverage of the arm's delivery and recovery contract.
 5. **Status:** fixed in this PR.
 
@@ -214,6 +215,12 @@ These patterns can plausibly flake on a slow runner but have no CI failure in th
 - `fm-afk-inject-e2e` fails deterministically in a container with no `LANG` set, because the away-mode digest begins with U+2063; GitHub runners use a UTF-8 locale, and it passes with `LANG=C.UTF-8`.
 - Fixed-sleep negative checks (`fm-procevent`, `fm-remote-backlog-handoff`, `fm-remote-secondmate-lifecycle-e2e`, `fm-remote-job`, `fm-busy-state`) cannot flake but lose coverage on a slow runner.
 
+## Still open
+
+- `fm-watcher-lock` `test_arm_propagates_immediate_wake_before_confirmation`: one silent watcher exit 1 during a contained shard 10 run on this branch, not seen in CI and not reproduced in 60 isolated runs.
+  The watcher printed nothing, which leaves its silent `exit 1` paths; the leading candidate is custom-check cleanup giving up when the check's process group is still visible about 1s after KILL.
+  The next occurrence should be read with the watcher's stderr and the cycle-exit ledger before changing code.
+
 ## Deletion candidates
 
 No test was deleted: every flaky test above is the only coverage of its behavior.
@@ -240,4 +247,24 @@ The commands below are the ones used for this record, run from the repository ro
 
 ## Proof runs for this PR
 
-PROOF_RUNS
+All runs used Linux containers on bash 5.2.21, each file serially with a hard 300s limit per run, at this branch's committed head.
+Containers used Node 22 and a UTF-8 locale where the suite needs them, as GitHub's runners do.
+
+| Test file | Serial runs passed |
+|---|---|
+| `fm-watch-triage-wedge` | 20 of 20 |
+| `fm-watch-triage-pause` | 20 of 20 |
+| `fm-watch-triage` | 20 of 20 |
+| `fm-watch-triage-events` | 18 of 20; both failures were 14s and 18s host pauses (see latent hazards) |
+| `fm-watch-arm` | 20 of 20 after its two race fixes (19 of 20 before each) |
+| `fm-watcher-lock` | 20 of 20 |
+| `fm-secondmate-safety` | 20 of 20 |
+| `fm-tmux-agent-liveness` | 20 of 20, plus 20 of 20 under required containment |
+| `fm-inactive-reconcile` | 20 of 20, plus 12 of 12 loaded parallel |
+| `fm-procevent` | 20 of 20 |
+| `fm-discord-bot` | 20 of 20, plus 20 of 20 in four loaded parallel copies |
+| `fm-afk-inject-e2e` | 20 of 20 |
+| `fm-daemon` | 17 of 20; all three failures were 17-19s host pauses in one alarm-bound case (see latent hazards) |
+
+CI shard layout: portable serial shards 4, 5, 6, 7, and 9 of 10 passed in one run each under `FM_TEST_CONTAINMENT=required` with `--enforce-duration-budgets`.
+Shard 10 failed once in `fm-watcher-lock` (`arm returned non-zero for an immediate wake ... watcher cycle exited 1 without an actionable reason`); that case then passed 60 of 60 in isolation and the whole file 20 of 20, so it stays open below.
