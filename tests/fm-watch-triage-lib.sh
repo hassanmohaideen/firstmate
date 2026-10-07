@@ -140,14 +140,45 @@ record_pi_busy() {  # <state-dir> <id>
 
 # Stop a background watcher and require it to exit within a bounded deadline, so a
 # watcher that cannot finish its stop path fails the case instead of hanging the
-# serial lane in an unbounded wait.
+# serial lane in an unbounded wait. A watcher still alive at the deadline is
+# described before it is killed - its process tree and every lock or reclaim
+# guard in the calling case's $state with the owner's pid and liveness - so a
+# stop-path hang on CI names what the watcher was waiting on.
 reap() {
-  local status
+  local i=0
   kill "$1" 2>/dev/null || true
-  wait_for_exit "$1" 300
-  status=$?
-  [ "$status" -ne 124 ] || fail "watcher pid $1 did not exit within 30s of TERM"
-  return 0
+  while [ "$i" -lt 300 ]; do
+    if ! is_live_non_zombie "$1"; then
+      wait "$1" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  watcher_stop_diagnostics "$1" "${state:-}" >&2
+  kill -KILL "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+  fail "watcher pid $1 did not exit within 30s of TERM"
+}
+
+watcher_stop_diagnostics() {  # <pid> [state-dir]
+  local pid=$1 state=${2:-} lock owner holder live
+  printf '# watcher %s still running after TERM; process tree:\n' "$pid"
+  ps -A -o pid= -o ppid= -o stat= -o command= 2>/dev/null \
+    | awk -v root="$pid" '{ parent[$1] = $2; line[$1] = $0 }
+      END { for (p in line) { q = p; while (q != "" && q != root && q in parent && q != parent[q]) q = parent[q]
+        if (q == root) print "#   " line[p] } }'
+  [ -n "$state" ] && [ -d "$state" ] || return 0
+  printf '# locks in %s:\n' "$state"
+  for lock in "$state"/*.lock "$state"/.*.lock "$state"/*.steal "$state"/.*.steal; do
+    [ -e "$lock" ] || [ -L "$lock" ] || continue
+    owner=$(readlink "$lock" 2>/dev/null || printf '(directory)')
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    live=dead
+    [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && live=live
+    printf '#   %s -> %s pid=%s (%s)\n' "${lock##*/}" "$owner" "${holder:-none}" "$live"
+  done
+  printf '# recovery marker: %s\n' "$(cat "$state/.watcher-down" 2>/dev/null || printf absent)"
 }
 
 # Wait up to 30s for <pid> to finish absorbing a stale pane: `test <op> <marker>`
@@ -1576,6 +1607,74 @@ test_stop_inside_marker_lock_exits_and_releases_locks() {
     *) fail "the stopped watcher did not publish its downtime marker: '$marker'" ;;
   esac
   pass "a stop inside the recovery-marker lock exits, publishes downtime, and releases every lock"
+}
+
+# Reclaiming an abandoned lock holds its .steal guard while the dead owner is
+# rechecked, and every acquisition of that lock refuses while the guard exists.
+# A stop landing inside that window must not leave the exit cleanup waiting on
+# the marker lock behind a guard the exiting watcher holds itself. The cat shim
+# parks the stale-owner recheck once this watcher owns the marker lock's guard.
+install_marker_steal_cat_pause() {  # <dir>
+  local dir=$1
+  REAL_CAT=$(command -v cat)
+  export REAL_CAT
+  cat > "$dir/fakebin/cat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */.watcher-down.lock/pid)
+    steal=${1%/pid}.steal
+    if [ -s "${FM_LOCK_CAT_ARM:-}" ] && [ ! -e "$FM_LOCK_CAT_READY" ] && [ -L "$steal" ] \
+      && [ "$("$REAL_CAT" "$steal/pid" 2>/dev/null)" = "$("$REAL_CAT" "$FM_LOCK_CAT_ARM")" ]; then
+      printf '1\n' > "$FM_LOCK_CAT_READY"
+      while [ ! -e "$FM_LOCK_CAT_RELEASE" ]; do sleep 0.02; done
+    fi
+    ;;
+esac
+exec "$REAL_CAT" "$@"
+SH
+  chmod +x "$dir/fakebin/cat"
+}
+
+test_stop_holding_marker_steal_guard_exits_and_releases_locks() {
+  local dir state fakebin out arm ready release pid exit_status marker lock owner i
+  dir=$(make_case stop-holding-marker-steal); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; arm="$dir/lock-cat-arm"; ready="$dir/lock-cat-ready"; release="$dir/lock-cat-release"
+  install_marker_steal_cat_pause "$dir"
+  FM_LOCK_CAT_ARM="$arm" FM_LOCK_CAT_READY="$ready" FM_LOCK_CAT_RELEASE="$release" \
+    watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_live_file "$state/.last-watcher-beat" "$pid" 100 \
+    || { reap "$pid"; fail "the watcher never entered its supervision loop: $(cat "$out")"; }
+  # Abandon the marker lock under a dead owner, as a holder killed mid-transition
+  # leaves it. The live watcher may hold the lock itself this instant, so retry.
+  owner=$(cd "$state" && pwd -P)/.watcher-down.lock.owner.abandoned
+  mkdir -p "$owner"
+  dead_pid > "$owner/pid"
+  i=0
+  until ln -s "$owner" "$state/.watcher-down.lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || { reap "$pid"; fail "could not plant the abandoned recovery-marker lock"; }
+    sleep 0.01
+  done
+  printf '%s\n' "$pid" > "$arm"
+  wait_numeric_file "$ready" 100 \
+    || { touch "$release"; reap "$pid"; fail "the watcher never reclaimed the abandoned recovery-marker lock"; }
+  kill -TERM "$pid" 2>/dev/null || true
+  touch "$release"
+  wait_for_exit "$pid" 100
+  exit_status=$?
+  [ "$exit_status" -ne 124 ] \
+    || fail "a watcher stopped while reclaiming the recovery-marker lock deadlocked in its own exit cleanup"
+  for lock in .watcher-down.lock .watcher-down.lock.steal .wake-queue.lock .wake-queue.lock.steal .watch.lock; do
+    [ ! -e "$state/$lock" ] && [ ! -L "$state/$lock" ] \
+      || fail "a watcher stopped while reclaiming the recovery-marker lock left $lock held"
+  done
+  marker=$(cat "$state/.watcher-down" 2>/dev/null || true)
+  case "$marker" in
+    pending:downtime:*) ;;
+    *) fail "the watcher stopped while reclaiming a lock did not publish its downtime marker: '$marker'" ;;
+  esac
+  pass "a stop while reclaiming an abandoned recovery-marker lock exits, publishes downtime, and releases every lock"
 }
 
 # --- triage debug log stays size capped -------------------------------------

@@ -723,6 +723,25 @@ fm_lock_release() {
   rmdir "$lockdir" 2>/dev/null || true
 }
 
+# Release every lock and every .steal reclaim guard directly under <dir> that
+# this process owns, except the named keep paths. A holder interrupted inside a
+# locked section calls this before its exit cleanup re-acquires any lock, so the
+# cleanup never waits on a lock, or behind a reclaim guard, it holds itself.
+# fm_lock_release is owner-checked, so locks held by anyone else are untouched.
+# Primary locks are released before guards, matching the order a reclaim does.
+fm_lock_release_owned() {  # <dir> [keep-path...]
+  local dir=$1 path keep held
+  shift
+  for path in "$dir"/*.lock "$dir"/.*.lock "$dir"/*.steal "$dir"/.*.steal; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    held=1
+    for keep in "$@"; do
+      [ "$path" != "$keep" ] || held=0
+    done
+    [ "$held" -eq 0 ] || fm_lock_release "$path"
+  done
+}
+
 fm_meta_lock_path() {
   local meta=$1 dir base id
   dir=${meta%/*}

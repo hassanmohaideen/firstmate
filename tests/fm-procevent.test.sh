@@ -87,6 +87,19 @@ wait_for() {  # <file> [tries]
   return 1
 }
 
+# Wait until <home>'s public listing shows a live owner for <source-id>: the
+# runner reconcile starts in the background claims the source asynchronously,
+# so a fixed pause can lose the race to a following start on a loaded machine.
+wait_owned() {  # <home> <source-id> [tries]
+  local home=$1 id=$2 n=${3:-200}
+  for _ in $(seq 1 "$n"); do
+    pe "$home" list 2>/dev/null | awk -v id="$id" '$1 == id && $3 == "live" { found = 1 } END { exit !found }' \
+      && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
 hold_source_lock() {  # <source-id> <ready-file> <release-file>
   local id=$1 ready=$2 release=$3 parent=$$
   FM_HOME="$TMP_ROOT/lock-helper-home" bash -c '
@@ -146,7 +159,7 @@ sup=$(PATH="${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" bash -c \
 assert_contains "$sup" yes "a registered source needs supervision with no task metadata"
 
 pe "$H1" reconcile >/dev/null
-sleep 0.5
+wait_owned "$H1" src-one || fail "reconcile did not start a runner that owns src-one"
 out=$(pe "$H1" start src-one)
 assert_contains "$out" "already owned" "a duplicate start loses instead of running a second child"
 
@@ -529,7 +542,7 @@ HW="$TMP_ROOT/hw"; new_home "$HW"
 TRIGW="$TMP_ROOT/trigger-restart-cut"
 pe_register "$HW" lavish restart-cut-src -- "$BLOCKER" "$TRIGW" "restart cut payload" >/dev/null
 pe "$HW" reconcile >/dev/null
-sleep 0.5
+wait_owned "$HW" restart-cut-src || fail "reconcile did not start a runner that owns restart-cut-src"
 : > "$TRIGW"
 wait_for "$HW/state/.wake-queue" || fail "the restart-cut source published no event"
 assert_contains "$(wake_payloads "$HW")" "procevent lavish restart-cut-src 1" \
@@ -607,7 +620,7 @@ TRIG2="$TMP_ROOT/trigger-two"
 pe_register "$HA" lavish shared-src -- "$BLOCKER" "$TRIG2" "shared" >/dev/null
 pe_register "$HB" lavish shared-src -- "$BLOCKER" "$TRIG2" "shared" >/dev/null
 pe "$HA" reconcile >/dev/null
-sleep 0.5
+wait_owned "$HA" shared-src || fail "reconcile did not start a runner that owns shared-src"
 out=$(pe "$HB" start shared-src)
 assert_contains "$out" "already owned" "a second home cannot own a source another home already owns"
 [ -z "$(wake_payloads "$HB")" ] || fail "the losing home published an event"
@@ -630,7 +643,7 @@ TRIG4="$TMP_ROOT/trigger-four"
 HZ="$TMP_ROOT/hz"; new_home "$HZ"
 pe_register "$HZ" lavish orphan-src -- "$BLOCKER" "$TRIG4" "orphan" >/dev/null
 pe "$HZ" reconcile >/dev/null
-sleep 0.5
+wait_owned "$HZ" orphan-src || fail "reconcile did not start a runner that owns orphan-src"
 orphan_pid=$(sed -n '2p' "$FM_PROCEVENT_CLAIM_ROOT/orphan-src.claim" 2>/dev/null)
 if [ -z "$orphan_pid" ] || ! kill -0 "$orphan_pid" 2>/dev/null; then
   fail "orphan fixture runner did not start"

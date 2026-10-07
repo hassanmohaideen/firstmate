@@ -190,6 +190,44 @@ test_guard_warnings() {
   pass "guard banner leads when down with pending wakes (repair-after-drain) and stays silent when live and fresh"
 }
 
+# Start 40 contenders on <lockdir>; each records its attempt, and a winner
+# records itself and then holds the lock until every contender has attempted.
+# A fixed hold could expire before a slow-starting contender attempts, and that
+# contender would then correctly reclaim a dead winner's lock as a second win.
+contend_lock_40() {  # <state> <lockdir> <wins-file> <work-dir>
+  local state=$1 lockdir=$2 marker=$3 work=$4 attempts release pids pid i rc=0
+  attempts="$work/attempts"; release="$work/release"
+  : > "$attempts"
+  pids=
+  i=1
+  while [ "$i" -le 40 ]; do
+    FM_STATE_OVERRIDE="$state" bash -c '
+      . "$1"
+      if fm_lock_try_acquire "$2"; then
+        printf "%s\n" "${BASHPID:-$$}" >> "$3"
+        printf "won\n" >> "$4"
+        n=0
+        while [ ! -e "$5" ] && [ "$n" -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
+      else
+        printf "lost\n" >> "$4"
+      fi
+    ' _ "$LIB" "$lockdir" "$marker" "$attempts" "$release" &
+    pids="$pids $!"
+    i=$((i + 1))
+  done
+  i=0
+  until [ "$(awk 'NF { c++ } END { print c + 0 }' "$attempts")" -ge 40 ]; do
+    i=$((i + 1))
+    [ "$i" -lt 600 ] || { rc=1; break; }
+    sleep 0.1
+  done
+  touch "$release"
+  for pid in $pids; do
+    wait "$pid" 2>/dev/null || true
+  done
+  return "$rc"
+}
+
 test_lock_single_winner_under_concurrency() {
   local dir state lockdir marker i pids pid wins
   dir=$(make_case lock-concurrency)
@@ -197,24 +235,8 @@ test_lock_single_winner_under_concurrency() {
   lockdir="$state/.contend.lock"
   marker="$dir/wins"
   : > "$marker"
-  pids=
-  i=1
-  while [ "$i" -le 40 ]; do
-    FM_STATE_OVERRIDE="$state" bash -c '
-      . "$1"
-      if fm_lock_try_acquire "$2"; then
-        printf "%s\n" "$$" >> "$3"
-        # Stay alive so the held lock names a live pid for the whole window;
-        # otherwise a late contender could legitimately reclaim a dead-pid lock.
-        sleep 1
-      fi
-    ' _ "$LIB" "$lockdir" "$marker" &
-    pids="$pids $!"
-    i=$((i + 1))
-  done
-  for pid in $pids; do
-    wait "$pid" 2>/dev/null || true
-  done
+  contend_lock_40 "$state" "$lockdir" "$marker" "$dir" \
+    || fail "the concurrent lock contenders did not all attempt within the deadline"
   wins=$(awk 'NF { c++ } END { print c + 0 }' "$marker")
   [ "$wins" -eq 1 ] || fail "expected exactly one lock winner under concurrency, got $wins"
   pass "concurrent fm_lock_try_acquire yields exactly one winner"
@@ -249,22 +271,8 @@ test_lock_stale_steal_single_winner_under_concurrency() {
   mkdir "$lockdir"
   printf '%s\n' "$dead" > "$lockdir/pid"
   : > "$marker"
-  pids=
-  i=1
-  while [ "$i" -le 40 ]; do
-    FM_STATE_OVERRIDE="$state" bash -c '
-      . "$1"
-      if fm_lock_try_acquire "$2"; then
-        printf "%s\n" "${BASHPID:-$$}" >> "$3"
-        sleep 1
-      fi
-    ' _ "$LIB" "$lockdir" "$marker" &
-    pids="$pids $!"
-    i=$((i + 1))
-  done
-  for pid in $pids; do
-    wait "$pid" 2>/dev/null || true
-  done
+  contend_lock_40 "$state" "$lockdir" "$marker" "$dir" \
+    || fail "the concurrent lock contenders did not all attempt within the deadline"
   wins=$(awk 'NF { c++ } END { print c + 0 }' "$marker")
   [ "$wins" -eq 1 ] || fail "expected exactly one stale-lock stealer, got $wins"
   pass "concurrent stale-lock steal yields exactly one winner"
