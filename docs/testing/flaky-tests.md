@@ -210,6 +210,8 @@ These patterns can plausibly flake on a slow runner but have no CI failure in th
 - `tests/fm-wake-queue.test.sh`: a fixed 3s enrichment delay window.
 - `tests/fm-test-run.test.sh`: a fixture `sleep 1` is the only window between started evidence and the KILL.
 - `fm-watch-arm`, `fm-watch-triage-pause`, and `fm-watch-triage-wedge` assertion windows, and the arm's 10s confirmation default, failed only when several serial-lane files shared one machine's CPU; CI runs them strictly serially.
+- Seen only in this work's local Linux container, with no CI occurrence: `fm-daemon` "a hung wedge notifier override blocked the alarm for 17-19s" (bound 6s) and `fm-watch-triage-events` "beacon went stale while absorbing (age 14s)", both the length of the container VM's periodic 12-18s pauses.
+- `fm-afk-inject-e2e` fails deterministically in a container with no `LANG` set, because the away-mode digest begins with U+2063; GitHub runners use a UTF-8 locale, and it passes with `LANG=C.UTF-8`.
 - Fixed-sleep negative checks (`fm-procevent`, `fm-remote-backlog-handoff`, `fm-remote-secondmate-lifecycle-e2e`, `fm-remote-job`, `fm-busy-state`) cannot flake but lose coverage on a slow runner.
 
 ## Deletion candidates
