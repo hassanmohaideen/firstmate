@@ -101,7 +101,11 @@ Against the real watcher on a busy-pane fixture, 1000 randomly timed single TERM
    In each hang the next step was a `reap` of a live watcher; cause 1 was demonstrated for these shards in 26ab30e.
 3. **Fix options:** as for the wedge shard; the stop-path fixes cover all three.
 4. **Delete?** No; each covers distinct triage behavior.
-5. **Status:** cause 1 fixed earlier in 26ab30e; causes 2 and 3 and the three 3s cold-start waits widened to 30s in this PR.
+   This PR's own new pause case, `test_stop_holding_marker_steal_guard_exits_and_releases_locks`, then failed on this PR's CI (37629791974, portable serial 5: "the watcher never reclaimed the abandoned recovery-marker lock").
+   When the watcher held the marker lock at plant time, `ln -s` followed the held lock's link and "planted" a stray link inside the watcher's owner directory, so no lock was abandoned (3 of 20 local runs).
+   Separately, the shim was armed only after planting, so a reclaim in that gap was never parked (reproduced with a 1.5s pause injected between plant and arm).
+   Fixed with `ln -sn` and arming before planting.
+5. **Status:** cause 1 fixed earlier in 26ab30e; causes 2 and 3, the three 3s cold-start waits widened to 30s, and the steal-guard case's planting race fixed in this PR.
 
 ### `tests/fm-watch-arm.test.sh`
 
@@ -266,6 +270,9 @@ Containers used Node 22 and a UTF-8 locale where the suite needs them, as GitHub
 | `fm-discord-bot` | 20 of 20, plus 20 of 20 in four loaded parallel copies |
 | `fm-afk-inject-e2e` | 20 of 20 |
 | `fm-daemon` | 17 of 20; all three failures were 17-19s host pauses in one alarm-bound case (see latent hazards) |
+
+The `fm-watch-triage-pause` steal-guard planting fix came after the runs above, from CI run 37629791974.
+Its case passed 25 of 25 serial runs on macOS, against 3 of 20 before the fix, and the whole file then passed.
 
 CI shard layout: portable serial shards 4, 5, 6, 7, and 9 of 10 passed in one run each under `FM_TEST_CONTAINMENT=required` with `--enforce-duration-budgets`.
 Shard 10 failed once in `fm-watcher-lock` (`arm returned non-zero for an immediate wake ... watcher cycle exited 1 without an actionable reason`); that case then passed 60 of 60 in isolation and the whole file 20 of 20, so it stays open below.

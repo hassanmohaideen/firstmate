@@ -1607,18 +1607,22 @@ test_stop_holding_marker_steal_guard_exits_and_releases_locks() {
   pid=$!
   wait_live_file "$state/.last-watcher-beat" "$pid" 100 \
     || { reap "$pid"; fail "the watcher never entered its supervision loop: $(cat "$out")"; }
+  # Arm before planting: the watcher can reclaim the abandoned lock the instant
+  # it exists, and the shim only parks a reclaim whose guard this watcher owns,
+  # which no ordinary acquisition creates.
+  printf '%s\n' "$pid" > "$arm"
   # Abandon the marker lock under a dead owner, as a holder killed mid-transition
-  # leaves it. The live watcher may hold the lock itself this instant, so retry.
+  # leaves it. The live watcher may hold the lock itself this instant, so retry;
+  # -n keeps ln from following that held lock's link into its owner directory.
   owner=$(cd "$state" && pwd -P)/.watcher-down.lock.owner.abandoned
   mkdir -p "$owner"
   dead_pid > "$owner/pid"
   i=0
-  until ln -s "$owner" "$state/.watcher-down.lock" 2>/dev/null; do
+  until ln -sn "$owner" "$state/.watcher-down.lock" 2>/dev/null; do
     i=$((i + 1))
     [ "$i" -lt 200 ] || { reap "$pid"; fail "could not plant the abandoned recovery-marker lock"; }
     sleep 0.01
   done
-  printf '%s\n' "$pid" > "$arm"
   wait_numeric_file "$ready" 100 \
     || { touch "$release"; reap "$pid"; fail "the watcher never reclaimed the abandoned recovery-marker lock"; }
   kill -TERM "$pid" 2>/dev/null || true
