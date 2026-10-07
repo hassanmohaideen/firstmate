@@ -138,48 +138,10 @@ record_pi_busy() {  # <state-dir> <id>
     --source pi-ext --event agent-start
 }
 
-# Stop a background watcher and require it to exit within a bounded deadline, so a
-# watcher that cannot finish its stop path fails the case instead of hanging the
-# serial lane in an unbounded wait. A watcher still alive at the deadline is
-# described before it is killed - its process tree and every lock or reclaim
-# guard in the calling case's $state with the owner's pid and liveness - so a
-# stop-path hang on CI names what the watcher was waiting on.
-reap() {
-  local i=0
-  kill "$1" 2>/dev/null || true
-  while [ "$i" -lt 300 ]; do
-    if ! is_live_non_zombie "$1"; then
-      wait "$1" 2>/dev/null || true
-      return 0
-    fi
-    sleep 0.1
-    i=$((i + 1))
-  done
-  watcher_stop_diagnostics "$1" "${state:-}" >&2
-  kill -KILL "$1" 2>/dev/null || true
-  wait "$1" 2>/dev/null || true
-  fail "watcher pid $1 did not exit within 30s of TERM"
-}
-
-watcher_stop_diagnostics() {  # <pid> [state-dir]
-  local pid=$1 state=${2:-} lock owner holder live
-  printf '# watcher %s still running after TERM; process tree:\n' "$pid"
-  ps -A -o pid= -o ppid= -o stat= -o command= 2>/dev/null \
-    | awk -v root="$pid" '{ parent[$1] = $2; line[$1] = $0 }
-      END { for (p in line) { q = p; while (q != "" && q != root && q in parent && q != parent[q]) q = parent[q]
-        if (q == root) print "#   " line[p] } }'
-  [ -n "$state" ] && [ -d "$state" ] || return 0
-  printf '# locks in %s:\n' "$state"
-  for lock in "$state"/*.lock "$state"/.*.lock "$state"/*.steal "$state"/.*.steal; do
-    [ -e "$lock" ] || [ -L "$lock" ] || continue
-    owner=$(readlink "$lock" 2>/dev/null || printf '(directory)')
-    holder=$(cat "$lock/pid" 2>/dev/null || true)
-    live=dead
-    [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && live=live
-    printf '#   %s -> %s pid=%s (%s)\n' "${lock##*/}" "$owner" "${holder:-none}" "$live"
-  done
-  printf '# recovery marker: %s\n' "$(cat "$state/.watcher-down" 2>/dev/null || printf absent)"
-}
+# Stop a background watcher and require it to exit within a bounded deadline
+# (fm_test_reap_watcher in tests/lib.sh), describing the calling case's $state
+# locks if it never does.
+reap() { fm_test_reap_watcher "$1" "${state:-}"; }
 
 # Wait up to 30s for <pid> to finish absorbing a stale pane: `test <op> <marker>`
 # holds for the marker the absorb path writes last and, when given, the

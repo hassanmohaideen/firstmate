@@ -224,7 +224,7 @@ test_attached_arm_still_fails_on_a_wake_it_did_not_deliver() {
   # observed watcher remains uninvolved, so only watcher-bound evidence can
   # distinguish this from a delivered watcher cycle.
   append_wake "$state" check process-event "check: process-event result captured: fixture"
-  kill "$SEED_PID" 2>/dev/null || true
+  fm_test_stop_pid "$SEED_PID" || fail "seed watcher pid $SEED_PID did not stop within 30s of TERM"
   wait "$SEED_PID" 2>/dev/null || true
   wait_for_exit "$ARM_PID" 120
   status=$?
@@ -325,7 +325,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
 
   # A later down interval can have no new queue rows at all. The unchanged
   # remote decision must still trigger a recovery wake and be folded again.
-  kill "$ARM_PID" 2>/dev/null || true
+  fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/decision-only-arm.out"
   wait_for_exit "$ARM_PID" 80 || fail "decision-only re-arm did not surface the open decision"
@@ -347,7 +347,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
   ! grep -F 'check: rearm-resurface' "$dir/decision-handling-successor.out" >/dev/null \
     || fail "decision-only handling successor emitted recursive recovery"
 
-  kill -TERM "$decision_successor" 2>/dev/null || fail "could not interrupt decision handling successor"
+  fm_test_stop_pid "$decision_successor" || fail "could not interrupt decision handling successor"
   wait "$decision_successor" 2>/dev/null || true
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/interrupted-decision-arm.out"
   wait_for_exit "$ARM_PID" 80 || fail "interrupted decision handling was not recovered on successor re-arm"
@@ -366,7 +366,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
     || fail "completed decision handling could not acknowledge current recovery"
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/decision-successor-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "acknowledged decision recovery did not leave a live successor"
-  kill "$ARM_PID" 2>/dev/null || true
+  fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   pass "watch-arm: re-arm surfaces every queued wake and an open remote decision after downtime"
 }
@@ -384,7 +384,7 @@ test_marker_publish_failure_retains_recovery_evidence() {
   is_live_non_zombie "$first_arm" || fail "marker-failure fixture watcher did not stay live"
   watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   mkdir "$state/.watcher-down"
-  kill -TERM "$watcher_pid" 2>/dev/null || fail "could not stop marker-failure fixture watcher"
+  fm_test_stop_pid "$watcher_pid" || fail "could not stop marker-failure fixture watcher"
   wait "$first_arm" 2>/dev/null || true
 
   [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$watcher_pid" ] \
@@ -435,7 +435,7 @@ test_delivery_gap_wake_is_recovered_once() {
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/stable-successor.out"
   is_live_non_zombie "$ARM_PID" || fail "successor looped after the delivery gap was drained"
-  kill "$ARM_PID" 2>/dev/null || true
+  fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   pass "watch-arm: a wake queued after handling drain is recovered once at successor arm"
 }
@@ -500,7 +500,7 @@ test_interrupted_handling_is_redrained_on_rearm() {
     || fail "interrupted handling removed the unacknowledged durable wake"
   is_live_non_zombie "$ARM_PID" || fail "handling drain stopped its live successor"
 
-  kill -TERM "$ARM_PID" 2>/dev/null || fail "could not interrupt the handling successor"
+  fm_test_stop_pid "$ARM_PID" || fail "could not interrupt the handling successor"
   wait "$ARM_PID" 2>/dev/null || true
   case "$(cat "$state/.watcher-down" 2>/dev/null || true)" in
     pending:downtime:*) ;;
@@ -547,7 +547,7 @@ test_malformed_marker_is_quarantined_once() {
   ack_wakes "$state" || fail "malformed-marker handling acknowledgement failed"
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/stable-successor.out"
   is_live_non_zombie "$ARM_PID" || fail "malformed marker caused a persistent recovery loop"
-  kill "$ARM_PID" 2>/dev/null || true
+  fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   pass "watch-arm: malformed recovery state is quarantined without a successor loop"
 }
@@ -648,7 +648,7 @@ test_downtime_marker_does_not_follow_symlink() {
   watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   printf 'must remain intact\n' > "$sentinel"
   ln -s "$sentinel" "$state/.watcher-down"
-  kill -TERM "$watcher_pid" 2>/dev/null || fail "could not stop symlink fixture watcher"
+  fm_test_stop_pid "$watcher_pid" || fail "could not stop symlink fixture watcher"
   wait "$ARM_PID" 2>/dev/null || true
 
   [ "$(cat "$sentinel")" = "must remain intact" ] \

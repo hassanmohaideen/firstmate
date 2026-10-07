@@ -755,6 +755,10 @@ elif [ "$FM_RECOVERY_MARKER_ACTION" = recover ]; then
 fi
 watcher_cleanup() {
   local cleanup_status=0 owns_lock=0 transition=release-lock
+  # A stopper re-delivers TERM because Bash 5.2 can lose one (see
+  # fm_stop_trapping_process), so once cleanup begins further stops are ignored
+  # and can never cut the recovery transition short.
+  trap '' HUP INT TERM
   # The stop trap can fire inside a locked transition, such as each cycle's
   # downtime arm check, or while reclaiming an abandoned lock under its .steal
   # guard, and the recovery transition below re-acquires the marker lock.

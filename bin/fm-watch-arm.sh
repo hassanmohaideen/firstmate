@@ -77,6 +77,9 @@ case "${OSTYPE:-}" in
   *) ARM_CONFIRM_DEFAULT=10 ;;
 esac
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
+# A watcher can defer a stop while one bounded child runs (the inactive-outcome
+# scan allows about 11s), so give it 15s of re-delivered TERM before KILL.
+ARM_CHILD_STOP_TICKS=150
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 CYCLE_LOG="$STATE/.watch-cycle-exits.log"
@@ -412,15 +415,10 @@ if [ "$mode" = restart ]; then
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
     if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
-      kill -TERM "$lock_pid" 2>/dev/null || true
       # Wait for it to actually exit before relaunching, so the fresh watcher
       # either takes a released lock or reclaims a now-dead-pid stale lock instead
       # of seeing the dying one as a live holder and no-opping.
-      i=0
-      while [ "$i" -lt 50 ] && fm_pid_alive "$lock_pid"; do
-        sleep 0.1
-        i=$((i + 1))
-      done
+      fm_stop_trapping_process "$lock_pid" 50 || true
     else
       if ! clear_stale_recorded_watcher_lock; then
         echo "watcher: FAILED - stale watcher recovery state could not be persisted" >&2
@@ -450,7 +448,7 @@ child=
 child_out=
 cleanup_child() {
   if [ -n "$child" ] && fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
+    fm_stop_trapping_process "$child" "$ARM_CHILD_STOP_TICKS" kill || true
   fi
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
@@ -462,7 +460,7 @@ handle_arm_signal() {
   local signal=$1 rc=$2
   trap - HUP TERM INT
   if [ -n "$child" ] && fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
+    fm_stop_trapping_process "$child" "$ARM_CHILD_STOP_TICKS" kill || true
     wait "$child" 2>/dev/null || true
   fi
   cycle_log_append "$rc" "$signal" arm-interrupted none

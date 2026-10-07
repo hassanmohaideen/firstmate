@@ -27,6 +27,48 @@ fm_pid_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# Like fm_pid_alive, but an exited child its parent has not yet reaped (a
+# zombie) counts as gone, so a parent can wait on its own child's exit.
+fm_pid_running() {
+  local stat
+  fm_pid_alive "$1" || return 1
+  stat=$(ps -p "$1" -o stat= 2>/dev/null || true)
+  case "$stat" in
+    Z*) return 1 ;;
+  esac
+  return 0
+}
+
+# Stop a Bash process that traps TERM, within <ticks> 0.1s ticks.
+# Bash 5.2 (through 5.2.37; fixed in 5.3) can lose a trapped signal: when it
+# arrives while the shell is parsing a $(...) command substitution, the trap
+# action fails to parse ("unexpected EOF while looking for matching `)'") and
+# the signal is consumed. One TERM is therefore not a reliable stop, so this
+# re-delivers TERM every second until the process is gone. A process whose exit
+# cleanup has begun ignores further stops, so re-delivery never cuts it short.
+# With "kill", a survivor at the deadline is sent KILL.
+# Returns 0 once it is gone, 2 if only KILL stopped it, 1 if it survived.
+fm_stop_trapping_process() {  # <pid> <ticks> [kill]
+  local pid=$1 ticks=$2 escalate=${3:-} i=0
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  while fm_pid_running "$pid"; do
+    [ "$i" -lt "$ticks" ] || break
+    [ $((i % 10)) -ne 0 ] || kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.1
+    i=$((i + 1))
+  done
+  fm_pid_running "$pid" || return 0
+  [ "$escalate" = kill ] || return 1
+  kill -KILL "$pid" 2>/dev/null || true
+  i=0
+  while fm_pid_running "$pid" && [ "$i" -lt 20 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  fm_pid_running "$pid" && return 1
+  return 2
+}
+
 fm_pid_identity() {
   local pid=$1 out proc_root stat_line starttime cmdline_hex identity_key
   local -a stat_fields
