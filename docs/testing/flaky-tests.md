@@ -111,6 +111,7 @@ Against the real watcher on a busy-pane fixture, 1000 randomly timed single TERM
    Reproduced in the Linux container (the 22-minute live hang above, in `test_delivery_gap_wake_is_recovered_once`).
 3. **Fix options:** bound the test waits only (leaves production arms hanging); fix the arm's stop.
    Done: the arm stops its child through `fm_stop_trapping_process` (15s, then KILL), and every test stop goes through `fm_test_stop_pid`.
+   The arm's signal handlers ignore further stops while they run, as the watcher's exit cleanup does, so a re-delivered TERM cannot kill the arm before it stops its child and records `arm-interrupted` (regression: `test_repeated_stop_does_not_cut_arm_stop_short`).
    Two test races surfaced once stops became reliable: the marker-publication-failure case now holds the wake-queue lock so a watcher cycle cannot quarantine its planted marker before the stop lands, and every arm-exit wait uses the suite's 30s deadline instead of 8s.
 4. **Delete?** No; it is the only end-to-end coverage of the arm's delivery and recovery contract.
 5. **Status:** fixed in this PR.
