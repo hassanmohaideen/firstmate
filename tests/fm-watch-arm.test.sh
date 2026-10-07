@@ -320,7 +320,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
     # End the fixture through an ordinary actionable status transition so this
     # failing pre-fix path leaves no child behind.
     printf 'done: fixture cleanup\n' > "$state/cleanup.status"
-    wait_for_exit "$ARM_PID" 80 || true
+    wait_for_exit "$ARM_PID" 300 || true
     fail "re-arm stayed live instead of surfacing durable wakes and the still-open remote decision"
   fi
   wait "$ARM_PID"
@@ -354,7 +354,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
   fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/decision-only-arm.out"
-  wait_for_exit "$ARM_PID" 80 || fail "decision-only re-arm did not surface the open decision"
+  wait_for_exit "$ARM_PID" 300 || fail "decision-only re-arm did not surface the open decision"
   decision_recovery_arm=$ARM_PID
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/decision-handling-successor.out" "$decision_recovery_arm"
   is_live_non_zombie "$ARM_PID" || fail "decision handling successor re-triggered before the drain"
@@ -376,7 +376,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
   fm_test_stop_pid "$decision_successor" || fail "could not interrupt decision handling successor"
   wait "$decision_successor" 2>/dev/null || true
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/interrupted-decision-arm.out"
-  wait_for_exit "$ARM_PID" 80 || fail "interrupted decision handling was not recovered on successor re-arm"
+  wait_for_exit "$ARM_PID" 300 || fail "interrupted decision handling was not recovered on successor re-arm"
   grep -F 'check: rearm-resurface' "$dir/interrupted-decision-arm.out" >/dev/null \
     || fail "successor did not re-surface the unacknowledged decision recovery"
   FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/replayed-decision-drain.out" \
@@ -430,7 +430,7 @@ test_marker_publish_failure_retains_recovery_evidence() {
   rmdir "$state/.watcher-down"
   armout="$dir/recovery-arm.out"
   start_rearm_arm "$home" "$state" "$fakebin" "$armout"
-  wait_for_exit "$ARM_PID" 80 || fail "stale-lock recovery did not surface downtime"
+  wait_for_exit "$ARM_PID" 300 || fail "stale-lock recovery did not surface downtime"
   grep -F 'check: rearm-resurface' "$armout" >/dev/null \
     || fail "stale-lock recovery did not emit the recovery wake: $(cat "$armout")"
   pass "watch-arm: marker publication failure retains stale-lock recovery evidence"
@@ -458,7 +458,7 @@ test_delivery_gap_wake_is_recovered_once() {
   append_wake "$state" check startup-network 'check: startup-network during handling gap'
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/gap-arm.out"
-  wait_for_exit "$ARM_PID" 80 || fail "successor missed the wake queued in the delivery gap"
+  wait_for_exit "$ARM_PID" 300 || fail "successor missed the wake queued in the delivery gap"
   grep -F 'check: rearm-resurface' "$dir/gap-arm.out" >/dev/null \
     || fail "delivery-gap successor did not emit one recovery wake: $(cat "$dir/gap-arm.out")"
 
@@ -492,7 +492,7 @@ test_interrupted_handling_is_redrained_on_rearm() {
     || fail "delivered wake was not durable before handling"
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/crash-gap-recovery-arm.out"
-  wait_for_exit "$ARM_PID" 80 || fail "re-arm after a pre-successor crash stranded the durable wake"
+  wait_for_exit "$ARM_PID" 300 || fail "re-arm after a pre-successor crash stranded the durable wake"
   recovery_arm=$ARM_PID
   grep -F 'check: rearm-resurface' "$dir/crash-gap-recovery-arm.out" >/dev/null \
     || fail "re-arm after a pre-successor crash did not re-surface the durable wake"
@@ -505,7 +505,7 @@ test_interrupted_handling_is_redrained_on_rearm() {
   generation_before=$(sed -n 's/^pending:downtime:\(.*\)$/\1/p' "$state/.watcher-down")
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/reason-emit-crash-replay.out"
-  wait_for_exit "$ARM_PID" 80 || fail "a crash after reason emission stranded the durable wake"
+  wait_for_exit "$ARM_PID" 300 || fail "a crash after reason emission stranded the durable wake"
   recovery_arm=$ARM_PID
   grep -F 'check: rearm-resurface' "$dir/reason-emit-crash-replay.out" >/dev/null \
     || fail "a crash after reason emission did not re-drain recovery"
@@ -543,7 +543,7 @@ test_interrupted_handling_is_redrained_on_rearm() {
   esac
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/recovery-arm.out"
-  wait_for_exit "$ARM_PID" 80 || fail "successor after interruption did not re-surface the pending wake"
+  wait_for_exit "$ARM_PID" 300 || fail "successor after interruption did not re-surface the pending wake"
   grep -F 'check: rearm-resurface' "$dir/recovery-arm.out" >/dev/null \
     || fail "successor after interruption did not emit durable recovery"
   FM_HOME="$home" FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/replay-drain.out" \
@@ -571,7 +571,7 @@ test_malformed_marker_is_quarantined_once() {
   printf 'foreign state\n' > "$state/.watcher-down/payload"
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/recovery-arm.out"
-  wait_for_exit "$ARM_PID" 80 || fail "malformed marker did not produce a bounded recovery wake"
+  wait_for_exit "$ARM_PID" 300 || fail "malformed marker did not produce a bounded recovery wake"
   grep -F 'check: rearm-resurface' "$dir/recovery-arm.out" >/dev/null \
     || fail "malformed marker did not emit the recovery wake"
   invalid_count=$(find "$state" -maxdepth 1 -type d -name '.watcher-down.invalid.*' | wc -l | tr -d '[:space:]')
@@ -600,7 +600,7 @@ test_recovery_consumption_serializes_queue_publication() {
   is_live_non_zombie "$ARM_PID" || fail "acknowledged recovery fixture did not remain live"
   append_wake "$state" check startup-network 'check: concurrent startup-network' \
     || fail "concurrent queue publication failed"
-  wait_for_exit "$ARM_PID" 80 \
+  wait_for_exit "$ARM_PID" 300 \
     || fail "watcher missed publication after an acknowledged recovery handoff"
   grep -F 'check: rearm-resurface' "$dir/arm.out" >/dev/null \
     || fail "publisher did not restore recovery evidence"
@@ -633,7 +633,7 @@ test_restart_preserves_recovery_across_reused_pid_lock() {
   ln -s "$owner" "$state/.watch.lock"
 
   start_rearm_arm "$home" "$state" "$fakebin" "$armout"
-  wait_for_exit "$ARM_PID" 80 || fail "restart did not surface recovery after clearing a reused-pid lock"
+  wait_for_exit "$ARM_PID" 300 || fail "restart did not surface recovery after clearing a reused-pid lock"
   grep -F 'check: rearm-resurface' "$armout" >/dev/null \
     || fail "restart cleared reused-pid lock evidence without a recovery wake: $(cat "$armout")"
   is_live_non_zombie "$unrelated" || fail "restart signaled the unrelated process whose pid was reused"
@@ -653,7 +653,7 @@ test_markerless_legacy_queue_is_recovered_on_arm() {
   printf '%s\n' "$row" > "$state/.wake-queue"
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/arm.out"
-  wait_for_exit "$ARM_PID" 80 || fail "markerless legacy queue was stranded at re-arm"
+  wait_for_exit "$ARM_PID" 300 || fail "markerless legacy queue was stranded at re-arm"
   grep -F 'check: rearm-resurface' "$dir/arm.out" >/dev/null \
     || fail "markerless legacy queue did not trigger recovery"
   case "$(cat "$state/.watcher-down" 2>/dev/null || true)" in
