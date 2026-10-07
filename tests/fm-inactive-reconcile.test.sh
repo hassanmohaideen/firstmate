@@ -360,51 +360,76 @@ test_watcher_hook_and_idle_secondmate_exemption() {
 
 # A stalled authoritative state read consumes only the aggregate scan budget.
 # The durable scan position lets the next invocation reach the following child.
+# Child a's state read stalls until child b's state has been read, so a scan
+# that restarted at a instead of resuming after it would spend its whole budget
+# on a and never reach b, however generous that budget is. A correctly resuming
+# scan reads b first, which releases a, so the second scan's budget only has to
+# cover real work and the result does not depend on runner speed.
+# The stall is measured in the stalled reader's own 0.05s steps rather than
+# wall-clock time: a starved or paused runner can only lower that count, so it
+# stays an exact bound while still failing if the configured budget is ignored.
 test_stalled_state_read_is_bounded_and_scan_progresses() {
-  local started elapsed
+  local steps
   make_world bounded
   write_child "$MAIN" a 'working: state read will stall'
-  cat > "$WORLD/fakebin/fm-crew-state.sh" <<'SH'
+  cat > "$WORLD/fakebin/fm-crew-state.sh" <<SH
 #!/usr/bin/env bash
-if [ "$1" = a ]; then
-  sleep 30
+if [ "\$1" = a ]; then
+  n=0
+  printf '0\n' > "$WORLD/a-steps"
+  while [ ! -e "$WORLD/b-read" ] && [ "\$n" -lt 600 ]; do
+    sleep 0.05; n=\$((n + 1))
+    printf '%s\n' "\$n" > "$WORLD/a-steps.tmp" && mv -f "$WORLD/a-steps.tmp" "$WORLD/a-steps"
+  done
+  printf 'state: working · source: fake\n'
 else
+  : > "$WORLD/b-read"
   printf 'state: done · source: fake\n'
 fi
 SH
   chmod +x "$WORLD/fakebin/fm-crew-state.sh"
 
-  started=$(date +%s)
-  FM_INACTIVE_RECONCILE_BUDGET_SECS=1 run_reconcile "$MAIN" --startup
-  elapsed=$(( $(date +%s) - started ))
-  [ "$elapsed" -le 3 ] || fail "stalled state read exceeded aggregate scan budget (${elapsed}s)"
+  # A 2s budget allows at most 40 steps; the 10s default would allow far more.
+  FM_INACTIVE_RECONCILE_BUDGET_SECS=2 run_reconcile "$MAIN" --startup
+  [ -e "$WORLD/a-steps" ] || fail "first bounded scan never reached the stalled child"
+  steps=$(cat "$WORLD/a-steps")
+  [ "$steps" -lt 100 ] || fail "stalled state read exceeded aggregate scan budget (${steps} steps)"
 
   write_child "$MAIN" b 'done: green'
-  FM_INACTIVE_RECONCILE_BUDGET_SECS=1 run_reconcile "$MAIN" --startup
-  grep -Fq 'child=b state=done' "$MAIN/state/.wake-queue" \
+  FM_INACTIVE_RECONCILE_BUDGET_SECS=10 run_reconcile "$MAIN" --startup
+  grep -Fq 'child=b state=done' "$MAIN/state/.wake-queue" 2>/dev/null \
     || fail "next bounded scan did not resume with the following child"
   pass "stalled state reads are bounded without starving later children"
 }
 
+# The holder counts its own 0.1s steps while it holds the wake lock, so the
+# scan's wait is bounded by the holder's progress rather than wall-clock time.
 test_full_scan_budget_includes_wake_lock_wait() {
-  local holder started elapsed i
+  local holder before after i
   make_world wake-lock; write_child "$MAIN" child 'done: green'
   FM_HOME="$MAIN" FM_STATE_OVERRIDE="$MAIN/state" bash -c '
     . "$1/bin/fm-wake-lib.sh"
     fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
-    : > "$2"
-    sleep 30
-  ' _ "$ROOT" "$WORLD/lock-ready" &
+    n=0
+    printf "0\n" > "$2.tmp" && mv -f "$2.tmp" "$2"
+    while [ "$n" -lt 300 ]; do
+      sleep 0.1; n=$((n + 1))
+      printf "%s\n" "$n" > "$2.tmp" && mv -f "$2.tmp" "$2"
+    done
+  ' _ "$ROOT" "$WORLD/holder-steps" &
   holder=$!
   i=0
-  while [ "$i" -lt 30 ] && [ ! -e "$WORLD/lock-ready" ]; do sleep 0.1; i=$((i + 1)); done
-  [ -e "$WORLD/lock-ready" ] || fail "wake lock holder did not start"
+  while [ "$i" -lt 100 ] && [ ! -s "$WORLD/holder-steps" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -s "$WORLD/holder-steps" ] || fail "wake lock holder did not start"
 
-  started=$(date +%s)
+  # A 1s budget lets the holder advance about 10 steps; the 10s default far more.
+  before=$(cat "$WORLD/holder-steps")
   FM_INACTIVE_RECONCILE_BUDGET_SECS=1 FM_FAKE_CREW_STATE='done' run_reconcile "$MAIN" --startup
-  elapsed=$(( $(date +%s) - started ))
+  after=$(cat "$WORLD/holder-steps")
   reap "$holder"
-  [ "$elapsed" -le 3 ] || fail "wake lock wait exceeded aggregate scan budget (${elapsed}s)"
+  [ "$after" -lt 300 ] || fail "wake lock holder released before the bounded scan returned"
+  [ $((after - before)) -lt 50 ] \
+    || fail "wake lock wait exceeded aggregate scan budget ($((after - before)) holder steps)"
   pass "aggregate scan budget includes durable wake operations"
 }
 
