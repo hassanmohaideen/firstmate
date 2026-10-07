@@ -128,6 +128,32 @@ ack_wakes() {  # <state>
     --recovery-generation "$generation"
 }
 
+wait_for_file() {  # <file> <ticks>
+  local i=0
+  until [ -e "$1" ]; do
+    i=$((i + 1))
+    [ "$i" -lt "$2" ] || return 1
+    sleep 0.1
+  done
+}
+
+# Hold <state>'s wake-queue lock from a helper process until <release> exists or
+# this test exits; <ready> appears once it is held. Sets QUEUE_HOLDER_PID.
+hold_wake_queue_lock() {  # <state> <ready> <release>
+  FM_STATE_OVERRIDE="$1" bash -c '
+    # shellcheck disable=SC1090,SC1091
+    . "$1"
+    fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK" || exit 1
+    trap "fm_lock_release \"\$FM_WAKE_QUEUE_LOCK\"" EXIT
+    : > "$2"
+    while [ ! -e "$3" ]; do
+      kill -0 "$4" 2>/dev/null || exit 0
+      sleep 0.02
+    done
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$2" "$3" "$$" &
+  QUEUE_HOLDER_PID=$!
+}
+
 start_rearm_arm() {  # <home> <state> <fakebin> <arm-out> [predecessor-arm-pid]
   local home=$1 state=$2 fakebin=$3 armout=$4 predecessor=${5:-} i
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$state" \
@@ -383,8 +409,17 @@ test_marker_publish_failure_retains_recovery_evidence() {
   first_arm=$ARM_PID
   is_live_non_zombie "$first_arm" || fail "marker-failure fixture watcher did not stay live"
   watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  # Each watcher cycle quarantines an invalid marker and writes a valid one, so
+  # a cycle that ran after the directory was planted would let exit cleanup
+  # publish successfully. That cycle check takes the wake-queue lock before it
+  # inspects the marker, while cleanup's publication does not, so holding the
+  # queue lock keeps the planted directory intact until the watcher is gone.
+  hold_wake_queue_lock "$state" "$dir/queue-held" "$dir/queue-release"
+  wait_for_file "$dir/queue-held" 100 || fail "could not hold the wake-queue lock"
   mkdir "$state/.watcher-down"
-  fm_test_stop_pid "$watcher_pid" || fail "could not stop marker-failure fixture watcher"
+  fm_test_stop_pid "$watcher_pid" || { touch "$dir/queue-release"; fail "could not stop marker-failure fixture watcher"; }
+  touch "$dir/queue-release"
+  wait "$QUEUE_HOLDER_PID" 2>/dev/null || true
   wait "$first_arm" 2>/dev/null || true
 
   [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$watcher_pid" ] \
