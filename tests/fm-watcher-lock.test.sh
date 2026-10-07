@@ -600,7 +600,7 @@ test_arm_attaches_and_waits_for_live_fresh_watcher() {
   [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "arm disturbed the healthy watcher's lock"
   is_live_non_zombie "$armpid" || fail "arm exited while the seed watcher was still healthy"
   # After the seed dies without a successor, the attached arm must fail loudly.
-  kill "$wpid" 2>/dev/null || true
+  fm_test_stop_pid "$wpid" || fail "seed watcher pid $wpid did not stop within 30s of TERM"
   # A loaded runner can leave the watcher's graceful trap waiting on a child.
   # Keep fixture teardown bounded so the arm observes either graceful exit or
   # the helper's forced exit instead of blocking this serial shard forever.
@@ -644,7 +644,7 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
   grep -q "arm_pid=$armpid.*watcher_pid=$wpid.*origin=attached.*exit_code=143.*signal=TERM.*reason=arm-interrupted" "$state/.watch-cycle-exits.log" \
     || fail "attached arm signal was not recorded in the lifecycle ledger"
   is_live_non_zombie "$wpid" || fail "signaling an attached arm terminated the peer watcher"
-  kill "$wpid" 2>/dev/null || true
+  fm_test_stop_pid "$wpid" || fail "peer watcher pid $wpid did not stop within 30s of TERM"
   wait "$wpid" 2>/dev/null || true
   pass "attached arm signals record a classified lifecycle entry"
 }
