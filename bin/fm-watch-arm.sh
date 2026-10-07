@@ -344,7 +344,9 @@ attach_and_wait() {
 # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
 handle_attached_signal() {
   local signal=$1 rc=$2
-  trap - HUP TERM INT
+  # A stopper re-delivers TERM because Bash 5.2 can lose one (see
+  # fm_stop_trapping_process), so further stops are ignored until this exits.
+  trap '' HUP TERM INT
   cycle_log_append "$rc" "$signal" arm-interrupted none
   exit "$rc"
 }
@@ -458,7 +460,11 @@ cleanup_child() {
 # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
 handle_arm_signal() {
   local signal=$1 rc=$2
-  trap - HUP TERM INT
+  # A stopper re-delivers TERM because Bash 5.2 can lose one (see
+  # fm_stop_trapping_process); ignoring further stops keeps a repeat from killing
+  # this arm before it has stopped its watcher child and recorded the cycle. The
+  # child stop's own deadline and KILL still bound the handler.
+  trap '' HUP TERM INT
   if [ -n "$child" ] && fm_pid_alive "$child"; then
     fm_stop_trapping_process "$child" "$ARM_CHILD_STOP_TICKS" kill || true
     wait "$child" 2>/dev/null || true

@@ -351,6 +351,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
 
   # A later down interval can have no new queue rows at all. The unchanged
   # remote decision must still trigger a recovery wake and be folded again.
+  kill -HUP "$ARM_PID" 2>/dev/null || true
   fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/decision-only-arm.out"
@@ -392,6 +393,7 @@ test_rearm_resurfaces_durable_queue_and_remote_open_decision() {
     || fail "completed decision handling could not acknowledge current recovery"
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/decision-successor-arm.out"
   is_live_non_zombie "$ARM_PID" || fail "acknowledged decision recovery did not leave a live successor"
+  kill -HUP "$ARM_PID" 2>/dev/null || true
   fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   pass "watch-arm: re-arm surfaces every queued wake and an open remote decision after downtime"
@@ -470,6 +472,7 @@ test_delivery_gap_wake_is_recovered_once() {
 
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/stable-successor.out"
   is_live_non_zombie "$ARM_PID" || fail "successor looped after the delivery gap was drained"
+  kill -HUP "$ARM_PID" 2>/dev/null || true
   fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   pass "watch-arm: a wake queued after handling drain is recovered once at successor arm"
@@ -535,6 +538,7 @@ test_interrupted_handling_is_redrained_on_rearm() {
     || fail "interrupted handling removed the unacknowledged durable wake"
   is_live_non_zombie "$ARM_PID" || fail "handling drain stopped its live successor"
 
+  kill -HUP "$ARM_PID" 2>/dev/null || true
   fm_test_stop_pid "$ARM_PID" || fail "could not interrupt the handling successor"
   wait "$ARM_PID" 2>/dev/null || true
   case "$(cat "$state/.watcher-down" 2>/dev/null || true)" in
@@ -582,6 +586,7 @@ test_malformed_marker_is_quarantined_once() {
   ack_wakes "$state" || fail "malformed-marker handling acknowledgement failed"
   start_rearm_arm "$home" "$state" "$fakebin" "$dir/stable-successor.out"
   is_live_non_zombie "$ARM_PID" || fail "malformed marker caused a persistent recovery loop"
+  kill -HUP "$ARM_PID" 2>/dev/null || true
   fm_test_stop_pid "$ARM_PID" || fail "watch-arm pid $ARM_PID did not stop within 30s of TERM"
   wait "$ARM_PID" 2>/dev/null || true
   pass "watch-arm: malformed recovery state is quarantined without a successor loop"
@@ -693,6 +698,50 @@ test_downtime_marker_does_not_follow_symlink() {
   pass "watch-arm: downtime marker publication does not follow symlinks"
 }
 
+# A stopper re-delivers TERM every second (fm_stop_trapping_process), and a
+# watcher defers a stop while a foreground child runs. An arm already stopping
+# on HUP must survive those TERMs long enough to stop its watcher and record the
+# interruption.
+test_repeated_stop_does_not_cut_arm_stop_short() {
+  local dir home state fakebin root armout watcher_pid
+  dir=$(make_case arm-repeated-term)
+  home="$dir/home"
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  root="$dir/root"
+  armout="$dir/arm.out"
+  mkdir -p "$home/data" "$root"
+  cp -R "$ROOT/bin" "$root/bin"
+  cat > "$root/bin/fm-inactive-reconcile.sh" <<SH
+#!/usr/bin/env bash
+if [ -e "$dir/slow-scan" ]; then
+  : > "$dir/scan-running"
+  sleep 3
+fi
+exit 0
+SH
+  chmod +x "$root/bin/fm-inactive-reconcile.sh"
+
+  WATCH_ARM="$root/bin/fm-watch-arm.sh" start_rearm_arm "$home" "$state" "$fakebin" "$armout"
+  is_live_non_zombie "$ARM_PID" || fail "repeated-TERM fixture arm did not stay live: $(cat "$armout")"
+  watcher_pid=$(sed -n 's/^watcher: started pid=\([0-9][0-9]*\).*/\1/p' "$armout")
+  [ -n "$watcher_pid" ] || fail "repeated-TERM fixture arm did not start a watcher: $(cat "$armout")"
+  : > "$dir/slow-scan"
+  wait_for_file "$dir/scan-running" 300 || fail "watcher never entered the slow scan"
+
+  kill -HUP "$ARM_PID" 2>/dev/null || true
+  fm_test_stop_pid "$ARM_PID" || fail "repeated-TERM fixture arm did not stop"
+  wait "$ARM_PID" 2>/dev/null || true
+  rm -f "$dir/slow-scan"
+
+  ! is_live_non_zombie "$watcher_pid" \
+    || { fm_test_reap_watcher "$watcher_pid" "$state"; fail "arm exited and orphaned its slow-to-stop watcher"; }
+  grep -F "watcher_pid=$watcher_pid" "$state/.watch-cycle-exits.log" 2>/dev/null \
+    | grep -F "signal=HUP" | grep -qF "reason=arm-interrupted" \
+    || fail "a repeated stop killed the arm before it recorded the interruption: $(cat "$state/.watch-cycle-exits.log" 2>/dev/null)"
+  pass "watch-arm: a repeated stop does not cut the arm's watcher stop short"
+}
+
 test_attached_arm_reports_the_delivered_wake
 test_attached_arm_reports_the_delivered_wake_after_drain
 test_attached_arm_still_fails_on_a_wake_it_did_not_deliver
@@ -705,3 +754,4 @@ test_recovery_consumption_serializes_queue_publication
 test_restart_preserves_recovery_across_reused_pid_lock
 test_markerless_legacy_queue_is_recovered_on_arm
 test_downtime_marker_does_not_follow_symlink
+test_repeated_stop_does_not_cut_arm_stop_short
