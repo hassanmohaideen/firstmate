@@ -27,7 +27,7 @@ The Docker VM used for this work pauses for 12-18s about once a minute, so wall-
 | `fm-watcher-lock` | 3 | unbounded waits on stopped watchers | fixed earlier (acae56d) and in this PR |
 | `fm-afk-inject-herdr-e2e` | 7 | away-mode daemon waited forever on its watcher | fixed earlier (94aceeb) |
 | `fm-afk-inject-e2e` | 1 | same as afk-inject-herdr-e2e | fixed earlier (94aceeb) |
-| `fm-discord-bot` | 11 | see its section | DISCORD_STATUS |
+| `fm-discord-bot` | 11 | fake Gateway crashed; a real refused-connection bug; tight time bounds | fixed in this PR |
 | `fm-tmux-agent-liveness` | 6 | tmux server outlived the script | fixed in this PR |
 | `fm-remote-job` | 6 | worker startup race; repeated TERM during shutdown | fixed earlier (4eb3138, 960b5c8, 2fb6b71) |
 | `fm-inactive-reconcile` | 3 | 1s whole-process budget on a loaded runner | fixed in this PR |
@@ -145,7 +145,21 @@ Against the real watcher on a busy-pane fixture, 1000 randomly timed single TERM
 
 ### `tests/fm-discord-bot.test.sh`
 
-DISCORD_SECTION
+1. **What it tests:** the self-hosted Discord bot's Gateway connection through its real service script against a local fake Gateway: reconnects, session resume across restarts, persisted retry delays, terminal suppression, and prompt stops.
+2. **Why it flaked:** four messages rotated across 31836467212-1 s9, 31858744908-1 and 31859655815-1 s6, 31922179087-1 s6, 31931601600-1 and -2 s6 (passed attempt 3), 31955144783-1 s6, 31996075621-1 s6 (main), 33124868363-1 s10, 37162599965-1 s10, and 37163933404-1 s10 (passed attempts 2-5).
+   - "restarted Gateway did not reconnect": the fake Gateway wrote scheduled frames to sockets already closed, Node raised an unhandled `ERR_STREAM_WRITE_AFTER_END`, and the fake server died; 9 of 36 loaded runs before the fix, each with that trace.
+   - That crash exposed a product bug: on Node 22 a refused connection fires `error` but never `close`, so the attempt never settled and the service exited 0 as if stopped, which the LaunchAgent's `SuccessfulExit=false` policy does not restart.
+   - "checkpoint replacement process did not preserve Resume" and "fresh process consumed Identify" occurred only before e3c689f, which fixed them; none in more than 100 targeted runs since.
+   - "same-boot retry restart did not resume" and the slow-start class: 10s wait deadlines and 1-4s absolute bounds that included a cold Node start.
+   - Exit 124 in 33124868363-1 was the script exceeding its old duration budget, since raised.
+   - About 45 idle fake servers per run were never stopped, which slowed parallel runs.
+3. **Fix options:** a longer reconnect wait (the earlier patch tried 30s and could not help a dead fake server); fix the fake and the bot.
+   Done: the fake drops frames for closed sockets and ignores socket errors; the bot settles a connection that errors before opening and falls back to settling 1s after a handshake or ready timeout; positive waits share a 30s deadline; prompt-stop checks assert the bot's own clean `service stopped` record; clock-anomaly bounds are 30s; the repeated-reboot bound starts at the bot's startup marker; fake servers stop when each case passes.
+   The terminal-fallback restart case now expects the documented clean stop (exit 0 after `reconnects stopped`), which launchd does not restart; its old check that the process was still running 0.15s after launch held only because Node had not started yet.
+   New regression: "refused Gateway connections settle and keep reconnecting", which fails against the old bot on Node 22.
+4. **Delete?** No; it is the only behavioral coverage of the bot and it found a real availability bug.
+5. **Status:** fixed in this PR; 20 of 20 serial and 20 of 20 in four loaded parallel copies on Linux.
+   One earlier loaded batch saw "replacement process did not reconnect" once; it did not recur in 130 later runs, and a recurrence now prints its logs.
 
 ### `tests/fm-tmux-agent-liveness.test.sh`
 
