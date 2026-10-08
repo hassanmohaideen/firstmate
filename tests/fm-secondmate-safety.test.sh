@@ -2802,8 +2802,7 @@ EOF
     grep -F "stale: $window" "$out" >/dev/null && fail "idle secondmate pane triggered stale wake"
     fail "watcher exited unexpectedly while supervising idle secondmate"
   fi
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  fm_test_reap_watcher "$pid" "$home/state"
   grep -F "stale: $window" "$out" >/dev/null && fail "idle secondmate pane triggered stale wake"
   pass "idle kind=secondmate pane is healthy and not stale"
 }

@@ -76,6 +76,23 @@ wait_numeric_file() {
   return 1
 }
 
+# Wait up to <limit> 0.1s ticks for numeric <file> to reach <target> while <pid>
+# runs: 0 once reached, 1 if the process exited first, 2 at the deadline.
+wait_live_count() {  # <file> <target> <pid> [limit]
+  local file=$1 target=$2 pid=$3 limit=${4:-30} i=0 value
+  while [ "$i" -lt "$limit" ]; do
+    value=$(cat "$file" 2>/dev/null || true)
+    case "$value" in
+      ''|*[!0-9]*) ;;
+      *) [ "$value" -lt "$target" ] || return 0 ;;
+    esac
+    is_live_non_zombie "$pid" || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 2
+}
+
 # Portable mtime in epoch seconds. Platform-detected, never the `stat -f || stat -c`
 # fallback (which writes a partial filesystem dump on Linux; see fm-watch.sh).
 file_mtime() {
@@ -121,7 +138,48 @@ record_pi_busy() {  # <state-dir> <id>
     --source pi-ext --event agent-start
 }
 
-reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+# Stop a background watcher and require it to exit within a bounded deadline
+# (fm_test_reap_watcher in tests/lib.sh), describing the calling case's $state
+# locks if it never does.
+reap() { fm_test_reap_watcher "$1" "${state:-}"; }
+
+# Wait up to 30s for <pid> to finish absorbing a stale pane: `test <op> <marker>`
+# holds for the marker the absorb path writes last and, when given, the
+# suppressor <stale_file> holds <hash>. 0 once absorbed, 1 if the process exited
+# first, 2 at the deadline (the caller's strict assertions then report the gap).
+wait_live_absorbed() {  # <pid> <-e|-s> <marker> [<stale_file> <hash>]
+  local pid=$1 op=$2 marker=$3 sf=${4:-} h=${5:-} i=0 present
+  case "$op" in
+    -e|-s) ;;
+    *) fail "wait_live_absorbed: unsupported marker test $op" ;;
+  esac
+  while [ "$i" -lt 300 ]; do
+    present=0
+    case "$op" in
+      -e) [ -e "$marker" ] && present=1 ;;
+      -s) [ -s "$marker" ] && present=1 ;;
+    esac
+    if [ "$present" -eq 1 ] && { [ -z "$sf" ] || [ "$(cat "$sf" 2>/dev/null || true)" = "$h" ]; }; then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 2
+}
+
+# Wait up to <limit> 0.1s ticks for <file> to exist while <pid> stays alive.
+wait_live_file() {  # <file> <pid> [limit]
+  local file=$1 pid=$2 limit=${3:-30} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ -e "$file" ] && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
 
@@ -502,9 +560,12 @@ test_stale_terminal_status_overridden_by_active_run() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb) after absorbing: $(cat "$out")"; }
   [ ! -s "$out" ] || fail "the overridden stale terminal status printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "the overridden stale terminal status enqueued a wake during absorb"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
@@ -556,9 +617,12 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb) after absorbing: $(cat "$out")"; }
   [ ! -s "$out" ] || fail "fresh provably-working stale printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "fresh provably-working stale enqueued a wake during absorb"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
@@ -656,9 +720,12 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -e "$state/.paused-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb) after absorbing: $(cat "$out")"; }
   [ ! -s "$out" ] || fail "fresh paused stale printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "fresh paused stale enqueued a wake during absorb"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on paused absorb"
@@ -700,7 +767,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
 # must surface once, while the unchanged hash must not append the same wake on
 # every watcher re-arm.
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
-  local dir state fakebin out capture_file statusf window key pane_hash sig pid back round wakes bare
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid back round wakes bare rechecks polls
   dir=$(make_case exited-declared-pause); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/held.status"
   window="test:fm-held"
@@ -716,22 +783,46 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
 
+  # Six watcher arms, each of which must really poll the unchanged pane. Every
+  # stop - the recheck wake or the test's own TERM - is drained and acknowledged
+  # the way firstmate handles it before re-arming; otherwise each later arm would
+  # only resurface the unacknowledged downtime and exit before its pane scan.
+  # Rounds sync on completed polls with a bounded deadline, never a fixed window,
+  # so a slow host cannot kill a watcher before it has polled.
+  wakes=0; bare=0; rechecks=0
   round=1
   while [ "$round" -le 6 ]; do
+    polls=$(cat "$state/.count-$key" 2>/dev/null || echo 0)
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_CREW_STATE='state: stopped · source: pane · bare shell' \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
-    if wait_live "$pid" 15; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
+    if [ "$round" -eq 1 ]; then
+      # The pause is already past the re-surface threshold: the first poll must
+      # surface it once as a bounded recheck.
+      wait_for_exit "$pid" 300 || fail "dead-agent declared pause did not surface its recheck: $(cat "$out")"
+    else
+      # Two more counted scans prove the first poll of this arm was fully
+      # classified and the watcher came back around without waking.
+      wait_live_count "$state/.count-$key" $((polls + 2)) "$pid" 300
+      case $? in
+        0) reap "$pid" ;;
+        1) wait "$pid" || fail "dead-agent watcher round $round failed" ;;
+        *) reap "$pid"; fail "dead-agent watcher round $round did not complete two polls" ;;
+      esac
+    fi
+    if [ -s "$state/.wake-queue" ]; then
+      wakes=$((wakes + $(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")))
+      bare=$((bare + $(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")))
+      grep -F "awaiting external" "$state/.wake-queue" >/dev/null && rechecks=$((rechecks + 1))
+    fi
+    ack_stopped_cycle "$state" || fail "could not acknowledge dead-agent watcher round $round stop"
     round=$((round + 1))
   done
-  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
-  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
   [ "$wakes" -le 1 ] || fail "dead-agent declared pause flooded $wakes stale wakes across six unchanged polls"
   [ "$bare" -eq 0 ] || fail "dead-agent declared pause surfaced as $bare bare stopped-crew wakes"
-  grep -F "awaiting external" "$state/.wake-queue" >/dev/null \
-    || fail "dead-agent declared pause did not use the bounded paused recheck"
+  [ "$rechecks" -ge 1 ] || fail "dead-agent declared pause did not use the bounded paused recheck"
 
   dir=$(make_case exited-captain-held); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/held.status"
@@ -988,7 +1079,7 @@ test_paused_authoritative_working_preserves_wedge_timer() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_numeric_file "$state/.stale-since-$key" 30 || { reap "$pid"; fail "authoritative working state did not start wedge tracking"; }
+  wait_numeric_file "$state/.stale-since-$key" 300 || { reap "$pid"; fail "authoritative working state did not start wedge tracking"; }
   since=$(cat "$state/.stale-since-$key")
   sleep 2
   [ "$(cat "$state/.stale-since-$key" 2>/dev/null || true)" = "$since" ] \
@@ -1043,9 +1134,12 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key" "$state/.stale-$key" "$pane_hash"
+  case $? in
+    1) reap "$pid"; fail "watcher exited on the priming round (should absorb): $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher exited on the priming round (should absorb) after absorbing: $(cat "$out")"; }
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional wedge priming stop"
 
@@ -1167,9 +1261,12 @@ test_busy_pane_stable_hash_escalates_past_turn_age_bound() {
     FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "a stable-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "a stable-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "a stable-hash busy pane past the turn-age bound escalated before the wedge threshold after absorbing: $(cat "$out")"; }
   [ -s "$state/.stale-since-$key" ] || fail "a stable-hash busy pane past the turn-age bound did not start a wedge timer"
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional stable-hash phase-A stop"
@@ -1210,9 +1307,12 @@ test_busy_pane_changing_hash_escalates_past_turn_age_bound() {
     FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "a changing-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "a changing-hash busy pane past the turn-age bound escalated before the wedge threshold: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "a changing-hash busy pane past the turn-age bound escalated before the wedge threshold after absorbing: $(cat "$out")"; }
   [ -s "$state/.stale-since-$key" ] || fail "a changing-hash busy pane past the turn-age bound did not start a wedge timer"
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional changing-hash phase-A stop"
@@ -1288,9 +1388,12 @@ test_busy_pane_repeated_escalation_reaches_demand_deep_inspection() {
     FM_STATE_OVERRIDE="$state" FM_BUSY_TURN_MAX_SECS=1 FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "priming round for busy turn-age escalation was not absorbed: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "priming round for busy turn-age escalation was not absorbed: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "priming round for busy turn-age escalation was not absorbed after absorbing: $(cat "$out")"; }
   reap "$pid"
   ack_stopped_cycle "$state" || fail "could not acknowledge the intentional busy-wedge priming stop"
 
@@ -1354,9 +1457,12 @@ test_busy_pane_default_turn_age_bound_is_3600s() {
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "a 66-minute-old completed turn escalated before the wedge threshold under the default bound: $(cat "$out")"
-  fi
+  wait_live_absorbed "$pid" -s "$state/.stale-since-$key"
+  case $? in
+    1) reap "$pid"; fail "a 66-minute-old completed turn escalated before the wedge threshold under the default bound: $(cat "$out")" ;;
+  esac
+  # Keep watching a few more polls: a later wake or exit still fails the case.
+  wait_live "$pid" 30 || { reap "$pid"; fail "a 66-minute-old completed turn escalated before the wedge threshold under the default bound after absorbing: $(cat "$out")"; }
   [ -s "$state/.stale-since-$key" ] || fail "a 66-minute-old completed turn did not start a wedge timer under the default bound (default is not 3600s)"
   reap "$pid"
   pass "the production default busy-turn-age bound is 3600s (5min under does not wedge, 66min over does)"
@@ -1381,7 +1487,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_numeric_file "$state/.stale-since-$key" 30 || { reap "$pid"; fail "matching stale suppressor with missing timer did not initialize stale-since"; }
+  wait_numeric_file "$state/.stale-since-$key" 300 || { reap "$pid"; fail "matching stale suppressor with missing timer did not initialize stale-since"; }
   if ! kill -0 "$pid" 2>/dev/null; then
     wait "$pid" 2>/dev/null || true
     fail "watcher exited while repairing a missing stale-since timer: $(cat "$out")"
@@ -1396,12 +1502,145 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_numeric_file "$state/.stale-since-$key" 30 || { reap "$pid"; fail "matching stale suppressor with corrupt timer did not repair stale-since"; }
+  wait_numeric_file "$state/.stale-since-$key" 300 || { reap "$pid"; fail "matching stale suppressor with corrupt timer did not repair stale-since"; }
   since=$(cat "$state/.stale-since-$key" 2>/dev/null || true)
   [ "$since" != "corrupt" ] || { reap "$pid"; fail "corrupt stale-since value was left in place"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "corrupt stale-since repair enqueued a wake"; }
   reap "$pid"
   pass "matching non-terminal stale suppressors repair missing or corrupt stale-since timers"
+}
+
+# --- stop signal inside a locked recovery-marker transition -------------------
+# Every cycle's downtime arm check holds the queue and recovery-marker locks, and
+# the watcher's EXIT cleanup republishes downtime under that same marker lock. A
+# TERM landing inside the locked section must still let the watcher exit and
+# leave no lock behind, rather than wait on a lock it holds itself forever. The
+# cat shim parks the watcher's own pid read-back while it owns the marker lock,
+# so the stop lands deterministically mid-transition.
+install_marker_lock_cat_pause() {  # <dir>
+  local dir=$1
+  REAL_CAT=$(command -v cat)
+  export REAL_CAT
+  cat > "$dir/fakebin/cat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */.watcher-down.lock.owner.*/pid)
+    owner=${1%/pid}
+    if [ -s "${FM_LOCK_CAT_ARM:-}" ] && [ ! -e "$FM_LOCK_CAT_READY" ] \
+      && [ "$(readlink "${owner%.owner.*}" 2>/dev/null)" = "$owner" ] \
+      && [ "$("$REAL_CAT" "$1" 2>/dev/null)" = "$("$REAL_CAT" "$FM_LOCK_CAT_ARM")" ]; then
+      printf '1\n' > "$FM_LOCK_CAT_READY"
+      while [ ! -e "$FM_LOCK_CAT_RELEASE" ]; do sleep 0.02; done
+    fi
+    ;;
+esac
+exec "$REAL_CAT" "$@"
+SH
+  chmod +x "$dir/fakebin/cat"
+}
+
+test_stop_inside_marker_lock_exits_and_releases_locks() {
+  local dir state fakebin out arm ready release pid exit_status marker lock
+  dir=$(make_case stop-inside-marker-lock); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; arm="$dir/lock-cat-arm"; ready="$dir/lock-cat-ready"; release="$dir/lock-cat-release"
+  install_marker_lock_cat_pause "$dir"
+  FM_LOCK_CAT_ARM="$arm" FM_LOCK_CAT_READY="$ready" FM_LOCK_CAT_RELEASE="$release" \
+    watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  # Arm only once the supervision loop (and its stop trap) is running.
+  wait_live_file "$state/.last-watcher-beat" "$pid" 100 \
+    || { reap "$pid"; fail "the watcher never entered its supervision loop: $(cat "$out")"; }
+  printf '%s\n' "$pid" > "$arm"
+  wait_numeric_file "$ready" 100 \
+    || { touch "$release"; reap "$pid"; fail "the watcher never held its recovery-marker lock"; }
+  kill -TERM "$pid" 2>/dev/null || true
+  touch "$release"
+  wait_for_exit "$pid" 100
+  exit_status=$?
+  [ "$exit_status" -ne 124 ] \
+    || fail "a watcher stopped inside its recovery-marker lock deadlocked in its own exit cleanup"
+  for lock in .watcher-down.lock .wake-queue.lock .watch.lock; do
+    [ ! -e "$state/$lock" ] && [ ! -L "$state/$lock" ] \
+      || fail "a watcher stopped inside its recovery-marker lock left $lock held"
+  done
+  marker=$(cat "$state/.watcher-down" 2>/dev/null || true)
+  case "$marker" in
+    pending:downtime:*) ;;
+    *) fail "the stopped watcher did not publish its downtime marker: '$marker'" ;;
+  esac
+  pass "a stop inside the recovery-marker lock exits, publishes downtime, and releases every lock"
+}
+
+# Reclaiming an abandoned lock holds its .steal guard while the dead owner is
+# rechecked, and every acquisition of that lock refuses while the guard exists.
+# A stop landing inside that window must not leave the exit cleanup waiting on
+# the marker lock behind a guard the exiting watcher holds itself. The cat shim
+# parks the stale-owner recheck once this watcher owns the marker lock's guard.
+install_marker_steal_cat_pause() {  # <dir>
+  local dir=$1
+  REAL_CAT=$(command -v cat)
+  export REAL_CAT
+  cat > "$dir/fakebin/cat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */.watcher-down.lock/pid)
+    steal=${1%/pid}.steal
+    if [ -s "${FM_LOCK_CAT_ARM:-}" ] && [ ! -e "$FM_LOCK_CAT_READY" ] && [ -L "$steal" ] \
+      && [ "$("$REAL_CAT" "$steal/pid" 2>/dev/null)" = "$("$REAL_CAT" "$FM_LOCK_CAT_ARM")" ]; then
+      printf '1\n' > "$FM_LOCK_CAT_READY"
+      while [ ! -e "$FM_LOCK_CAT_RELEASE" ]; do sleep 0.02; done
+    fi
+    ;;
+esac
+exec "$REAL_CAT" "$@"
+SH
+  chmod +x "$dir/fakebin/cat"
+}
+
+test_stop_holding_marker_steal_guard_exits_and_releases_locks() {
+  local dir state fakebin out arm ready release pid exit_status marker lock owner i
+  dir=$(make_case stop-holding-marker-steal); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; arm="$dir/lock-cat-arm"; ready="$dir/lock-cat-ready"; release="$dir/lock-cat-release"
+  install_marker_steal_cat_pause "$dir"
+  FM_LOCK_CAT_ARM="$arm" FM_LOCK_CAT_READY="$ready" FM_LOCK_CAT_RELEASE="$release" \
+    watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  wait_live_file "$state/.last-watcher-beat" "$pid" 100 \
+    || { reap "$pid"; fail "the watcher never entered its supervision loop: $(cat "$out")"; }
+  # Arm before planting: the watcher can reclaim the abandoned lock the instant
+  # it exists, and the shim only parks a reclaim whose guard this watcher owns,
+  # which no ordinary acquisition creates.
+  printf '%s\n' "$pid" > "$arm"
+  # Abandon the marker lock under a dead owner, as a holder killed mid-transition
+  # leaves it. The live watcher may hold the lock itself this instant, so retry;
+  # -n keeps ln from following that held lock's link into its owner directory.
+  owner=$(cd "$state" && pwd -P)/.watcher-down.lock.owner.abandoned
+  mkdir -p "$owner"
+  dead_pid > "$owner/pid"
+  i=0
+  until ln -sn "$owner" "$state/.watcher-down.lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || { reap "$pid"; fail "could not plant the abandoned recovery-marker lock"; }
+    sleep 0.01
+  done
+  wait_numeric_file "$ready" 100 \
+    || { touch "$release"; reap "$pid"; fail "the watcher never reclaimed the abandoned recovery-marker lock"; }
+  kill -TERM "$pid" 2>/dev/null || true
+  touch "$release"
+  wait_for_exit "$pid" 100
+  exit_status=$?
+  [ "$exit_status" -ne 124 ] \
+    || fail "a watcher stopped while reclaiming the recovery-marker lock deadlocked in its own exit cleanup"
+  for lock in .watcher-down.lock .watcher-down.lock.steal .wake-queue.lock .wake-queue.lock.steal .watch.lock; do
+    [ ! -e "$state/$lock" ] && [ ! -L "$state/$lock" ] \
+      || fail "a watcher stopped while reclaiming the recovery-marker lock left $lock held"
+  done
+  marker=$(cat "$state/.watcher-down" 2>/dev/null || true)
+  case "$marker" in
+    pending:downtime:*) ;;
+    *) fail "the watcher stopped while reclaiming a lock did not publish its downtime marker: '$marker'" ;;
+  esac
+  pass "a stop while reclaiming an abandoned recovery-marker lock exits, publishes downtime, and releases every lock"
 }
 
 # --- triage debug log stays size capped -------------------------------------

@@ -755,6 +755,19 @@ elif [ "$FM_RECOVERY_MARKER_ACTION" = recover ]; then
 fi
 watcher_cleanup() {
   local cleanup_status=0 owns_lock=0 transition=release-lock
+  # A stopper re-delivers TERM because Bash 5.2 can lose one (see
+  # fm_stop_trapping_process), so once cleanup begins further stops are ignored
+  # and can never cut the recovery transition short.
+  trap '' HUP INT TERM
+  # The stop trap can fire inside a locked transition, such as each cycle's
+  # downtime arm check, or while reclaiming an abandoned lock under its .steal
+  # guard, and the recovery transition below re-acquires the marker lock.
+  # Release whatever this exiting shell still holds first, or it would wait on
+  # its own lock or guard forever. The singleton lock is kept: the transition
+  # releases it only after downtime is published.
+  fm_lock_release_owned "$STATE" "$WATCH_LOCK"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK"
+  fm_lock_release "$FM_WAKE_QUEUE_LOCK.steal"
   if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
     owns_lock=1
     if [ "${WATCHER_RECOVERY_PENDING:-0}" -eq 1 ] \

@@ -94,6 +94,7 @@ Containment claims and the explicitly non-enforcing real-Herdr exception are doc
 Its header and `--help` own the flags, family labels, lanes, and changed-file map; this section only documents the entry points.
 `bin/fm-test-isolation-proof.sh` remains the single owner of the Phase 2 concurrent isolation proof and the exact proven candidate set; see `docs/fm-test-isolation-proof.md`.
 CI shard balance evidence lives in `docs/fm-test-portable-shards.md`.
+CI never reruns a failed test; known flaky tests, their root causes, and their fixes are recorded in [`docs/testing/flaky-tests.md`](docs/testing/flaky-tests.md), and a stopped watcher or arm in a test goes through `fm_test_stop_pid` or `fm_test_reap_watcher` in `tests/lib.sh` because Bash 5.2 can lose a single TERM.
 Local no-mistakes Test stays intent-targeted and must not wire `commands.test` to `--all` or a `tests/*.test.sh` walk.
 Focused scripts and conservative changed selection are the ordinary local paths.
 `--portable` is the routine complete local regression and leaves real-Herdr integration to its required CI shards, while `--all` is the explicit operator path that includes it.

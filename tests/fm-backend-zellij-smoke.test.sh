@@ -14,6 +14,8 @@
 # delete-all-sessions - the same fleet-safety discipline PR #199 established
 # for herdr.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

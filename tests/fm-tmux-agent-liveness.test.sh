@@ -16,6 +16,8 @@
 # between macOS and Linux, so every case asserts only the platform-independent
 # property that the verdict itself is correct.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -31,23 +33,73 @@ LAB=$(mktemp -d "${TMPDIR:-/tmp}/fm-liveness.XXXXXX")
 SESSION=liveness
 bg_pid=
 
-cleanup_all() {
-  # The background-process case deliberately creates a separate process group,
-  # so killing the tmux server does not reap it. Stop it explicitly before the
-  # test exits; otherwise the CI process-domain supervisor correctly reports a
-  # containment failure even though every assertion passed.
-  if [ -n "${bg_pid:-}" ] && kill -0 "$bg_pid" 2>/dev/null; then
-    kill "$bg_pid" 2>/dev/null || true
-    cleanup_try=0
-    while kill -0 "$bg_pid" 2>/dev/null && [ "$cleanup_try" -lt 20 ]; do
-      sleep 0.05
-      cleanup_try=$((cleanup_try + 1))
+# Is <pid> a process that can still run? A zombie only waits to be reaped by
+# its parent or init, so it counts as gone; `kill -0` alone would report it.
+pid_running() {  # <pid>
+  local stat
+  stat=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  case $stat in '' | Z*) return 1 ;; esac
+  return 0
+}
+
+# The private tmux server's pid and every process descended from it: each pane
+# process, a launcher's harness child, and the background case's job.
+private_server_tree() {
+  local server
+  server=$("$REAL_TMUX" -L "$SOCKET" display-message -p '#{pid}' 2>/dev/null) || return 0
+  case $server in '' | *[!0-9]*) return 0 ;; esac
+  ps -A -o pid= -o ppid= | awk -v root="$server" '
+    { parent[$1] = $2 }
+    END {
+      keep[root] = 1
+      grew = 1
+      while (grew) {
+        grew = 0
+        for (p in parent) if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; grew = 1 }
+      }
+      for (p in keep) print p
+    }'
+}
+
+# Wait until none of <pids...> can still run, up to ~10s. Prints survivors.
+wait_pids_gone() {  # <pids...>
+  local tries=0 pid alive
+  while :; do
+    alive=
+    for pid in "$@"; do
+      pid_running "$pid" && alive="$alive $pid"
     done
-    if kill -0 "$bg_pid" 2>/dev/null; then
-      kill -KILL "$bg_pid" 2>/dev/null || true
-    fi
+    [ -z "$alive" ] && return 0
+    [ "$tries" -ge 200 ] && { printf '%s\n' "$alive"; return 1; }
+    sleep 0.05
+    tries=$((tries + 1))
+  done
+}
+
+cleanup_all() {
+  # `tmux kill-server` returns as soon as the server ACCEPTS the command; the
+  # server and every pane process then exit asynchronously, after this script
+  # would otherwise already be gone. Under required CI containment the leased
+  # credential domain is probed the instant the script exits, so those still
+  # exiting processes made a test that passed every assertion end as a
+  # containment failure. Record the whole private server tree first, then wait
+  # for it to be gone before exiting.
+  local tree stragglers
+  tree=$(private_server_tree)
+  # The background-process case deliberately creates a separate process group,
+  # so the pane hangup on kill-server does not reach it. Stop it explicitly.
+  if [ -n "${bg_pid:-}" ] && pid_running "$bg_pid"; then
+    kill "$bg_pid" 2>/dev/null || true
   fi
   "$REAL_TMUX" -L "$SOCKET" kill-server >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086 # word-splitting the pid list is intended
+  if [ -n "$tree$bg_pid" ] && ! stragglers=$(wait_pids_gone $tree $bg_pid); then
+    # shellcheck disable=SC2086
+    kill -KILL $stragglers 2>/dev/null || true
+    # shellcheck disable=SC2086
+    wait_pids_gone $stragglers >/dev/null ||
+      printf 'warning: private tmux processes survived cleanup:%s\n' "$stragglers" >&2
+  fi
   [ -n "${LAB:-}" ] && rm -rf "$LAB"
 }
 trap cleanup_all EXIT

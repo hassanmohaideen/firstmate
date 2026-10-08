@@ -620,6 +620,99 @@ wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
 RECOVERY_WORKER_PID=
 pass "quarantine clears only after recorded execution has stopped"
 
+# A stop delivers TERM more than once: the stop path signals the whole worker
+# group and the restart supervisor forwards its own TERM to the serving child.
+# Every repeat that lands mid-shutdown must be absorbed, or the worker dies with
+# its quarantine half-published and no replacement can ever acquire ownership.
+REPEAT_STATE="$TMP_ROOT/repeat-term-jobs"
+start_isolated_worker() { # <state-root>
+  HOME="$ACCOUNT_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" FM_REMOTE_JOB_STATE_ROOT="$1" \
+    FM_REMOTE_JOB_PLATFORM_OVERRIDE=Linux "$REMOTE_ROOT/bin/fm-remote-job-worker.sh" \
+    >> "$TMP_ROOT/isolated-worker.out" 2>> "$TMP_ROOT/isolated-worker.err" &
+  RECOVERY_WORKER_PID=$!
+  for _ in $(seq 1 300); do
+    [ -f "$1/worker.ready" ] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+await_isolated_supervisor_exit() {
+  for _ in $(seq 1 300); do
+    kill -0 "$RECOVERY_WORKER_PID" 2>/dev/null || break
+    sleep 0.05
+  done
+  ! kill -0 "$RECOVERY_WORKER_PID" 2>/dev/null || return 1
+  wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
+  RECOVERY_WORKER_PID=
+}
+start_isolated_worker "$REPEAT_STATE" || fail "the repeated-TERM fixture worker did not become ready"
+REPEAT_CHILD_PID=$(cat "$REPEAT_STATE/worker.pid")
+kill -TERM "$REPEAT_CHILD_PID"
+for _ in $(seq 1 500); do
+  kill -0 "$REPEAT_CHILD_PID" 2>/dev/null || break
+  kill -TERM "$REPEAT_CHILD_PID" 2>/dev/null || true
+  sleep 0.01
+done
+await_isolated_supervisor_exit \
+  || fail "a worker hit by repeated TERM did not finish a clean shutdown"
+assert_absent "$REPEAT_STATE/worker.lock" "repeated TERM during shutdown stranded worker ownership"
+assert_absent "$REPEAT_STATE/worker.ready" "repeated TERM during shutdown left a stale readiness heartbeat"
+pass "repeated TERM during shutdown still releases worker ownership"
+
+# A writer killed between creating a lock staging file and renaming it into
+# place leaves that file behind. Once the lock is provably stale, a replacement
+# must clear it rather than fail to remove a non-empty lock forever.
+STAGING_STATE="$TMP_ROOT/staging-jobs"
+mkdir -p "$STAGING_STATE/worker.lock"
+chmod 700 "$STAGING_STATE" "$STAGING_STATE/worker.lock"
+: > "$STAGING_STATE/worker.lock/.quarantine.AbC123"
+printf '12345\n' > "$STAGING_STATE/worker.lock/.pid.XyZ789"
+chmod 600 "$STAGING_STATE/worker.lock"/.quarantine.* "$STAGING_STATE/worker.lock"/.pid.*
+touch -t 200001010000 "$STAGING_STATE/worker.lock"
+start_isolated_worker "$STAGING_STATE" \
+  || fail "stale ownership stranded with publication staging files was never reclaimed"
+for staged in "$STAGING_STATE/worker.lock"/.quarantine.* "$STAGING_STATE/worker.lock"/.pid.*; do
+  [ ! -e "$staged" ] || fail "the reclaimed lock retained a stale staging file: ${staged##*/}"
+done
+kill -TERM "$RECOVERY_WORKER_PID"
+await_isolated_supervisor_exit || fail "the reclaiming worker did not stop"
+assert_absent "$STAGING_STATE/worker.lock" "the reclaiming worker did not release ownership"
+pass "stale ownership with interrupted publication staging is reclaimed"
+
+# A stop waits on the whole worker group, not the serving child it was handed.
+# The child exits on the first TERM while its supervisor is still finishing a
+# graceful shutdown; a wait that ended with the child KILLed that supervisor
+# mid-shutdown and could report the group as a survivor before it was reaped.
+STOP_FIXTURE="$TMP_ROOT/stop-group/bin"
+mkdir -p "$STOP_FIXTURE"
+cat > "$STOP_FIXTURE/fm-remote-job-worker.sh" <<'SH'
+#!/bin/bash
+trap 'sleep 1; : > "$2"; exit 0' TERM
+sleep 30 &
+printf '%s\n' "$!" > "$1"
+while :; do sleep 0.1; done
+SH
+chmod 755 "$STOP_FIXTURE/fm-remote-job-worker.sh"
+STOP_CHILD_FILE="$TMP_ROOT/stop-group/child.pid"
+STOP_GRACEFUL="$TMP_ROOT/stop-group/graceful"
+set -m
+"$STOP_FIXTURE/fm-remote-job-worker.sh" "$STOP_CHILD_FILE" "$STOP_GRACEFUL" &
+RECOVERY_WORKER_PID=$!
+set +m
+for _ in $(seq 1 100); do
+  [ -s "$STOP_CHILD_FILE" ] && break
+  sleep 0.05
+done
+STOP_CHILD_PID=$(cat "$STOP_CHILD_FILE" 2>/dev/null || true)
+[ -n "$STOP_CHILD_PID" ] || fail "the stop-group fixture did not start its serving child"
+fm_remote_job_stop_worker_tree "$STOP_CHILD_PID" \
+  || fail "stopping a worker group reported a survivor while its supervisor shut down gracefully"
+! kill -0 -- "-$RECOVERY_WORKER_PID" 2>/dev/null || fail "the stopped worker group is still alive"
+assert_present "$STOP_GRACEFUL" "the stop KILLed the supervisor before its TERM shutdown finished"
+wait "$RECOVERY_WORKER_PID" 2>/dev/null || true
+RECOVERY_WORKER_PID=
+pass "stopping a worker tree waits for the whole group to finish its TERM shutdown"
+
 # The Linux readiness recovery must re-run the idempotent worker start more than
 # once. A replaced supervisor can lose its ownership handoff for longer than a
 # single probe window under load - or a KILL-forced quarantine recovery can

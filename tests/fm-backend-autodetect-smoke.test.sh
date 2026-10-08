@@ -25,6 +25,8 @@
 # default fleet session is unchanged after teardown. Never replace the helper
 # with an ambient HERDR_SESSION-only command.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

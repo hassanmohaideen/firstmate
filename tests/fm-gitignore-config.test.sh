@@ -6,6 +6,8 @@
 # the working tree read as dirty, which then blocks guarded sync paths that
 # refuse to touch a dirty home.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

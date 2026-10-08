@@ -25,6 +25,10 @@ if [ -n "${FM_TEST_LIB_SOURCED:-}" ]; then
 fi
 FM_TEST_LIB_SOURCED=1
 
+# Never let a direct run inherit the launching session's live home.
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
+
 # Exempt firstmate's own test suite from the gate-lifecycle refusal
 # (bin/fm-gate-refuse-lib.sh). The no-mistakes gate runs this suite FROM a gate
 # worktree - the exact environment that guard refuses - so without this every
@@ -148,6 +152,59 @@ fm_test_reap_orphans() {
 }
 
 fm_test_reap_orphans
+
+# --- stopping background watchers and arms ----------------------------------
+#
+# fm_test_stop_pid <pid> [ticks] stops a Bash process that traps TERM through
+# the production stop protocol (fm_stop_trapping_process in bin/fm-wake-lib.sh):
+# TERM is re-delivered every second until the process is gone, because Bash 5.2
+# can lose a trapped TERM, so a single TERM is not a reliable stop there.
+# Returns 1, leaving the process running, if it survives <ticks> 0.1s ticks
+# (default 300); reaping it stays the caller's job.
+#
+# fm_test_reap_watcher <pid> [state-dir] stops and reaps a background watcher
+# and fails the case if it is still alive after 30s. A survivor is described
+# first - its process tree and every lock or reclaim guard in <state-dir> with
+# the holder's pid and liveness - so a stop-path hang names what it waited on.
+
+fm_test_stop_pid() {  # <pid> [ticks]
+  FM_STATE_OVERRIDE="${TMP_ROOT:-${TMPDIR:-/tmp}}" bash -c '
+    # shellcheck disable=SC1090,SC1091
+    . "$1"
+    fm_stop_trapping_process "$2" "$3"
+  ' _ "$ROOT/bin/fm-wake-lib.sh" "$1" "${2:-300}"
+}
+
+fm_test_reap_watcher() {  # <pid> [state-dir]
+  if fm_test_stop_pid "$1" 300; then
+    wait "$1" 2>/dev/null || true
+    return 0
+  fi
+  fm_test_watcher_stop_diagnostics "$1" "${2:-}" >&2
+  kill -KILL "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+  fail "watcher pid $1 did not exit within 30s of TERM"
+}
+
+fm_test_watcher_stop_diagnostics() {  # <pid> [state-dir]
+  local pid=$1 state=${2:-} lock owner holder live
+  printf '# watcher %s still running after TERM; process tree:\n' "$pid"
+  ps -A -o pid= -o ppid= -o stat= -o command= 2>/dev/null \
+    | awk -v root="$pid" '{ parent[$1] = $2; line[$1] = $0 }
+      END { for (p in line) { q = p; while (q != "" && q != root && q in parent && q != parent[q]) q = parent[q]
+        if (q == root) print "#   " line[p] } }'
+  [ -n "$state" ] && [ -d "$state" ] || return 0
+  printf '# locks in %s:\n' "$state"
+  for lock in "$state"/*.lock "$state"/.*.lock "$state"/*.steal "$state"/.*.steal; do
+    [ -e "$lock" ] || [ -L "$lock" ] || continue
+    owner=$(readlink "$lock" 2>/dev/null || printf '(directory)')
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    live=dead
+    [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && live=live
+    printf '#   %s -> %s pid=%s (%s)\n' "${lock##*/}" "$owner" "${holder:-none}" "$live"
+  done
+  printf '# recovery marker: %s\n' "$(cat "$state/.watcher-down" 2>/dev/null || printf absent)"
+}
 
 # --- fakebin / PATH shims ---------------------------------------------------
 #

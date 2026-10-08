@@ -1467,6 +1467,91 @@ PY
   pass "aggregate accepts complete schema-v2 lanes and rejects incomplete, duplicate, or mixed evidence"
 }
 
+test_aggregate_from_ci_artifacts_uses_newest_rerun_attempt() {
+  local tmp art out rc
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-test-run-aggci.XXXXXX")
+  art="$tmp/artifacts"
+  # One lane script whose outcome the fixture flips between attempts, the way a
+  # flaky lane fails its first run attempt and passes its rerun.
+  # The runner passes only allowlisted environment to its children, so the flip
+  # is a marker file rather than a variable.
+  cat >"$tmp/lane.test.sh" <<SH
+#!/usr/bin/env bash
+echo ok
+[ ! -e "$tmp/fail-marker" ]
+SH
+  cat >"$tmp/other.test.sh" <<'SH'
+#!/usr/bin/env bash
+echo ok
+SH
+  chmod +x "$tmp"/*.test.sh
+  mkdir -p "$tmp/fail" "$tmp/pass" "$tmp/other"
+  touch "$tmp/fail-marker"
+  set +e
+  "$RUNNER" --json "$tmp/fail/lane.json" "$tmp/lane.test.sh" >/dev/null 2>&1
+  rc=$?
+  set -e
+  rm -f "$tmp/fail-marker"
+  [ "$rc" -ne 0 ] || fail "ci-artifact failing attempt fixture passed"
+  "$RUNNER" --json "$tmp/pass/lane.json" "$tmp/lane.test.sh" >/dev/null 2>&1 \
+    || fail "ci-artifact passing attempt fixture failed"
+  "$RUNNER" --json "$tmp/other/lane.json" "$tmp/other.test.sh" >/dev/null 2>&1 \
+    || fail "ci-artifact second lane fixture failed"
+  place() { # <source.json> <artifact-dir> <json-relative-path>
+    mkdir -p "$art/$2/$(dirname "$3")"
+    cp "$1" "$art/$2/$3"
+  }
+  # Attempt 9 failed and rerun attempt 10 passed: the newest attempt must win by
+  # numeric order, not by name order, and a nested JSON (the Herdr artifact
+  # shape) must still be found.
+  place "$tmp/fail/lane.json" fm-test-timing-portable-serial-5-attempt-9 fm-test-timing-portable-serial-5.json
+  place "$tmp/pass/lane.json" fm-test-timing-portable-serial-5-attempt-10 fm-test-timing-portable-serial-5.json
+  place "$tmp/other/lane.json" fm-test-timing-herdr-1-attempt-1 fm-test/fm-test-timing-herdr-1.json
+  set +e
+  out=$("$RUNNER" --aggregate-json "$tmp/agg.json" --from-ci-artifacts "$art" 2>"$tmp/agg.err")
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || { cat "$tmp/agg.err"; fail "aggregate counted a superseded failed attempt over its passing rerun"; }
+  assert_contains "$out" "FM_TEST_AGGREGATE lanes=2 total=2 failed=0" "rerun-aware aggregate summary"
+  grep -q 'lane portable-serial-5 attempt 9 superseded by rerun attempt 10' "$tmp/agg.err" \
+    || fail "aggregate did not report the superseded attempt"
+  # The newest attempt failing stays red: supersession never hides a failure.
+  rm -rf "$art/fm-test-timing-portable-serial-5-attempt-10"
+  place "$tmp/fail/lane.json" fm-test-timing-portable-serial-5-attempt-11 fm-test-timing-portable-serial-5.json
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/agg-red.json" --from-ci-artifacts "$art" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate passed when the newest lane attempt failed"
+  # Anything other than attempt-named lane artifacts is refused, never guessed.
+  mkdir -p "$art/fm-test-timing-aggregate"
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/agg-bad.json" --from-ci-artifacts "$art" >/dev/null 2>"$tmp/bad.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate accepted a non-lane artifact directory"
+  grep -q 'not a lane artifact' "$tmp/bad.err" || fail "non-lane artifact refusal was not actionable"
+  mkdir -p "$tmp/empty"
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/agg-empty.json" --from-ci-artifacts "$tmp/empty" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate accepted an empty artifact directory"
+  mkdir -p "$tmp/nojson/fm-test-timing-portable-serial-1-attempt-1"
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/agg-nojson.json" --from-ci-artifacts "$tmp/nojson" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate accepted a lane artifact holding no timing JSON"
+  set +e
+  "$RUNNER" --aggregate-json "$tmp/agg-mixed.json" --from-ci-artifacts "$art" "$tmp/pass/lane.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "aggregate accepted --from-ci-artifacts mixed with explicit inputs"
+  rm -rf "$tmp"
+  pass "aggregate from CI artifacts uses each lane's newest rerun attempt and refuses anything else"
+}
+
 make_parallel_dev_manifest() { # <manifest> <artifact> <root> <jobs> <budget-ms:path>...
   local manifest=$1 artifact=$2 root=$3 jobs=$4
   shift 4
@@ -1691,6 +1776,90 @@ PY
   pass "required non-quiescence and unreadable-probe cleanup terminalize as quarantined containment_ambiguous"
 }
 
+test_linux_inventory_skips_pids_reaped_mid_read() {
+  # A cleanup probe inventories every /proc entry right after a test exits,
+  # while that test's descendants are still being reaped. A pid reaped between
+  # open() and read() of /proc/<pid>/status fails the read with ESRCH rather
+  # than ENOENT; that is a vanished process, not an unreadable one, and must
+  # not turn the probe into a sticky containment_ambiguous. Genuinely
+  # unreadable entries must still fail the inventory closed. Drives the Linux
+  # inventory against a simulated /proc so it runs on every platform.
+  python3 - "$SUPERVISOR" <<'PY' || fail "Linux inventory mishandled a pid reaped mid-read"
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("fm_test_supervisor", sys.argv[1])
+supervisor = importlib.util.module_from_spec(spec)
+sys.modules["fm_test_supervisor"] = supervisor
+spec.loader.exec_module(supervisor)
+
+
+def status(uid):
+    return (f"Name:\tx\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+            f"Gid:\t{uid}\t{uid}\t{uid}\t{uid}\nGroups:\t\nNoNewPrivs:\t1\n"
+            "CapInh:\t0\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\n")
+
+
+stat = "1 (x) S " + " ".join(["0"] * 17) + " 4242 0\n"
+fake = {}
+real_is_dir, real_iterdir, real_read_text = pathlib.Path.is_dir, pathlib.Path.iterdir, pathlib.Path.read_text
+
+
+def is_dir(self):
+    return True if str(self) == "/proc" else real_is_dir(self)
+
+
+def iterdir(self):
+    if str(self) == "/proc":
+        return iter(pathlib.Path(f"/proc/{name}") for name in [*fake, "self"])
+    return real_iterdir(self)
+
+
+def read_text(self, *args, **kwargs):
+    parts = str(self).split("/")
+    if len(parts) == 4 and parts[1] == "proc" and parts[2] in fake:
+        outcome = fake[parts[2]]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return status(outcome) if parts[3] == "status" else stat
+    return real_read_text(self, *args, **kwargs)
+
+
+pathlib.Path.is_dir, pathlib.Path.iterdir, pathlib.Path.read_text = is_dir, iterdir, read_text
+platform = supervisor.CredentialPlatform
+fake.update({
+    "100": 61001,
+    "200": ProcessLookupError(3, "No such process"),
+    "300": FileNotFoundError(2, "No such file or directory"),
+})
+inventory = platform._linux_inventory()
+assert sorted(inventory) == [100], sorted(inventory)
+assert inventory[100].uids[:3] == (61001, 61001, 61001), inventory[100].uids
+linux = object.__new__(platform)
+linux.name = "linux"
+try:
+    linux.pid_credentials(200)
+except supervisor.InventoryError as exc:
+    assert "disappeared before credential verification" in str(exc), exc
+else:
+    raise AssertionError("a pid reaped mid-read verified as a live child")
+fake["400"] = PermissionError(13, "Permission denied")
+try:
+    platform._linux_inventory()
+except supervisor.InventoryError as exc:
+    assert "unreadable" in str(exc), exc
+else:
+    raise AssertionError("an unreadable /proc entry did not fail the inventory closed")
+del fake["400"]
+fake["500"] = OSError(5, "Input/output error")
+try:
+    platform._linux_inventory()
+except supervisor.InventoryError:
+    pass
+else:
+    raise AssertionError("an unexplained /proc read error did not fail the inventory closed")
+PY
+  pass "Linux inventory skips a pid reaped mid-read and still fails closed on unreadable entries"
+}
+
 test_required_public_runner_leased_uid() {
   local tmp tmp_root artifact fixture_runner rc
   # Proves the required credential-domain path through the PUBLIC runner: a test
@@ -1814,12 +1983,14 @@ ALL_TESTS=(
   test_concurrent_atomic_polling_across_parallel_transitions
   test_required_unsupported_refuses_before_execution
   test_required_containment_ambiguity_terminalizes
+  test_linux_inventory_skips_pids_reaped_mid_read
   test_required_public_runner_leased_uid
   test_privileged_artifact_rejects_intermediate_symlink
   test_required_platform_qualification
   test_environment_isolation_in_serial_and_parallel_children
   test_duration_budget_warns_and_ci_enforces
   test_aggregate_json
+  test_aggregate_from_ci_artifacts_uses_newest_rerun_attempt
 )
 
 # Optional targeted subset: FM_TEST_RUN_ONLY="test_a test_b" runs only those,

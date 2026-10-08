@@ -334,6 +334,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": "docs/testing/flaky-tests.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/tmux-backend.md",
       "audience": "operator-current"
     },

@@ -139,7 +139,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fm-test-timing-portable-parallel-1
+          name: fm-test-timing-portable-parallel-1-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fm-test/
           if-no-files-found: warn
 
@@ -183,7 +183,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fm-test-timing-portable-parallel-2
+          name: fm-test-timing-portable-parallel-2-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fm-test/
           if-no-files-found: warn
 
@@ -255,7 +255,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fm-test-timing-portable-serial-${{ matrix.shard }}
+          name: fm-test-timing-portable-serial-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fm-test/
           if-no-files-found: warn
 
@@ -415,7 +415,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fm-test-timing-herdr-${{ matrix.shard }}
+          name: fm-test-timing-herdr-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/fm-test/
             ${{ runner.temp }}/fm-herdr/sessions-before.json
@@ -441,32 +441,24 @@ jobs:
     # only time bound it needs.
     steps:
       - uses: actions/checkout@v6
+      # Lane artifacts are named per run attempt, and a partial rerun keeps
+      # every earlier attempt's artifact in the run, so a merged download would
+      # let a superseded failed attempt overwrite the passing rerun's evidence.
+      # Keep one directory per artifact and let the runner pick each lane's
+      # newest attempt.
       - name: Download lane timing artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: fm-test-timing-*
+          pattern: fm-test-timing-*-attempt-*
           path: ${{ runner.temp }}/fm-test-aggregate
-          merge-multiple: true
+          merge-multiple: false
       - name: Build aggregate timing summary
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/fm-test"
-          # Recursive: the Herdr shard artifacts nest their timing JSON under a
-          # subdirectory, and a top-level-only glob silently dropped that lane
-          # from the aggregate.
-          inputs=()
-          if [ -d "$RUNNER_TEMP/fm-test-aggregate" ]; then
-            while IFS= read -r f; do
-              inputs+=("$f")
-            done < <(find "$RUNNER_TEMP/fm-test-aggregate" -name 'fm-test-timing-*.json' -type f | LC_ALL=C sort)
-          fi
-          if [ "${#inputs[@]}" -eq 0 ]; then
-            echo "::error::no complete schema-v2 lane evidence found to aggregate"
-            exit 1
-          fi
           bin/fm-test-run.sh --aggregate-json \
             "$RUNNER_TEMP/fm-test/fm-test-timing-aggregate.json" \
-            "${inputs[@]}"
+            --from-ci-artifacts "$RUNNER_TEMP/fm-test-aggregate"
       - name: Upload aggregate timing artifact
         if: always()
         uses: actions/upload-artifact@v4

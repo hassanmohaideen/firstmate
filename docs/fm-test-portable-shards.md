@@ -186,7 +186,7 @@ The per-lane timing artifacts and aggregate of the next green CI run are the aft
 The aggregate now finds nested timing JSON recursively; the prior top-level-only glob silently dropped the Herdr lane from the aggregate artifact.
 The floor for the complete run at this composition is the presentation E2E's retained 260,721 ms baseline plus per-job setup and the aggregate tail.
 
-Refresh the hints by downloading the per-shard timing artifacts from a green CI run, replacing the `portable_serial_weight_hints` table in `bin/fm-test-run.sh` with the measured `path`/`duration_ms` pairs, and updating the table above:
+Refresh the hints by downloading the per-shard timing artifacts from a green CI run (after a partial rerun, keep only each shard's highest `-attempt-<N>` directory), replacing the `portable_serial_weight_hints` table in `bin/fm-test-run.sh` with the measured `path`/`duration_ms` pairs, and updating the table above:
 
 ```sh
 gh run download <run-id> -R hassanmohaideen/firstmate --pattern 'fm-test-timing-portable-serial-*' -D /tmp/fm-serial
@@ -205,6 +205,7 @@ It verifies the real-Herdr CI shards the same way against the real-herdr-gated f
 
 Portable shards, each portable serial shard, and each real-Herdr shard upload schema-v2 timing JSON with durable per-script diagnostics.
 `bin/fm-test-run.sh --aggregate-json` creates the combined summary artifact with deterministic lane and script ordering and complete-evidence validation.
+Lane artifacts carry their workflow run attempt in their name, and `--from-ci-artifacts` aggregates only each lane's newest attempt, so a failed attempt superseded by a passing partial rerun never reaches the aggregate.
 The runner derives generous per-script duration budgets from the measured hints used for shard balance and archived timing artifacts.
 An unmeasured script has no budget: local execution reports it as missing, enforced execution fails, and the coverage guard rejects it from every required lane.
 Budget overruns warn during local runs and are enforced by required CI lanes without replacing the test's own exit evidence.

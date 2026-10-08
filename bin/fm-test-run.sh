@@ -26,6 +26,15 @@
 #
 # Aggregation (no suite execution):
 #   fm-test-run.sh --aggregate-json <out.json> <lane.json> [more lane.json...]
+#   fm-test-run.sh --aggregate-json <out.json> --from-ci-artifacts <dir>
+#
+# --from-ci-artifacts reads a directory holding one subdirectory per downloaded
+# CI lane artifact named fm-test-timing-<lane>-attempt-<N>, where N is the
+# workflow run attempt that uploaded it. A partial rerun leaves every earlier
+# attempt's artifact in the run beside the rerun's, so only the newest attempt
+# of each lane is aggregated; every fm-test-timing-*.json under that newest
+# directory is an input. Any other subdirectory, or an empty directory, is
+# refused rather than guessed at.
 #
 # Options:
 #   --json <path>   write a deterministic timing artifact after the run
@@ -109,6 +118,7 @@ LIST_FAMILIES=0
 LIST_LANES=0
 CHECK_COVERAGE=0
 AGGREGATE_OUT=
+CI_ARTIFACT_DIR=
 FAMILY=
 LANE=
 BASE_REF=origin/main
@@ -938,6 +948,48 @@ run_coverage_guard() {
   return 0
 }
 
+# Fill SCRIPTS with the timing JSON of the newest run attempt of every lane
+# artifact under <dir> (contract in the --from-ci-artifacts header note).
+select_ci_lane_artifacts() { # <dir>
+  local dir=$1 entry name lane attempt previous_lane previous_attempt json found
+  local -a found_artifacts=() newest=()
+  [ -d "$dir" ] && [ ! -L "$dir" ] || die "--from-ci-artifacts directory not found: $dir"
+  for entry in "$dir"/* "$dir"/.[!.]*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name=${entry##*/}
+    [ -d "$entry" ] && [ ! -L "$entry" ] \
+      || die "--from-ci-artifacts entry is not an artifact directory: $name"
+    [[ "$name" =~ ^fm-test-timing-([a-z0-9-]+)-attempt-([1-9][0-9]{0,3})$ ]] \
+      || die "--from-ci-artifacts entry is not a lane artifact named fm-test-timing-<lane>-attempt-<N>: $name"
+    found_artifacts+=("${BASH_REMATCH[1]} ${BASH_REMATCH[2]}")
+  done
+  [ "${#found_artifacts[@]}" -gt 0 ] || die "--from-ci-artifacts found no lane artifacts in $dir"
+  # Lane then numeric attempt order, so the last row of each lane is its newest.
+  previous_lane=
+  previous_attempt=
+  while read -r lane attempt; do
+    if [ "$lane" = "$previous_lane" ]; then
+      log "aggregate: lane $lane attempt $previous_attempt superseded by rerun attempt $attempt"
+      newest[${#newest[@]} - 1]="$lane $attempt"
+    else
+      newest+=("$lane $attempt")
+    fi
+    previous_lane=$lane
+    previous_attempt=$attempt
+  done < <(printf '%s\n' "${found_artifacts[@]}" | LC_ALL=C sort -k1,1 -k2,2n)
+  for entry in "${newest[@]}"; do
+    lane=${entry% *}
+    attempt=${entry##* }
+    found=0
+    while IFS= read -r json; do
+      SCRIPTS+=("$json")
+      found=1
+    done < <(find "$dir/fm-test-timing-$lane-attempt-$attempt" -type f -name 'fm-test-timing-*.json' | LC_ALL=C sort)
+    [ "$found" -eq 1 ] \
+      || die "--from-ci-artifacts lane $lane attempt $attempt holds no timing JSON"
+  done
+}
+
 aggregate_timing_json() {
   local out=$1
   shift
@@ -1537,6 +1589,11 @@ while [ "$#" -gt 0 ]; do
       # For aggregation we accept only input JSON paths as free args after this.
       MODE=aggregate
       ;;
+    --from-ci-artifacts)
+      [ "$#" -gt 1 ] || die "--from-ci-artifacts requires a directory"
+      CI_ARTIFACT_DIR=$2
+      shift 2
+      ;;
     --exclude-family)
       [ "$#" -gt 1 ] || die "--exclude-family requires a name"
       EXCLUDE_FAMILIES+=("$2")
@@ -1596,6 +1653,12 @@ fi
 if [ "$CHECK_COVERAGE" -eq 1 ]; then
   run_coverage_guard
   exit $?
+fi
+
+if [ -n "$CI_ARTIFACT_DIR" ]; then
+  [ "${MODE:-}" = "aggregate" ] || die "--from-ci-artifacts requires --aggregate-json"
+  [ "${#SCRIPTS[@]}" -eq 0 ] || die "--from-ci-artifacts cannot be combined with explicit input timing JSON"
+  select_ci_lane_artifacts "$CI_ARTIFACT_DIR"
 fi
 
 if [ "${MODE:-}" = "aggregate" ]; then

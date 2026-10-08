@@ -2,6 +2,8 @@
 # Opt-in credentialed Grok regression proving the shared arm wrapper still works
 # through Grok's tracked background-task notification path.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 if [ "${FM_GROK_LIVE_E2E:-0}" != 1 ]; then
   echo "skip: set FM_GROK_LIVE_E2E=1 to run the interactive Grok continuity regression"

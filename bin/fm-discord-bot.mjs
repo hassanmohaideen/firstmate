@@ -1627,11 +1627,14 @@ class GatewayRunner {
       let serverDelayMs = 0;
       let settled = false;
       let checkpointBlocked = false;
+      let closeHandled = false;
+      let closeFallback = null;
       const clearTimers = () => {
         if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (handshakeTimeout) clearTimeout(handshakeTimeout);
         if (stableTimeout) clearTimeout(stableTimeout);
+        if (closeFallback) clearTimeout(closeFallback);
       };
       const finish = (result) => {
         if (settled) return;
@@ -1670,7 +1673,28 @@ class GatewayRunner {
         return;
       }
       this.socket = socket;
-      handshakeTimeout = setTimeout(() => socket.close(4000, "gateway handshake timeout"), 15_000);
+      // A failed or abandoned connection must always settle this attempt so
+      // the bounded reconnect loop continues. Some WebSocket runtimes (Node 22)
+      // report a refused connection with "error" and never dispatch "close",
+      // which would otherwise leave the attempt pending until the event loop
+      // drains and the service exits as if it had stopped cleanly.
+      const armCloseFallback = (delayMs) => {
+        if (closeHandled || closeFallback) return;
+        closeFallback = setTimeout(() => {
+          closeFallback = null;
+          try {
+            if (socket.readyState === WebSocket.OPEN) socket.close(4000, "gateway connection error");
+          } catch {}
+          handleClose(1006);
+        }, delayMs);
+      };
+      const abandon = (code, reason) => {
+        try {
+          socket.close(code, reason);
+        } catch {}
+        armCloseFallback(1000);
+      };
+      handshakeTimeout = setTimeout(() => abandon(4000, "gateway handshake timeout"), 15_000);
       socket.addEventListener("open", () => { opened = true; });
       socket.addEventListener("message", (event) => {
         let packet;
@@ -1684,7 +1708,7 @@ class GatewayRunner {
         switch (packet.op) {
           case 10: {
             if (handshakeTimeout) clearTimeout(handshakeTimeout);
-            handshakeTimeout = setTimeout(() => socket.close(4000, "gateway ready timeout"), 30_000);
+            handshakeTimeout = setTimeout(() => abandon(4000, "gateway ready timeout"), 30_000);
             const interval = Number(packet.d?.heartbeat_interval);
             if (!Number.isFinite(interval) || interval < 50) {
               socket.close(4002, "invalid hello");
@@ -1796,19 +1820,19 @@ class GatewayRunner {
             break;
         }
       });
-      socket.addEventListener("error", () => {
-        // Close drives the bounded reconnect path; browser-style WebSocket
-        // errors intentionally carry no raw diagnostic into logs.
-      });
-      socket.addEventListener("close", (event) => {
+      const handleClose = (code) => {
+        if (closeHandled) return;
+        closeHandled = true;
+        if (closeFallback) clearTimeout(closeFallback);
+        closeFallback = null;
         this.connected = false;
         if (this.socket === socket) this.socket = null;
         removeMarker(READY_FILE).catch(() => {});
         const complete = async () => {
-          if ([4007, 4009].includes(event.code)) {
+          if ([4007, 4009].includes(code)) {
             this.clearSession();
             if (!await this.persistDurableStateOrStop()) {
-              finish({ opened, ready, stable, code: event.code, terminalCode: "", serverDelayMs });
+              finish({ opened, ready, stable, code, terminalCode: "", serverDelayMs });
               return;
             }
           }
@@ -1816,13 +1840,22 @@ class GatewayRunner {
             opened,
             ready,
             stable,
-            code: event.code,
-            terminalCode: terminalDiagnosticForClose(event.code),
+            code,
+            terminalCode: terminalDiagnosticForClose(code),
             serverDelayMs,
           });
         };
         void complete();
+      };
+      socket.addEventListener("error", () => {
+        // Close normally follows and drives the bounded reconnect path;
+        // browser-style WebSocket errors intentionally carry no raw diagnostic
+        // into logs. A connection that never opened has definitively failed,
+        // so settle it now rather than waiting on a close event the runtime
+        // may never dispatch.
+        armCloseFallback(opened ? 1000 : 0);
       });
+      socket.addEventListener("close", (event) => handleClose(event.code));
     });
   }
 

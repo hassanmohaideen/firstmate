@@ -111,6 +111,21 @@ worker_publish_lock_owner() {
   mv -f -- "$pid_tmp" "$WORKER_LOCK/pid" || { rm -f -- "$pid_tmp" "$WORKER_LOCK/start" "$WORKER_LOCK/command"; return 1; }
 }
 
+# Remove the mktemp staging files a lock publication leaves behind when its
+# writer dies between creating a temp file and renaming it into place. Without
+# this sweep one such file keeps the lock directory non-empty, so every later
+# rmdir fails and no worker can ever release or reclaim ownership. Callers
+# invoke it only on a lock they own or one already proven stale, never on a
+# lock whose owner may still be publishing.
+worker_remove_lock_staging() { # <lock-dir>
+  local lock=$1 file
+  for file in "$lock"/.pid.* "$lock"/.start.* "$lock"/.command.* "$lock"/.quarantine.*; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    rm -f -- "$file" || return 1
+  done
+}
+
 worker_lock_recent() {
   local mtime now
   mtime=$(fm_remote_job_path_mtime "$WORKER_LOCK" 2>/dev/null || true)
@@ -163,6 +178,7 @@ worker_acquire_lock() {
       continue
     fi
     [ ! -L "$WORKER_LOCK/pid" ] && [ ! -L "$WORKER_LOCK/start" ] && [ ! -L "$WORKER_LOCK/command" ] || return 1
+    worker_remove_lock_staging "$WORKER_LOCK" || return 1
     rm -f -- "$WORKER_LOCK/pid" "$WORKER_LOCK/start" "$WORKER_LOCK/command" || return 1
     rmdir "$WORKER_LOCK" || return 1
   done
@@ -190,6 +206,7 @@ worker_cleanup() {
   if [ -z "$owner_pid" ]; then
     [ ! -L "$WORKER_LOCK/start" ] && [ ! -L "$WORKER_LOCK/command" ] &&
       rm -f -- "$WORKER_LOCK/start" "$WORKER_LOCK/command" 2>/dev/null || true
+    worker_remove_lock_staging "$WORKER_LOCK" 2>/dev/null || true
     rmdir "$WORKER_LOCK" 2>/dev/null || true
     WORKER_LOCK_HELD=0
     return 0
@@ -202,6 +219,7 @@ worker_cleanup() {
   [ ! -L "$ready" ] && rm -f -- "$ready" 2>/dev/null || true
   [ ! -L "$identity" ] && rm -f -- "$identity" 2>/dev/null || true
   rm -f -- "$WORKER_LOCK/pid" "$WORKER_LOCK/start" "$WORKER_LOCK/command" 2>/dev/null || true
+  worker_remove_lock_staging "$WORKER_LOCK" 2>/dev/null || true
   rmdir "$WORKER_LOCK" 2>/dev/null || true
   WORKER_LOCK_HELD=0
 }
@@ -292,7 +310,13 @@ worker_stop_active_execution() {
 }
 
 worker_shutdown() {
-  trap - HUP INT TERM
+  # A stop routinely delivers TERM twice: fm_remote_job_stop_worker_tree signals
+  # the whole worker group and the restart supervisor then forwards its own TERM
+  # to this child. Restoring the default disposition here let that second TERM
+  # kill the worker mid-shutdown, stranding a half-published quarantine in the
+  # lock so no replacement could acquire ownership. Absorb repeats until the
+  # shutdown finishes; KILL remains the stop path's escalation.
+  trap : HUP INT TERM
   worker_publish_quarantine || {
     worker_error "cannot guard worker ownership for shutdown"
     trap worker_shutdown HUP INT TERM
@@ -719,6 +743,7 @@ worker_supervisor_cleanup_dead_child() { # <account-home> <pid>
   [ ! -L "$ready" ] && rm -f -- "$ready" || return 1
   [ ! -L "$identity" ] && rm -f -- "$identity" || return 1
   [ ! -L "$lock/start" ] && [ ! -L "$lock/command" ] || return 1
+  worker_remove_lock_staging "$lock" || return 1
   rm -f -- "$lock/pid" "$lock/start" "$lock/command" || return 1
   rmdir "$lock"
 }

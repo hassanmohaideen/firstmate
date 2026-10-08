@@ -22,6 +22,8 @@
 # one (tests/herdr-test-safety.sh; the 2026-07-02 incident). Skips cleanly
 # when herdr or jq is missing.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

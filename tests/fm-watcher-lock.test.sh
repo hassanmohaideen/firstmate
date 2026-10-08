@@ -95,7 +95,7 @@ test_stale_watch_lock_reclaimed() {
   done
   [ "$live" -eq 1 ] || fail "watcher did not reclaim stale lock and stay alive"
   [ "$lock_pid" != "$dead_pid" ] || fail "stale watch lock pid was not replaced"
-  kill "$pid" 2>/dev/null || true
+  fm_test_stop_pid "$pid" || fail "watcher pid $pid did not stop within 30s of TERM"
   wait "$pid" 2>/dev/null || true
   pass "killed watcher stale lock is reclaimed"
 }
@@ -184,10 +184,48 @@ test_guard_warnings() {
   # Non-git FM_ROOT keeps the worktree-tangle check inert so "fresh watcher ->
   # total silence" stays a pure assertion about watcher state.
   FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
-  kill "$pid" 2>/dev/null || true
+  fm_test_stop_pid "$pid" || fail "watcher pid $pid did not stop within 30s of TERM"
   wait "$pid" 2>/dev/null || true
   [ ! -s "$err" ] || fail "guard warned with a live watcher and fresh beacon: $(cat "$err")"
   pass "guard banner leads when down with pending wakes (repair-after-drain) and stays silent when live and fresh"
+}
+
+# Start 40 contenders on <lockdir>; each records its attempt, and a winner
+# records itself and then holds the lock until every contender has attempted.
+# A fixed hold could expire before a slow-starting contender attempts, and that
+# contender would then correctly reclaim a dead winner's lock as a second win.
+contend_lock_40() {  # <state> <lockdir> <wins-file> <work-dir>
+  local state=$1 lockdir=$2 marker=$3 work=$4 attempts release pids pid i rc=0
+  attempts="$work/attempts"; release="$work/release"
+  : > "$attempts"
+  pids=
+  i=1
+  while [ "$i" -le 40 ]; do
+    FM_STATE_OVERRIDE="$state" bash -c '
+      . "$1"
+      if fm_lock_try_acquire "$2"; then
+        printf "%s\n" "${BASHPID:-$$}" >> "$3"
+        printf "won\n" >> "$4"
+        n=0
+        while [ ! -e "$5" ] && [ "$n" -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
+      else
+        printf "lost\n" >> "$4"
+      fi
+    ' _ "$LIB" "$lockdir" "$marker" "$attempts" "$release" &
+    pids="$pids $!"
+    i=$((i + 1))
+  done
+  i=0
+  until [ "$(awk 'NF { c++ } END { print c + 0 }' "$attempts")" -ge 40 ]; do
+    i=$((i + 1))
+    [ "$i" -lt 600 ] || { rc=1; break; }
+    sleep 0.1
+  done
+  touch "$release"
+  for pid in $pids; do
+    wait "$pid" 2>/dev/null || true
+  done
+  return "$rc"
 }
 
 test_lock_single_winner_under_concurrency() {
@@ -197,24 +235,8 @@ test_lock_single_winner_under_concurrency() {
   lockdir="$state/.contend.lock"
   marker="$dir/wins"
   : > "$marker"
-  pids=
-  i=1
-  while [ "$i" -le 40 ]; do
-    FM_STATE_OVERRIDE="$state" bash -c '
-      . "$1"
-      if fm_lock_try_acquire "$2"; then
-        printf "%s\n" "$$" >> "$3"
-        # Stay alive so the held lock names a live pid for the whole window;
-        # otherwise a late contender could legitimately reclaim a dead-pid lock.
-        sleep 1
-      fi
-    ' _ "$LIB" "$lockdir" "$marker" &
-    pids="$pids $!"
-    i=$((i + 1))
-  done
-  for pid in $pids; do
-    wait "$pid" 2>/dev/null || true
-  done
+  contend_lock_40 "$state" "$lockdir" "$marker" "$dir" \
+    || fail "the concurrent lock contenders did not all attempt within the deadline"
   wins=$(awk 'NF { c++ } END { print c + 0 }' "$marker")
   [ "$wins" -eq 1 ] || fail "expected exactly one lock winner under concurrency, got $wins"
   pass "concurrent fm_lock_try_acquire yields exactly one winner"
@@ -249,22 +271,8 @@ test_lock_stale_steal_single_winner_under_concurrency() {
   mkdir "$lockdir"
   printf '%s\n' "$dead" > "$lockdir/pid"
   : > "$marker"
-  pids=
-  i=1
-  while [ "$i" -le 40 ]; do
-    FM_STATE_OVERRIDE="$state" bash -c '
-      . "$1"
-      if fm_lock_try_acquire "$2"; then
-        printf "%s\n" "${BASHPID:-$$}" >> "$3"
-        sleep 1
-      fi
-    ' _ "$LIB" "$lockdir" "$marker" &
-    pids="$pids $!"
-    i=$((i + 1))
-  done
-  for pid in $pids; do
-    wait "$pid" 2>/dev/null || true
-  done
+  contend_lock_40 "$state" "$lockdir" "$marker" "$dir" \
+    || fail "the concurrent lock contenders did not all attempt within the deadline"
   wins=$(awk 'NF { c++ } END { print c + 0 }' "$marker")
   [ "$wins" -eq 1 ] || fail "expected exactly one stale-lock stealer, got $wins"
   pass "concurrent stale-lock steal yields exactly one winner"
@@ -592,7 +600,7 @@ test_arm_attaches_and_waits_for_live_fresh_watcher() {
   [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "arm disturbed the healthy watcher's lock"
   is_live_non_zombie "$armpid" || fail "arm exited while the seed watcher was still healthy"
   # After the seed dies without a successor, the attached arm must fail loudly.
-  kill "$wpid" 2>/dev/null || true
+  fm_test_stop_pid "$wpid" || fail "seed watcher pid $wpid did not stop within 30s of TERM"
   # A loaded runner can leave the watcher's graceful trap waiting on a child.
   # Keep fixture teardown bounded so the arm observes either graceful exit or
   # the helper's forced exit instead of blocking this serial shard forever.
@@ -629,14 +637,14 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
     i=$((i + 1))
   done
   grep -qF "watcher: attached pid=$wpid" "$armout" || fail "arm did not report attach before signal"
-  kill -TERM "$armpid" 2>/dev/null || fail "could not signal the attached arm"
+  fm_test_stop_pid "$armpid" || fail "could not stop the attached arm"
   wait_for_exit "$armpid" 80
   status=$?
   [ "$status" -eq 143 ] || fail "attached arm did not exit with TERM status (got $status)"
   grep -q "arm_pid=$armpid.*watcher_pid=$wpid.*origin=attached.*exit_code=143.*signal=TERM.*reason=arm-interrupted" "$state/.watch-cycle-exits.log" \
     || fail "attached arm signal was not recorded in the lifecycle ledger"
   is_live_non_zombie "$wpid" || fail "signaling an attached arm terminated the peer watcher"
-  kill "$wpid" 2>/dev/null || true
+  fm_test_stop_pid "$wpid" || fail "peer watcher pid $wpid did not stop within 30s of TERM"
   wait "$wpid" 2>/dev/null || true
   pass "attached arm signals record a classified lifecycle entry"
 }
@@ -935,7 +943,7 @@ test_stopped_watcher_is_live_but_stale_then_exit_is_classified() {
   fi
 
   kill -CONT "$watcher_pid" 2>/dev/null || true
-  kill -TERM "$watcher_pid" 2>/dev/null || true
+  fm_test_stop_pid "$watcher_pid" || fail "resumed watcher pid $watcher_pid did not stop within 30s of TERM"
   wait_for_exit "$armpid" 80
   status=$?
   [ "$status" -ne 0 ] && [ "$status" -ne 124 ] || fail "terminated stopped-watcher cycle did not surface nonzero (status $status)"
@@ -1104,7 +1112,60 @@ test_msys_pid_identity_uses_proc() {
   pass "MSYS process identity uses compatible /proc fields"
 }
 
+wait_ready_file() {  # <file>: up to 10s
+  local i=0
+  until [ -e "$1" ]; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || return 1
+    sleep 0.1
+  done
+}
+
+# Bash 5.2 can consume a trapped TERM without running its action, so the stop
+# protocol re-delivers TERM until the process is gone. The fixture's trap
+# deliberately discards its first TERM, standing in for that lost signal on
+# every Bash version, and exits only on a later one.
+test_stop_trapping_process_redelivers_a_lost_term() {
+  local dir ready pid rc start
+  dir=$(make_case stop-lost-term)
+  ready="$dir/ready"
+  bash -c 'seen=0
+    trap '\''seen=$((seen + 1)); [ "$seen" -lt 2 ] || exit 0'\'' TERM
+    : > "$1"
+    while :; do sleep 0.05; done' _ "$ready" &
+  pid=$!
+  wait_ready_file "$ready" || fail "lost-TERM fixture never installed its trap"
+  start=$SECONDS
+  rc=0
+  FM_STATE_OVERRIDE="$dir/state" bash -c '. "$1"; fm_stop_trapping_process "$2" 100' _ "$LIB" "$pid" || rc=$?
+  wait "$pid" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || fail "a process whose first TERM was lost was not stopped by re-delivery (rc=$rc)"
+  [ $((SECONDS - start)) -lt 8 ] || fail "re-delivery took longer than a few one-second periods"
+  pass "the stop protocol re-delivers TERM so a lost first signal still stops the process"
+}
+
+test_stop_trapping_process_reports_or_kills_a_survivor() {
+  local dir ready pid rc
+  dir=$(make_case stop-survivor)
+  ready="$dir/ready"
+  bash -c 'trap "" TERM; : > "$1"; while :; do sleep 0.05; done' _ "$ready" &
+  pid=$!
+  wait_ready_file "$ready" || fail "TERM-immune fixture never started"
+  rc=0
+  FM_STATE_OVERRIDE="$dir/state" bash -c '. "$1"; fm_stop_trapping_process "$2" 15' _ "$LIB" "$pid" || rc=$?
+  [ "$rc" -eq 1 ] || fail "a TERM-immune process was not reported as surviving (rc=$rc)"
+  is_live_non_zombie "$pid" || fail "without kill, the stop protocol must leave a survivor running"
+  rc=0
+  FM_STATE_OVERRIDE="$dir/state" bash -c '. "$1"; fm_stop_trapping_process "$2" 15 kill' _ "$LIB" "$pid" || rc=$?
+  wait "$pid" 2>/dev/null || true
+  [ "$rc" -eq 2 ] || fail "a TERM-immune process stopped only by KILL did not report rc 2 (rc=$rc)"
+  ! is_live_non_zombie "$pid" || fail "kill escalation left the TERM-immune process running"
+  pass "the stop protocol reports a survivor at its deadline and escalates to KILL only when asked"
+}
+
 test_singleton_start
+test_stop_trapping_process_redelivers_a_lost_term
+test_stop_trapping_process_reports_or_kills_a_survivor
 test_pid_identity_is_locale_invariant
 test_proc_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_msys_pid_identity_uses_proc

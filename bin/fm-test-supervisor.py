@@ -247,6 +247,16 @@ class DarwinProcBSDInfo(ctypes.Structure):
     ]
 
 
+# A /proc/<pid> entry that vanishes mid-inventory is a reaped process, not an
+# unreadable one. Path lookup after the reap raises ENOENT, but a reap landing
+# between open() and read() of an already-resolved /proc/<pid>/status or stat
+# makes the read itself fail with ESRCH. Both prove the pid is gone, so neither
+# can be a surviving credential-domain member; treating ESRCH as an inventory
+# failure turned the first post-exit probe of a test whose descendants were
+# still being reaped into a spurious, sticky containment_ambiguous.
+PROC_VANISHED_ERRORS = (FileNotFoundError, ProcessLookupError)
+
+
 class CredentialPlatform:
     def __init__(self) -> None:
         if sys.platform.startswith("linux"):
@@ -300,7 +310,7 @@ class CredentialPlatform:
             try:
                 result[int(entry.name)] = cls._linux_pid_credentials(int(entry.name))
             except InventoryError as exc:
-                if isinstance(exc.__cause__, FileNotFoundError):
+                if isinstance(exc.__cause__, PROC_VANISHED_ERRORS):
                     continue
                 if isinstance(exc.__cause__, PermissionError):
                     unreadable.append(entry.name)
@@ -395,7 +405,7 @@ class CredentialPlatform:
             try:
                 return self._linux_pid_credentials(pid)
             except InventoryError as exc:
-                if isinstance(exc.__cause__, FileNotFoundError):
+                if isinstance(exc.__cause__, PROC_VANISHED_ERRORS):
                     raise InventoryError(f"blocked child {pid} disappeared before credential verification") from exc
                 raise
         inventory = self._darwin_inventory_for_pids((pid,))

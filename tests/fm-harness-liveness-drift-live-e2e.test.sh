@@ -21,6 +21,8 @@
 # tests/fm-tmux-agent-liveness.test.sh pins the classifier logic in CI. Run this
 # guard after any harness upgrade and before trusting refreshed evidence.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 if [ "${FM_HARNESS_LIVENESS_DRIFT:-0}" != 1 ]; then
   echo "skip: set FM_HARNESS_LIVENESS_DRIFT=1 to run the installed-harness liveness drift guard"

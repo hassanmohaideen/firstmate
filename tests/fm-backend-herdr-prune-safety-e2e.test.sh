@@ -21,6 +21,8 @@
 # stop` - the exact category of unscoped destructive call that caused the
 # 2026-07-02 incident in the first place.
 set -u
+# shellcheck source=tests/home-isolation.sh
+. "$(dirname "${BASH_SOURCE[0]}")/home-isolation.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
