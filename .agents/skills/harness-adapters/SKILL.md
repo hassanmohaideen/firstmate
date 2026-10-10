@@ -174,11 +174,14 @@ Skip the consult, and record nothing, when any of these holds:
 - The action steers an existing worker rather than dispatching one, such as answering its decision or steering a rebase, conflict resolution, or mechanical merge.
 - No trigger above holds; a consult with nothing genuinely open is the documented anti-pattern of asking the model what fixed logic already decides.
 
+The captain-override, non-intake, and worker-steering skips always win; otherwise any consult trigger wins over the single-obvious-rule skip, which applies only when no trigger holds.
+
 When you consult:
 
 1. Decide first: settle your own rule and effort choice before consulting, so the advice cannot anchor it.
 2. On `JEV_UNAVAILABLE` or a disabled key, proceed with your choice unchanged; never retry, wait, or escalate for it.
-3. Read the advice through the documented confidence bands: below 0.5 is no signal, so proceed with your choice; when Jev agrees at any confidence, proceed.
+3. Read the advice through the documented confidence bands, using `tier_confidence` for the tier and for the effort when `effort_source=rule`, and the ambiguity `confidence` for the effort when `effort_source=ambiguity` or in `effort` mode.
+   Below 0.5 is no signal, so proceed with your choice; when Jev agrees at any confidence, proceed.
 4. When Jev favors a different tier or effort at 0.5 or above, re-read both rule texts against the task once, then keep or switch with judgment; at 0.9 or above, keep your choice only when you can name the concrete rule-text reason it fits better.
    Your final choice stands and nothing switches automatically.
 5. After every consult, record the actual choice and whether you followed the advice with `bin/fm-jev.sh record --task-id <id> --tier <label|none> --effort <effort> --followed yes|no|partial --reason <short why>`, naming the trigger that prompted the consult in the reason, so `bin/fm-jev.sh report` can judge Jev's value per confidence band through use.
