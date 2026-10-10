@@ -154,14 +154,37 @@ This preserves launch success instead of passing a known-bad value.
 
 ## Optional Jev dispatch second opinion
 
-When `bin/fm-jev.sh status` reports a configured key, firstmate MAY consult `bin/fm-jev.sh dispatch-tier --task-file <task text> --task-id <id>` at crewmate or scout intake as a second opinion on the dispatch rule and effort; `effort` rates ambiguity alone when no rule question is open.
+When `bin/fm-jev.sh status` reports a configured key, firstmate consults `bin/fm-jev.sh dispatch-tier --task-file <task text> --task-id <id>` at crewmate or scout intake only when a consult trigger below holds; `effort` rates ambiguity alone when the rule is settled and only the effort is open.
 `docs/configuration.md` "TypeSafe Jev dispatch advisory" owns the key file, data egress, audit log, and hard exclusions, and the script header owns its mechanics.
+
+TypeSafe documents Jev as a fast, calibrated System One model to insert only where a judgment is actually needed, keeping deterministic decisions in code and acting on its confidence ([How to build with TypeSafe](https://docs.typesafe.ai/concepts/how-to-build-with-system-one), [Confidence](https://docs.typesafe.ai/confidence), [Confidence-gated routing](https://docs.typesafe.ai/patterns/confidence-routing)).
+So a dispatch that a fixed rule already decides gets no consult, and a consult is warranted only where the rule or effort choice is a genuine judgment.
+
+Consult when at least one of these holds after you have formed your own choice:
+
+- **Rule tie:** two or more effective dispatch rules plausibly match the task, or you cannot tell whether any rule's `when` text matches rather than the default.
+- **Effort split:** no explicit captain or configured effort applies, and the generic fallback leaves you genuinely between two adjacent levels because the approach's ambiguity is unclear.
+- **High-consequence under-tiering:** the task is novel to the project or has a wide blast radius, such as a cross-subsystem change, a migration, or a shared contract, and your choice is below the strongest reasoning class or below `high` effort; [risk-based thresholds](https://docs.typesafe.ai/confidence) call for more certainty before acting when a wrong call costs more.
+
+Skip the consult, and record nothing, when any of these holds:
+
+- An explicit per-task captain override fixes the profile or effort.
+- Exactly one rule's `when` text clearly matches, or clearly none does, and the effort is fixed by captain, configuration, or that rule's profile.
+- The work is not new intake: a relaunch, recovery, resume, scout promotion, re-validation, or a re-run or follow-up of an already-dispatched task keeps that task's recorded choice.
+- The action steers an existing worker rather than dispatching one, such as answering its decision or steering a rebase, conflict resolution, or mechanical merge.
+- No trigger above holds; a consult with nothing genuinely open is the documented anti-pattern of asking the model what fixed logic already decides.
+
+The captain-override, non-intake, and worker-steering skips always win; otherwise any consult trigger wins over the single-obvious-rule skip, which applies only when no trigger holds.
+
+When you consult:
 
 1. Decide first: settle your own rule and effort choice before consulting, so the advice cannot anchor it.
 2. On `JEV_UNAVAILABLE` or a disabled key, proceed with your choice unchanged; never retry, wait, or escalate for it.
-3. When Jev agrees, or its confidence is low, proceed.
-4. When Jev confidently favors a different tier or effort, re-read both rule texts against the task once, then keep or switch with judgment; your final choice stands and nothing switches automatically.
-5. After every consult, record the actual choice and whether you followed the advice with `bin/fm-jev.sh record --task-id <id> --tier <label|none> --effort <effort> --followed yes|no|partial --reason <short why>`, so `bin/fm-jev.sh report` can judge Jev's value through use.
+3. Read the advice through the documented confidence bands, using `tier_confidence` for the tier and for the effort when `effort_source=rule`, and the ambiguity `confidence` for the effort when `effort_source=ambiguity` or in `effort` mode.
+   Below 0.5 is no signal, so proceed with your choice; when Jev agrees at any confidence, proceed.
+4. When Jev favors a different tier or effort at 0.5 or above, re-read both rule texts against the task once, then keep or switch with judgment; at 0.9 or above, keep your choice only when you can name the concrete rule-text reason it fits better.
+   Your final choice stands and nothing switches automatically.
+5. After every consult, record the actual choice and whether you followed the advice with `bin/fm-jev.sh record --task-id <id> --tier <label|none> --effort <effort> --followed yes|no|partial --reason <short why>`, naming the trigger that prompted the consult in the reason, so `bin/fm-jev.sh report` can judge Jev's value per confidence band through use.
 
 The advice ranks rules, never a profile array's candidates: a matched array still goes through `quota-array-dispatch`, and the strongest-reasoning-class and effort precedence rules in "Launch profile axes" are untouched.
 Never consult Jev for merge approval or PR readiness, ask-user dispositions, destructive, irreversible, or security-sensitive determinations, quota-array profile selection, or any watcher, away-mode, supervision, or startup path.

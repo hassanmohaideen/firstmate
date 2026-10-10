@@ -318,13 +318,14 @@ Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstr
 Malformed JSON, an empty or malformed rule/default array, an unverified harness, an effort value unsupported by that harness, or an `advisor` on a non-`claude` profile is reported against its file as `CREW_DISPATCH: invalid <path> - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
 While either file is effective, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration in either layer must be reported and corrected rather than selected around.
 Secondmate homes inherit the primary's local file when one exists, while their synced repository copy supplies the same tracked layer.
-Firstmate may also consult the optional Jev second opinion described in [TypeSafe Jev dispatch advisory](#typesafe-jev-dispatch-advisory-configtypesafeenv) at this intake; it never replaces this best-fit judgment.
+When one of its documented consult triggers leaves this intake genuinely uncertain, firstmate may also consult the optional Jev second opinion described in [TypeSafe Jev dispatch advisory](#typesafe-jev-dispatch-advisory-configtypesafeenv); it never replaces this best-fit judgment, and clear, routine dispatches skip it.
 
 ## TypeSafe Jev dispatch advisory (config/typesafe.env)
 
 [`bin/fm-jev.sh`](../bin/fm-jev.sh) is an optional second opinion from TypeSafe's Jev decision model for crewmate and scout dispatch intake.
 It ranks the effective crew-dispatch rules against the task text and rates approach ambiguity, then prints a recommended tier, effort, and confidence as data.
 It is advisory-only, fail-open, and data-only: nothing applies its output, and firstmate still chooses the rule and effort with judgment.
+Firstmate consults it only on the documented consult triggers, not on every dispatch; [`harness-adapters`](../.agents/skills/harness-adapters/SKILL.md#optional-jev-dispatch-second-opinion) owns those triggers and the skip conditions.
 It is inert until a key is configured, so a home without one behaves exactly as before.
 This section is the single owner of the key file and audit-log schema; the script header and `--help` own subcommands, flags, output, and environment tuning, and [`harness-adapters`](../.agents/skills/harness-adapters/SKILL.md#optional-jev-dispatch-second-opinion) owns the intake protocol.
 
@@ -342,7 +343,7 @@ Each advice call sends only the bounded task text and, for `dispatch-tier`, the 
 Every advice call and every recorded decision appends one JSON line to the home-private, mode-`0600` `state/jev-advice.jsonl`, rotated once to `state/jev-advice.jsonl.1` past its size cap.
 An advice record carries `ts`, `kind: "advice"`, `mode`, `task_id`, `outcome` (`ok` or `unavailable` with `reason`), `model`, `recommended_tier`, `tier_confidence`, `recommended_effort`, `effort_source`, `ambiguity_score`, `ambiguity_confidence`, `tier_probabilities`, `latency_ms`, `input_tokens`, `task_sha256`, and `task_bytes`.
 A decision record carries `ts`, `kind: "decision"`, `task_id`, `chosen_tier`, `chosen_effort`, `followed` (`yes`, `no`, or `partial`), and a short `reason`.
-Records never contain the key or the task text, and `fm-jev.sh report` summarizes availability, latency, and agreement between the latest advice and decision per task.
+Records never contain the key or the task text, and `fm-jev.sh report` summarizes availability, latency, and agreement between the latest advice and decision per task, with tier agreement split into TypeSafe's documented high (0.9 and above), medium (0.5 to 0.9), and low (below 0.5) confidence bands.
 
 Jev must never be consulted for merge approval or PR readiness, ask-user dispositions, destructive, irreversible, or security-sensitive determinations, quota-array profile selection, or any watcher, away-mode, supervision, wake-drain, or session-startup path.
 The script enforces that boundary by exposing only fixed advisory subcommands with code-owned questions and no generic question surface.

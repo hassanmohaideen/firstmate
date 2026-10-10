@@ -2,13 +2,16 @@
 # fm-jev.sh - optional TypeSafe Jev second opinion for crewmate and scout
 # dispatch intake. Advisory-only, fail-open, and data-only.
 #
-# Firstmate MAY consult this at crewmate or scout intake, AFTER it has formed its
-# own dispatch-rule and effort choice, as a calibrated second opinion. Nothing
+# Firstmate consults this at crewmate or scout intake only when one of the
+# documented consult triggers holds, AFTER it has formed its own dispatch-rule
+# and effort choice, as a calibrated second opinion; clear, routine dispatches
+# skip it. Nothing
 # applies the output automatically: firstmate keeps choosing the rule and effort
 # with judgment, records whether it followed the advice with `record`, and the
-# rest of dispatch is unchanged. The operating protocol lives in
-# .agents/skills/harness-adapters/SKILL.md ("Optional Jev dispatch second
-# opinion"); docs/configuration.md owns the config/typesafe.env schema.
+# rest of dispatch is unchanged. The operating protocol, including the consult
+# and skip triggers, lives in .agents/skills/harness-adapters/SKILL.md
+# ("Optional Jev dispatch second opinion"); docs/configuration.md owns the
+# config/typesafe.env schema.
 #
 # Hard exclusions. This script exposes only the fixed advisory subcommands below
 # with code-owned questions; it has no generic question surface, and it must
@@ -67,7 +70,9 @@
 #   record         appends firstmate's actual choice and whether it followed the
 #                  advice, so `report` can compare advice with decisions
 #   report         summarizes availability, latency, and agreement or
-#                  disagreement between the latest advice and decision per task
+#                  disagreement between the latest advice and decision per task,
+#                  with tier agreement split into the documented TypeSafe
+#                  confidence bands: high (>=0.9), medium (0.5-0.9), low (<0.5)
 #
 # Output: key=value lines. The first line of an advice call is either
 # `jev=ok ...` or a single `JEV_UNAVAILABLE: <reason>` line.
@@ -568,7 +573,7 @@ cmd_report() {
     "jev_report advice_calls=\($adv | length) ok=\($ok | length) unavailable=\(($adv | length) - ($ok | length)) decisions=\($dec | length) median_latency_ms=\([$ok[].latency_ms | select(type == "number")] | median // "n/a")",
     "comparisons=\($pairs | length) tier_agree=\([$pairs[] | select(.tier_agree)] | length) tier_disagree=\([$pairs[] | select(.tier_agree | not)] | length) effort_agree=\([$pairs[] | select(.effort_agree)] | length) effort_disagree=\([$pairs[] | select(.effort_agree | not)] | length)",
     "followed yes=\([$pairs[] | select(.followed == "yes")] | length) partial=\([$pairs[] | select(.followed == "partial")] | length) no=\([$pairs[] | select(.followed == "no")] | length)",
-    "tier_agreement high_confidence(>=0.7)=\(rate([$pairs[] | select((.conf // 0) >= 0.7)])) low_confidence(<0.7)=\(rate([$pairs[] | select((.conf // 0) < 0.7)]))",
+    "tier_agreement high_confidence(>=0.9)=\(rate([$pairs[] | select((.conf // 0) >= 0.9)])) medium_confidence(0.5-0.9)=\(rate([$pairs[] | select((.conf // 0) >= 0.5 and (.conf // 0) < 0.9)])) low_confidence(<0.5)=\(rate([$pairs[] | select((.conf // 0) < 0.5)]))",
     "advice_without_decision=\([$tiers[] | select($dmap[.task_id] == null)] | length)",
     ([$adv[] | select(.outcome == "unavailable") | .reason] | group_by(.) | .[] | "unavailable_reason count=\(length) reason=\"\(.[0])\""),
     ($pairs[] | select((.tier_agree and .effort_agree) | not)

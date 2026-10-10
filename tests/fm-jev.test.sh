@@ -33,7 +33,7 @@ SECRET_KEY='tsk-SENTINEL-KEY-0123456789abcdef'
 STUB_DIR="$TMP_ROOT/stub"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/server.py" <<'PY'
-import http.server, json, sys, time
+import http.server, json, os, sys, time
 port_file, mode_file, log = sys.argv[1], sys.argv[2], sys.argv[3]
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -98,7 +98,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             options = list(questions['tier']['criteria'].keys())
             pick = open(mode_file + '.pick').read().strip() if mode == 'pick' else options[1]
             probs = {o: (0.8 if o == pick else round(0.2 / (len(options) - 1), 4)) for o in options}
-            answers['tier'] = {'type': 'choice', 'choice': pick, 'probabilities': probs, 'confidence': 0.74}
+            conf_file = mode_file + '.conf'
+            conf = float(open(conf_file).read().strip()) if os.path.exists(conf_file) else 0.74
+            answers['tier'] = {'type': 'choice', 'choice': pick, 'probabilities': probs, 'confidence': conf}
             for key in questions:
                 if key.startswith('fits:'):
                     answers[key] = {'type': 'noul', 'noul': 0.9 if key == 'fits:' + pick else 0.1}
@@ -400,9 +402,16 @@ test_log_format_and_report() {
   run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-agree
   run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-disagree
   run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-pending
+  printf '0.95\n' > "$STUB_MODE.conf"
+  run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-high
+  printf '0.3\n' > "$STUB_MODE.conf"
+  run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-low
+  rm -f "$STUB_MODE.conf"
   run_jev "$home" record --task-id t-agree --tier local-2 --effort medium --followed yes
   assert_contains "$OUT" "recorded task_id=t-agree chosen_tier=local-2" "record confirms"
   run_jev "$home" record --task-id t-disagree --tier local-3 --effort xhigh --followed no --reason "design is still open"
+  run_jev "$home" record --task-id t-high --tier local-2 --effort medium --followed yes
+  run_jev "$home" record --task-id t-low --tier local-3 --effort medium --followed no --reason "low confidence carries no signal"
   set_mode 529
   run_jev "$home" dispatch-tier --task-file "$home/task.md" --task-id t-down
   set_mode ok
@@ -424,10 +433,10 @@ test_log_format_and_report() {
 
   run_jev "$home" report
   expect_code 0 "$RC" "report"
-  assert_contains "$OUT" "jev_report advice_calls=4 ok=3 unavailable=1 decisions=2" "report totals"
-  assert_contains "$OUT" "comparisons=2 tier_agree=1 tier_disagree=1 effort_agree=1 effort_disagree=1" "report agreement"
-  assert_contains "$OUT" "followed yes=1 partial=0 no=1" "report followed counts"
-  assert_contains "$OUT" "tier_agreement high_confidence(>=0.7)=1/2" "report confidence buckets"
+  assert_contains "$OUT" "jev_report advice_calls=6 ok=5 unavailable=1 decisions=4" "report totals"
+  assert_contains "$OUT" "comparisons=4 tier_agree=2 tier_disagree=2 effort_agree=3 effort_disagree=1" "report agreement"
+  assert_contains "$OUT" "followed yes=2 partial=0 no=2" "report followed counts"
+  assert_contains "$OUT" "tier_agreement high_confidence(>=0.9)=1/1 medium_confidence(0.5-0.9)=1/2 low_confidence(<0.5)=0/1" "report splits agreement into the documented confidence bands"
   assert_contains "$OUT" "advice_without_decision=1" "report unreconciled advice"
   assert_contains "$OUT" 'unavailable_reason count=1 reason="HTTP 529 (overloaded)"' "report unavailable reasons"
   assert_contains "$OUT" "disagreement task_id=t-disagree jev=local-2/medium@0.74 chosen=local-3/xhigh followed=no" "report lists disagreements"
