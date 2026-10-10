@@ -318,7 +318,7 @@ Valid files stay silent by default; with `FM_BOOTSTRAP_VERBOSE_FACTS=1`, bootstr
 Malformed JSON, an empty or malformed rule/default array, an unverified harness, an effort value unsupported by that harness, or an `advisor` on a non-`claude` profile is reported against its file as `CREW_DISPATCH: invalid <path> - ...`; missing `jq` is reported through the normal `MISSING: jq` install-consent flow.
 While either file is effective, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration in either layer must be reported and corrected rather than selected around.
 Secondmate homes inherit the primary's local file when one exists, while their synced repository copy supplies the same tracked layer.
-When a rule tie, an effort split, or a high-consequence choice leaves this intake genuinely uncertain, firstmate may also consult the optional Jev second opinion described in [TypeSafe Jev dispatch advisory](#typesafe-jev-dispatch-advisory-configtypesafeenv); it never replaces this best-fit judgment, and clear, routine dispatches skip it.
+When one of its documented consult triggers leaves this intake genuinely uncertain, firstmate may also consult the optional Jev second opinion described in [TypeSafe Jev dispatch advisory](#typesafe-jev-dispatch-advisory-configtypesafeenv); it never replaces this best-fit judgment, and clear, routine dispatches skip it.
 
 ## TypeSafe Jev dispatch advisory (config/typesafe.env)
 
