@@ -112,7 +112,8 @@ Effort precedence is an explicit per-task captain instruction first, then any ap
 Never replace an effort value supplied by either higher-precedence source.
 Use the fallback only when neither the captain nor applicable standing configuration specifies effort.
 Use `low` for well-understood work with an explicit bounded path and `xhigh` for ambiguous investigation or design.
-Choose intermediate levels proportionally as complexity, uncertainty, blast radius, or open-ended reasoning increases.
+Default routine bounded work to `medium`, such as authoring against existing primitives, UI tweaks, documentation, and steering conflict resolution.
+Reserve `high` and `xhigh` for genuinely new engine logic, unresolved design, or high-blast-radius work, because a stronger effort on bounded work spends more tokens without a better outcome.
 When a verified adapter lacks `xhigh`, cap the choice at its highest supported non-`max` level rather than omitting the intended effort silently.
 Never select `max` from this fallback; use it only when the captain has explicitly expressed that per-task or standing preference.
 
@@ -183,6 +184,7 @@ When you consult:
 3. Read the advice through the documented confidence bands, using `tier_confidence` for the tier and for the effort when `effort_source=rule`, and the ambiguity `confidence` for the effort when `effort_source=ambiguity` or in `effort` mode.
    Below 0.5 is no signal, so proceed with your choice; when Jev agrees at any confidence, proceed.
 4. When Jev favors a different tier or effort at 0.5 or above, re-read both rule texts against the task once, then keep or switch with judgment; at 0.9 or above, keep your choice only when you can name the concrete rule-text reason it fits better.
+   When Jev's recommended effort is lower than yours at 0.5 or above, follow the lower effort unless you can name a concrete reason - new engine logic, security or privacy, replay or persistence, or a high blast radius - and record that reason.
    Your final choice stands and nothing switches automatically.
 5. After every consult, record the actual choice and whether you followed the advice with `bin/fm-jev.sh record --task-id <id> --tier <label|none> --effort <effort> --followed yes|no|partial --reason <short why>`, naming the trigger that prompted the consult in the reason, so `bin/fm-jev.sh report` can judge Jev's value per confidence band through use.
 

@@ -809,6 +809,12 @@ test_ship_and_scout_briefs_carry_context_hygiene() {
       "$id: context-hygiene nudge lost the safe no-op for harnesses without compaction"
     assert_grep "This is a judgement nudge, not a required step" "$brief" \
       "$id: context-hygiene nudge lost its soft-nudge framing"
+    assert_grep "Helper sub-agents: run at most 2 at a time" "$brief" \
+      "$id: brief lost the default helper sub-agent cap"
+    assert_grep "stop any long-running background helper once its result is in" "$brief" \
+      "$id: helper cap lost the stop-finished-background-helpers rule"
+    assert_grep "do focused work directly instead of delegating it" "$brief" \
+      "$id: helper cap lost the do-focused-work-directly preference"
   done
 
   # A persistent secondmate charter is not a per-task worker brief, so it must not
@@ -818,7 +824,9 @@ test_ship_and_scout_briefs_carry_context_hygiene() {
     || fail "secondmate charter did not scaffold"
   assert_no_grep "# Context hygiene" "$home/data/ctxh-secondmate/brief.md" \
     "secondmate charter must not carry the per-task context-hygiene nudge"
-  pass "fm-brief.sh: ship and scout briefs carry the context-hygiene nudge; secondmate charters do not"
+  assert_no_grep "Helper sub-agents: run at most 2 at a time" "$home/data/ctxh-secondmate/brief.md" \
+    "secondmate charter must not carry the per-task helper cap"
+  pass "fm-brief.sh: ship and scout briefs carry the context-hygiene nudge and helper cap; secondmate charters do not"
 }
 
 # Scout and secondmate paths still scaffold well-formed briefs.

@@ -51,7 +51,7 @@ Open fresh contexts only for required independent review roles so those reviews 
 ## Effort classes
 
 Use `low` for promotion-only card promotion, UI copy, and documentation-only work that changes no engine behavior, contract, or test.
-Use `medium` for bounded contract, protocol, UI, fixture, documentation, test, straightforward remediation, and independent review work.
+Use `medium` for card authoring against existing engine primitives, bounded contract, protocol, UI, fixture, documentation, test, straightforward remediation, conflict-resolution, and independent review work.
 Use `high` for battle resolution and work whose accepted scope changes or verifies source-side privacy, persistence, authorization, replay, or authoritative undo behavior.
 Use `xhigh` only for genuinely unresolved architecture whose answer can materially change the design.
 Never select `max` by default.
@@ -61,7 +61,7 @@ Do not lower effort, or the model tier, merely to conserve usage when the task r
 
 Complete producer contracts and other dependencies before starting consumer lanes that rely on them.
 Keep genuinely independent work concurrent, including authoritative undo when it has no unresolved dependency on another lane.
-Treat same-file overlap as a reconciliation risk, not a reason to serialize otherwise independent work.
+Treat same-file overlap as a reconciliation risk, not a reason to serialize otherwise independent work, except for the hot-shared-file case in `AGENTS.md` section 7: card-authoring lanes that all edit the curated catalog and its manifest pin run sequentially or combine into one batch.
 Serialize only for a real semantic dependency or another unsafe shared-state condition under the general concurrency contract.
 
 ## Implementation and final validation
