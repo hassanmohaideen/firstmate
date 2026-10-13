@@ -37,8 +37,14 @@
 #              running worker sheds stale context at a clean phase seam. Acts
 #              only when the agent is alive and its busy verdict reads exactly
 #              idle, so it never lands mid-turn or mid-edit; then waits up to
-#              FM_CONTROL_COMPACT_WAIT for the busy verdict to leave busy so the
-#              next message lands after compaction. Prints `compacted` or
+#              FM_CONTROL_COMPACT_WAIT for the busy verdict to leave busy and
+#              reports what it saw as `settle=<verdict>`, or
+#              `settle=busy-timeout` when the wait expires still busy. That
+#              verdict is an observation, not proof compaction finished:
+#              claude's busy record comes from prompt/stop hooks whose
+#              behavior around built-in /compact is unverified, and a message
+#              sent while compaction still runs is queued by the harness and
+#              submit path rather than lost. Prints `compacted settle=...` or
 #              `compact-skipped ... reason=<why>`, both exit 0: a harness with
 #              no verified compaction command, a busy or unclassifiable turn,
 #              or a backend without a recovery-grade state classifier is a
@@ -103,7 +109,7 @@
 #   FM_CONTROL_EXIT_WAIT         alive->dead wait after the exit command (30)
 #   FM_CONTROL_LAUNCH_WAIT       dead->alive wait after a relaunch (90)
 #   FM_CONTROL_EXIT_RETRIES      Enter retries for the exit command (3)
-#   FM_CONTROL_COMPACT_WAIT      busy->settled wait after compact (120)
+#   FM_CONTROL_COMPACT_WAIT      best-effort busy observation after compact (120)
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -499,7 +505,9 @@ do_exit() {
 }
 
 # do_compact: submit the verified compaction command to a provably idle agent.
-# Prints `compacted settle=<verdict>` or `compact-skipped reason=<why>`.
+# Prints `compacted settle=<observed verdict|busy-timeout>` or
+# `compact-skipped reason=<why>`. The settle field is a best-effort observation
+# of the busy record, not proof that compaction completed.
 do_compact() {
   local cmd state verdict elapsed=0
   if ! cmd=$(fm_control_compact_command "$HARNESS"); then
@@ -532,12 +540,16 @@ do_compact() {
     || die "the compaction command was not confirmed submitted to task $ID on $BACKEND (verdict: $verdict)"
   while :; do
     verdict=$(busy_verdict)
-    [ "${verdict%% *}" = busy ] || break
-    awk -v e="$elapsed" -v t="$COMPACT_WAIT" 'BEGIN{exit !(e < t)}' || break
+    verdict=${verdict%% *}
+    [ "$verdict" = busy ] || break
+    if ! awk -v e="$elapsed" -v t="$COMPACT_WAIT" 'BEGIN{exit !(e < t)}'; then
+      verdict=busy-timeout
+      break
+    fi
     sleep "$POLL"
     elapsed=$(awk -v e="$elapsed" -v p="$POLL" 'BEGIN{printf "%.3f", e + p}')
   done
-  printf 'compacted settle=%s' "${verdict%% *}"
+  printf 'compacted settle=%s' "$verdict"
 }
 
 # --- transactional relaunch -------------------------------------------------
