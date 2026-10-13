@@ -14,7 +14,11 @@
 #   4. Verb allowlist: no arbitrary text, no raw keys, no resume.
 #   5. Lifecycle states: busy interrupts first, idle does not, already-stopped
 #      is idempotent success, and an agent that does not stop fails closed.
-#   6. Marker non-regression: a control command to a kind=secondmate task
+#   6. Compact: a provably idle agent on a harness with a verified native
+#      compaction command receives exactly that command; every other case
+#      (no verified command, busy or unknown turn, unverified-state backend)
+#      is a reported no-op that sends nothing.
+#   7. Marker non-regression: a control command to a kind=secondmate task
 #      carries NO from-firstmate marker and opens no pending-reply expectation,
 #      while fm-send's marking of the same task is untouched.
 set -u
@@ -860,6 +864,111 @@ test_fm_send_still_marks_the_same_secondmate_task() {
   pass "fm-control's arrival leaves fm-send's from-firstmate marking untouched"
 }
 
+# --- compact ------------------------------------------------------------------
+
+arm_idle() {  # <case-dir> <id>
+  local gen
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$1/home/state" "$2" --state idle --source fm-spawn --event seed)
+  printf 'busy_gen=%s\n' "$gen" >> "$1/home/state/$2.meta"
+}
+
+test_compact_sends_verified_command_only_where_one_exists() {
+  local dir out rc harness
+  for harness in $VERIFIED_HARNESSES; do
+    dir=$(new_case "compact-$harness")
+    add_task "$dir" t1 "$harness"
+    alive_as "$dir" "$harness"
+    # Grok's busy verdict is read from its rendered footer, not a hook record.
+    [ "$harness" = grok ] || arm_idle "$dir" t1
+    [ "$harness" != grok ] \
+      || printf '╭────╮\n│    │\n╰────╯\n Shift+Tab:mode │ Ctrl+.:shortcuts\n' > "$dir/fake/pane"
+    out=$(run_control "$dir" t1 compact); rc=$?
+    expect_code 0 "$rc" "compact on $harness should succeed or no-op"$'\n'"$out"
+    case "$harness" in
+      claude)
+        assert_contains "$out" "compacted t1 harness=claude" "claude should compact"
+        case "$(literals "$dir")" in
+          '/compact Keep '*) ;;
+          *) fail "claude should receive its focused /compact command, got: $(literals "$dir")" ;;
+        esac
+        ;;
+      grok)
+        assert_contains "$out" "compacted t1 harness=grok" "grok should compact"
+        [ "$(literals "$dir")" = /compact ] \
+          || fail "grok should receive the bare verified /compact, got: $(literals "$dir")"
+        ;;
+      *)
+        assert_contains "$out" "compact-skipped t1 harness=$harness" "$harness has no verified compaction command"
+        assert_contains "$out" "reason=no-verified-compaction-command" "the no-op should name its reason"
+        [ -z "$(literals "$dir")" ] || fail "$harness must receive no compaction text"
+        ;;
+    esac
+    [ -z "$(keys_sent "$dir")" ] || fail "compact must never send a control key on $harness"
+  done
+  pass "fm-control compact: only verified compaction commands are sent; every other harness no-ops"
+}
+
+test_compact_skips_a_busy_or_unknown_turn() {
+  local dir out rc gen
+  dir=$(new_case compact-busy)
+  add_task "$dir" t1 claude
+  alive_as "$dir" claude
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$dir/home/state" t1)
+  printf 'busy_gen=%s\n' "$gen" >> "$dir/home/state/t1.meta"
+  out=$(run_control "$dir" t1 compact); rc=$?
+  expect_code 0 "$rc" "a busy compact should be a reported no-op"$'\n'"$out"
+  assert_contains "$out" "compact-skipped t1" "a busy turn is not a seam"
+  assert_contains "$out" "reason=not-idle verdict=busy" "the skip should name the busy verdict"
+  [ -z "$(literals "$dir")" ] || fail "a busy agent must receive no compaction command"
+  [ -z "$(keys_sent "$dir")" ] || fail "a busy agent must not be interrupted by compact"
+
+  dir=$(new_case compact-unknown)
+  add_task "$dir" t1 claude
+  alive_as "$dir" claude
+  out=$(run_control "$dir" t1 compact); rc=$?
+  expect_code 0 "$rc" "an unknown-busy compact should be a reported no-op"$'\n'"$out"
+  assert_contains "$out" "reason=not-idle" "an unclassifiable turn cannot be proven a seam"
+  [ -z "$(literals "$dir")" ] || fail "an unknown-busy agent must receive no compaction command"
+  pass "fm-control compact: a busy or unclassifiable turn is skipped, never interrupted"
+}
+
+test_compact_refuses_a_stopped_agent_and_noops_on_unverified_backends() {
+  local dir out rc
+  dir=$(new_case compact-dead)
+  add_task "$dir" t1 claude
+  out=$(run_control "$dir" t1 compact); rc=$?
+  expect_code 1 "$rc" "compacting a stopped agent should refuse"
+  assert_contains "$out" "nothing to compact" "the refusal should say why"
+  [ -z "$(literals "$dir")" ] || fail "a shell must receive no compaction command"
+
+  dir=$(new_case compact-zellij)
+  add_task "$dir" t1 claude ship zellij "sess:7"
+  {
+    echo "zellij_session=sess"
+    echo "zellij_tab_id=1"
+    echo "zellij_pane_id=7"
+  } >> "$dir/home/state/t1.meta"
+  out=$(run_control "$dir" t1 compact); rc=$?
+  expect_code 0 "$rc" "compact on an unverified-state backend should no-op"$'\n'"$out"
+  assert_contains "$out" "reason=backend-state-unverified" "the no-op should name the backend gap"
+  [ -z "$(literals "$dir")" ] || fail "an unverified-state backend must receive no compaction command"
+  pass "fm-control compact: a stopped agent refuses and an unverified-state backend no-ops"
+}
+
+test_compact_takes_no_arguments() {
+  local dir out rc
+  dir=$(new_case compact-args)
+  add_task "$dir" t1 claude
+  alive_as "$dir" claude
+  arm_idle "$dir" t1
+  out=$(run_control "$dir" t1 compact --note "summarize everything"); rc=$?
+  expect_code 1 "$rc" "compact must not accept caller text"
+  [ -z "$(literals "$dir")" ] || fail "a refused compact must send nothing"
+  out=$(run_control "$dir" t1 compact extra); rc=$?
+  expect_code 1 "$rc" "compact must not accept free arguments"
+  pass "fm-control compact: the focus text is fixed, never caller-supplied"
+}
+
 test_exit_types_each_harness_verified_command
 test_interrupt_sends_each_harness_verified_key
 test_opencode_interrupts_twice_and_others_once
@@ -895,3 +1004,7 @@ test_grok_interrupt_without_acknowledgement_reports_unconfirmed
 test_grok_idle_footer_does_not_confirm_cancellation
 test_secondmate_control_command_carries_no_marker
 test_fm_send_still_marks_the_same_secondmate_task
+test_compact_sends_verified_command_only_where_one_exists
+test_compact_skips_a_busy_or_unknown_turn
+test_compact_refuses_a_stopped_agent_and_noops_on_unverified_backends
+test_compact_takes_no_arguments

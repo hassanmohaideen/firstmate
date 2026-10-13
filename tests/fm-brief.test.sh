@@ -811,8 +811,14 @@ test_ship_and_scout_briefs_carry_context_hygiene() {
       "$id: context-hygiene nudge lost its soft-nudge framing"
     assert_grep "Helper sub-agents: run at most 2 at a time" "$brief" \
       "$id: brief lost the default helper sub-agent cap"
-    assert_grep "stop any long-running background helper once its result is in" "$brief" \
-      "$id: helper cap lost the stop-finished-background-helpers rule"
+    assert_grep "budget each one at about 30 minutes or 200k tokens and stop it once it exceeds that or its result is in" "$brief" \
+      "$id: helper cap lost the per-helper budget and stop rule"
+    assert_grep "never spawn a helper whose only job is to run or poll a test suite" "$brief" \
+      "$id: helper cap lost the no-test-polling-helper rule"
+    assert_grep "Run tests and other long commands in your own foreground with bounded output" "$brief" \
+      "$id: helper cap lost the foreground-test rule"
+    assert_grep "Firstmate may also compact your context itself at a committed seam" "$brief" \
+      "$id: context hygiene lost the firstmate-driven compaction notice"
     assert_grep "do focused work directly instead of delegating it" "$brief" \
       "$id: helper cap lost the do-focused-work-directly preference"
   done

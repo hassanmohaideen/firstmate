@@ -4,6 +4,7 @@
 #
 # Usage: fm-control.sh <task-id> interrupt
 #        fm-control.sh <task-id> exit
+#        fm-control.sh <task-id> compact
 #        fm-control.sh <task-id> relaunch [--harness <name>] [--model <name>]
 #                                         [--effort <level>]
 #                                         (--note <text> | --note-file <path>)
@@ -31,6 +32,19 @@
 #              busy, then submits the harness's exit command. Postcondition:
 #              the backend's recovery-grade classifier reports the agent gone.
 #              Already-stopped is success (idempotent).
+#   compact    Submit the harness's verified native context-compaction
+#              command (fixed text owned by bin/fm-control-lib.sh) so a long-
+#              running worker sheds stale context at a clean phase seam. Acts
+#              only when the agent is alive and its busy verdict reads exactly
+#              idle, so it never lands mid-turn or mid-edit; then waits up to
+#              FM_CONTROL_COMPACT_WAIT for the busy verdict to leave busy so the
+#              next message lands after compaction. Prints `compacted` or
+#              `compact-skipped ... reason=<why>`, both exit 0: a harness with
+#              no verified compaction command, a busy or unclassifiable turn,
+#              or a backend without a recovery-grade state classifier is a
+#              reported no-op, because compaction is an optimization and must
+#              never be faked or forced. WHEN firstmate calls it is owned by
+#              AGENTS.md section 7.
 #   relaunch   Transactionally replace the running agent with a new one, in the
 #              SAME endpoint and SAME worktree, on the same or a newly chosen
 #              harness/model/effort - so switching harness is one ordinary use
@@ -89,6 +103,7 @@
 #   FM_CONTROL_EXIT_WAIT         alive->dead wait after the exit command (30)
 #   FM_CONTROL_LAUNCH_WAIT       dead->alive wait after a relaunch (90)
 #   FM_CONTROL_EXIT_RETRIES      Enter retries for the exit command (3)
+#   FM_CONTROL_COMPACT_WAIT      busy->settled wait after compact (120)
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -138,6 +153,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 POLL=${FM_CONTROL_POLL:-0.5}
 SETTLE_WAIT=${FM_CONTROL_SETTLE_WAIT:-5}
 EXIT_WAIT=${FM_CONTROL_EXIT_WAIT:-30}
+COMPACT_WAIT=${FM_CONTROL_COMPACT_WAIT:-120}
 LAUNCH_WAIT=${FM_CONTROL_LAUNCH_WAIT:-90}
 EXIT_RETRIES=${FM_CONTROL_EXIT_RETRIES:-3}
 
@@ -480,6 +496,48 @@ do_exit() {
   # orphaned generation survives the agent that produced it.
   retire_busy_incarnation
   printf 'stopped'
+}
+
+# do_compact: submit the verified compaction command to a provably idle agent.
+# Prints `compacted settle=<verdict>` or `compact-skipped reason=<why>`.
+do_compact() {
+  local cmd state verdict elapsed=0
+  if ! cmd=$(fm_control_compact_command "$HARNESS"); then
+    printf 'compact-skipped reason=no-verified-compaction-command'
+    return 0
+  fi
+  if ! fm_control_backend_state_verified "$BACKEND"; then
+    printf 'compact-skipped reason=backend-state-unverified'
+    return 0
+  fi
+  state=$(agent_state)
+  case "$state" in
+    alive) ;;
+    dead|missing) die "no agent is running at task $ID's recorded endpoint (state: $state); there is nothing to compact" ;;
+    *) die "task $ID's endpoint reads '$state' rather than a positively classified state; refusing to send a command into an unattributed endpoint" ;;
+  esac
+  # Only a provably idle turn is a seam: busy means mid-turn, and unknown
+  # cannot rule that out, so both skip rather than interleave with live work.
+  verdict=$(busy_verdict)
+  case "${verdict%% *}" in
+    idle) ;;
+    *)
+      printf 'compact-skipped reason=not-idle verdict=%s' "${verdict%% *}"
+      return 0
+      ;;
+  esac
+  verdict=$(fm_backend_send_text_submit "$BACKEND" "$T" "$cmd" "$EXIT_RETRIES" "$POLL" 1.2 "$LABEL") \
+    || die "the compaction command could not be sent to task $ID on $BACKEND"
+  [ "$verdict" = empty ] \
+    || die "the compaction command was not confirmed submitted to task $ID on $BACKEND (verdict: $verdict)"
+  while :; do
+    verdict=$(busy_verdict)
+    [ "${verdict%% *}" = busy ] || break
+    awk -v e="$elapsed" -v t="$COMPACT_WAIT" 'BEGIN{exit !(e < t)}' || break
+    sleep "$POLL"
+    elapsed=$(awk -v e="$elapsed" -v p="$POLL" 'BEGIN{printf "%.3f", e + p}')
+  done
+  printf 'compacted settle=%s' "${verdict%% *}"
 }
 
 # --- transactional relaunch -------------------------------------------------
@@ -855,6 +913,10 @@ case "$VERB" in
   exit)
     result=$(do_exit)
     echo "$result $ID harness=$HARNESS backend=$BACKEND endpoint=$T worktree=$WT"
+    ;;
+  compact)
+    result=$(do_compact)
+    echo "${result%% *} $ID harness=$HARNESS backend=$BACKEND ${result#* }"
     ;;
   relaunch)
     do_relaunch
