@@ -68,6 +68,15 @@
 # standalone Kimi is not: a seeded record with no writer could never be
 # cleared. See fm_busy_muse_run_state for the fold.
 #
+# Background-wait hint (fm_busy_background_wait_tail) is NOT a state source
+# and never changes a verdict: an agent whose turn ended while a harness-tracked
+# background command (for example a test run) is still running classifies idle
+# here exactly as before. The watcher alone consumes the hint to defer stale
+# and wedge escalation for a bounded time (bin/fm-watch.sh BG_WAIT_MAX_SECS),
+# because that agent will be resumed by its harness's completion notice.
+# It is scoped per harness to the verified rendered shape and is false for
+# every other harness.
+#
 # Codex negotiation (fm_busy_codex_appserver_observable,
 # fm_busy_codex_hooks_verified): the approved contract prefers Codex's
 # app-server turn lifecycle with capability negotiation, and sanctions its
@@ -602,6 +611,25 @@ fm_busy_muse_run_terminal() {  # <session-log> <run-id>
 fm_busy_grok_tail_busy() {
   grep -v '^[[:space:]]*$' | tail -12 \
     | grep -qiE "${FM_BUSY_REGEX:-${FM_TMUX_GROK_BUSY_REGEX_DEFAULT:-Ctrl\\+c:cancel}}"
+}
+
+# fm_busy_background_wait_tail: 0 iff the rendered tail on stdin shows a
+# <harness> agent waiting on a harness-tracked background command it will be
+# notified about. Claude Code (verified 2.1.288) renders two independent
+# signals and either one carries the verdict: the turn summary row ends
+# "· N shell(s) still running", and the mode footer carries a "· N shell(s) ·"
+# segment while the shells run. Only the last 12 non-blank rows are read, so
+# conversation content cannot assert the hint. Every other harness has no
+# verified completion-notifying background facility and returns 1.
+# docs/verification/supervision.md owns the evidence and
+# tests/fm-background-wait-live-e2e.test.sh refreshes it.
+fm_busy_background_wait_tail() {  # <harness>, tail on stdin
+  case "${1-}" in
+    claude) ;;
+    *) cat >/dev/null; return 1 ;;
+  esac
+  grep -v '^[[:space:]]*$' | tail -12 \
+    | grep -qE '·[[:space:]]*[1-9][0-9]* shells?([[:space:]]+still running)?[[:space:]]*(·|$)'
 }
 
 # fm_busy_classify: semantic classification for a task whose endpoint the

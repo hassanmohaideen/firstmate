@@ -356,6 +356,44 @@ test_boolean_view_never_promotes_unknown() {
   pass "the boolean view reports busy only on an exact busy verdict"
 }
 
+# --- background-wait hint: never a verdict, scoped to verified shapes -------
+
+test_background_wait_tail_shapes() {
+  local state gen footer summary both quiet out h
+  footer=$'❯ \n  ⏵⏵ bypass permissions on · 2 shells · ← for agents · ↓ to manage'
+  summary=$'✻ Brewed for 3s · done 7:47 PM · 1 shell still running\n❯ \n  ⏵⏵ bypass permissions on'
+  both=$'✻ Churned for 4s · done 7:46 PM · 1 shell still running\n❯ \n  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage'
+  quiet=$'✻ Churned for 4s · done 7:46 PM\n❯ \n  ⏵⏵ bypass permissions on · ← for agents'
+  # Either independent signal alone carries the verdict; the divergence is
+  # asserted so neither case can go vacuous.
+  [ "$footer" != "$summary" ] || fail "footer and summary fixtures must differ"
+  printf '%s\n' "$footer" | fm_busy_background_wait_tail claude || fail "footer-only shell count was not read as a background wait"
+  printf '%s\n' "$summary" | fm_busy_background_wait_tail claude || fail "summary-only 'still running' was not read as a background wait"
+  printf '%s\n' "$both" | fm_busy_background_wait_tail claude || fail "both signals together were not read as a background wait"
+  if printf '%s\n' "$quiet" | fm_busy_background_wait_tail claude; then
+    fail "an idle Claude pane with no background shell was read as a background wait"
+  fi
+  # Scoped to the verified harness: identical text never applies to another adapter.
+  for h in codex opencode pi pi-signed grok kimi muse ''; do
+    if printf '%s\n' "$both" | fm_busy_background_wait_tail "$h"; then
+      fail "background-wait hint leaked to harness '$h'"
+    fi
+  done
+  # Content scrolled above the bounded footer window cannot assert the hint.
+  out=$(printf '%s\n' "$footer"; for _ in $(seq 1 15); do printf 'line\n'; done)
+  if printf '%s\n' "$out" | fm_busy_background_wait_tail claude; then
+    fail "a shell count outside the last 12 non-blank rows asserted the hint"
+  fi
+  # It is never a state verdict: an idle Claude record stays idle.
+  state=$(new_state_dir bgwait)
+  gen=$("$EV" arm "$state" t1) || fail "arm failed"
+  "$EV" apply "$state" t1 idle --gen "$gen" --source claude-hook --event stop \
+    || fail "idle apply failed"
+  out=$(fm_busy_classify tmux w1 claude t1 "$state" "$both")
+  [ "$out" = "idle claude-hook" ] || fail "background-wait text changed the semantic verdict: '$out'"
+  pass "background-wait hint reads either verified Claude signal, stays harness-scoped and bounded, and never changes a verdict"
+}
+
 test_arm_seeds_busy_spawn
 test_apply_advances_seq_and_source
 test_apply_current_gen_reset
@@ -376,5 +414,6 @@ test_dead_endpoint_overrides
 test_herdr_native_busy_only
 test_record_read_leaves_caller_shell_intact
 test_boolean_view_never_promotes_unknown
+test_background_wait_tail_shapes
 
 echo "all fm-busy-state tests passed"

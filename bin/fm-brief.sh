@@ -342,8 +342,10 @@ fi
 # helps" judgement call that no-ops on any harness without a native command.
 # The same block carries the default helper sub-agent cap and per-helper
 # budget, which bound token spend per delivered outcome for every per-task
-# worker; the foreground-test rule exists because a background helper that only
-# polls a test run re-reads context on every poll.
+# worker. The test-run rule exists because waiting costs no tokens while long
+# output in context and a helper that polls a test run both do; the watcher
+# absorbs the resulting idle pane as a bounded background wait (bin/fm-watch.sh
+# BG_WAIT_MAX_SECS) only for the harness shapes bin/fm-busy-lib.sh verifies.
 IFS= read -r -d '' CONTEXT_HYGIENE <<'EOF' || true
 # Context hygiene
 On a long task, try to compact your own context at a clean phase seam - for example after you finish investigation and before you start implementing, before you start a validation run, or when you move on to a distinct new subsystem - instead of relying only on your harness's automatic mid-thought compaction.
@@ -352,7 +354,10 @@ Use your harness's own native context-compaction command when it has one; if it 
 This is a judgement nudge, not a required step: compact when it clearly helps, and only you can see the seam.
 Firstmate may also compact your context itself at a committed seam, such as after your `done:` and before validation; continue from the summary, your branch, and your status file.
 Helper sub-agents: run at most 2 at a time, budget each one at about 30 minutes or 200k tokens and stop it once it exceeds that or its result is in, and do focused work directly instead of delegating it - every helper re-reads context and multiplies token cost.
-Run tests and other long commands in your own foreground with bounded output (for example piped through `tail`); never spawn a helper whose only job is to run or poll a test suite.
+Long test suites: on Claude Code, run them as a background Bash command (`run_in_background`) with output redirected to a file, then end your turn or keep doing unrelated work and rely on the completion notice; never sleep-poll, re-read partial output, or spawn a helper to watch it.
+When it finishes, read only the summary and failures (for example with `tail` or `grep`), never the whole log.
+On any other harness, run tests and other long commands in your own foreground with bounded output (for example piped through `tail`).
+Never spawn a helper whose only job is to run or poll a test suite.
 EOF
 CONTEXT_HYGIENE=${CONTEXT_HYGIENE%$'\n'}
 

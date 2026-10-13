@@ -158,6 +158,16 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 # turn-ended and resets the age. Set generously above any legitimate interval
 # between completed turns, including long tool calls, builds, or test runs.
 BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
+# A stale pane whose agent ended its turn while a harness-tracked background
+# command still runs (fm_busy_background_wait_tail, e.g. a long test suite) will
+# be resumed by the harness's own completion notice, so its stale is absorbed
+# with no wake instead of surfacing and then wedge-escalating every
+# STALE_ESCALATE_SECS. BG_WAIT_MAX_SECS bounds that continuous wait, anchored
+# on the first background-wait sighting (.stale-bgwait-<key>); past it, normal
+# stale and wedge escalation resume so a truly hung command still surfaces.
+# A pane change, a busy pane, or the hint disappearing resets the anchor. A
+# genuinely terminal status line is never absorbed this way.
+BG_WAIT_MAX_SECS=${FM_BG_WAIT_MAX_SECS:-3600}
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A captain-held or paused crew whose agent has confidently exited uses the same
@@ -305,6 +315,29 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
       fi
       ;;
   esac
+}
+
+# background_wait_absorbs: 0 iff <window>'s stale pane is a bounded background
+# wait (see BG_WAIT_MAX_SECS) and was absorbed; clears any pending wedge timer
+# so the wait never counts toward a possible-wedge escalation. 1 otherwise,
+# after dropping a stale anchor when the hint is gone, so the caller's normal
+# triage runs unchanged.
+background_wait_absorbs() {  # <window> <tail40> <key>
+  local win=$1 tail40=$2 key=$3 bgf since age
+  bgf="$STATE/.stale-bgwait-$key"
+  if ! printf '%s' "$tail40" | fm_busy_background_wait_tail "$(window_harness "$win")"; then
+    rm -f "$bgf"
+    return 1
+  fi
+  since=$(cat "$bgf" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*) since=$(date +%s); printf '%s\n' "$since" > "$bgf" ;;
+  esac
+  age=$(( $(date +%s) - since ))
+  [ "$age" -lt "$BG_WAIT_MAX_SECS" ] || return 1
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  triage_log "absorbed stale (background wait ${age}s): $win"
+  return 0
 }
 
 # busy_turn_over_age: 0 iff <task>'s latest completed-turn marker is at least
@@ -1061,6 +1094,8 @@ EOF
             printf '%s' "$h" > "$sf"
             wake "stale: $w"
           fi
+        elif ! stale_is_terminal "$w" "$STATE" && background_wait_absorbs "$w" "$tail40" "$key"; then
+          :
         elif stale_is_terminal "$w" "$STATE"; then
           # The log's last line is captain-relevant - but that alone is not
           # proof the crew is actually done: a crew's own status log gets no
@@ -1149,6 +1184,7 @@ EOF
         # Pane busy or not yet stably stale: reset pending escalation bookkeeping,
         # unless a genuinely busy pane has gone too long with no completed turn -
         # then route it through the same wedge timer instead of erasing it.
+        rm -f "$STATE/.stale-bgwait-$key"
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
           wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
         else
@@ -1161,6 +1197,7 @@ EOF
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
+      rm -f "$STATE/.stale-bgwait-$key"
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
         wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
       else

@@ -233,7 +233,7 @@ family_for_basename_into() {
       ;;
     fm-afk-pi-herdr-return-e2e.test.sh|\
     fm-cmux-claude-composer-live-e2e.test.sh|\
-    fm-composer-matrix-live-e2e.test.sh|\
+    fm-composer-matrix-live-e2e.test.sh|fm-background-wait-live-e2e.test.sh|\
     fm-codex-continuity-live-e2e.test.sh|fm-grok-continuity-live-e2e.test.sh|\
     fm-grok-stop-live-e2e.test.sh|fm-harness-liveness-drift-live-e2e.test.sh|\
     fm-muse-signals-live-e2e.test.sh|\
@@ -466,6 +466,7 @@ tests/fm-backend.test.sh 17423
 tests/fm-backlog-handoff.test.sh 3272
 tests/fm-bearings-snapshot.test.sh 57310
 tests/fm-bootstrap.test.sh 120000
+tests/fm-background-wait-live-e2e.test.sh 40
 tests/fm-busy-adapter-wiring.test.sh 14845
 tests/fm-busy-state.test.sh 1482
 tests/fm-calm-pi-extension.test.sh 166
@@ -1353,7 +1354,7 @@ families_for_changed_path() {
     docs/configuration.md|docs/supervision-protocols/*)
       printf '%s\n' pure-contract-unit
       ;;
-    tests/lib.sh|tests/*-helpers.sh)
+    tests/lib.sh|tests/*-helpers.sh|tests/fm-watch-triage-lib.sh)
       families_for_test_reference "$(basename "$path")" \
         || printf '%s\n' "__unmapped__:$path"
       ;;
