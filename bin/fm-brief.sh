@@ -340,15 +340,19 @@ fi
 # harness-adapters skill's "Context compaction" section, its single owner, so it
 # is not restated per harness here. Safe by construction: a "compact when it
 # helps" judgement call that no-ops on any harness without a native command.
-# The same block carries the default helper sub-agent cap, which bounds token
-# spend per delivered outcome for every per-task worker.
+# The same block carries the default helper sub-agent cap and per-helper
+# budget, which bound token spend per delivered outcome for every per-task
+# worker; the foreground-test rule exists because a background helper that only
+# polls a test run re-reads context on every poll.
 IFS= read -r -d '' CONTEXT_HYGIENE <<'EOF' || true
 # Context hygiene
 On a long task, try to compact your own context at a clean phase seam - for example after you finish investigation and before you start implementing, before you start a validation run, or when you move on to a distinct new subsystem - instead of relying only on your harness's automatic mid-thought compaction.
 Only compact at a seam where your progress is already durably recorded (a commit and/or a status line), never mid-edit or mid-tool-call.
 Use your harness's own native context-compaction command when it has one; if it has none, skip this - it is simply a no-op for that harness, not something to work around or fake.
 This is a judgement nudge, not a required step: compact when it clearly helps, and only you can see the seam.
-Helper sub-agents: run at most 2 at a time, stop any long-running background helper once its result is in, and do focused work directly instead of delegating it - every helper re-reads context and multiplies token cost.
+Firstmate may also compact your context itself at a committed seam, such as after your `done:` and before validation; continue from the summary, your branch, and your status file.
+Helper sub-agents: run at most 2 at a time, budget each one at about 30 minutes or 200k tokens and stop it once it exceeds that or its result is in, and do focused work directly instead of delegating it - every helper re-reads context and multiplies token cost.
+Run tests and other long commands in your own foreground with bounded output (for example piped through `tail`); never spawn a helper whose only job is to run or poll a test suite.
 EOF
 CONTEXT_HYGIENE=${CONTEXT_HYGIENE%$'\n'}
 

@@ -22,7 +22,8 @@
 #   2. Per-harness control mechanics: which key interrupts a running turn, how
 #      many times it must be sent, whether the composer needs clearing after
 #      that key, which adapter-owned cancellation acknowledgement is observable,
-#      which command exits the agent, and which task kinds the adapter is
+#      which command exits the agent, which native command compacts its
+#      context (when one is verified), and which task kinds the adapter is
 #      verified to run. These are the empirically verified facts previously
 #      carried only in the harness-adapters skill's per-adapter tables; that
 #      skill now points here so one executable owner holds them, and
@@ -47,13 +48,14 @@ fm_control_verbs() {
   cat <<'EOF'
 interrupt
 exit
+compact
 relaunch
 EOF
 }
 
 fm_control_verb_allowed() {  # <verb>
   case "${1-}" in
-    interrupt|exit|relaunch) return 0 ;;
+    interrupt|exit|compact|relaunch) return 0 ;;
   esac
   return 1
 }
@@ -152,6 +154,23 @@ fm_control_exit_command() {  # <harness>
   case "${1-}" in
     claude|opencode|grok|kimi|muse) printf '/exit' ;;
     codex|pi|pi-signed) printf '/quit' ;;
+    *) return 1 ;;
+  esac
+}
+
+# The harness's manually verified native context-compaction command line, or
+# nonzero when the adapter has none, in which case `compact` is a reported
+# no-op rather than a guess. Only claude and grok have a verified manual
+# command; the harness-adapters skill's "Context compaction" section keeps the
+# per-harness verification status and points here for the command itself. Claude takes a fixed focus argument so the summary keeps
+# what the next phase needs; grok's `/compact` is argument-taking with an
+# unverified free-text form, so it gets the bare verified command. The focus
+# text is fixed here, never caller-supplied, so this stays a closed verb rather
+# than an arbitrary-text entry point.
+fm_control_compact_command() {  # <harness>
+  case "${1-}" in
+    claude) printf '%s' '/compact Keep the task goal, branch, commits, status-file path, current phase, every open decision or blocker, and any active validation run with its current step and finding IDs; drop exploration output and resolved detail.' ;;
+    grok) printf '/compact' ;;
     *) return 1 ;;
   esac
 }

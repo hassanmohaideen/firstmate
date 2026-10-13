@@ -27,7 +27,7 @@ Inheritance copies the literal `config/crew-dispatch.json` file when present, an
 
 Each adapter splits into mechanics and knowledge.
 The per-task mechanics, including launch command, autonomy flag, and any enabled crewmate turn-end hook, live in `bin/fm-spawn.sh`.
-Agent lifecycle mechanics - which key interrupts a turn, how many times it must be sent, whether the composer needs clearing afterwards, which command exits the agent, and which task kinds the adapter can run - are owned by the executable control plane in `bin/fm-control-lib.sh` and delivered by `bin/fm-control.sh <task-id> interrupt|exit|relaunch`.
+Agent lifecycle mechanics - which key interrupts a turn, how many times it must be sent, whether the composer needs clearing afterwards, which command exits the agent, which command compacts its context, and which task kinds the adapter can run - are owned by the executable control plane in `bin/fm-control-lib.sh` and delivered by `bin/fm-control.sh <task-id> interrupt|exit|compact|relaunch`.
 Never hand-type an interrupt key or exit command through `fm-send`: a routing-marked lifecycle command becomes chat the agent reasons about instead of executing, which is the defect the control plane exists to remove ([`docs/agent-control.md`](../../../docs/agent-control.md)).
 The per-adapter `Exit command` and `Interrupt` rows below remain the verification record for those values; the executable owner is what firstmate actually runs, so a newly verified adapter is not reachable by the control plane until its rows land in that owner.
 The primary-session "no turn ends blind" guard contract and harness hook installation paths live in `docs/turnend-guard.md`.
@@ -213,14 +213,15 @@ The shared symptom is a healthy-looking pane with no work in progress, so each a
 ## Context compaction
 
 A long-running crewmate should proactively compact its own context at a clean task-phase seam - after investigation and before implementation, before a validation run, or when moving to a distinct new subsystem - rather than relying only on the harness's automatic mid-thought compaction.
-`bin/fm-brief.sh` carries that behavioral nudge (when and why to compact) in every ship and scout brief; this section is the single owner of the per-harness manual command (which command) that satisfies it, so the scaffold does not restate it per harness.
-The nudge is safe by construction: it is a "compact when it helps" judgement call, so a harness with no verified manual compaction command simply no-ops it rather than working around the gap.
+`bin/fm-brief.sh` carries that behavioral nudge (when and why to compact) in every ship and scout brief, and firstmate also compacts a worker automatically at its committed seams through `bin/fm-control.sh <id> compact` (AGENTS.md section 7 owns when).
+`bin/fm-control-lib.sh`'s `fm_control_compact_command` is the single executable owner of the command each harness receives; this section owns only the per-harness verification status behind it.
+Both paths are safe by construction: a harness with no verified manual compaction command no-ops rather than working around the gap.
 Automatic in-run compaction, which several adapters' busy-state rows already note, is not a substitute, because a proactive at-a-seam compaction needs a command the worker can invoke.
 
 Record only a manually verified command here, following this skill's verified-versus-unknown discipline; never guess one, because a fabricated command wastes a worker turn and can land as unintended composer text.
 These commands are interactive TUI slash commands rather than `--help` subcommands, so verifying an unconfirmed one means driving the real harness in a live session, the same bar the harness-dependent-checks rule sets.
 
-| Harness | Manual compaction command | Status |
+| Harness | Verified manual compaction | Status |
 |---|---|---|
 | claude | `/compact` (optionally `/compact <instructions>`) | Verified: claude is firstmate's own reference harness and exposes the native manual compaction slash command. |
 | grok | `/compact` (argument-taking, so a genuine second Enter submits it) | Verified live - the same command is recorded in grok's Skill invocation row below (`/compact` expands to `/compact compaction instructions`). |
