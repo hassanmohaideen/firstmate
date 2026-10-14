@@ -11,7 +11,7 @@ metadata:
 # ask-user-authority
 
 This skill is the single owner of the decision procedure for ask-user findings.
-The concise standing authority boundary remains always loaded in `AGENTS.md` section 7.
+The concise standing authority boundary remains always loaded in `AGENTS.md` section 7, and this skill also owns the exact decision message that returns an answer to the worker.
 
 ## Decide who has authority
 
@@ -32,6 +32,12 @@ The concise standing authority boundary remains always loaded in `AGENTS.md` sec
 
 The implementation worker never decides or answers its own ask-user finding.
 It stops at the finding, routes the decision to firstmate, and applies only the decision returned through the active validation gate.
+
+## Return the decision to the worker
+
+Send the same worker one exact decision naming the decision key, step, action, affected finding IDs, instructions where needed, and the exact guarded response command.
+Pass `fm-send`'s `--resolve-key` so the worker's open decision record closes at answer time.
+Require the matching `resolved` event, forbid `--yes`, and require the worker to process every synchronous return until completion or a genuinely new escalation.
 
 ## Captain-facing escalation
 

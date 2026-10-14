@@ -14,6 +14,9 @@
 #   - context-aware next-step guidance for read-only, AFK, X mode, and normal
 #     watcher ownership
 #   - status-tail bounding, default and FM_SESSION_START_STATUS_TAIL override
+#   - context re-emit bounds: dead tasks, status tails, held/blocked/ready
+#     backlog rows, and over-cap context files are bounded with pointers, while
+#     wakes, OPEN DECISIONS, the supervision block, and live records stay whole
 #   - the per-line status-tail cap and its truncation marker
 #   - startup backlog composition: done rows dropped, every in-flight/held/
 #     blocked row kept whole, the dispatchable queued listing bounded with an
@@ -1983,6 +1986,152 @@ EOF
   pass "--reemit reprints the digest without repeating startup's mutating sweeps and still drains queued wakes"
 }
 
+# A re-emit rebuilds context for a session that already took the helm, so its
+# bulk sections are bounded while the parts the next turn acts on stay whole.
+# The fixture is shaped like a busy real home: many finished tasks with dead
+# endpoints and long status logs, a deep ready queue, and curated memory files
+# far larger than the context cap.
+test_reemit_bounds_bulk_sections_but_never_the_actionable_ones() {
+  local rec root home fakebin reemit full i supervision decisions_section size
+  rec=$(new_world reemit-bounds)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_tasks_axi_compact "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:live"
+  write_long_body_backlog "$home/data/backlog.md"
+
+  printf 'window=fm-sess:live\nworktree=%s/wt-live\nproject=firstmate\nkind=ship\nmode=no-mistakes\n' "$home" \
+    > "$home/state/live-task.meta"
+  i=1
+  while [ "$i" -le 12 ]; do
+    printf 'working: live step %s\n' "$i" >> "$home/state/live-task.status"
+    i=$((i + 1))
+  done
+  i=1
+  while [ "$i" -le 25 ]; do
+    printf 'window=fm-sess:gone-%s\nworktree=%s/wt-%s\nproject=firstmate\nkind=ship\npr=https://github.com/o/r/pull/%s\nDEAD-META-BODY-%s=1\n' \
+      "$i" "$home" "$i" "$i" "$i" > "$home/state/dead-$i.meta"
+    printf 'working: dead %s step a\nworking: dead %s step b\n' "$i" "$i" > "$home/state/dead-$i.status"
+    i=$((i + 1))
+  done
+  printf 'needs-decision: [key=pick-path] dead task asks which path to take\n' >> "$home/state/dead-3.status"
+  printf 'blocked: [key=need-cred] live task needs a credential\n' >> "$home/state/live-task.status"
+  printf 'orphan: only line\n' > "$home/state/orphan-task.status"
+
+  printf '# Projects\n- firstmate - SMALL-PROJECTS-REGISTRY\n' > "$home/data/projects.md"
+  awk 'BEGIN { print "# Captain"; while (i++ < 400) print "CAPTAIN-PREFERENCE-LINE " i " keep the captain informed" }' \
+    > "$home/data/captain.md"
+  awk 'BEGIN { print "# Learnings"; while (i++ < 400) print "LEARNING-LINE " i " an evidence-backed operational fact" }' \
+    > "$home/data/learnings.md"
+
+  # Startup takes the helm, then queued wakes arrive before the context loss.
+  FM_FAKE_HARNESS_PID=$$ run_session_start "$home" "$root" "$fakebin:$BASE_PATH" >/dev/null
+  i=1
+  while [ "$i" -le 30 ]; do
+    append_wake "$home/state" signal "task-$i" "done: QUEUED-WAKE-$i arrived after startup" || fail "seed wake $i failed"
+    i=$((i + 1))
+  done
+
+  reemit=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    FM_FAKE_TASKS_AXI_READY=12 env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
+    "$SESSION_START" --reemit)
+
+  # Never bounded: every queued wake, every open decision, the supervision block,
+  # and the live task's full record.
+  i=1
+  while [ "$i" -le 30 ]; do
+    assert_contains "$reemit" "QUEUED-WAKE-$i arrived after startup" "the re-emit dropped queued wake $i"
+    i=$((i + 1))
+  done
+  assert_contains "$reemit" "WAKE_ACK_REQUIRED:" "the re-emit dropped the wake acknowledgement"
+  decisions_section=$(printf '%s\n' "$reemit" | awk '/^OPEN DECISIONS \(/ { flag = 1 } flag { print } /^OPEN DECISIONS: close one/ { flag = 0 }')
+  assert_contains "$decisions_section" "dead task asks which path to take" \
+    "the re-emit dropped an open decision whose task endpoint is dead"
+  assert_contains "$decisions_section" "live task needs a credential" "the re-emit dropped a live task's open decision"
+  supervision=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$fakebin:$BASE_PATH" \
+    "$ROOT/bin/fm-supervision-instructions.sh" --harness claude --read-only 0 --afk 0 --x-mode 0)
+  [ -n "$supervision" ] || fail "fixture could not render the supervision block"
+  case "$reemit" in
+    *"$supervision"*) ;;
+    *) fail "the re-emit did not carry the complete supervision block" ;;
+  esac
+  assert_contains "$reemit" "worktree=$home/wt-live" "the re-emit dropped a live task's full record"
+  assert_contains "$reemit" "mode=no-mistakes" "the re-emit dropped a live task's full record"
+  assert_contains "$reemit" "working: live step 12" "the re-emit dropped the live task's newest status line"
+  assert_contains "$reemit" "compact-startup,in_flight,ship,firstmate,Compact startup digest" \
+    "the re-emit dropped an in-flight backlog row"
+  assert_contains "$reemit" "SMALL-PROJECTS-REGISTRY" "the re-emit withheld a context file under the cap"
+
+  # Bounded, each with a pointer to the rest.
+  assert_not_contains "$reemit" "working: live step 9" "the re-emit status tail was not bounded to 3 lines"
+  assert_contains "$reemit" "- dead-7: endpoint dead (backend=tmux window=fm-sess:gone-7) kind=ship pr=https://github.com/o/r/pull/7" \
+    "the re-emit did not keep a dead task's identity line"
+  assert_contains "$reemit" "full record $home/state/<id>.meta, status log $home/state/<id>.status" \
+    "the re-emit did not point at the dead tasks' records"
+  assert_not_contains "$reemit" "DEAD-META-BODY-7" "the re-emit reprinted a dead task's full record"
+  assert_not_contains "$reemit" "working: dead 7 step b" "the re-emit reprinted a dead task's status tail"
+  assert_not_contains "$reemit" "orphan: only line" "the re-emit reprinted an orphan status tail"
+  assert_contains "$reemit" "orphan-task" "the re-emit did not name the orphan status log"
+  assert_contains "$reemit" "held: 1 item(s) - tasks-axi list --file $home/data/backlog.md --state held" \
+    "the re-emit did not count held rows with the command that lists them"
+  assert_contains "$reemit" "blocked queued: 1 item(s) - tasks-axi list --file $home/data/backlog.md --state queued --blocked" \
+    "the re-emit did not count blocked rows with the command that lists them"
+  assert_contains "$reemit" "(shown 5 of 12 ready queued item(s))" "the re-emit did not bound ready rows to 5"
+  assert_contains "$reemit" "(7 more queued - tasks-axi ready --file $home/data/backlog.md, or raise FM_SESSION_START_REEMIT_QUEUED_LIMIT)" \
+    "the re-emit ready remainder did not name the knob that bounds it"
+  assert_not_contains "$reemit" "CAPTAIN-PREFERENCE-LINE" "the re-emit reprinted an over-cap captain.md"
+  assert_not_contains "$reemit" "LEARNING-LINE" "the re-emit reprinted an over-cap learnings.md"
+  assert_contains "$reemit" "over the 4096-byte context re-emit cap, so not reprinted." \
+    "the re-emit did not disclose the context cap"
+  assert_contains "$reemit" "Read $home/data/captain.md before acting" "the re-emit did not point at captain.md"
+  assert_contains "$reemit" "Read $home/data/learnings.md before acting" "the re-emit did not point at learnings.md"
+  assert_contains "$reemit" "This is a bounded context re-emit." "the re-emit read-once contract did not describe its bounds"
+
+  # The bulk sections are what scaled the observed 92KB re-emit; with them
+  # bounded, a home this size stays well under 25KB even with 30 queued wakes.
+  size=$(printf '%s\n' "$reemit" | wc -c | tr -d ' ')
+  [ "$size" -lt 25000 ] || fail "the re-emit ran $size bytes, over the 25000-byte budget"
+
+  # The first digest is the recovery point and keeps the full rendering.
+  full=$(FM_FAKE_HARNESS_PID=$$ FM_FAKE_TASKS_AXI_READY=12 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$full" "DEAD-META-BODY-7" "the first digest stopped printing every task record"
+  assert_contains "$full" "CAPTAIN-PREFERENCE-LINE 400" "the first digest stopped printing captain.md whole"
+  assert_contains "$full" "held-queued,queued,ship,firstmate,Held queued work" "the first digest stopped listing held rows"
+
+  pass "--reemit bounds bulk sections with pointers and never truncates wakes, decisions, supervision, or live records"
+}
+
+# The re-emit bound is its own knob, so the remainder hint a re-emit prints must
+# name that knob; the first digest keeps naming its own.
+test_reemit_manual_backlog_remainder_names_the_reemit_knob() {
+  local rec root home fakebin reemit full
+  rec=$(new_world reemit-manual-knob)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf '%s\n' manual > "$home/config/backlog-backend"
+  write_long_body_backlog "$home/data/backlog.md"
+
+  full=$(FM_FAKE_HARNESS_PID=$$ run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$full" "(5 more queued - raise FM_SESSION_START_QUEUED_LIMIT or read data/backlog.md for the rest)" \
+    "the first digest stopped naming its own queued knob"
+
+  reemit=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
+    "$SESSION_START" --reemit)
+  assert_contains "$reemit" "(20 more queued - raise FM_SESSION_START_REEMIT_QUEUED_LIMIT or read data/backlog.md for the rest)" \
+    "the re-emit manual remainder hint did not name the re-emit knob"
+  assert_not_contains "$reemit" "raise FM_SESSION_START_QUEUED_LIMIT" \
+    "the re-emit pointed at the first-digest knob, which does not bound it"
+
+  pass "the manual re-emit backlog remainder names the knob that actually bounds it"
+}
+
 test_agents_baseline_stays_at_true_start_and_reemits_on_every_drifted_pi_compact() {
   local rec root home fakebin startup compact_equal compact_first compact_second clear_out resume_out reset_out baseline baseline_after expected_hash refresh_line bootstrap_line
   rec=$(new_world agents-refresh)
@@ -2465,6 +2614,8 @@ test_portable_timeout_escalates_term_resistant_process
 test_runtime_bound_leaves_a_healthy_digest_untouched
 test_runtime_bound_leaves_harness_ancestry_headroom
 test_reemit_skips_startup_sweeps_but_keeps_the_wake_drain
+test_reemit_bounds_bulk_sections_but_never_the_actionable_ones
+test_reemit_manual_backlog_remainder_names_the_reemit_knob
 test_agents_baseline_stays_at_true_start_and_reemits_on_every_drifted_pi_compact
 test_read_only_pi_compact_refreshes_against_its_own_session_identity
 test_codex_unreachable_reset_sources_do_not_claim_instruction_refresh

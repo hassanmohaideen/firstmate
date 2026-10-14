@@ -159,6 +159,28 @@
 # status log path, and AGENTS.md section 8 treats a status line as a wake EVENT
 # rather than current state - bin/fm-crew-state.sh owns current state.
 #
+# CONTEXT RE-EMIT BOUNDS: --reemit rebuilds a session that already took the helm
+# and only lost its context, so it reprints what the next turn acts on and
+# points at everything the session's own startup already reconciled. An
+# unbounded re-emit was observed at 92KB, large enough that the harness spilled
+# it to a file. Never bounded: the lock result, the wake queue and its OPEN
+# DECISIONS section, the supervision block, public commitments, and every meta
+# whose endpoint is alive or unknown. Bounded, each with a pointer to the rest:
+#   - a meta whose endpoint is dead prints one identity line (backend, window,
+#     kind, pr) under one shared record-path pointer: startup already
+#     reconciled it, and a dead endpoint has no new live state to show.
+#   - status tails print FM_SESSION_START_REEMIT_STATUS_TAIL lines, default 3,
+#     and only beside metas that print in full; orphan logs print ids only.
+#   - the backlog keeps in-flight rows whole, counts held and blocked rows with
+#     the exact command that lists them (they wait on a captain, a time gate, or
+#     another task, so no re-emit turn dispatches them), and bounds ready rows
+#     to FM_SESSION_START_REEMIT_QUEUED_LIMIT, default 5.
+#   - each context file prints whole only up to FM_SESSION_START_REEMIT_CONTEXT_CAP
+#     bytes, default 4096 (about 1K tokens); a larger file prints its size and
+#     path instead.
+# The first session-start digest keeps its full behavior: it is the recovery
+# point where every task is reconciled, so it pays the full cost once.
+#
 # RUNTIME BOUND: the digest is now executed on a session-open hook (see
 # bin/fm-sessionstart-run.sh), which blocks session initialization while it
 # runs, so an unbounded digest is no longer merely slow - it can strand a whole
@@ -197,7 +219,8 @@
 #             ownership must be re-verified rather than assumed: fm-lock.sh already treats a lock
 #             this session's own harness holds as its own, so the re-emit
 #             proceeds, while a lock another live session took meanwhile still
-#             produces the ordinary read-only path.
+#             produces the ordinary read-only path. Bulk sections are
+#             bounded as the CONTEXT RE-EMIT BOUNDS note above describes.
 #
 #   --source  The native session-open source, supplied only by
 #             fm-sessionstart-run.sh. A genuine `startup` that owns the active
@@ -348,6 +371,20 @@ case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
 QUEUED_LIMIT=${FM_SESSION_START_QUEUED_LIMIT:-20}
 case "$QUEUED_LIMIT" in ''|*[!0-9]*|0) QUEUED_LIMIT=20 ;; esac
 BACKLOG_FIELDS=blocked_by,hold_kind,hold_reason
+# Context re-emit bounds (see this file's CONTEXT RE-EMIT BOUNDS note).
+REEMIT_STATUS_TAIL=${FM_SESSION_START_REEMIT_STATUS_TAIL:-3}
+case "$REEMIT_STATUS_TAIL" in ''|*[!0-9]*) REEMIT_STATUS_TAIL=3 ;; esac
+REEMIT_QUEUED_LIMIT=${FM_SESSION_START_REEMIT_QUEUED_LIMIT:-5}
+case "$REEMIT_QUEUED_LIMIT" in ''|*[!0-9]*|0) REEMIT_QUEUED_LIMIT=5 ;; esac
+REEMIT_CONTEXT_CAP=${FM_SESSION_START_REEMIT_CONTEXT_CAP:-4096}
+case "$REEMIT_CONTEXT_CAP" in ''|*[!0-9]*|0) REEMIT_CONTEXT_CAP=4096 ;; esac
+if [ "$REEMIT" -eq 1 ]; then
+  STATUS_TAIL=$REEMIT_STATUS_TAIL
+  QUEUED_LIMIT=$REEMIT_QUEUED_LIMIT
+  QUEUED_LIMIT_KNOB=FM_SESSION_START_REEMIT_QUEUED_LIMIT
+else
+  QUEUED_LIMIT_KNOB=FM_SESSION_START_QUEUED_LIMIT
+fi
 
 RULE='================================================================================'
 SUBRULE='--------------------------------------------------------------------------------'
@@ -365,10 +402,14 @@ print_file_or_absent() {
   local path=$1 label=$2
   subsection "$label"
   if [ -f "$path" ]; then
-    if [ -s "$path" ]; then
-      cat "$path"
-    else
+    if [ ! -s "$path" ]; then
       printf '(present, empty)\n'
+    elif [ "$REEMIT" -eq 1 ] && [ "$(wc -c < "$path" | tr -d ' ')" -gt "$REEMIT_CONTEXT_CAP" ]; then
+      printf 'present, %s bytes - over the %s-byte context re-emit cap, so not reprinted.\n' \
+        "$(wc -c < "$path" | tr -d ' ')" "$REEMIT_CONTEXT_CAP"
+      printf 'Read %s before acting on anything it governs that your compacted context no longer holds.\n' "$path"
+    else
+      cat "$path"
     fi
   else
     printf 'ABSENT\n'
@@ -388,9 +429,14 @@ MANUAL_KEEP_RE='[(]hold|blocked-by:'
 
 print_backlog_manual_compact() {
   local path=$1 reason=$2
-  printf 'compact backlog listing (%s; done rows omitted; every in-flight, held, and blocked title line kept; other queued bounded to %s; indented task bodies omitted)\n' \
-    "$reason" "$QUEUED_LIMIT"
-  awk -v max="$QUEUED_LIMIT" -v keep_re="$MANUAL_KEEP_RE" '
+  if [ "$REEMIT" -eq 1 ]; then
+    printf 'context re-emit backlog listing (%s; done rows omitted; every in-flight title line kept; held and blocked queued counted only; other queued bounded to %s; indented task bodies omitted)\n' \
+      "$reason" "$QUEUED_LIMIT"
+  else
+    printf 'compact backlog listing (%s; done rows omitted; every in-flight, held, and blocked title line kept; other queued bounded to %s; indented task bodies omitted)\n' \
+      "$reason" "$QUEUED_LIMIT"
+  fi
+  awk -v max="$QUEUED_LIMIT" -v knob="$QUEUED_LIMIT_KNOB" -v keep_re="$MANUAL_KEEP_RE" -v reemit="$REEMIT" '
     function state_for_heading(line, heading) {
       heading = line
       sub(/^##[[:space:]]+/, "", heading)
@@ -410,7 +456,7 @@ print_backlog_manual_compact() {
     state == "done" && /^[-*][[:space:]]+/ { done_total++; next }
     state == "queued" && /^[-*][[:space:]]+/ {
       queued_total++
-      if ($0 ~ keep_re) { gated++; print $0; next }
+      if ($0 ~ keep_re) { gated++; if (reemit != 1) print $0; next }
       if (plain_shown < max) { plain_shown++; print $0 }
       next
     }
@@ -419,10 +465,15 @@ print_backlog_manual_compact() {
       if (in_flight + queued_total + done_total == 0) {
         print "(no backlog item title lines found)"
       } else {
-        printf "(shown %d in-flight, %d held or blocked queued, %d of %d other queued title line(s); %d done row(s) omitted)\n", \
-          in_flight, gated, plain_shown, plain_total, done_total
+        if (reemit == 1) {
+          printf "(shown %d in-flight and %d of %d other queued title line(s); %d held or blocked queued counted only; %d done row(s) omitted)\n", \
+            in_flight, plain_shown, plain_total, gated, done_total
+        } else {
+          printf "(shown %d in-flight, %d held or blocked queued, %d of %d other queued title line(s); %d done row(s) omitted)\n", \
+            in_flight, gated, plain_shown, plain_total, done_total
+        }
         if (plain_total > plain_shown) {
-          printf "(%d more queued - raise FM_SESSION_START_QUEUED_LIMIT or read data/backlog.md for the rest)\n", plain_total - plain_shown
+          printf "(%d more queued - raise %s or read data/backlog.md for the rest)\n", plain_total - plain_shown, knob
         }
       }
     }
@@ -443,8 +494,8 @@ strip_axi_help() {
 # and every other line it prints (its count, its public-followup line) passes
 # through untouched. Whatever is cut is disclosed exactly.
 print_ready_queued_bounded() {
-  local ready=$1 path=$2
-  printf '%s\n' "$ready" | awk -v max="$QUEUED_LIMIT" -v path="$path" '
+  local ready=$1 path=$2 knob=${3:-}
+  printf '%s\n' "$ready" | awk -v max="$QUEUED_LIMIT" -v path="$path" -v knob="$knob" '
     /^help\[/ { exit }
     /^ready\[/ { rows = 1; print; next }
     rows && /^[[:space:]]/ {
@@ -457,11 +508,21 @@ print_ready_queued_bounded() {
       if (total > 0) {
         printf "(shown %d of %d ready queued item(s))\n", shown, total
         if (total > shown) {
-          printf "(%d more queued - tasks-axi ready --file %s)\n", total - shown, path
+          if (knob != "") {
+            printf "(%d more queued - tasks-axi ready --file %s, or raise %s)\n", total - shown, path, knob
+          } else {
+            printf "(%d more queued - tasks-axi ready --file %s)\n", total - shown, path
+          }
         }
       }
     }
   '
+}
+
+# axi_listing_count <listing>: the tool's own "count: N" line, or "unknown" when
+# the listing carries none, so a re-emit count is never invented.
+axi_listing_count() {
+  printf '%s\n' "$1" | awk '/^count: [0-9]+$/ { print $2; found = 1; exit } END { if (!found) print "unknown" }'
 }
 
 print_backlog_tasks_axi_compact() {
@@ -474,6 +535,18 @@ print_backlog_tasks_axi_compact() {
     err=$blocked
   elif ! ready=$(tasks-axi ready --file "$path" 2>&1); then
     err=$ready
+  elif [ "$REEMIT" -eq 1 ]; then
+    printf 'context re-emit backlog listing (tasks-axi; in-flight rows in full; held and blocked counted only; ready queued bounded to %s; done rows and task bodies omitted)\n' \
+      "$QUEUED_LIMIT"
+    printf '\nin flight:\n'
+    printf '%s\n' "$in_flight" | strip_axi_help
+    printf '\nheld: %s item(s) - tasks-axi list --file %s --state held --fields %s\n' \
+      "$(axi_listing_count "$held")" "$path" "$BACKLOG_FIELDS"
+    printf 'blocked queued: %s item(s) - tasks-axi list --file %s --state queued --blocked --fields %s\n' \
+      "$(axi_listing_count "$blocked")" "$path" "$BACKLOG_FIELDS"
+    printf '\nready queued (dispatchable now):\n'
+    print_ready_queued_bounded "$ready" "$path" "$QUEUED_LIMIT_KNOB"
+    return 0
   else
     printf 'compact backlog listing (tasks-axi; done rows omitted; every in-flight, held, and blocked row shown in full; ready queued bounded to %s; task bodies omitted)\n' \
       "$QUEUED_LIMIT"
@@ -777,6 +850,21 @@ fi
 # a stage that never ran, which the truncation banner names by stage.
 stage read-once
 section "READ-ONCE CONTRACT"
+if [ "$REEMIT" -eq 1 ]; then
+  cat <<EOF
+This is a bounded context re-emit. Printed in full: the lock result, the wake
+queue and OPEN DECISIONS above, the supervision block above, and every state/*.meta
+whose endpoint is alive or unknown. Bounded: a dead endpoint prints one identity
+line with its record paths; status tails are the last $REEMIT_STATUS_TAIL line(s) for
+non-dead tasks only; the backlog lists in-flight rows in full, counts held and
+blocked rows, and bounds ready rows to $REEMIT_QUEUED_LIMIT; a context file over
+$REEMIT_CONTEXT_CAP bytes prints a pointer instead of its contents.
+Do NOT bulk re-read what is printed below. Read a source directly only when a
+pointer below names it and this turn needs it, when it is flagged ABSENT or
+looks corrupt, or when a STARTUP TRUNCATED banner names the stage that would
+have printed it.
+EOF
+else
 cat <<'EOF'
 Everything below is printed in full for this session start: every state/*.meta,
 a compact data/backlog.md listing, a bounded tail of every state/*.status,
@@ -799,6 +887,7 @@ Go to a source directly only when:
   - or a STARTUP TRUNCATED banner named the stage that would have printed it, in
     which case that stage's sources were never emitted and must be reconciled.
 EOF
+fi
 
 # --- 6. fleet-state digest ---------------------------------------------
 # Before CONTEXT: see this file's ORDERING note. Live fleet identity is what a
@@ -809,27 +898,37 @@ print_backlog_compact "$DATA/backlog.md" "data/backlog.md"
 
 subsection "Work under way (state/*.meta)"
 META_FOUND=0
+REEMIT_DEAD=
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   META_FOUND=1
   id=$(basename "$meta" .meta)
-  printf '\n--- %s ---\n' "$id"
-  cat "$meta"
+  status="$STATE/$id.status"
 
   window=$(fm_meta_get "$meta" window)
   target=$(fm_backend_target_of_meta "$meta")
   if [ -n "$window" ]; then
     backend=$(fm_backend_of_meta "$meta")
     if fm_backend_target_exists "$backend" "${target:-$window}" "fm-$id"; then
-      printf 'endpoint: alive (backend=%s window=%s)\n' "$backend" "$window"
+      endpoint_line=$(printf 'endpoint: alive (backend=%s window=%s)' "$backend" "$window")
     else
-      printf 'endpoint: dead (backend=%s window=%s)\n' "$backend" "$window"
+      endpoint_line=$(printf 'endpoint: dead (backend=%s window=%s)' "$backend" "$window")
+      if [ "$REEMIT" -eq 1 ]; then
+        # A dead endpoint was already reconciled by this session's own startup;
+        # one identity line is enough to reach its records again.
+        pr=$(fm_meta_get "$meta" pr)
+        REEMIT_DEAD="$REEMIT_DEAD- $id: endpoint dead (backend=$backend window=$window) kind=$(fm_meta_get "$meta" kind)${pr:+ pr=$pr}
+"
+        continue
+      fi
     fi
   else
-    printf 'endpoint: unknown (no window recorded)\n'
+    endpoint_line='endpoint: unknown (no window recorded)'
   fi
+  printf '\n--- %s ---\n' "$id"
+  cat "$meta"
+  printf '%s\n' "$endpoint_line"
 
-  status="$STATE/$id.status"
   if [ -f "$status" ]; then
     print_status_tail "$status"
   else
@@ -837,18 +936,32 @@ for meta in "$STATE"/*.meta; do
   fi
 done
 [ "$META_FOUND" -eq 1 ] || printf '(none)\n'
+if [ -n "$REEMIT_DEAD" ]; then
+  printf '\ndead endpoints (reconciled at startup; full record %s/<id>.meta, status log %s/<id>.status):\n%s' \
+    "$STATE" "$STATE" "$REEMIT_DEAD"
+fi
 
 subsection "Orphan status logs (state/*.status without matching .meta)"
 ORPHAN_STATUS_FOUND=0
+ORPHAN_IDS=
 for status in "$STATE"/*.status; do
   [ -f "$status" ] || continue
   id=$(basename "$status" .status)
   [ -f "$STATE/$id.meta" ] && continue
   ORPHAN_STATUS_FOUND=1
+  if [ "$REEMIT" -eq 1 ]; then
+    ORPHAN_IDS="$ORPHAN_IDS $id"
+    continue
+  fi
   printf '\n--- %s ---\n' "$id"
   print_status_tail "$status"
 done
-[ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
+if [ "$ORPHAN_STATUS_FOUND" -eq 0 ]; then
+  printf '(none)\n'
+elif [ "$REEMIT" -eq 1 ]; then
+  # No meta means no live task, so the re-emit names them without tails.
+  printf 'tails not reprinted on context re-emit; logs under %s/<id>.status:%s\n' "$STATE" "$ORPHAN_IDS"
+fi
 
 subsection "AFK"
 if [ -e "$STATE/.afk" ]; then
