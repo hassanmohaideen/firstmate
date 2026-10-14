@@ -813,10 +813,17 @@ test_ship_and_scout_briefs_carry_context_hygiene() {
       "$id: brief lost the default helper sub-agent cap"
     assert_grep "budget each one at about 30 minutes or 200k tokens and stop it once it exceeds that or its result is in" "$brief" \
       "$id: helper cap lost the per-helper budget and stop rule"
-    assert_grep "never spawn a helper whose only job is to run or poll a test suite" "$brief" \
+    assert_grep "Never spawn a helper whose only job is to run or poll a test suite" "$brief" \
       "$id: helper cap lost the no-test-polling-helper rule"
-    assert_grep "Run tests and other long commands in your own foreground with bounded output" "$brief" \
-      "$id: helper cap lost the foreground-test rule"
+    # shellcheck disable=SC2016 # Literal backticks are part of the generated brief text.
+    assert_grep 'on Claude Code, run them as a background Bash command (`run_in_background`) with output redirected to a file' "$brief" \
+      "$id: brief lost the async Claude test-run rule"
+    assert_grep "never sleep-poll, re-read partial output, or spawn a helper to watch it" "$brief" \
+      "$id: async test-run rule lost its no-poll guard"
+    assert_grep "read only the summary and failures" "$brief" \
+      "$id: async test-run rule lost its bounded-read rule"
+    assert_grep "On any other harness, run tests and other long commands in your own foreground with bounded output" "$brief" \
+      "$id: brief lost the foreground fallback for harnesses without a verified background facility"
     assert_grep "Firstmate may also compact your context itself at a committed seam" "$brief" \
       "$id: context hygiene lost the firstmate-driven compaction notice"
     assert_grep "do focused work directly instead of delegating it" "$brief" \

@@ -203,6 +203,39 @@ tests/fm-busy-adapter-wiring.test.sh
 tests/fm-crew-state.test.sh
 ```
 
+### Background-wait shape
+
+`fm_busy_background_wait_tail` in [`bin/fm-busy-lib.sh`](../../bin/fm-busy-lib.sh) never changes a busy verdict; the watcher uses it only to defer stale escalation for a bounded time.
+Verified on 2026-10-13 against Claude Code 2.1.288 in an isolated tmux pane after asking the agent to start `sleep` with `run_in_background` and end its turn.
+The idle pane showed two independent signals, the turn-summary row and the mode footer:
+
+```text
+✻ Churned for 4s · done 7:46 PM · 1 shell still running
+❯
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage
+```
+
+With two shells the rows read `· 2 shells still running` and `· 2 shells ·`.
+Mid-turn the footer reads `· 1 shell · esc to interrupt · ↓ to manage`.
+After the shell completed and the agent handled the completion notice, the earlier summary row was re-rendered as `done 7:51 PM` with no shell count and the footer segment was gone, so neither signal outlives the shell.
+No other harness has a verified shape, so the hint is false for every other adapter.
+
+Refresh with the opt-in live guard after any Claude Code upgrade:
+
+```sh
+FM_BACKGROUND_WAIT_LIVE=1 tests/fm-background-wait-live-e2e.test.sh
+```
+
+On 2026-10-13 it printed:
+
+```text
+ok - claude (2.1.288 (Claude Code)): idle with a background shell reads as a background wait through both independent signals
+ok - claude (2.1.288 (Claude Code)): a settled turn with no background shell is not read as a background wait
+all fm-background-wait-live-e2e checks passed (2)
+```
+
+Portable regressions: `tests/fm-busy-state.test.sh` pins the shapes and harness scoping, and `tests/fm-watch-triage-wedge.test.sh` pins the bounded watcher absorb.
+
 ## Turn-end guard
 
 The direct and passive mechanisms were validated across all five harnesses on 2026-07-08 through 2026-07-12, with Claude's replacement Stop-owned path revalidated on 2026-07-24.

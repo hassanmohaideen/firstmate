@@ -686,6 +686,87 @@ test_nonterminal_stale_not_working_surfaced() {
   pass "a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)"
 }
 
+# --- stale pane waiting on a harness-tracked background command --------------
+# The 2026-10-13 case: a Claude worker ended its turn while its background test
+# shell ran, so its idle pane surfaced once and then wedge-escalated every few
+# minutes until demand-deep-inspection. A verified background-wait shape must be
+# absorbed with no wake (and clear any pending wedge timer), but only for
+# BG_WAIT_MAX_SECS of continuous waiting so a truly hung command still surfaces.
+
+bgwait_case() {  # <name> <status-line> -> sets dir state fakebin out capture_file window key pane_hash
+  local sig text
+  dir=$(make_case "$1"); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-bgwait"
+  text='✻ Churned for 4s · done 7:46 PM · 1 shell still running
+❯ 
+  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage'
+  printf '%s' "$text" > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=claude\n' "$window" > "$state/bgwait.meta"
+  printf '%s\n' "$2" > "$state/bgwait.status"
+  sig=$(seen_sig "$state/bgwait.status"); printf '%s' "$sig" > "$state/.seen-bgwait_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "$text")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The Stop hook reports idle and no pipeline runs: without the hint this
+  # stale would surface at once.
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+}
+
+test_background_wait_stale_absorbed_then_bounded() {
+  local dir state fakebin out capture_file window key pane_hash pid drain_out
+  bgwait_case bgwait-bounded 'working: running the test suite'
+  drain_out="$dir/drain.out"
+  # A pending wedge timer from an earlier sighting must not keep counting.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  printf '2\n' > "$state/.wedge-escalations-$key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_live_absorbed "$pid" -s "$state/.stale-bgwait-$key"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a background-waiting stale (should absorb): $(cat "$out")" ;;
+    2) reap "$pid"; fail "watcher never anchored the background wait" ;;
+  esac
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher woke during a bounded background wait: $(cat "$out")"; }
+  [ ! -s "$out" ] || fail "background wait printed a wake reason"
+  [ ! -s "$state/.wake-queue" ] || fail "background wait enqueued a wake"
+  [ ! -e "$state/.stale-since-$key" ] || fail "background wait left the wedge timer running"
+  [ ! -e "$state/.wedge-escalations-$key" ] || fail "background wait kept the wedge escalation count"
+  [ ! -e "$state/.stale-$key" ] || fail "background wait recorded the hash as already surfaced"
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional phase-A watcher stop"
+
+  # Past the bound, normal triage resumes and the hung wait surfaces.
+  echo $(( $(date +%s) - 3700 )) > "$state/.stale-bgwait-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "a background wait past the default 3600s bound did not surface"
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "an over-bound background wait did not print the stale wake"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the over-bound wait failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "over-bound background wait was not queued"
+  pass "a stale pane waiting on a background shell is absorbed with no wedge timer, then surfaces past the 3600s default bound"
+}
+
+test_background_wait_never_hides_terminal_status() {
+  local dir state fakebin out capture_file window key pane_hash pid
+  bgwait_case bgwait-terminal 'needs-decision: pick the retry policy'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "a captain-relevant status was hidden behind a background wait"
+  grep -F "stale: $window" "$out" >/dev/null || fail "terminal-status stale with a background shell did not surface"
+  [ ! -e "$state/.stale-bgwait-$key" ] || fail "a terminal-status stale anchored a background wait"
+  pass "a background shell never hides a captain-relevant status line"
+}
+
 # --- non-terminal stale, crew DECLARED a pause: absorbed, re-surfaced on a long
 #     cadence, never wedge-escalated ------------------------------------------
 # The live 2026-07-09/10 case: a crew intentionally held awaiting an upstream tool
