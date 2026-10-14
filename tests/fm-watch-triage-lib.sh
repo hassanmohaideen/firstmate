@@ -609,8 +609,9 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · ci running'
+  # The crew's pipeline is actively running a non-CI step, so a static pane is
+  # absorbed but still wedge-escalates (a CI wait is covered by the ci-wait cases).
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # Phase A: a high escalation threshold means the first sighting is absorbed.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
@@ -765,6 +766,90 @@ test_background_wait_never_hides_terminal_status() {
   grep -F "stale: $window" "$out" >/dev/null || fail "terminal-status stale with a background shell did not surface"
   [ ! -e "$state/.stale-bgwait-$key" ] || fail "a terminal-status stale anchored a background wait"
   pass "a background shell never hides a captain-relevant status line"
+}
+
+# --- stale pane whose no-mistakes run is waiting on CI ----------------------
+# The 2026-10-14 case: a worker's run sat in its CI step for 10-25 minutes after
+# opening its PR, and every expired wedge timer woke firstmate with a "possible
+# wedge" only to find the run healthy. While the authoritative run-step still
+# reads `ci running`, an expired wedge timer restarts with no wake, bounded by
+# CI_WAIT_MAX_SECS; any other run verdict escalates exactly as before.
+
+ciwait_case() {  # <name> <crew-state-line> -> sets dir state fakebin out capture_file window key pane_hash
+  local sig
+  dir=$(make_case "$1"); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-ciwait"
+  printf 'idle waiting on CI' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/ciwait.meta"
+  printf 'working: validating\n' > "$state/ciwait.status"
+  sig=$(seen_sig "$state/ciwait.status"); printf '%s' "$sig" > "$state/.seen-ciwait_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle waiting on CI")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # Already absorbed as provably working on first sight, with an expired wedge
+  # timer and earlier escalations pending.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  printf '2\n' > "$state/.wedge-escalations-$key"
+  export FM_FAKE_CREW_STATE="$2"
+}
+
+run_ciwait_watch() {  # -> sets pid
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+}
+
+test_ci_wait_stale_absorbed_then_bounded() {
+  local dir state fakebin out capture_file window key pane_hash pid drain_out since
+  ciwait_case ciwait-bounded 'state: working · source: run-step · ci running · status-log superseded by active run'
+  drain_out="$dir/drain.out"
+  run_ciwait_watch
+  wait_live_absorbed "$pid" -s "$state/.stale-ciwait-$key"
+  case $? in
+    1) reap "$pid"; fail "watcher exited for a stale run waiting on CI (should absorb): $(cat "$out")" ;;
+    2) reap "$pid"; fail "watcher never anchored the CI wait" ;;
+  esac
+  wait_live "$pid" 30 || { reap "$pid"; fail "watcher woke during a bounded CI wait: $(cat "$out")"; }
+  [ ! -s "$out" ] || fail "CI wait printed a wake reason"
+  [ ! -s "$state/.wake-queue" ] || fail "CI wait enqueued a wake"
+  since=$(cat "$state/.stale-since-$key" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - since )) -lt 240 ] || fail "CI wait did not restart the wedge timer"
+  [ ! -e "$state/.wedge-escalations-$key" ] || fail "CI wait kept the wedge escalation count"
+  grep -F "absorbed stale (ci wait" "$state/.watch-triage.log" >/dev/null || fail "CI wait absorb was not logged to the triage log"
+  reap "$pid"
+  ack_stopped_cycle "$state" || fail "could not acknowledge the intentional phase-A watcher stop"
+
+  # Past the default 3600s bound, the expired wedge timer escalates again.
+  echo $(( $(date +%s) - 3700 )) > "$state/.stale-ciwait-$key"
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  run_ciwait_watch
+  wait_for_exit "$pid" 40 || fail "a CI wait past the default 3600s bound did not surface"
+  grep -F "stale: $window" "$out" | grep -F "possible wedge" >/dev/null || fail "an over-bound CI wait did not print a possible-wedge stale wake"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the over-bound CI wait failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "over-bound CI wait was not queued"
+  pass "a stale run waiting on CI restarts its wedge timer with no wake, then escalates past the 3600s default bound"
+}
+
+test_ci_wait_never_absorbs_failed_cancelled_or_parked() {
+  local dir state fakebin out capture_file window key pane_hash pid verdict i=0
+  for verdict in \
+    'state: failed · source: run-step · run failed' \
+    'state: failed · source: run-step · run cancelled' \
+    'state: parked · source: run-step · parked at review: 2 finding(s)' \
+    'state: parked · source: run-step · parked at ci: 1 finding(s)'; do
+    i=$((i + 1))
+    ciwait_case "ciwait-noabsorb-$i" "$verdict"
+    run_ciwait_watch
+    wait_for_exit "$pid" 40 || { reap "$pid"; fail "an expired wedge timer was absorbed for: $verdict"; }
+    grep -F "possible wedge" "$out" >/dev/null || fail "no possible-wedge escalation for: $verdict"
+    [ ! -e "$state/.stale-ciwait-$key" ] || fail "a CI-wait anchor was recorded for: $verdict"
+  done
+  pass "a failed, cancelled, or parked run is never absorbed as a CI wait"
 }
 
 # --- non-terminal stale, crew DECLARED a pause: absorbed, re-surfaced on a long

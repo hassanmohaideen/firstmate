@@ -168,6 +168,16 @@ BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
 # A pane change, a busy pane, or the hint disappearing resets the anchor. A
 # genuinely terminal status line is never absorbed this way.
 BG_WAIT_MAX_SECS=${FM_BG_WAIT_MAX_SECS:-3600}
+# A provably-working stale whose authoritative current state is a no-mistakes
+# run waiting on CI (fm-crew-state.sh's run-step `ci running` verdict) is
+# expected to sit idle for many minutes, so when its wedge timer expires the
+# watcher re-reads that state once and, while CI is still running, restarts the
+# timer with no wake instead of escalating a possible wedge (ci_wait_absorbs).
+# CI_WAIT_MAX_SECS bounds that continuous wait, anchored on the first CI-wait
+# re-read (.stale-ciwait-<key>); past it, wedge escalation resumes so a truly
+# hung CI wait still surfaces. Any other verdict - failed, cancelled, parked,
+# done, or a non-CI step - escalates exactly as before.
+CI_WAIT_MAX_SECS=${FM_CI_WAIT_MAX_SECS:-3600}
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A captain-held or paused crew whose agent has confidently exited uses the same
@@ -292,8 +302,8 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> [<task> (enables the CI-wait absorb)]
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 task=${5:-} since age n reason
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -303,6 +313,9 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+        if [ -n "$task" ] && ci_wait_absorbs "$win" "$task" "$since_file" "$escalation_file"; then
+          return 0
+        fi
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
@@ -337,6 +350,35 @@ background_wait_absorbs() {  # <window> <tail40> <key>
   [ "$age" -lt "$BG_WAIT_MAX_SECS" ] || return 1
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   triage_log "absorbed stale (background wait ${age}s): $win"
+  return 0
+}
+
+# ci_wait_absorbs: 0 iff <task>'s authoritative current state is a no-mistakes
+# run waiting on CI and the continuous wait is still under CI_WAIT_MAX_SECS;
+# restarts the wedge timer and clears the escalation count so the wait never
+# counts toward a possible-wedge escalation. 1 otherwise, after dropping the
+# anchor when the run is no longer waiting on CI. One fm-crew-state.sh read per
+# expired wedge timer, never per poll.
+ci_wait_absorbs() {  # <window> <task> <since-file> <escalation-count-file>
+  local win=$1 task=$2 since_file=$3 escalation_file=$4 key cif line since age
+  key=${win//:/_}
+  key=${key//\//_}
+  key=${key//./_}
+  cif="$STATE/.stale-ciwait-$key"
+  line=$("$FM_CREW_STATE_BIN" "$task" 2>/dev/null) || true
+  case "$line" in
+    'state: working · source: run-step · ci running'|'state: working · source: run-step · ci running · '*) ;;
+    *) rm -f "$cif"; return 1 ;;
+  esac
+  since=$(cat "$cif" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*) since=$(date +%s); printf '%s\n' "$since" > "$cif" ;;
+  esac
+  age=$(( $(date +%s) - since ))
+  [ "$age" -lt "$CI_WAIT_MAX_SECS" ] || return 1
+  date +%s > "$since_file"
+  rm -f "$escalation_file"
+  triage_log "absorbed stale (ci wait ${age}s): $win"
   return 0
 }
 
@@ -1128,7 +1170,7 @@ EOF
             # wedge timer is running for it) - keep treating it that way
             # without re-reading the crew state every poll, and without
             # letting the still-captain-relevant log line re-surface it.
-            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
+            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf" "$(window_to_task "$w" "$STATE")"
           fi
           # else: already surfaced as genuinely terminal on a prior poll of
           # this same hash - nothing left to do (matches the original,
@@ -1171,12 +1213,12 @@ EOF
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
-                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
+                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" "$task"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       handle_paused_stale "$w" "$task" "$h" ;;
               esac
             else
-              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
+              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" "$task"
             fi
           fi
         fi
@@ -1184,7 +1226,7 @@ EOF
         # Pane busy or not yet stably stale: reset pending escalation bookkeeping,
         # unless a genuinely busy pane has gone too long with no completed turn -
         # then route it through the same wedge timer instead of erasing it.
-        rm -f "$STATE/.stale-bgwait-$key"
+        rm -f "$STATE/.stale-bgwait-$key" "$STATE/.stale-ciwait-$key"
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
           wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
         else
@@ -1197,7 +1239,7 @@ EOF
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
-      rm -f "$STATE/.stale-bgwait-$key"
+      rm -f "$STATE/.stale-bgwait-$key" "$STATE/.stale-ciwait-$key"
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
         wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
       else

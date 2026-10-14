@@ -236,6 +236,11 @@ all fm-background-wait-live-e2e checks passed (2)
 
 Portable regressions: `tests/fm-busy-state.test.sh` pins the shapes and harness scoping, and `tests/fm-watch-triage-wedge.test.sh` pins the bounded watcher absorb.
 
+### CI-wait absorb
+
+The CI-wait absorb reads only `bin/fm-crew-state.sh`'s run-step verdict, which is harness-neutral, so it needs no live harness guard.
+`tests/fm-watch-triage-wedge.test.sh` pins that an expired wedge timer on a `ci running` run restarts with no wake and a triage-log entry, that it escalates again past the 3600s default bound, and that failed, cancelled, and parked runs are never absorbed.
+
 ## Turn-end guard
 
 The direct and passive mechanisms were validated across all five harnesses on 2026-07-08 through 2026-07-12, with Claude's replacement Stop-owned path revalidated on 2026-07-24.
