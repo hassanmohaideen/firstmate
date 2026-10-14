@@ -2080,6 +2080,8 @@ EOF
   assert_contains "$reemit" "blocked queued: 1 item(s) - tasks-axi list --file $home/data/backlog.md --state queued --blocked" \
     "the re-emit did not count blocked rows with the command that lists them"
   assert_contains "$reemit" "(shown 5 of 12 ready queued item(s))" "the re-emit did not bound ready rows to 5"
+  assert_contains "$reemit" "(7 more queued - tasks-axi ready --file $home/data/backlog.md, or raise FM_SESSION_START_REEMIT_QUEUED_LIMIT)" \
+    "the re-emit ready remainder did not name the knob that bounds it"
   assert_not_contains "$reemit" "CAPTAIN-PREFERENCE-LINE" "the re-emit reprinted an over-cap captain.md"
   assert_not_contains "$reemit" "LEARNING-LINE" "the re-emit reprinted an over-cap learnings.md"
   assert_contains "$reemit" "over the 4096-byte context re-emit cap, so not reprinted." \
@@ -2100,6 +2102,34 @@ EOF
   assert_contains "$full" "held-queued,queued,ship,firstmate,Held queued work" "the first digest stopped listing held rows"
 
   pass "--reemit bounds bulk sections with pointers and never truncates wakes, decisions, supervision, or live records"
+}
+
+# The re-emit bound is its own knob, so the remainder hint a re-emit prints must
+# name that knob; the first digest keeps naming its own.
+test_reemit_manual_backlog_remainder_names_the_reemit_knob() {
+  local rec root home fakebin reemit full
+  rec=$(new_world reemit-manual-knob)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf '%s\n' manual > "$home/config/backlog-backend"
+  write_long_body_backlog "$home/data/backlog.md"
+
+  full=$(FM_FAKE_HARNESS_PID=$$ run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$full" "(5 more queued - raise FM_SESSION_START_QUEUED_LIMIT or read data/backlog.md for the rest)" \
+    "the first digest stopped naming its own queued knob"
+
+  reemit=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_FAKE_HARNESS_PID=$$ PATH="$fakebin:$BASE_PATH" \
+    env -u CLAUDECODE -u PI_CODING_AGENT -u FM_PI_HARNESS -u GROK_AGENT \
+    "$SESSION_START" --reemit)
+  assert_contains "$reemit" "(20 more queued - raise FM_SESSION_START_REEMIT_QUEUED_LIMIT or read data/backlog.md for the rest)" \
+    "the re-emit manual remainder hint did not name the re-emit knob"
+  assert_not_contains "$reemit" "raise FM_SESSION_START_QUEUED_LIMIT" \
+    "the re-emit pointed at the first-digest knob, which does not bound it"
+
+  pass "the manual re-emit backlog remainder names the knob that actually bounds it"
 }
 
 test_agents_baseline_stays_at_true_start_and_reemits_on_every_drifted_pi_compact() {
@@ -2585,6 +2615,7 @@ test_runtime_bound_leaves_a_healthy_digest_untouched
 test_runtime_bound_leaves_harness_ancestry_headroom
 test_reemit_skips_startup_sweeps_but_keeps_the_wake_drain
 test_reemit_bounds_bulk_sections_but_never_the_actionable_ones
+test_reemit_manual_backlog_remainder_names_the_reemit_knob
 test_agents_baseline_stays_at_true_start_and_reemits_on_every_drifted_pi_compact
 test_read_only_pi_compact_refreshes_against_its_own_session_identity
 test_codex_unreachable_reset_sources_do_not_claim_instruction_refresh

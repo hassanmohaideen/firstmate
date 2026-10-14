@@ -381,6 +381,9 @@ case "$REEMIT_CONTEXT_CAP" in ''|*[!0-9]*|0) REEMIT_CONTEXT_CAP=4096 ;; esac
 if [ "$REEMIT" -eq 1 ]; then
   STATUS_TAIL=$REEMIT_STATUS_TAIL
   QUEUED_LIMIT=$REEMIT_QUEUED_LIMIT
+  QUEUED_LIMIT_KNOB=FM_SESSION_START_REEMIT_QUEUED_LIMIT
+else
+  QUEUED_LIMIT_KNOB=FM_SESSION_START_QUEUED_LIMIT
 fi
 
 RULE='================================================================================'
@@ -433,7 +436,7 @@ print_backlog_manual_compact() {
     printf 'compact backlog listing (%s; done rows omitted; every in-flight, held, and blocked title line kept; other queued bounded to %s; indented task bodies omitted)\n' \
       "$reason" "$QUEUED_LIMIT"
   fi
-  awk -v max="$QUEUED_LIMIT" -v keep_re="$MANUAL_KEEP_RE" -v reemit="$REEMIT" '
+  awk -v max="$QUEUED_LIMIT" -v knob="$QUEUED_LIMIT_KNOB" -v keep_re="$MANUAL_KEEP_RE" -v reemit="$REEMIT" '
     function state_for_heading(line, heading) {
       heading = line
       sub(/^##[[:space:]]+/, "", heading)
@@ -470,7 +473,7 @@ print_backlog_manual_compact() {
             in_flight, gated, plain_shown, plain_total, done_total
         }
         if (plain_total > plain_shown) {
-          printf "(%d more queued - raise FM_SESSION_START_QUEUED_LIMIT or read data/backlog.md for the rest)\n", plain_total - plain_shown
+          printf "(%d more queued - raise %s or read data/backlog.md for the rest)\n", plain_total - plain_shown, knob
         }
       }
     }
@@ -491,8 +494,8 @@ strip_axi_help() {
 # and every other line it prints (its count, its public-followup line) passes
 # through untouched. Whatever is cut is disclosed exactly.
 print_ready_queued_bounded() {
-  local ready=$1 path=$2
-  printf '%s\n' "$ready" | awk -v max="$QUEUED_LIMIT" -v path="$path" '
+  local ready=$1 path=$2 knob=${3:-}
+  printf '%s\n' "$ready" | awk -v max="$QUEUED_LIMIT" -v path="$path" -v knob="$knob" '
     /^help\[/ { exit }
     /^ready\[/ { rows = 1; print; next }
     rows && /^[[:space:]]/ {
@@ -505,7 +508,11 @@ print_ready_queued_bounded() {
       if (total > 0) {
         printf "(shown %d of %d ready queued item(s))\n", shown, total
         if (total > shown) {
-          printf "(%d more queued - tasks-axi ready --file %s)\n", total - shown, path
+          if (knob != "") {
+            printf "(%d more queued - tasks-axi ready --file %s, or raise %s)\n", total - shown, path, knob
+          } else {
+            printf "(%d more queued - tasks-axi ready --file %s)\n", total - shown, path
+          }
         }
       }
     }
@@ -538,7 +545,7 @@ print_backlog_tasks_axi_compact() {
     printf 'blocked queued: %s item(s) - tasks-axi list --file %s --state queued --blocked --fields %s\n' \
       "$(axi_listing_count "$blocked")" "$path" "$BACKLOG_FIELDS"
     printf '\nready queued (dispatchable now):\n'
-    print_ready_queued_bounded "$ready" "$path"
+    print_ready_queued_bounded "$ready" "$path" "$QUEUED_LIMIT_KNOB"
     return 0
   else
     printf 'compact backlog listing (tasks-axi; done rows omitted; every in-flight, held, and blocked row shown in full; ready queued bounded to %s; task bodies omitted)\n' \
