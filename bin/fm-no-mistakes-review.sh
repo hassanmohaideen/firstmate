@@ -120,7 +120,8 @@
 # of the run the same way before acting, so a crash or failure at any point
 # converges: a response that landed is finalized from the record without a second
 # invocation, and an unlanded one is retried only when its recorded client is
-# proven stopped (null, or no live process with that PID and start time), never
+# proven stopped (null, or no live process with that PID and start time, read
+# with a fixed locale and UTC so it depends only on the process), never
 # while a client that could still deliver it is running. An unlanded attempt may
 # be retried with the same or a different explicit choice; a landed round is never
 # answered twice. no-mistakes accepts at most one response per open review gate,
@@ -183,8 +184,9 @@
 # or the active CI monitor whose latest public CI line reports green checks,
 # never the no_ci declaration) and independent public CI evidence from the PR:
 # it must be open with headRefOid equal to the authoritative head and report at
-# least one check; the latest result of every check name must be completed and
-# successful, neutral, or skipped, with at least one success; and a rollup of 100
+# least one check; every entry must be completed (a pending or queued rerun
+# refuses whatever its timestamp), the latest completed result of every check
+# name must be successful, neutral, or skipped, with at least one success; and a rollup of 100
 # or more entries refuses as possibly truncated. Absent, unreadable, pending,
 # failing, or zero-check evidence refuses, including a trusted no_ci declaration.
 # Historical clean reviews, tests, and CI never imply approval or rejection.
@@ -945,7 +947,7 @@ write_receipt() {  # <round> <phase> <action> <findings-csv> <attempt> <head> <c
 }
 
 process_start() {  # <pid>; prints the process start time, or nothing when no such process
-  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
 }
 
 client_alive() {  # <pid> <start>; 0 only while that exact process still runs
@@ -1345,12 +1347,13 @@ require_public_green_ci() {
     def name: .name // .context // "";
     def key: "\(.__typename)|\(.workflowName // "")|\(name)";
     def when: .startedAt // .createdAt // .completedAt // "";
+    def completed:
+      if .__typename == "CheckRun" then .status == "COMPLETED"
+      else (.state == "SUCCESS" or .state == "FAILURE" or .state == "ERROR") end;
     def green:
       if .__typename == "CheckRun" then
-        .status == "COMPLETED"
-        and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED")
-      elif .__typename == "StatusContext" then .state == "SUCCESS"
-      else false end;
+        .conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"
+      else .state == "SUCCESS" end;
     def success:
       (.__typename == "CheckRun" and .conclusion == "SUCCESS")
       or (.__typename == "StatusContext" and .state == "SUCCESS");
@@ -1363,6 +1366,8 @@ require_public_green_ci() {
       elif ($all | length) >= 100 then "refuse:the PR reports \($all | length) checks, which may be a truncated rollup"
       elif any($all[]; (.__typename != "CheckRun" and .__typename != "StatusContext") or (name | length) == 0) then
         "refuse:the PR check rollup has an unrecognized or unnamed entry"
+      elif any($all[]; completed | not) then
+        "refuse:public CI is not green: \([$all[] | select(completed | not) | describe] | join(", "))"
       else
         ($all | group_by(key) | map(sort_by(when) | last)) as $latest
         | [$latest[] | select(green | not) | describe] as $bad

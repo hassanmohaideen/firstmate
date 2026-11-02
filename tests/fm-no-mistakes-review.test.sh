@@ -795,7 +795,8 @@ set_rollup() {  # <dir> <check-json>...
 # authoritative head, and refuses whenever that green-CI fact is absent.
 test_checks_passed_requires_public_green_ci() {
   local d out rc label
-  for label in zero-checks no_ci-zero-checks unreadable pending failing head-mismatch merged truncated unnamed; do
+  for label in zero-checks no_ci-zero-checks unreadable pending queued-rerun-null queued-rerun-zero-time \
+      status-pending failing head-mismatch merged truncated unnamed; do
     d=$(new_ready_case "ci-evidence-$label")
     printf 'checks-passed\n' > "$d/fake-state/status-outcome"
     case "$label" in
@@ -803,6 +804,18 @@ test_checks_passed_requires_public_green_ci() {
       no_ci-zero-checks) set_rollup "$d"; : > "$d/fake-state/ci-declared-no-ci" ;;
       unreadable) : > "$d/fake-state/gh-fail" ;;
       pending) set_rollup "$d" "$(check_run test COMPLETED SUCCESS)" "$(check_run lint IN_PROGRESS '')" ;;
+      queued-rerun-null)
+        set_rollup "$d" "$(check_run test COMPLETED SUCCESS)" "$(check_run lint COMPLETED SUCCESS)" \
+          "$(check_run lint QUEUED '' | jq -c '.startedAt = null')"
+        ;;
+      queued-rerun-zero-time)
+        set_rollup "$d" "$(check_run test COMPLETED SUCCESS)" "$(check_run lint COMPLETED SUCCESS)" \
+          "$(check_run lint QUEUED '' 0001-01-01T00:00:00Z)"
+        ;;
+      status-pending)
+        set_rollup "$d" "$(check_run test COMPLETED SUCCESS)" \
+          '{"__typename":"StatusContext","context":"lint","state":"PENDING","createdAt":"2026-01-01T00:00:00Z"}'
+        ;;
       failing) set_rollup "$d" "$(check_run test COMPLETED SUCCESS)" "$(check_run lint COMPLETED FAILURE)" ;;
       head-mismatch) printf '%s\n' 0123456789abcdef0123456789abcdef01234567 > "$d/fake-state/gh-head" ;;
       merged) printf 'MERGED\n' > "$d/fake-state/gh-state" ;;
@@ -821,7 +834,7 @@ test_checks_passed_requires_public_green_ci() {
     case "$label" in
       zero-checks|no_ci-zero-checks) assert_contains "$out" 'zero CI checks' "$label: zero-check refusal was not explicit" ;;
       unreadable) assert_contains "$out" 'cannot read public CI evidence' "$label: unreadable-CI refusal was not explicit" ;;
-      pending|failing) assert_contains "$out" 'public CI is not green: lint' "$label: refusal did not name the non-green check" ;;
+      pending|queued-rerun-*|status-pending|failing) assert_contains "$out" 'public CI is not green: lint' "$label: refusal did not name the non-green check" ;;
       head-mismatch) assert_contains "$out" 'is not the authoritative head' "$label: head-mismatch refusal was not explicit" ;;
       merged) assert_contains "$out" 'MERGED, not open' "$label: closed-PR refusal was not explicit" ;;
       truncated) assert_contains "$out" 'truncated' "$label: truncated-rollup refusal was not explicit" ;;
@@ -1316,16 +1329,16 @@ test_orphaned_client_blocks_only_its_retry_until_proven_stopped() {
   f=$(finding held ask-user)
   set_round "$d" "$f"
   mkfifo "$d/fake-state/respond-hold"
-  FM_NM_REVIEW_TEST_CRASH_AFTER_LAUNCH=1 run_driver "$d" respond --approve held >/dev/null 2>&1 \
+  TZ=UTC0 FM_NM_REVIEW_TEST_CRASH_AFTER_LAUNCH=1 run_driver "$d" respond --approve held >/dev/null 2>&1 \
     && fail "the crash-after-launch fixture unexpectedly completed"
   pid=$(receipt_client_pid "$d")
   [ -n "$pid" ] || fail "the authorized client identity was not recorded before the crash"
   kill -0 "$pid" 2>/dev/null || fail "the orphaned client is not running"
-  out=$(run_driver "$d" respond --approve held 2>&1); rc=$?
+  out=$(TZ=Asia/Kolkata LC_ALL=C run_driver "$d" respond --approve held 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "a response was re-sent while the recorded client could still deliver it"
-  assert_contains "$out" 'still running' "live-client refusal was not actionable"
+  assert_contains "$out" 'still running' "live-client refusal under a different TZ was not actionable"
   assert_not_contains "$out" 'live owner' "the orphaned response client held the review lock"
-  out=$(run_driver "$d" audit-ready 2>&1); rc=$?
+  out=$(TZ=America/Los_Angeles run_driver "$d" audit-ready 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "readiness accepted an undelivered response"
   printf 'deliver\n' > "$d/fake-state/respond-hold"
   wait_process_gone "$pid"
