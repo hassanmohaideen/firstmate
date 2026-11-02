@@ -12,7 +12,10 @@ permissions:
 jobs:
   lint:
     name: Lint shell scripts
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: ubuntu-latest moved to 26.04 which breaks three tests
+    # environmentally (tmux 3.6 behavior change, per-script budget kill on
+    # slower runner). Unpin in a follow-up once tests pass on 26.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
@@ -36,7 +39,7 @@ jobs:
   # required lane exactly.
   test-coverage:
     name: Test coverage guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned; see lint job comment
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
@@ -57,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]  # ubuntu pinned; see lint job comment
     steps:
       # This job qualifies the kernel primitive and drives the executor fixtures,
       # which each embed their own fixture deadlines; it consumes none of the
@@ -100,7 +103,7 @@ jobs:
   tests-portable-parallel-1:
     name: Behavior portable parallel 1
     needs: test-containment-qualification
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned; see lint job comment
     env:
       FM_TEST_CONTAINMENT: required
     # Measured shard wall is ~1 min of serial sum on proven scripts; this cap is
@@ -146,7 +149,7 @@ jobs:
   tests-portable-parallel-2:
     name: Behavior portable parallel 2
     needs: test-containment-qualification
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned; see lint job comment
     timeout-minutes: 10
     env:
       FM_TEST_CONTAINMENT: required
@@ -196,7 +199,7 @@ jobs:
   tests-portable-serial:
     name: Behavior portable serial ${{ matrix.shard }}
     needs: test-containment-qualification
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned; see lint job comment
     env:
       FM_TEST_CONTAINMENT: required
     # Current measured hints total about 38 min of serial work; the balanced
@@ -272,7 +275,7 @@ jobs:
   tests-herdr:
     name: Behavior tests (Herdr ${{ matrix.shard }})
     needs: test-containment-qualification
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned; see lint job comment
     # Real Herdr is slower than the portable suite; this is a hang tripwire,
     # not the expected healthy end of the lane (balanced shards are under
     # five minutes each).
@@ -425,7 +428,7 @@ jobs:
   # Aggregate per-lane timing into one summary artifact for critical-path review.
   tests-timing-aggregate:
     name: Behavior timing aggregate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned; see lint job comment
     timeout-minutes: 10
     needs:
       - tests-portable-parallel-1
@@ -515,7 +518,7 @@ jobs:
 
   invariants:
     name: Repo invariants
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned; see lint job comment
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6

@@ -21,7 +21,9 @@ concurrency:
 jobs:
   check:
     name: PR must be raised via no-mistakes
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: ubuntu-latest moved to 26.04 which breaks tests
+    # environmentally. Unpin in a follow-up once tests pass on 26.04.
+    runs-on: ubuntu-24.04
     if: >-
       github.event.pull_request.user.login != 'github-actions[bot]' &&
       github.event.pull_request.user.login != 'dependabot[bot]'
