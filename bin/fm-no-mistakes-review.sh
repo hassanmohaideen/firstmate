@@ -23,17 +23,20 @@
 #   no-mistakes axi status
 #   no-mistakes axi logs --run <run-id> --step review --full
 #   no-mistakes axi logs --run <run-id> --step ci
+#   gh pr view <pr-url> --json headRefOid,state,statusCheckRollup
+# and reads no-mistakes' own durable state store strictly READ-ONLY
+# (~/.no-mistakes/state.sqlite, overridable with FM_NM_STATE_DB) for the
+# per-round review record described under "Authoritative review resolution".
+# It never writes to that store and never contacts the network except for the
+# gh query at the readiness boundary.
 # The per-round structured review result comes from one of two shapes, because
 # review agents differ in what they echo to the review log:
 #   - Structured-log agents (e.g. codex/gpt/pi) emit one JSON review object per
 #     round into the review log; the guard reconstructs the round model from the
-#     log, exactly as before.
+#     log.
 #   - Prose-log agents (e.g. claude) narrate the review in prose and echo NO
-#     per-round JSON object to the log. no-mistakes still records the authoritative
-#     structured per-round result in its own durable state store, so when the
-#     review log carries no structured object the guard sources the identical round
-#     model READ-ONLY from that store's review rounds (~/.no-mistakes/state.sqlite,
-#     overridable with FM_NM_STATE_DB). This read never writes to that store.
+#     per-round JSON object to the log, so the guard sources the identical round
+#     model from the state store's review rounds.
 # Both shapes produce the same round model, so every disposition, ledger, and
 # readiness check below applies uniformly regardless of the review agent. A review
 # whose result is genuinely missing, truncated, or not yet produced still refuses.
@@ -47,16 +50,13 @@
 # store (~/.no-mistakes/repos/<hash>.git, overridable with FM_NM_REPOS_DIR) into
 # this worktree's object database. It never writes to that store, never moves a
 # local branch, and never contacts the network; if the head cannot be resolved
-# from the worktree or that store the command refuses closed. This removes the
-# manual per-round bare-repo fetch the worktree-isolation gap used to require.
+# from the worktree or that store the command refuses closed.
 # The local branch must be the public head or an ancestor of it, with one bound
 # exception: a pre-push pipeline-owned head move (the rebase step or a
 # pipeline-owned rebase-conflict resolution rewrites history). It is accepted only
 # when axi status branch_sync reports state pipeline_owned for this exact run, a
 # clean local branch still at the run's submitted_head, and a pipeline
 # current_head equal to the public head; any other head refuses as stale.
-# Responses are accepted while the review step is parked at either its
-# awaiting_approval or its post-fix fix_review gate.
 # Only review-step findings are mapped; a finding from another step (e.g. ci) is
 # refused as an unknown finding.
 # It invokes the underlying whole-step response only after every finding in the
@@ -67,24 +67,70 @@
 # A partial set, duplicate ID, unknown ID, or mixed choice is refused before the
 # underlying response command and before any ledger write.
 #
-# no-mistakes axi respond sends a fast (~millisecond) response IPC and then
-# FOREGROUND-DRIVES the run through push, PR, and GitHub CI with no client-side
-# timeout, so the guard must never block on that whole drive while it holds the
-# ledger lock. It backgrounds the respond client, waits only until the review gate
-# leaves (proof the IPC has landed) or the bounded FM_NM_REVIEW_IPC_BUDGET elapses,
-# then stops the client so the ledger lock is released promptly. Stopping the
-# client only tears down the run observer; it never cancels the daemon's run
-# (cancellation is a separate axi abort path), so the pipeline keeps driving CI in
-# the background. A decision (approve/reject) is finalized the moment its gate is
-# consumed, since it needs no CI; a fix leaves its durable attempting receipt in
-# place (no premature landed-but-unconfirmed state) and is confirmed later by
-# audit-ready or a later response through the same attempting->landed reconciliation
-# the guard already applies to a crashed drive, from the next authoritative review
-# result. If the client returns before the budget, the whole drive finished
-# in-band and the response is finalized exactly as before. This narrows only how
-# long the ledger lock is held (the fast IPC-landing window, never the CI drive);
-# it does not weaken single-owner exclusion, receipt reconciliation, or the
-# never-infer-a-decision-from-generic-completion guarantees below.
+# Authoritative review resolution.
+# Whether a response landed is decided only from no-mistakes' own durable record
+# of how that exact review round was resolved, never from this guard's in-process
+# observations, the response client's exit status, the review gate leaving, or a
+# generic completed status. For round N of the run's latest review step, whose
+# recorded actionable finding IDs must equal round N of the public review history,
+# the resolution is:
+#   fix:<ids>  round N records selection source "user" with exactly <ids>;
+#   approve    round N records "user_declined" and the step completed at round N,
+#              or a later round exists (a skipped review is never re-run);
+#   skip       round N records "user_declined" and the step is skipped;
+#   pending    round N is the latest round, records no decision, and the step is
+#              parked at awaiting_approval or fix_review;
+#   transient  a response was accepted and is still being recorded (for example
+#              the step is fixing, or the decision is recorded but the step has
+#              not yet completed or skipped);
+#   anything else - an auto_fix selection, an abort, a round closed without a
+#   recorded human decision, a round whose findings differ from the public
+#   history, or an unreadable store - is out-of-band or unknown and refuses.
+# --fix, --approve, and --reject land only on fix:<their exact ids>, approve, and
+# skip respectively, so a guarded approve that failed followed by a direct skip
+# can never be recorded as approved_as_is.
+# The per-round decision record exists from no-mistakes v1.55.1; an older store
+# records no approve or skip decision, so its rounds refuse as unverifiable.
+#
+# Response boundary.
+# Each response for a run and round is governed by a durable receipt at:
+#   <project-worktree>/.no-mistakes/.firstmate-review-receipt.<run-id>.<round>.json
+# written only by same-directory atomic rename in this exact version-2 shape:
+#   {"version":2,"run":"<run-id>","branch":"<branch>","round":<integer>,
+#   "action":"fix"|"approve"|"reject","findings":["<id>",...],
+#   "attempt":<integer>,"head":"<commit>","phase":"attempting"|"landed",
+#   "client":{"pid":<integer>,"start":"<process-start-time>"}|null}
+# A new response is sent only into a round whose resolution is pending.
+# The guard records the intent with a null client before launching anything,
+# then launches the no-mistakes response client gated: the client may contact
+# no-mistakes only after the receipt names its own PID and process start time,
+# and it exits without responding if this guard dies first or that authorization
+# never arrives. So every client that could ever have sent a response is
+# durably identified, and a null client proves none did.
+# The guard then waits, bounded by FM_NM_REVIEW_IPC_BUDGET, for the round's
+# authoritative resolution, stops the client (after its response the client only
+# observes the run; stopping it never cancels the daemon's run, which keeps
+# driving push, PR, and CI), and re-reads the resolution with the client proven
+# stopped:
+#   matches the recorded action -> receipt landed, then the ledger disposition;
+#   pending   -> refuses; the attempt is recorded and can be safely retried;
+#   transient -> refuses; rerun the same command to confirm it;
+#   otherwise -> refuses as out-of-band or unverifiable.
+# Every later invocation, respond and audit-ready alike, reconciles every receipt
+# of the run the same way before acting, so a crash or failure at any point
+# converges: a response that landed is finalized from the record without a second
+# invocation, and an unlanded one is retried only when its recorded client is
+# proven stopped (null, or no live process with that PID and start time, read
+# with a fixed locale and UTC so it depends only on the process), never
+# while a client that could still deliver it is running. An unlanded attempt may
+# be retried with the same or a different explicit choice; a landed round is never
+# answered twice. no-mistakes accepts at most one response per open review gate,
+# so a retry that races a late delivery of the same response is accepted at most
+# once, and a round resolved without a matching receipt refuses readiness.
+# A receipt written by an earlier guard version (no version or client field) is
+# reconciled the same way: it finalizes when its action matches the record, an
+# unlanded "failed" one is retryable because its client had returned, and any
+# other unlanded one refuses because its client cannot be proven stopped.
 #
 # The ledger is JSON at:
 #   <project-worktree>/.no-mistakes/firstmate-review-ledger.json
@@ -99,84 +145,52 @@
 # structured objects emitted by no-mistakes.
 # Disposition <state> is requested, approved_as_is, rejected_or_skipped,
 # fixed_and_confirmed, or survived_unchanged.
-# An approve or reject the pipeline accepted is written straight to its final
-# approved_as_is or rejected_or_skipped state in one ledger commit; it is never
-# parked in an intermediate "requested" state a crash could strand.
-# A selected fix is written requested, then confirmed only from public evidence:
-# it becomes fixed_and_confirmed when the public review log contains both a
-# completed fix round and the authoritative next structured review result AND the
-# exact finding object does not survive unchanged into that result; otherwise it
-# stays requested or becomes survived_unchanged and readiness refuses.
-#
-# Single-owner exclusion is proven solely by the host kernel's nonblocking
-# advisory lock (flock on Linux, lockf on macOS/BSD) held for the entire guarded
-# invocation. That proof is non-mintable: a contender cannot forge holding the
-# lock, and the kernel releases it the instant the owning process exits for any
-# reason, so a crashed owner never wedges the ledger. No PID, incarnation token,
-# or on-disk owner record is consulted, so no forgeable ownership capability
-# exists and PID reuse cannot impersonate a past owner. A concurrent invocation
-# that cannot take the lock refuses and retries rather than entering, and if the
-# kernel lock primitive is unavailable or unsupported the command refuses with a
-# red diagnostic instead of proceeding without exclusion.
-# The internal lock-held entry point re-proves that the guard is actively locked
-# before touching the ledger by attempting a fresh non-blocking acquire: only the
-# lock primitive's documented contention status means the guard is held (proceed),
-# a successful acquire means it was free so a direct caller is refused, and any
-# other probe error refuses closed rather than assuming an active lock.
-# The response boundary is governed by a durable response receipt per run and
-# round at:
-#   <project-worktree>/.no-mistakes/.firstmate-review-receipt.<run-id>.<round>.json
-# The guard writes this exact shape by same-directory atomic rename:
-#   {"run":"<run-id>","branch":"<branch>","round":<integer>,
-#   "action":"fix"|"approve"|"reject","findings":["<id>",...],
-#   "attempt":<integer>,"head":"<commit>",
-#   "phase":"attempting"|"landed"|"failed"}
-# It records the exact action and findings in phase attempting BEFORE the
-# underlying no-mistakes response runs, then records landed or failed after it
-# returns, so a crash at any point leaves a reconcilable record rather than a
-# silently accepted or permanently stranded finding.
-# A fresh invocation reconciles outstanding receipts across every public round
-# before acting, from authoritative evidence bound to the exact round and action.
-# An in-process landed receipt directly proves the CLI returned zero and may be
-# finalized idempotently. An attempting fix may be inferred landed only when a
-# later authoritative review result and that round's committed-agent-fix marker
-# both exist. Approve/reject are NEVER inferred landed from generic review, CI,
-# or outcome completion because those cannot distinguish the recorded action from
-# an out-of-band skip. A proven-unstarted or failed attempt may be retried while
-# its gate remains open; every indeterminate or possibly in-flight state refuses.
-# So a transient failure has a real recovery path (retry), while an unresolved
-# finding is never finalized without evidence that this exact action landed.
-# At most one invocation runs per attempt: each attempt claims an atomic
-# O_CREAT|O_EXCL marker keyed by run, round, and attempt immediately before the
-# CLI runs, and a retry uses the next attempt. Two serialized legitimate callers
-# never both invoke, because the kernel guard makes the second observe a terminal
-# receipt, not a live attempting one. The only residual is a caller that bypasses
-# the kernel guard concurrently with a live responder; the per-attempt marker
-# still binds each attempt to a single invocation, and any such actor already has
-# write access to this private state directory and can rewrite the ledger outright.
+# Dispositions are written only after the round's resolution matched its receipt.
+# A landed approve or reject is written straight to approved_as_is or
+# rejected_or_skipped in one ledger commit.
+# A landed fix is written requested and is confirmed against the next review
+# round of the public history: fixed_and_confirmed when the exact finding object
+# does not survive unchanged into it, otherwise survived_unchanged. Until that
+# round exists the fix stays requested and readiness refuses.
 # Every ledger write is a same-directory atomic rename, so a crash mid-write
-# leaves the ledger at its prior or next complete state, never a partial one.
-# Ledger commits also use optimistic concurrency: the content hash captured when
-# a mutation reads the ledger is re-checked at the rename, and a changed ledger
-# forces a recompute from the current contents instead of overwriting it. So a
-# stale copy computed by a caller that bypassed the guard cannot clobber a
-# concurrent append. One accepted residual remains at that boundary: the hash
-# re-check and the rename are separate steps, leaving a sub-instruction window in
-# which two concurrent committers could both see an unchanged ledger and both
-# rename, losing one update. It is deliberately left open because a portable,
-# crash-safe, truly atomic commit is not available in shell, and the legitimate
-# path never reaches it -- it is fully serialized by the kernel guard, and any
-# actor that could reach it already has write access to this state directory.
+# leaves the ledger at its prior or next complete state. Ledger commits also
+# re-check the content hash read at mutation time and recompute rather than
+# overwrite a ledger that changed underneath them.
 #
-# audit-ready refreshes the append-only public review history, then reconciles
-# outstanding response receipts across all rounds without invoking a response.
-# It fills only a missing finalization for a landed action, requires
-# action-specific public evidence for a detached fix, and refuses every unlanded
-# or indeterminate attempt. It then refuses
-# for missing or rewritten history, stale run/branch/head context, malformed or
+# Single-owner exclusion.
+# respond and audit-ready hold an exclusive, nonblocking kernel advisory lock
+# (flock(2): flock(1) on Linux, perl on macOS) for the whole invocation on an
+# open file description of
+#   <project-worktree>/.no-mistakes/.firstmate-review-ledger.guard
+# that the guard process itself owns. Acquiring the lock and owning it are one
+# kernel operation, so there is no on-disk owner record, PID, or token to be lost,
+# forged, or left half-written: the lock exists only while its owning process
+# lives, the kernel releases it the instant that process exits for any reason
+# including SIGKILL, and a live owner can never be preempted. A contender refuses
+# ("live owner") and retries later. Commands that can start long-lived detached
+# processes - no-mistakes, which may start its daemon, git, and gh - and the
+# response client always run with that descriptor closed, so the lock can never
+# outlive the guard. If the kernel lock primitive is unavailable the command
+# refuses instead of proceeding without exclusion.
+#
+# audit-ready refreshes the append-only public review history, reconciles every
+# outstanding response receipt without invoking a response, and refuses any
+# unlanded, in-flight, out-of-band, or unverifiable attempt. It then refuses for
+# missing or rewritten history, stale run/branch/head context, malformed or
 # duplicate findings, missing/duplicate/contradictory dispositions, requested
-# but unconfirmed fixes, unchanged surviving fixes, or absent public PR/green-CI
-# evidence.
+# but unconfirmed fixes, unchanged surviving fixes, or any dispositioned round
+# whose authoritative resolution does not match its disposition kind.
+# Readiness then requires the run to report CI readiness (outcome checks-passed,
+# or the active CI monitor whose latest public CI line reports green checks,
+# never the no_ci declaration) and independent public CI evidence from the PR:
+# it must be open with headRefOid equal to the authoritative head and report at
+# least one check; every entry must be completed (a pending or queued rerun
+# refuses whatever its timestamp), the latest completed result of every check
+# name must be successful, neutral, or skipped, with at least one success; and a
+# rollup of 100 or more entries refuses as possibly truncated. The gh query is
+# bounded by FM_NM_REVIEW_GH_TIMEOUT, so evidence that never arrives refuses
+# promptly. Absent, unreadable, unanswered, pending, failing, or zero-check
+# evidence refuses, including a trusted no_ci declaration.
 # Historical clean reviews, tests, and CI never imply approval or rejection.
 # If the full structured review history or any required context is absent or
 # unparsable, the command exits nonzero with an actionable diagnostic.
@@ -191,13 +205,15 @@
 #                                    root used to import an isolated pipeline head
 #                                    (default: ~/.no-mistakes/repos).
 #   FM_NM_STATE_DB                   overrides the no-mistakes state store read
-#                                    READ-ONLY for the structured review rounds when
-#                                    the review log carries no per-round JSON object
+#                                    READ-ONLY for review rounds and resolutions
 #                                    (default: ~/.no-mistakes/state.sqlite).
-#   FM_NM_REVIEW_IPC_BUDGET          maximum whole seconds to wait under the ledger
-#                                    lock for the review gate to leave (the response
-#                                    IPC to land) before refusing closed; the long
-#                                    push/PR/CI drive is never awaited under the lock
+#   FM_NM_REVIEW_IPC_BUDGET          maximum whole seconds to wait for the
+#                                    authoritative record of a response before
+#                                    stopping its client and refusing closed; the
+#                                    long push/PR/CI drive is never awaited
+#                                    (default: 60).
+#   FM_NM_REVIEW_GH_TIMEOUT          maximum whole seconds the readiness gh query
+#                                    may take before readiness refuses closed
 #                                    (default: 60).
 # Environment used by hermetic tests only:
 #   FM_NM_REVIEW_STATE_DIR           overrides the ledger directory.
@@ -205,12 +221,15 @@
 #   FM_NM_REVIEW_TEST_HOLD_FIFO      blocks the lock holder on a fixture FIFO.
 #   FM_NM_REVIEW_TEST_CRASH_HOLDING  kills the holder just after it takes the lock.
 #   FM_NM_REVIEW_TEST_NO_LOCKER      simulates an unavailable kernel lock primitive.
-#   FM_NM_REVIEW_TEST_INFLIGHT_FIFO  blocks a responder after it claims the attempt marker.
 #   FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO  blocks a ledger mutation once before its first commit.
 #   FM_NM_REVIEW_TEST_CRASH_BEFORE_RESPOND  kills a responder after it records the
-#                                    attempting receipt but before the CLI runs.
-#   FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND   kills a responder after the CLI lands but
-#                                    before the receipt is marked landed.
+#                                    intent receipt but before launching a client.
+#   FM_NM_REVIEW_TEST_CRASH_BEFORE_IDENTITY kills a responder after it launches the
+#                                    gated client but before recording its identity.
+#   FM_NM_REVIEW_TEST_CRASH_AFTER_LAUNCH    kills a responder once its client is
+#                                    authorized, leaving that client running.
+#   FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND   kills a responder after the response
+#                                    landed but before the receipt and ledger record it.
 set -eu
 
 SCRIPT_NAME=${0##*/}
@@ -220,9 +239,15 @@ LEDGER_COMMIT_HOOK_FIRED=0
 WORK_FILE=
 MODEL_FILE=
 DRIVE_LOG=
-RESP_PID=
-DRIVE_RESULT=
-DRIVE_RC=0
+CLIENT_PID=
+CLIENT_ID_PID=
+CLIENT_START=
+CLIENT_RC=
+RESOLUTION=
+RECONCILE=
+RECONCILE_ATTEMPT=
+RECEIPT_ACTION=
+RECEIPT_FINDINGS=
 CAPTURE_STATUS=
 CAPTURE_LOGS=
 CAPTURE_MODEL=
@@ -236,6 +261,18 @@ CAPTURE_OUTCOME=
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
+
+# The review lock lives on file descriptor 9 of this process, and every process
+# that inherits that descriptor shares the lock. These commands can start
+# long-lived detached processes (the no-mistakes daemon, detached git
+# maintenance), so they always run with descriptor 9 closed and the lock can
+# never outlive the guard. The overrides also cover git calls made by the sourced
+# run library.
+nm_cli() { "$NM" "$@" 9>&-; }
+git() { command git "$@" 9>&-; }
+gh() { command gh "$@" 9>&-; }
 
 usage() {
   awk '
@@ -252,14 +289,12 @@ die() {
 
 cleanup() {
   # The kernel advisory lock is released automatically when this process exits,
-  # so cleanup only removes this invocation's private temporary work files. It
-  # never touches the shared guard file or any ownership artifact, so an exiting
-  # or crashing owner can never remove a successor's lock.
-  # A backgrounded response client is stopped too, so an interrupted guard never
-  # leaves the run observer running; stopping it never cancels the daemon's run.
-  if [ -n "$RESP_PID" ]; then
-    kill -TERM "$RESP_PID" 2>/dev/null || true
-    RESP_PID=
+  # so cleanup only stops a still-running response client and removes this
+  # invocation's private temporary work files. It never touches the shared guard
+  # file, receipts, or the ledger. Stopping the client never cancels the daemon's run.
+  if [ -n "$CLIENT_PID" ]; then
+    kill -TERM "$CLIENT_PID" 2>/dev/null || true
+    CLIENT_PID=
   fi
   [ -z "$WORK_FILE" ] || rm -f "$WORK_FILE"
   [ -z "$MODEL_FILE" ] || rm -f "$MODEL_FILE"
@@ -296,9 +331,15 @@ status_field() {
   strip_value "$value"
 }
 
+require_safe_run_id() {
+  case "$CAPTURE_RUN_ID" in
+    ''|*[!A-Za-z0-9._-]*) die "unsupported validation run id '$CAPTURE_RUN_ID'" ;;
+  esac
+}
+
 capture_public_history() {
   local declared table_count actual_run
-  if ! CAPTURE_STATUS=$("$NM" axi status); then
+  if ! CAPTURE_STATUS=$(nm_cli axi status); then
     die "no-mistakes axi status failed; validation state was not changed"
   fi
   CAPTURE_RUN_ID=$(status_field id)
@@ -308,10 +349,11 @@ capture_public_history() {
   CAPTURE_STATUS_VALUE=$(status_field status)
   CAPTURE_OUTCOME=$(status_field outcome)
   [ -n "$CAPTURE_RUN_ID" ] || die "axi status omitted the validation run ID"
+  require_safe_run_id
   [ -n "$CAPTURE_BRANCH" ] || die "axi status omitted the validation branch for run $CAPTURE_RUN_ID"
   [ -n "$CAPTURE_HEAD" ] || die "axi status omitted the validation head for run $CAPTURE_RUN_ID"
 
-  if ! CAPTURE_LOGS=$("$NM" axi logs --run "$CAPTURE_RUN_ID" --step review --full); then
+  if ! CAPTURE_LOGS=$(nm_cli axi logs --run "$CAPTURE_RUN_ID" --step review --full); then
     die "full public review history is unavailable for run $CAPTURE_RUN_ID"
   fi
   actual_run=$(printf '%s\n' "$CAPTURE_LOGS" | sed -n 's/^run:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}$/\1/p' | head -1)
@@ -379,24 +421,24 @@ capture_public_history() {
   ' >/dev/null 2>&1 || die "review result for run $CAPTURE_RUN_ID contains no complete structured review result or has malformed findings"
 }
 
+store_ready_or_die() {
+  command -v sqlite3 >/dev/null 2>&1 \
+    || die "sqlite3 is required to read the authoritative no-mistakes review record for run $CAPTURE_RUN_ID"
+  [ -f "$NM_STATE_DB" ] \
+    || die "the no-mistakes review record store is absent at $NM_STATE_DB; cannot verify run $CAPTURE_RUN_ID"
+}
+
 capture_review_model_from_state_store() {
   # Prose-log fallback source for the structured per-round review model. no-mistakes
   # records every review round's authoritative structured result (the same JSON
   # object a structured-log agent echoes to the review log) in its own state store,
   # so when the review log carries no per-round object the guard reads the identical
-  # round model from that store. The read is strictly READ-ONLY (sqlite3 -readonly):
-  # it never writes to, checkpoints, or otherwise mutates no-mistakes' state, and it
-  # never contacts the network. It refuses closed when the tool, store, or a
-  # completed review record is genuinely absent, so a missing or in-progress review
-  # is never mistaken for a clean pass.
+  # round model from that store. The read is strictly READ-ONLY (sqlite3 -readonly).
+  # It refuses closed when the tool, store, or a completed review record is
+  # genuinely absent, so a missing or in-progress review is never mistaken for a
+  # clean pass.
   local srid rstatus rounds_json
-  command -v sqlite3 >/dev/null 2>&1 \
-    || die "review log for run $CAPTURE_RUN_ID carries no structured result and sqlite3 is unavailable to read the authoritative review record"
-  [ -f "$NM_STATE_DB" ] \
-    || die "review log for run $CAPTURE_RUN_ID carries no structured result and the no-mistakes review record store is absent at $NM_STATE_DB"
-  case "$CAPTURE_RUN_ID" in
-    ''|*[!A-Za-z0-9._-]*) die "cannot read the review record for run id '$CAPTURE_RUN_ID'" ;;
-  esac
+  store_ready_or_die
   # A brief busy timeout tolerates a transient lock from a concurrent writer rather
   # than refusing spuriously; the store is WAL, so read-only readers do not block.
   srid=$(sqlite3 -readonly -cmd '.timeout 2000' "$NM_STATE_DB" \
@@ -407,11 +449,10 @@ capture_review_model_from_state_store() {
   rstatus=$(sqlite3 -readonly -cmd '.timeout 2000' "$NM_STATE_DB" \
     "SELECT status FROM step_results WHERE id='$srid';" 2>/dev/null) \
     || die "cannot read the review status for run $CAPTURE_RUN_ID from the no-mistakes state store"
-  # fix_review is the gate no-mistakes parks at after a fix round's re-check; like
-  # awaiting_approval it accepts the same approve/fix/skip response, and its latest
-  # round already carries the re-checked structured result.
+  # awaiting_approval and fix_review are parked gates whose latest round carries the
+  # result to answer; completed and skipped steps have finished every round.
   case "$rstatus" in
-    completed|awaiting_approval|fix_review) ;;
+    completed|skipped|awaiting_approval|fix_review) ;;
     *) die "review step for run $CAPTURE_RUN_ID has not produced a complete result (state: ${rstatus:-unknown}); refusing an incomplete or in-progress review" ;;
   esac
   rounds_json=$(sqlite3 -readonly -cmd '.timeout 2000' -json "$NM_STATE_DB" \
@@ -551,6 +592,10 @@ selection_json() {
   '
 }
 
+sorted_csv() {  # <csv>; prints the same IDs sorted, for set comparison
+  printf '%s' "$1" | jq -Rr 'split(",") | map(select(length > 0)) | sort | join(",")'
+}
+
 validate_selection() {
   local kind=$1 raw=$2 selected current duplicate_count omitted extras count
   selected=$(selection_json "$raw") || die "cannot parse the explicit $kind finding list"
@@ -587,44 +632,6 @@ review_lock_held_hooks() {
   fi
 }
 
-verify_guard_actively_locked() {
-  # Non-mintable reentry proof for the internal lock-held entry point. It is
-  # legitimate only when an ancestor run_with_kernel_lock already holds the guard
-  # lock, so probe with a fresh non-blocking acquire: a failed acquire proves the
-  # guard is actively held (proceed), while a successful acquire proves it was
-  # free, meaning this process was invoked directly without the kernel lock
-  # (refuse). A direct caller cannot forge a held lock, so the credential cannot
-  # be minted. The probe keeps the guard file (-k) and never blocks (-t 0 / -n).
-  local guard="$STATE_DIR/.firstmate-review-ledger.guard" probe_rc=0
-  [ -e "$guard" ] \
-    || die "review-ledger internal entry was invoked without the kernel guard; direct reentry is refused"
-  [ -f "$guard" ] && [ ! -L "$guard" ] \
-    || die "review-ledger kernel guard is not a regular private file"
-  # Both probes report the documented contention status 75 when the guard is
-  # already held; every other nonzero status is an operational failure (missing
-  # or unreadable guard, permission error) and must refuse closed rather than be
-  # mistaken for an active lock.
-  case "$(uname -s 2>/dev/null || true)" in
-    Darwin)
-      command -v lockf >/dev/null 2>&1 \
-        || die "lockf is required to verify crash-safe review-ledger exclusion on macOS"
-      lockf -k -s -t 0 "$guard" true >/dev/null 2>&1 || probe_rc=$?
-      ;;
-    Linux)
-      command -v flock >/dev/null 2>&1 \
-        || die "flock is required to verify crash-safe review-ledger exclusion on Linux"
-      flock -E 75 -n "$guard" -c true >/dev/null 2>&1 || probe_rc=$?
-      ;;
-    *) die "kernel-backed review-ledger exclusion is unsupported on this operating system" ;;
-  esac
-  case "$probe_rc" in
-    75) ;;
-    0) die "review-ledger internal entry was invoked without holding the kernel guard; direct reentry is refused" ;;
-    *) die "review-ledger guard-lock probe failed (status $probe_rc); refusing internal entry rather than assuming an active lock" ;;
-  esac
-  LOCK_GUARD="$guard"
-}
-
 prepare_guard_file() {
   umask 077
   mkdir -p "$STATE_DIR"
@@ -638,27 +645,38 @@ prepare_guard_file() {
   chmod 600 "$LOCK_GUARD" || die "cannot make review-ledger kernel guard private"
 }
 
-run_with_kernel_lock() {
+acquire_review_lock() {
+  # Take the exclusive kernel lock on descriptor 9, an open file description this
+  # process owns for the rest of its life. The helper that performs the flock(2)
+  # call exits immediately; the lock stays with the shared open file description,
+  # so it is held exactly as long as this guard process lives.
   local rc=0
   prepare_guard_file
   if [ "${FM_NM_REVIEW_TEST_NO_LOCKER:-}" = 1 ]; then
     die "kernel-backed review-ledger exclusion is unavailable; refusing to proceed without single-owner exclusion"
   fi
+  exec 9<>"$LOCK_GUARD" || die "cannot open the review-ledger kernel guard"
   case "$(uname -s 2>/dev/null || true)" in
-    Darwin)
-      command -v lockf >/dev/null 2>&1 \
-        || die "lockf is required for crash-safe review-ledger exclusion on macOS"
-      lockf -k -s -t 0 "$LOCK_GUARD" "$SCRIPT_DIR/$SCRIPT_NAME" __fm_review_lock_held "$@" || rc=$?
-      ;;
     Linux)
       command -v flock >/dev/null 2>&1 \
-        || die "flock is required for crash-safe review-ledger exclusion on Linux"
-      flock -E 75 -n "$LOCK_GUARD" "$SCRIPT_DIR/$SCRIPT_NAME" __fm_review_lock_held "$@" || rc=$?
+        || die "flock is required for crash-safe review-ledger exclusion on Linux; refusing to proceed without single-owner exclusion"
+      flock -n -E 75 9 || rc=$?
       ;;
-    *) die "kernel-backed review-ledger exclusion is unsupported on this operating system" ;;
+    Darwin)
+      command -v perl >/dev/null 2>&1 \
+        || die "perl is required for crash-safe review-ledger exclusion on macOS; refusing to proceed without single-owner exclusion"
+      perl -MFcntl=:flock -e '
+        open(my $fh, "+<&=", 9) or exit 70;
+        exit 0 if flock($fh, LOCK_EX | LOCK_NB);
+        exit($!{EWOULDBLOCK} ? 75 : 71);' || rc=$?
+      ;;
+    *) die "kernel-backed review-ledger exclusion is unsupported on this operating system; refusing to proceed without single-owner exclusion" ;;
   esac
-  [ "$rc" -ne 75 ] || die "review ledger has a live owner; retry after the guarded invocation finishes"
-  return "$rc"
+  case "$rc" in
+    0) ;;
+    75) die "review ledger has a live owner; retry after the guarded invocation finishes" ;;
+    *) die "review-ledger kernel lock failed (status $rc); refusing to proceed without single-owner exclusion" ;;
+  esac
 }
 
 ledger_content_hash() {
@@ -679,9 +697,10 @@ ledger_mutate() {
   # never clobber a concurrent append. The mutation callback reads $LEDGER and
   # writes the next content to $WORK_FILE; we capture the ledger hash at read
   # time and rename only if the on-disk ledger is still unchanged at commit,
-  # otherwise we recompute from the now-current ledger. The legitimate path is
-  # already serialized by the kernel guard, so this protects the append-preserving
-  # invariant against a caller that reached the ledger by bypassing the guard.
+  # otherwise we recompute from the now-current ledger. The guarded path is
+  # already serialized by the kernel lock, so this only protects the
+  # append-preserving invariant against a writer that bypassed the guard; such a
+  # writer already has write access to this private state directory.
   local mutation=$1 before attempts=0
   shift
   while :; do
@@ -692,18 +711,6 @@ ledger_mutate() {
       : > "$FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO.reached" 2>/dev/null || true
       IFS= read -r _ledger_commit_release < "$FM_NM_REVIEW_TEST_LEDGER_COMMIT_FIFO" || true
     fi
-    # Accepted residual: the hash re-check and the rename are separate steps, so
-    # a check-to-rename window remains where two concurrent committers could both
-    # observe an unchanged ledger and both rename, losing one update. This is
-    # unreachable on the legitimate path, which is fully serialized by the kernel
-    # guard, and is not closed further on purpose: a portable, crash-safe, truly
-    # atomic commit is not available in shell (macOS has no in-process kernel lock
-    # and there is no atomic compare-and-swap-on-content primitive). The only way
-    # to reach the window is to invoke the undocumented internal entry point
-    # directly while a legitimate responder is active and win a sub-instruction
-    # race, and any actor able to do that already has write access to this state
-    # directory and can rewrite or delete the ledger outright, so it adds no
-    # practical exposure. See the header note for the full rationale.
     if [ "$(ledger_content_hash)" = "$before" ]; then
       mv "$WORK_FILE" "$LEDGER" || die "cannot commit the disposition ledger"
       WORK_FILE=$(mktemp "$STATE_DIR/.firstmate-review-ledger.work.XXXXXX") \
@@ -803,10 +810,13 @@ _sync_ledger_apply() {
       end
     | (.runs | map(.id) | index($m.run.id)) as $ri
     | .runs[$ri].rounds as $rounds
+    # A fix disposition exists only after the round authoritatively resolved as
+    # that exact fix, so the next round of the history is its re-review: confirm
+    # each requested fix against it.
     | .runs[$ri].rounds = [$rounds | to_entries[]
         | .key as $i
         | .value
-        | if .fix_completed_after == true and ($i + 1) < ($rounds | length) then
+        | if ($i + 1) < ($rounds | length) then
             ([($rounds[$i + 1].result.findings // [])[] | select(.action != "no-op")]) as $next_findings
             | .dispositions = [.dispositions[]
                 | . as $d
@@ -824,10 +834,92 @@ current_round_number() {
   printf '%s' "$CAPTURE_MODEL" | jq '.rounds | length'
 }
 
-receipt_file() {  # <round>
-  case "$CAPTURE_RUN_ID" in
-    ''|*[!A-Za-z0-9._-]*) die "cannot record a response receipt for run id '$CAPTURE_RUN_ID'" ;;
+round_dispositions_count() {  # <round>
+  jq -r --arg run "$CAPTURE_RUN_ID" --argjson round "$1" '
+    [.runs[] | select(.id == $run) | .rounds[] | select(.round == $round) | .dispositions[]?] | length
+  ' "$LEDGER"
+}
+
+review_round_resolution() {  # <round>; sets RESOLUTION (see "Authoritative review resolution")
+  # Strictly READ-ONLY. Reads the latest review step of this run and all of its
+  # rounds, binds round N to round N of the public history by its actionable
+  # finding IDs, and classifies how no-mistakes recorded that round's resolution.
+  local round=$1 rows model_ids
+  RESOLUTION="unknown:cannot read the no-mistakes review record for run $CAPTURE_RUN_ID round $round"
+  require_safe_run_id
+  if ! rows=$(sqlite3 -readonly -cmd '.timeout 2000' -json "$NM_STATE_DB" "
+      SELECT sr.status AS status, rd.round AS round, rd.selection_source AS source,
+             rd.selected_finding_ids AS selected, rd.findings_json AS findings
+        FROM step_rounds rd JOIN step_results sr ON sr.id = rd.step_result_id
+       WHERE sr.id = (SELECT id FROM step_results
+                       WHERE run_id = '$CAPTURE_RUN_ID' AND step_name = 'review'
+                       ORDER BY rowid DESC LIMIT 1)
+       ORDER BY rd.round;" 2>/dev/null); then
+    return 0
+  fi
+  if [ -z "$rows" ] || [ "$rows" = "[]" ]; then
+    RESOLUTION="unknown:the no-mistakes state store has no review rounds for run $CAPTURE_RUN_ID"
+    return 0
+  fi
+  model_ids=$(printf '%s' "$CAPTURE_MODEL" | jq -c --argjson round "$round" \
+    '[(.rounds[$round - 1].result.findings // [])[].id] | sort') || return 0
+  RESOLUTION=$(printf '%s' "$rows" | jq -r --argjson round "$round" --argjson model_ids "$model_ids" '
+    def ids: [((. // "{}") | fromjson | .findings // [])[] | select(.action != "no-op") | .id] | sort;
+    def gate: . == "awaiting_approval" or . == "fix_review";
+    . as $rows
+    | ($rows | map(.round) | max) as $latest
+    | [$rows[] | select(.round == $round)] as $match
+    | if ($match | length) != 1 then
+        "unknown:the no-mistakes store has no unique review round \($round) for this run"
+      else
+        $match[0] as $r
+        | ($r.round < $latest) as $later
+        | if ($r.findings | ids) != $model_ids then
+            "unknown:no-mistakes review round \($round) does not match round \($round) of the public review history"
+          elif $r.source == "user" then
+            (($r.selected // "null") | fromjson) as $sel
+            | if ($sel | type) == "array" and ($sel | length) > 0
+              then "fix:" + ($sel | map(tostring) | sort | join(","))
+              else "unknown:no-mistakes recorded a fix for round \($round) without its finding IDs" end
+          elif $r.source == "auto_fix" then "auto_fix"
+          elif $r.source == "user_declined" then
+            if $later or $r.status == "completed" then "approve"
+            elif $r.status == "skipped" then "skip"
+            elif $r.status == "failed" then "abort"
+            else "transient" end
+          elif $r.source == null then
+            if $later then
+              "unknown:no-mistakes review round \($round) has a later round but no recorded decision"
+            elif ($r.status | gate) then "pending"
+            elif $r.status == "running" or $r.status == "fixing" or $r.status == "pending" then "transient"
+            else "unknown:no-mistakes review round \($round) closed (\($r.status)) without a recorded human decision" end
+          else "unknown:no-mistakes recorded an unrecognized decision source \($r.source) for round \($round)" end
+      end
+  ') || RESOLUTION="unknown:the no-mistakes review record for run $CAPTURE_RUN_ID round $round is not parseable"
+  return 0
+}
+
+resolution_matches() {  # <action> <findings-csv>; tests the current RESOLUTION
+  case "$1" in
+    fix) [ "$RESOLUTION" = "fix:$(sorted_csv "$2")" ] ;;
+    approve) [ "$RESOLUTION" = approve ] ;;
+    reject) [ "$RESOLUTION" = skip ] ;;
+    *) return 1 ;;
   esac
+}
+
+refuse_unmatched_resolution() {  # <round> <action>; dies for any non-matching RESOLUTION
+  local round=$1 action=$2
+  case "$RESOLUTION" in
+    pending) die "the $action response for run $CAPTURE_RUN_ID round $round has not landed; retry it through the guarded response path" ;;
+    transient) die "no-mistakes accepted a response for run $CAPTURE_RUN_ID round $round that it is still recording; rerun the same command shortly to confirm it" ;;
+    unknown:*) die "${RESOLUTION#unknown:}; the response for run $CAPTURE_RUN_ID round $round cannot be verified" ;;
+    *) die "run $CAPTURE_RUN_ID round $round was resolved as '$RESOLUTION' outside the guarded $action response; its findings cannot be accounted, so start a fresh validation run" ;;
+  esac
+}
+
+receipt_file() {  # <round>
+  require_safe_run_id
   printf '%s/.firstmate-review-receipt.%s.%s.json' "$STATE_DIR" "$CAPTURE_RUN_ID" "$1"
 }
 
@@ -836,77 +928,39 @@ read_receipt() {  # <round>; prints the receipt JSON, or nothing when absent
   f=$(receipt_file "$1")
   [ -e "$f" ] || return 0
   [ -f "$f" ] && [ ! -L "$f" ] || die "review-ledger response receipt is not a regular private file"
+  jq -e 'type == "object" and (.action | type) == "string" and (.phase | type) == "string"' "$f" >/dev/null 2>&1 \
+    || die "response receipt for run $CAPTURE_RUN_ID round $1 is malformed"
   cat "$f"
 }
 
-write_receipt() {  # <round> <phase> <action> <findings-csv> <attempt> <head>
-  local round=$1 phase=$2 action=$3 findings=$4 attempt=$5 head=$6 f tmp
+write_receipt() {  # <round> <phase> <action> <findings-csv> <attempt> <head> <client-pid> <client-start>
+  local round=$1 phase=$2 action=$3 findings=$4 attempt=$5 head=$6 pid=$7 start=$8 f tmp
   f=$(receipt_file "$round")
   [ ! -L "$f" ] || die "review-ledger response receipt must not be a symlink"
   tmp=$(mktemp "$STATE_DIR/.firstmate-review-receipt.XXXXXX") \
     || die "cannot allocate a response-receipt work file"
   jq -cn --arg run "$CAPTURE_RUN_ID" --arg branch "$CAPTURE_BRANCH" \
     --argjson round "$round" --arg phase "$phase" --arg action "$action" \
-    --arg findings "$findings" --argjson attempt "$attempt" --arg head "$head" '
-    {run: $run, branch: $branch, round: $round, action: $action,
+    --arg findings "$findings" --argjson attempt "$attempt" --arg head "$head" \
+    --arg pid "$pid" --arg start "$start" '
+    {version: 2, run: $run, branch: $branch, round: $round, action: $action,
      findings: ($findings | split(",") | map(select(length > 0))),
-     attempt: $attempt, head: $head, phase: $phase}' > "$tmp" \
+     attempt: $attempt, head: $head, phase: $phase,
+     client: (if $pid == "" then null else {pid: ($pid | tonumber), start: $start} end)}' > "$tmp" \
     || { rm -f "$tmp"; die "cannot render the response receipt"; }
   # Same-directory atomic rename: a crash leaves the prior or next complete
-  # receipt, never a partial one. Serialized by the kernel guard, so no CAS.
+  # receipt, never a partial one. Serialized by the kernel lock.
   mv "$tmp" "$f" || { rm -f "$tmp"; die "cannot commit the response receipt"; }
 }
 
-review_step_status() {
-  printf '%s\n' "$CAPTURE_STATUS" \
-    | sed -n 's/^[[:space:]]*review,\([^,]*\),.*/\1/p' | head -1
+process_start() {  # <pid>; prints the process start time, or nothing when no such process
+  LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
 }
 
-response_landed_evidence() {  # <round> <kind>; prints landed | unlanded | ambiguous
-  # Only a fix has public action-specific evidence: its round's committed-fix
-  # marker followed by a later authoritative review result. Generic completion
-  # can never prove that this process's approve/reject, rather than a skip, landed.
-  local round=$1 kind=$2 fresh_rounds rstatus fix_marker
-  capture_public_history
-  validate_capture_context
-  fresh_rounds=$(printf '%s' "$CAPTURE_MODEL" | jq '.rounds | length')
-  rstatus=$(review_step_status)
-  if [ "$kind" = fix ]; then
-    fix_marker=$(printf '%s' "$CAPTURE_MODEL" | jq -r --argjson round "$round" \
-      '.rounds[$round - 1].fix_completed_after // false')
-    if [ "$fresh_rounds" -gt "$round" ] && [ "$fix_marker" = true ]; then
-      printf landed
-      return 0
-    fi
-  fi
-  case "$rstatus" in
-    awaiting_approval|fix_review|blocked|parked|awaiting_agent) printf unlanded; return 0 ;;
-  esac
-  [ "$CAPTURE_STATUS_VALUE" != review ] || { printf unlanded; return 0; }
-  printf ambiguous
-  return 0
-}
-
-attempt_marker_exists() {  # <round> <attempt>
-  [ -e "$STATE_DIR/.firstmate-review-inflight.$CAPTURE_RUN_ID.$1.$2" ]
-}
-
-claim_attempt_marker() {  # <round> <attempt>
-  # At most one invocation per attempt: an atomic O_CREAT|O_EXCL claim keyed by
-  # run, round, and attempt, taken immediately before the CLI runs. A retry uses
-  # the next attempt and so a fresh marker, while a second caller of the same
-  # attempt -- however it entered -- cannot create the marker twice. Because the
-  # claim precedes the invocation, an absent marker for an attempt proves the CLI
-  # never ran for it, and a present one proves it may have.
-  local round=$1 attempt=$2 marker
-  marker="$STATE_DIR/.firstmate-review-inflight.$CAPTURE_RUN_ID.$round.$attempt"
-  [ ! -L "$marker" ] || die "review-ledger in-flight marker must not be a symlink"
-  if ! (umask 077; set -C; : > "$marker") 2>/dev/null; then
-    die "a no-mistakes response for run $CAPTURE_RUN_ID round $round attempt $attempt is already in flight or completed; refusing a duplicate response"
-  fi
-  if [ -n "${FM_NM_REVIEW_TEST_INFLIGHT_FIFO:-}" ]; then
-    IFS= read -r _inflight_release < "$FM_NM_REVIEW_TEST_INFLIGHT_FIFO" || true
-  fi
+client_alive() {  # <pid> <start>; 0 only while that exact process still runs
+  local current
+  current=$(process_start "$1")
+  [ -n "$current" ] && [ "$current" = "$2" ]
 }
 
 ensure_uniform_disposition() {  # <round> <kind> <final-state>
@@ -950,228 +1004,192 @@ _init_fix_dispositions_apply() {
     ' "$LEDGER" > "$WORK_FILE" || die "cannot record fix disposition requests"
 }
 
-finalize_fix_disposition() {  # <round>
-  local round=$1 errors
-  init_fix_dispositions "$round"
+finalize_disposition() {  # <round> <kind>; only after the resolution matched the receipt
+  case "$2" in
+    approve) ensure_uniform_disposition "$1" approve approved_as_is ;;
+    reject) ensure_uniform_disposition "$1" reject rejected_or_skipped ;;
+    fix) init_fix_dispositions "$1"; sync_ledger ;;
+    *) die "internal finalize error for $2" ;;
+  esac
+}
+
+confirm_fix_round() {  # <round>; refreshes history so a re-review already present confirms the fix
+  local round=$1 survived pending
   capture_public_history
   validate_capture_context
   printf '%s\n' "$CAPTURE_MODEL" > "$MODEL_FILE"
   sync_ledger
-  errors=$(jq -r --arg run "$CAPTURE_RUN_ID" --argjson round "$round" '
+  survived=$(jq -r --arg run "$CAPTURE_RUN_ID" --argjson round "$round" '
     .runs[] | select(.id == $run) | .rounds[] | select(.round == $round)
-    | .dispositions[]
-    | select(.state != "fixed_and_confirmed")
-    | "finding \(.finding_id) fix is \(.state), not fixed_and_confirmed"
+    | .dispositions[] | select(.state == "survived_unchanged")
+    | "finding \(.finding_id) fix is survived_unchanged, not fixed_and_confirmed"
   ' "$LEDGER") || die "cannot verify completed fixes"
-  [ -z "$errors" ] || die "$errors"
+  [ -z "$survived" ] || die "$survived"
+  pending=$(jq -r --arg run "$CAPTURE_RUN_ID" --argjson round "$round" '
+    [.runs[] | select(.id == $run) | .rounds[] | select(.round == $round)
+     | .dispositions[] | select(.state == "requested")] | length
+  ' "$LEDGER") || die "cannot verify completed fixes"
+  if [ "$pending" -gt 0 ]; then
+    printf '%s: the fix response landed; it is confirmed once no-mistakes re-reviews the fix. Confirm readiness with audit-ready.\n' \
+      "$SCRIPT_NAME" >&2
+  fi
 }
 
-finalize_from_receipt() {  # <round> <kind>
-  local round=$1 kind=$2
-  case "$kind" in
-    approve) ensure_uniform_disposition "$round" approve approved_as_is ;;
-    reject) ensure_uniform_disposition "$round" reject rejected_or_skipped ;;
-    fix) finalize_fix_disposition "$round" ;;
-    *) die "internal finalize error for $kind" ;;
-  esac
-}
-
-reconcile_response() {  # <kind> <round> <findings-csv>; sets RESPONSE_DECISION/RESPONSE_ATTEMPT
-  local kind=$1 round=$2 selected_csv=$3 existing r_action r_findings r_phase r_attempt ev
-  RESPONSE_DECISION=proceed
-  RESPONSE_ATTEMPT=1
+reconcile_round() {  # <round>; sets RECONCILE to none, landed, or retry (with RECONCILE_ATTEMPT)
+  # The one reconciliation procedure every invocation applies to a receipt before
+  # acting. It never invokes a response; it finalizes a landed response from the
+  # authoritative resolution and decides whether an unlanded one may be re-sent.
+  local round=$1 existing r_phase r_attempt r_head c_pid c_start has_client
+  RECONCILE=none
+  RECONCILE_ATTEMPT=1
+  RECEIPT_ACTION=
+  RECEIPT_FINDINGS=
   existing=$(read_receipt "$round")
   [ -n "$existing" ] || return 0
-
-  r_action=$(printf '%s' "$existing" | jq -r '.action // ""')
-  r_findings=$(printf '%s' "$existing" | jq -r '.findings // [] | join(",")')
-  r_phase=$(printf '%s' "$existing" | jq -r '.phase // ""')
+  RECEIPT_ACTION=$(printf '%s' "$existing" | jq -r '.action')
+  RECEIPT_FINDINGS=$(printf '%s' "$existing" | jq -r '.findings // [] | join(",")')
+  r_phase=$(printf '%s' "$existing" | jq -r '.phase')
   r_attempt=$(printf '%s' "$existing" | jq -r '.attempt // 0')
-  [ "$r_action" = "$kind" ] && [ "$r_findings" = "$selected_csv" ] \
-    || die "a different response ($r_action findings=$r_findings) is already recorded for run $CAPTURE_RUN_ID round $round; refusing to change the decision mid-flight"
-
+  r_head=$(printf '%s' "$existing" | jq -r '.head // ""')
+  has_client=$(printf '%s' "$existing" | jq -r 'has("client")')
+  c_pid=$(printf '%s' "$existing" | jq -r '.client.pid // ""')
+  c_start=$(printf '%s' "$existing" | jq -r '.client.start // ""')
+  case "$RECEIPT_ACTION" in
+    fix|approve|reject) ;;
+    *) die "response receipt for run $CAPTURE_RUN_ID round $round has an unrecognized action '$RECEIPT_ACTION'" ;;
+  esac
   case "$r_phase" in
-    landed)
-      finalize_from_receipt "$round" "$kind"
-      RESPONSE_DECISION=replay
-      ;;
-    attempting)
-      ev=$(response_landed_evidence "$round" "$kind")
-      case "$ev" in
-        landed)
-          write_receipt "$round" landed "$kind" "$selected_csv" "$r_attempt" "$CAPTURE_HEAD"
-          finalize_from_receipt "$round" "$kind"
-          RESPONSE_DECISION=replay
-          ;;
-        unlanded)
-          # The gate is still open. Retry only when the attempt marker is absent,
-          # which proves the CLI never ran for that attempt. If the marker is
-          # present the CLI may have started and a detached response could still be
-          # in flight, so refuse rather than risk a duplicate side effect.
-          if attempt_marker_exists "$round" "$r_attempt"; then
-            die "a prior response attempt for run $CAPTURE_RUN_ID round $round claimed the response but never confirmed it; a detached response may still be in flight -- resolve the pipeline state before retrying"
-          fi
-          RESPONSE_ATTEMPT=$((r_attempt + 1))
-          ;;
-        *) die "a prior response attempt for run $CAPTURE_RUN_ID round $round is in an indeterminate state and cannot be safely retried or confirmed; resolve the pipeline state and retry" ;;
-      esac
-      ;;
-    failed)
-      # A failed receipt is written only after the CLI returned nonzero, so the
-      # attempt is proven done and unlanded and can be retried safely.
-      ev=$(response_landed_evidence "$round" "$kind")
-      case "$ev" in
-        unlanded) RESPONSE_ATTEMPT=$((r_attempt + 1)) ;;
-        landed) die "the review gate for run $CAPTURE_RUN_ID round $round closed after a failed response attempt; the failed action cannot be confirmed as landed -- resolve the pipeline state and retry" ;;
-        *) die "a failed response attempt for run $CAPTURE_RUN_ID round $round is in an indeterminate state; resolve the pipeline state and retry" ;;
-      esac
-      ;;
+    attempting|landed|failed) ;;
     *) die "response receipt for run $CAPTURE_RUN_ID round $round has an unrecognized phase '$r_phase'" ;;
   esac
-}
 
-round_dispositions_count() {  # <round>
-  jq -r --arg run "$CAPTURE_RUN_ID" --argjson round "$1" '
-    [.runs[] | select(.id == $run) | .rounds[] | select(.round == $round) | .dispositions[]?] | length
-  ' "$LEDGER"
-}
-
-reconcile_receipts_readonly() {  # <last-round>
-  # Fill only missing finalizations and never invoke the CLI. Scanning every round
-  # prevents a fix that advanced N to N+1 before crashing from being stranded.
-  local last_round=$1 round=1 existing r_action r_findings r_phase r_attempt r_head ev
-  while [ "$round" -le "$last_round" ]; do
-    existing=$(read_receipt "$round")
-    if [ -n "$existing" ]; then
-      r_action=$(printf '%s' "$existing" | jq -r '.action // ""')
-      r_findings=$(printf '%s' "$existing" | jq -r '.findings // [] | join(",")')
-      r_phase=$(printf '%s' "$existing" | jq -r '.phase // ""')
-      r_attempt=$(printf '%s' "$existing" | jq -r '.attempt // 0')
-      r_head=$(printf '%s' "$existing" | jq -r '.head // ""')
-      case "$r_phase" in
-        landed)
-          [ "$(round_dispositions_count "$round")" -gt 0 ] \
-            || finalize_from_receipt "$round" "$r_action"
-          ;;
-        attempting)
-          ev=$(response_landed_evidence "$round" "$r_action")
-          case "$ev" in
-            landed)
-              write_receipt "$round" landed "$r_action" "$r_findings" "$r_attempt" "$r_head"
-              [ "$(round_dispositions_count "$round")" -gt 0 ] \
-                || finalize_from_receipt "$round" "$r_action"
-              ;;
-            *) die "an unconfirmed response attempt for run $CAPTURE_RUN_ID round $round is not landed; complete or retry it through the guarded response path before readiness" ;;
-          esac
-          ;;
-        failed)
-          die "a failed response attempt for run $CAPTURE_RUN_ID round $round has no confirmed disposition; retry it through the guarded response path before readiness"
-          ;;
-        *) die "response receipt for run $CAPTURE_RUN_ID round $round has an unrecognized phase '$r_phase'" ;;
-      esac
+  review_round_resolution "$round"
+  if resolution_matches "$RECEIPT_ACTION" "$RECEIPT_FINDINGS"; then
+    if [ "$r_phase" != landed ] || [ "$(printf '%s' "$existing" | jq -r '.version // 1')" != 2 ]; then
+      write_receipt "$round" landed "$RECEIPT_ACTION" "$RECEIPT_FINDINGS" "$r_attempt" "$r_head" "$c_pid" "$c_start"
     fi
-    round=$((round + 1))
-  done
+    if [ "$(round_dispositions_count "$round")" -eq 0 ] || [ "$RECEIPT_ACTION" = fix ]; then
+      finalize_disposition "$round" "$RECEIPT_ACTION"
+    fi
+    RECONCILE=landed
+    return 0
+  fi
+  [ "$RESOLUTION" = pending ] || refuse_unmatched_resolution "$round" "$RECEIPT_ACTION"
+
+  # Proven unlanded so far. Re-sending is safe only when no client that could
+  # still deliver this attempt is running.
+  if [ -n "$c_pid" ]; then
+    if client_alive "$c_pid" "$c_start"; then
+      die "a prior response client (pid $c_pid) for run $CAPTURE_RUN_ID round $round is still running and may yet deliver its response; retry after it exits"
+    fi
+  elif [ "$has_client" != true ] && [ "$r_phase" != failed ]; then
+    # A receipt written by an earlier guard version records no client identity,
+    # so a client it launched cannot be proven stopped.
+    die "an earlier guard's unconfirmed response attempt for run $CAPTURE_RUN_ID round $round has no recorded client identity, so it cannot be proven stopped; start a fresh validation run"
+  fi
+  RECONCILE=retry
+  RECONCILE_ATTEMPT=$((r_attempt + 1))
 }
 
-review_gate_open_fresh() {
-  # 0 (true) while the review step is still awaiting a response (the gate is open);
-  # 1 (false) once the gate has left, i.e. the response IPC has landed and the run
-  # advanced past the review step. It reads a fresh READ-ONLY axi status into
-  # locals and never mutates the CAPTURE_* context the ledger finalize relies on.
-  # An unavailable or unreadable status is treated as still-open so the caller
-  # keeps waiting (up to its bounded budget) rather than declaring a premature land.
-  local st rstatus topstatus
-  st=$("$NM" axi status 2>/dev/null) || return 0
-  rstatus=$(printf '%s\n' "$st" | sed -n 's/^[[:space:]]*review,\([^,]*\),.*/\1/p' | head -1)
-  topstatus=$(printf '%s\n' "$st" | sed -n 's/^[[:space:]]*status:[[:space:]]*\(.*\)/\1/p' | head -1)
-  topstatus=$(strip_value "$topstatus")
-  case "$rstatus" in
-    ''|awaiting_approval|fix_review|blocked|parked|awaiting_agent) return 0 ;;
-  esac
-  [ "$topstatus" = review ] && return 0
-  return 1
-}
-
-launch_review_drive() {  # <kind> <selected-csv> <instructions>
-  # Background the response client. It lands the fast IPC and then foreground-
-  # drives push/PR/CI; we never await that drive under the ledger lock. Its
-  # progress output goes to a private log, so it never pollutes the recorded line.
-  local kind=$1 selected_csv=$2 instructions=$3
+launch_response_client() {  # <round> <kind> <findings-csv> <instructions> <attempt>
+  # Launch the response client gated on its own durably recorded identity: it
+  # waits, without contacting no-mistakes, until this attempt's receipt names its
+  # PID, and exits without responding if this guard dies first or the
+  # authorization does not arrive. It runs with the lock descriptor closed.
+  local round=$1 kind=$2 selected_csv=$3 instructions=$4 attempt=$5 receipt
+  receipt=$(receipt_file "$round")
+  command -v ps >/dev/null 2>&1 || die "ps is required to record the response client identity"
+  DRIVE_LOG=$(mktemp "$STATE_DIR/.firstmate-review-drive.XXXXXX") \
+    || die "cannot allocate a response drive log"
+  set -- "$NM" axi respond --step review
   case "$kind" in
     fix)
-      if [ -n "$instructions" ]; then
-        "$NM" axi respond --step review --action fix --findings "$selected_csv" --instructions "$instructions" >"$DRIVE_LOG" 2>&1 &
-      else
-        "$NM" axi respond --step review --action fix --findings "$selected_csv" >"$DRIVE_LOG" 2>&1 &
-      fi
+      set -- "$@" --action fix --findings "$selected_csv"
+      [ -z "$instructions" ] || set -- "$@" --instructions "$instructions"
       ;;
-    approve) "$NM" axi respond --step review --action approve >"$DRIVE_LOG" 2>&1 & ;;
-    reject) "$NM" axi respond --step review --action skip >"$DRIVE_LOG" 2>&1 & ;;
-    *) die "internal drive error for $kind" ;;
+    approve) set -- "$@" --action approve ;;
+    reject) set -- "$@" --action skip ;;
+    *) die "internal response error for $kind" ;;
   esac
-  RESP_PID=$!
+  # shellcheck disable=SC2016  # the gate script expands its own positional parameters
+  sh -c '
+    receipt=$1 parent=$2 attempt=$3 polls=$4
+    shift 4
+    i=0
+    while [ "$i" -lt "$polls" ]; do
+      if jq -e --argjson pid "$$" --argjson attempt "$attempt" \
+          ".phase == \"attempting\" and .attempt == \$attempt and .client.pid == \$pid" \
+          "$receipt" >/dev/null 2>&1; then
+        exec "$@"
+      fi
+      [ "$(ps -o ppid= -p "$$" 2>/dev/null | tr -d " ")" = "$parent" ] || exit 86
+      i=$((i + 1))
+      sleep 0.05
+    done
+    exit 86' fm-review-client "$receipt" "$$" "$attempt" 200 "$@" \
+    </dev/null >"$DRIVE_LOG" 2>&1 9>&- &
+  CLIENT_PID=$!
+  CLIENT_ID_PID=$CLIENT_PID
+  [ "${FM_NM_REVIEW_TEST_CRASH_BEFORE_IDENTITY:-}" != 1 ] || kill -KILL "$$"
+  CLIENT_START=$(process_start "$CLIENT_PID")
+  if [ -z "$CLIENT_START" ]; then
+    stop_response_client
+    die "cannot record the response client identity; no response was sent and the attempt can be safely retried"
+  fi
+  write_receipt "$round" attempting "$kind" "$selected_csv" "$attempt" "$CAPTURE_HEAD" "$CLIENT_PID" "$CLIENT_START"
 }
 
-stop_review_drive() {
-  # Stop the backgrounded client so the ledger lock releases promptly. A killed
-  # client only tears down the observer; the daemon's run keeps driving CI.
-  [ -n "$RESP_PID" ] || return 0
-  if kill -0 "$RESP_PID" 2>/dev/null; then
-    kill -TERM "$RESP_PID" 2>/dev/null || true
-    local spins=0
-    while kill -0 "$RESP_PID" 2>/dev/null; do
+stop_response_client() {
+  # Stop the client and reap it, so it is proven stopped before the final
+  # resolution read. A stopped client only stops observing; the daemon's run
+  # keeps driving push, PR, and CI.
+  local spins=0
+  [ -n "$CLIENT_PID" ] || return 0
+  if kill -0 "$CLIENT_PID" 2>/dev/null; then
+    kill -TERM "$CLIENT_PID" 2>/dev/null || true
+    while kill -0 "$CLIENT_PID" 2>/dev/null; do
       spins=$((spins + 1))
-      if [ "$spins" -ge 25 ]; then kill -KILL "$RESP_PID" 2>/dev/null || true; break; fi
+      if [ "$spins" -ge 25 ]; then kill -KILL "$CLIENT_PID" 2>/dev/null || true; break; fi
       sleep 0.2
     done
   fi
-  wait "$RESP_PID" 2>/dev/null || true
-  RESP_PID=
+  wait "$CLIENT_PID" 2>/dev/null || true
+  CLIENT_PID=
 }
 
-settle_review_drive() {
-  # Wait only until the response IPC has landed (the review gate leaves) or the
-  # bounded budget elapses, then stop the drive. Sets DRIVE_RESULT to:
-  #   complete - the client returned 0 before the budget (whole drive finished);
-  #   failed   - the client returned nonzero fast (IPC rejected), see DRIVE_RC;
-  #   landed   - the gate left, proving the IPC landed, with the drive still going;
-  #   timeout  - the gate never left within the budget (cannot confirm landing).
-  # A client that lands the response and then returns almost immediately (the whole
-  # drive was cheap, e.g. CI already green) races the gate-left observation, so once
-  # the gate has left we grant a short grace for the client to exit naturally and
-  # report complete/failed before concluding it is genuinely still driving CI.
-  local waited=0 max_polls cli_rc=0 gate_left=0 grace=0 grace_max=10
-  max_polls=$((IPC_BUDGET * 5))
-  [ "$max_polls" -ge 1 ] || max_polls=1
-  DRIVE_RESULT=
-  DRIVE_RC=0
+settle_response() {  # <round> <kind> <findings-csv>; leaves the final RESOLUTION
+  # Poll the round's authoritative resolution every 0.1s, bounded by the IPC
+  # budget, or for a one-second grace once the client has exited on its own. The
+  # client's exit status is recorded for diagnostics only; it never decides
+  # whether the response landed.
+  local round=$1 kind=$2 selected_csv=$3 polls=0 max grace=0 rc
+  max=$((IPC_BUDGET * 10))
+  CLIENT_RC=
   while :; do
-    if ! kill -0 "$RESP_PID" 2>/dev/null; then
-      cli_rc=0
-      wait "$RESP_PID" || cli_rc=$?
-      RESP_PID=
-      if [ "$cli_rc" -eq 0 ]; then DRIVE_RESULT=complete; else DRIVE_RESULT=failed; DRIVE_RC=$cli_rc; fi
-      return 0
+    review_round_resolution "$round"
+    resolution_matches "$kind" "$selected_csv" && break
+    case "$RESOLUTION" in pending|transient) ;; *) break ;; esac
+    if [ -z "$CLIENT_RC" ] && ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+      rc=0
+      wait "$CLIENT_PID" 2>/dev/null || rc=$?
+      CLIENT_RC=$rc
+      CLIENT_PID=
     fi
-    if [ "$gate_left" -eq 0 ] && ! review_gate_open_fresh; then
-      gate_left=1
-    fi
-    if [ "$gate_left" -eq 1 ]; then
+    if [ -n "$CLIENT_RC" ]; then
       grace=$((grace + 1))
-      if [ "$grace" -ge "$grace_max" ]; then DRIVE_RESULT=landed; break; fi
+      [ "$grace" -lt 10 ] || break
     else
-      waited=$((waited + 1))
-      if [ "$waited" -ge "$max_polls" ]; then DRIVE_RESULT=timeout; break; fi
+      polls=$((polls + 1))
+      [ "$polls" -lt "$max" ] || break
     fi
-    sleep 0.2
+    sleep 0.1
   done
-  stop_review_drive
-  return 0
+  stop_response_client
+  review_round_resolution "$round"
 }
 
 respond() {
-  local fix='' approve='' reject='' instructions='' want='' kind='' raw='' selected_csv round head_ok modes=0 drive_tail=''
+  local fix='' approve='' reject='' instructions='' want='' kind='' raw='' selected_csv round head_ok modes=0 attempt r drive_tail=''
   shift
   while [ "$#" -gt 0 ]; do
     if [ -n "$want" ]; then
@@ -1209,6 +1227,7 @@ respond() {
   capture_public_history
   validate_capture_context
   validate_selection "$kind" "$raw"
+  store_ready_or_die
   prepare_work_files
   sync_ledger
   round=$(current_round_number)
@@ -1218,95 +1237,162 @@ respond() {
   [ "$head_ok" = 1 ] || die "current review round has no exact head context"
   selected_csv=$(printf '%s' "$SELECTED_JSON" | jq -r 'join(",")')
 
-  # Resolve every older outstanding receipt before accepting a new round, then
-  # reconcile this round for replay or a safe next attempt.
-  [ "$round" -le 1 ] || reconcile_receipts_readonly "$((round - 1))"
-  reconcile_response "$kind" "$round" "$selected_csv"
-  if [ "$RESPONSE_DECISION" = replay ]; then
+  # Every earlier round's receipt must already be authoritatively resolved.
+  r=1
+  while [ "$r" -lt "$round" ]; do
+    reconcile_round "$r"
+    [ "$RECONCILE" != retry ] \
+      || die "an earlier response for run $CAPTURE_RUN_ID round $r never landed; resolve it before answering round $round"
+    r=$((r + 1))
+  done
+
+  reconcile_round "$round"
+  case "$RECONCILE" in
+    landed)
+      [ "$RECEIPT_ACTION" = "$kind" ] && [ "$(sorted_csv "$RECEIPT_FINDINGS")" = "$(sorted_csv "$selected_csv")" ] \
+        || die "run $CAPTURE_RUN_ID round $round is already resolved by the recorded $RECEIPT_ACTION response (findings=$RECEIPT_FINDINGS); a different response cannot be applied"
+      [ "$kind" != fix ] || confirm_fix_round "$round"
+      printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
+        "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
+      return 0
+      ;;
+    retry) attempt=$RECONCILE_ATTEMPT ;;
+    none)
+      [ "$(round_dispositions_count "$round")" -eq 0 ] \
+        || die "run $CAPTURE_RUN_ID round $round already has recorded dispositions without a response receipt; refusing a second response"
+      # Send only into a review gate the record shows open and unanswered.
+      review_round_resolution "$round"
+      case "$RESOLUTION" in
+        pending) ;;
+        transient) die "the review step for run $CAPTURE_RUN_ID round $round is not parked at a response gate; retry once it is" ;;
+        unknown:*) die "${RESOLUTION#unknown:}; refusing to respond without a verifiable review record" ;;
+        *) die "run $CAPTURE_RUN_ID round $round is already resolved as '$RESOLUTION' outside this guard; refusing a second response" ;;
+      esac
+      attempt=1
+      ;;
+  esac
+
+  # Record intent with no client before launching anything, then launch the
+  # gated client, which may act only once its identity is recorded.
+  write_receipt "$round" attempting "$kind" "$selected_csv" "$attempt" "$CAPTURE_HEAD" "" ""
+  [ "${FM_NM_REVIEW_TEST_CRASH_BEFORE_RESPOND:-}" != 1 ] || kill -KILL "$$"
+  launch_response_client "$round" "$kind" "$selected_csv" "$instructions" "$attempt"
+  if [ "${FM_NM_REVIEW_TEST_CRASH_AFTER_LAUNCH:-}" = 1 ]; then
+    CLIENT_PID=
+    kill -KILL "$$"
+  fi
+  settle_response "$round" "$kind" "$selected_csv"
+
+  if resolution_matches "$kind" "$selected_csv"; then
+    [ "${FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND:-}" != 1 ] || kill -KILL "$$"
+    write_receipt "$round" landed "$kind" "$selected_csv" "$attempt" "$CAPTURE_HEAD" "$CLIENT_ID_PID" "$CLIENT_START"
+    finalize_disposition "$round" "$kind"
+    [ "$kind" != fix ] || confirm_fix_round "$round"
     printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
       "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
     return 0
   fi
 
-  # Record intent BEFORE the side effect so a crash is reconcilable, then claim
-  # this attempt's exclusive marker immediately before invoking the CLI.
-  write_receipt "$round" attempting "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
-  [ "${FM_NM_REVIEW_TEST_CRASH_BEFORE_RESPOND:-}" != 1 ] || kill -KILL "$$"
-  claim_attempt_marker "$round" "$RESPONSE_ATTEMPT"
-
-  # Land the response without ever awaiting the long push/PR/CI drive under the
-  # ledger lock: background the client, wait only until the gate leaves or the
-  # bounded budget elapses, then stop it (see settle_review_drive).
-  DRIVE_LOG=$(mktemp "$STATE_DIR/.firstmate-review-drive.XXXXXX") \
-    || die "cannot allocate a response drive log"
-  launch_review_drive "$kind" "$selected_csv" "$instructions"
-  settle_review_drive
-
-  case "$DRIVE_RESULT" in
-    failed)
-      write_receipt "$round" failed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
-      # Surface the backgrounded client's own diagnostic explaining WHY the IPC was
-      # rejected before cleanup removes DRIVE_LOG. The pre-bounded foreground path
-      # let that output reach the operator directly; backgrounding it must not
-      # silently swallow it.
-      drive_tail=$(tail -n 20 "$DRIVE_LOG" 2>/dev/null || true)
-      if [ -n "$drive_tail" ]; then
-        die "underlying no-mistakes response failed with exit $DRIVE_RC; the attempt is recorded as unlanded and can be safely retried. Client output (last 20 lines):
+  if [ "$RESOLUTION" = pending ]; then
+    # Surface the client's own diagnostic before cleanup removes the drive log.
+    drive_tail=$(tail -n 20 "$DRIVE_LOG" 2>/dev/null || true)
+    if [ -n "$drive_tail" ]; then
+      die "the no-mistakes response did not land (client exit ${CLIENT_RC:-stopped}); the attempt is recorded, its client is stopped, and the same command can be safely retried. Client output (last 20 lines):
 $drive_tail"
-      fi
-      die "underlying no-mistakes response failed with exit $DRIVE_RC; the attempt is recorded as unlanded and can be safely retried"
-      ;;
-    complete)
-      # The client returned before the budget, so the whole drive finished in-band
-      # (e.g. CI was already green). Finalize exactly as the pre-bounded path did.
-      [ "${FM_NM_REVIEW_TEST_CRASH_AFTER_RESPOND:-}" != 1 ] || kill -KILL "$$"
-      write_receipt "$round" landed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
-      finalize_from_receipt "$round" "$kind"
-      printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
-        "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
-      ;;
-    landed)
-      # The review gate left, proving THIS invocation's IPC landed, while the CI
-      # drive is still going in the background.
-      case "$kind" in
-        approve|reject)
-          # A decision finalizes the moment its gate is consumed; it needs no CI.
-          # The gate left immediately after THIS invocation sent this exact action
-          # under the exclusive ledger lock and attempt marker, and a rejected IPC
-          # returns fast (nonzero) rather than leaving the gate, so gate-left is
-          # specific proof this action -- not an out-of-band skip -- landed. Record
-          # the landed receipt and finalize now.
-          write_receipt "$round" landed "$kind" "$selected_csv" "$RESPONSE_ATTEMPT" "$CAPTURE_HEAD"
-          finalize_from_receipt "$round" "$kind"
-          printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
-            "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
-          ;;
-        fix)
-          # A fix cannot be confirmed until the next authoritative review result
-          # shows the finding did not survive, which the daemon produces later in
-          # the background drive. Rather than record a premature landed receipt
-          # whose dispositions are still unconfirmed, leave the durable attempting
-          # receipt (and its attempt marker) exactly as written before launch: the
-          # same attempting->landed reconciliation the guard already applies to a
-          # crashed drive confirms it from that public evidence, run by audit-ready
-          # or a later response. This preserves the invariant that a landed fix
-          # receipt always has confirmed dispositions, so no landed-but-unconfirmed
-          # intermediate state is ever created.
-          printf 'recorded: run=%s round=%s action=%s findings=%s\n' \
-            "$CAPTURE_RUN_ID" "$round" "$kind" "$selected_csv"
-          printf '%s: the fix response landed; the pipeline is driving CI in the background. Confirm readiness with audit-ready.\n' \
-            "$SCRIPT_NAME" >&2
-          ;;
-      esac
-      ;;
-    timeout)
-      # The gate never left within the budget, so the IPC landing is unconfirmed.
-      # Leave the attempting receipt and its attempt marker in place so a later
-      # response or audit-ready reconciles from authoritative evidence rather than
-      # recording an unproven landing.
-      die "the no-mistakes response was sent but the review gate did not leave within ${IPC_BUDGET}s; a detached response may still be in flight -- resolve the pipeline state and retry"
-      ;;
-    *) die "internal drive-settle error: ${DRIVE_RESULT:-unknown}" ;;
+    fi
+    die "the no-mistakes response did not land within ${IPC_BUDGET}s (client exit ${CLIENT_RC:-stopped}); the attempt is recorded, its client is stopped, and the same command can be safely retried"
+  fi
+  refuse_unmatched_resolution "$round" "$kind"
+}
+
+reconcile_all_rounds_for_audit() {  # <last-round>
+  local last=$1 round=1
+  while [ "$round" -le "$last" ]; do
+    reconcile_round "$round"
+    [ "$RECONCILE" != retry ] \
+      || die "the $RECEIPT_ACTION response for run $CAPTURE_RUN_ID round $round has not landed; retry it through the guarded response path before readiness"
+    round=$((round + 1))
+  done
+}
+
+verify_dispositions_against_resolution() {
+  # Readiness accepts a disposition only when no-mistakes' authoritative record of
+  # that exact round shows the same action, whichever guard version wrote it.
+  local rows round kind ids
+  rows=$(jq -r --arg run "$CAPTURE_RUN_ID" '
+    .runs[] | select(.id == $run) | .rounds[]
+    | select((.dispositions | length) > 0)
+    | "\(.round) \([.dispositions[].kind] | unique | join("+")) \([(.result.findings // [])[] | select(.action != "no-op") | .id] | sort | join(","))"
+  ' "$LEDGER") || die "cannot read the recorded dispositions"
+  while read -r round kind ids; do
+    [ -n "$round" ] || continue
+    case "$kind" in
+      fix|approve|reject) ;;
+      *) die "round $round has contradictory disposition kinds $kind" ;;
+    esac
+    review_round_resolution "$round"
+    resolution_matches "$kind" "$ids" && continue
+    case "$RESOLUTION" in
+      unknown:*) die "${RESOLUTION#unknown:}; the recorded $kind disposition for round $round cannot be verified" ;;
+    esac
+    die "the recorded $kind disposition for round $round contradicts the no-mistakes record '$RESOLUTION' for that round; readiness is refused"
+  done <<EOF
+$rows
+EOF
+}
+
+require_public_green_ci() {
+  # Independent public CI evidence from the PR itself, bound to the
+  # authoritative head. Every absent, unreadable, or non-green fact refuses.
+  local head_full view verdict rc=0
+  [ -n "$(type -P gh 2>/dev/null)" ] || die "gh is required to verify public CI evidence for readiness"
+  head_full=$(git rev-parse --verify "${CAPTURE_HEAD}^{commit}" 2>/dev/null) \
+    || die "cannot resolve the authoritative head $CAPTURE_HEAD for CI verification"
+  # Bounded, so evidence that never arrives refuses promptly instead of blocking.
+  # bin/fm-timeout-lib.sh owns the bound; the lock descriptor stays closed.
+  view=$(fm_run_timed "$GH_TIMEOUT" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh pr view "$CAPTURE_PR" --json headRefOid,state,statusCheckRollup 2>/dev/null 9>&-) || rc=$?
+  [ "$rc" -ne 124 ] \
+    || die "public CI evidence for $CAPTURE_PR did not answer within ${GH_TIMEOUT}s; readiness requires verified green checks"
+  [ "$rc" -eq 0 ] \
+    || die "cannot read public CI evidence for $CAPTURE_PR; readiness requires verified green checks"
+  verdict=$(printf '%s' "$view" | jq -r --arg head "$head_full" '
+    def name: .name // .context // "";
+    def key: "\(.__typename)|\(.workflowName // "")|\(name)";
+    def when: .startedAt // .createdAt // .completedAt // "";
+    def completed:
+      if .__typename == "CheckRun" then .status == "COMPLETED"
+      else (.state == "SUCCESS" or .state == "FAILURE" or .state == "ERROR") end;
+    def green:
+      if .__typename == "CheckRun" then
+        .conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"
+      else .state == "SUCCESS" end;
+    def success:
+      (.__typename == "CheckRun" and .conclusion == "SUCCESS")
+      or (.__typename == "StatusContext" and .state == "SUCCESS");
+    def describe: "\(name) (\(.status // .state // "unknown")/\(.conclusion // "none"))";
+    (.statusCheckRollup) as $all
+    | if ($all | type) != "array" then "refuse:the PR check rollup is missing or malformed"
+      elif .headRefOid != $head then "refuse:the PR head \(.headRefOid // "unknown") is not the authoritative head \($head)"
+      elif .state != "OPEN" then "refuse:the PR is \(.state // "in an unknown state"), not open"
+      elif ($all | length) == 0 then "refuse:the PR reports zero CI checks; readiness requires at least one green check"
+      elif ($all | length) >= 100 then "refuse:the PR reports \($all | length) checks, which may be a truncated rollup"
+      elif any($all[]; (.__typename != "CheckRun" and .__typename != "StatusContext") or (name | length) == 0) then
+        "refuse:the PR check rollup has an unrecognized or unnamed entry"
+      elif any($all[]; completed | not) then
+        "refuse:public CI is not green: \([$all[] | select(completed | not) | describe] | join(", "))"
+      else
+        ($all | group_by(key) | map(sort_by(when) | last)) as $latest
+        | [$latest[] | select(green | not) | describe] as $bad
+        | if ($bad | length) > 0 then "refuse:public CI is not green: \($bad | join(", "))"
+          elif any($latest[]; success) | not then "refuse:no PR check reports success"
+          else "green:\($latest | length)" end
+      end
+  ') || die "public CI evidence for $CAPTURE_PR is not parseable"
+  case "$verdict" in
+    green:*) ;;
+    refuse:*) die "${verdict#refuse:}" ;;
+    *) die "public CI evidence for $CAPTURE_PR could not be classified" ;;
   esac
 }
 
@@ -1316,9 +1402,10 @@ audit_ready() {
   command -v jq >/dev/null 2>&1 || die "jq is required"
   capture_public_history
   validate_capture_context
+  store_ready_or_die
   prepare_work_files
   sync_ledger
-  reconcile_receipts_readonly "$(current_round_number)"
+  reconcile_all_rounds_for_audit "$(current_round_number)"
 
   errors=$(jq -r --arg run "$CAPTURE_RUN_ID" --arg branch "$CAPTURE_BRANCH" '
     (.runs | map(select(.id == $run))) as $matches
@@ -1388,6 +1475,7 @@ audit_ready() {
     printf '%s\n' "$errors" >&2
     die "review findings are not fully and unambiguously accounted"
   fi
+  verify_dispositions_against_resolution
 
   [ -n "$CAPTURE_PR" ] || die "axi status has no PR URL; readiness is not public"
   case "$CAPTURE_PR" in https://*) ;; *) die "axi status PR is not a full https URL: $CAPTURE_PR" ;; esac
@@ -1396,28 +1484,30 @@ audit_ready() {
     failed|cancelled)
       die "authoritative validation run outcome is $CAPTURE_OUTCOME; historical CI evidence cannot authorize readiness"
       ;;
-    passed)
-      die "authoritative validation run outcome is passed; the PR is no longer awaiting readiness"
+    passed|passed-with-override)
+      die "authoritative validation run outcome is $CAPTURE_OUTCOME; the PR is no longer awaiting readiness"
       ;;
     "")
       # Accept both "ci" (pre-v1.60.2 no-mistakes TOON format) and "running"
       # (v1.60.2+ format, where the run status stays "running" during CI monitoring).
       [ "$CAPTURE_STATUS_VALUE" = ci ] || [ "$CAPTURE_STATUS_VALUE" = running ] \
         || die "authoritative validation run is not in the active CI monitor: ${CAPTURE_STATUS_VALUE:-unknown}"
-      if ! ci_logs=$("$NM" axi logs --run "$CAPTURE_RUN_ID" --step ci); then
+      if ! ci_logs=$(nm_cli axi logs --run "$CAPTURE_RUN_ID" --step ci); then
         die "public CI log is unavailable for run $CAPTURE_RUN_ID"
       fi
       marker=$(printf '%s\n' "$ci_logs" \
-        | grep -E 'CI checks passed|no CI checks reported - still monitoring|no CI checks reported yet|checks failed|issues detected|CI checks running|base branch advanced.*re-arming CI monitor timeout' \
+        | grep -E 'CI checks passed|treating as all checks passed|no CI checks reported|checks failed|issues detected|CI checks running|base branch advanced.*re-arming CI monitor timeout' \
         | tail -1 || true)
       case "$marker" in
-        *"checks passed"*) ;;
+        *"no_ci"*|*"treating as all checks passed"*) die "the run treats a no_ci declaration as passing; readiness requires green public CI checks" ;;
+        *"CI checks passed"*) ;;
         "") die "public CI history has no recognized readiness result" ;;
         *) die "latest public CI result is not green: $marker" ;;
       esac
       ;;
     *) die "authoritative validation run has unrecognized outcome: $CAPTURE_OUTCOME" ;;
   esac
+  require_public_green_ci
 
   printf 'ready: %s run=%s branch=%s head=%s\n' \
     "$CAPTURE_PR" "$CAPTURE_RUN_ID" "$CAPTURE_BRANCH" "$CAPTURE_HEAD"
@@ -1437,22 +1527,23 @@ case "$IPC_BUDGET" in
   ''|*[!0-9]*) die "FM_NM_REVIEW_IPC_BUDGET must be a whole number of seconds" ;;
 esac
 [ "$IPC_BUDGET" -ge 1 ] || die "FM_NM_REVIEW_IPC_BUDGET must be at least 1 second"
+GH_TIMEOUT=${FM_NM_REVIEW_GH_TIMEOUT:-60}
+case "$GH_TIMEOUT" in
+  ''|*[!0-9]*) die "FM_NM_REVIEW_GH_TIMEOUT must be a whole number of seconds" ;;
+esac
+[ "$GH_TIMEOUT" -ge 1 ] || die "FM_NM_REVIEW_GH_TIMEOUT must be at least 1 second"
 
 case "${1:-}" in
-  respond|audit-ready)
-    guarded_command=$1
-    shift
-    run_with_kernel_lock "$guarded_command" "$@"
-    ;;
-  __fm_review_lock_held)
-    shift
-    verify_guard_actively_locked
+  respond)
+    acquire_review_lock
     review_lock_held_hooks
-    case "${1:-}" in
-      respond) respond "$@" ;;
-      audit-ready) [ "$#" -eq 1 ] || die "audit-ready accepts no arguments"; audit_ready ;;
-      *) die "invalid guarded review-ledger command" ;;
-    esac
+    respond "$@"
+    ;;
+  audit-ready)
+    [ "$#" -eq 1 ] || die "audit-ready accepts no arguments"
+    acquire_review_lock
+    review_lock_held_hooks
+    audit_ready
     ;;
   ledger-path) [ "$#" -eq 1 ] || die "ledger-path accepts no arguments"; printf '%s\n' "$LEDGER" ;;
   -h|--help) usage ;;
