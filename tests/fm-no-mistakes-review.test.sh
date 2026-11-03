@@ -10,6 +10,9 @@ set -u
 
 TMP_ROOT=$(fm_test_tmproot fm-no-mistakes-review)
 DRIVER="$ROOT/bin/fm-no-mistakes-review.sh"
+# A guarded invocation finishes in a few seconds; anything slower is a hang.
+DRIVER_TIMEOUT=30
+HUNG_LOG="$TMP_ROOT/hung-invocations"
 
 new_case() {
   local name=$1 dir="$TMP_ROOT/$1"
@@ -268,6 +271,8 @@ state=${FM_FAKE_NM_STATE:?}
 [ "${1:-} ${2:-}" = "pr view" ] || exit 2
 : > "$state/gh-queried"
 if [ -f "$state/gh-fail" ]; then printf 'fake gh: HTTP 502\n' >&2; exit 1; fi
+# gh-hang models a query that never answers.
+if [ -f "$state/gh-hang" ]; then printf '%s\n' "$$" > "$state/gh-hang.pid"; exec sleep 600; fi
 if [ -f "$state/gh-head" ]; then head=$(cat "$state/gh-head")
 elif [ -f "$state/status-head" ]; then head=$(git rev-parse "$(cat "$state/status-head")")
 else head=$(git rev-parse HEAD)
@@ -305,13 +310,32 @@ set_next() {
 }
 
 run_driver() {
-  local dir=$1
+  local dir=$1 rc=0 pid watchdog
   shift
   # Bind FM_NM_STATE_DB to the fixture's own store so no case can ever read the
   # host's real ~/.no-mistakes/state.sqlite. The fake rebuilds that store from the
   # fixture files on every invocation, for every review agent.
+  # Every invocation runs under a watchdog, so a guard that blocks instead of
+  # refusing is killed within DRIVER_TIMEOUT and recorded as a suite failure,
+  # never mistaken for a refusal or left for the shard deadline. The driver's own
+  # exit status, including death by a signal, is preserved.
   (cd "$dir" && FM_FAKE_NM_STATE="$dir/fake-state" FM_NM_STATE_DB="$dir/fake-state/state.sqlite" \
-    PATH="$dir/fakebin:$PATH" "$DRIVER" "$@")
+    PATH="$dir/fakebin:$PATH" exec "$DRIVER" "$@") &
+  pid=$!
+  (
+    trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+    sleep "$DRIVER_TIMEOUT" & sleeper=$!
+    wait "$sleeper"
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$*" >> "$HUNG_LOG"
+      kill -KILL "$pid" 2>/dev/null
+    fi
+  ) >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$pid" || rc=$?
+  kill -TERM "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$rc"
 }
 
 # Run the fake no-mistakes directly, as a direct (unguarded) caller would.
@@ -782,6 +806,11 @@ check_run() {  # <name> <status> <conclusion> [started-at]
       conclusion: (if $conclusion == "" then null else $conclusion end), startedAt: $started}'
 }
 
+reset_ci_evidence() {  # <dir>: restore the default single green check
+  rm -f "$1/fake-state/gh-rollup" "$1/fake-state/gh-fail" "$1/fake-state/gh-head" \
+    "$1/fake-state/gh-state" "$1/fake-state/gh-queried" "$1/fake-state/ci-declared-no-ci"
+}
+
 set_rollup() {  # <dir> <check-json>...
   local d=$1
   shift
@@ -795,10 +824,13 @@ set_rollup() {  # <dir> <check-json>...
 # authoritative head, and refuses whenever that green-CI fact is absent.
 test_checks_passed_requires_public_green_ci() {
   local d out rc label
+  # One ready run serves every case: audit-ready only reads it, and each case
+  # replaces the public CI evidence it is checked against.
+  d=$(new_ready_case ci-evidence)
+  printf 'checks-passed\n' > "$d/fake-state/status-outcome"
   for label in zero-checks no_ci-zero-checks unreadable pending queued-rerun-null queued-rerun-zero-time \
       status-pending failing head-mismatch merged truncated unnamed; do
-    d=$(new_ready_case "ci-evidence-$label")
-    printf 'checks-passed\n' > "$d/fake-state/status-outcome"
+    reset_ci_evidence "$d"
     case "$label" in
       zero-checks) set_rollup "$d" ;;
       no_ci-zero-checks) set_rollup "$d"; : > "$d/fake-state/ci-declared-no-ci" ;;
@@ -844,15 +876,13 @@ test_checks_passed_requires_public_green_ci() {
 
   # The latest attempt of a check name decides it, so a rerun that went green
   # supersedes its earlier failure, and neutral or skipped checks do not block.
-  d=$(new_ready_case ci-evidence-green)
-  printf 'checks-passed\n' > "$d/fake-state/status-outcome"
+  reset_ci_evidence "$d"
   set_rollup "$d" "$(check_run test COMPLETED FAILURE 2026-01-01T00:00:00Z)" \
     "$(check_run test COMPLETED SUCCESS 2026-01-01T01:00:00Z)" "$(check_run docs COMPLETED SKIPPED)"
   out=$(run_driver "$d" audit-ready 2>&1) || fail "verified green public CI was refused: $out"
   assert_contains "$out" 'ready: https://github.com/example/repo/pull/11' "green public CI did not reach readiness"
 
-  d=$(new_ready_case ci-evidence-only-skipped)
-  printf 'checks-passed\n' > "$d/fake-state/status-outcome"
+  reset_ci_evidence "$d"
   set_rollup "$d" "$(check_run docs COMPLETED SKIPPED)"
   out=$(run_driver "$d" audit-ready 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "readiness accepted a rollup with no successful check"
@@ -869,6 +899,26 @@ test_declared_no_ci_monitor_line_refuses_readiness() {
   [ "$rc" -ne 0 ] || fail "readiness accepted a run that only declares no CI"
   assert_contains "$out" 'no_ci declaration' "declared-no-CI refusal was not explicit"
   pass "the no_ci declaration never authorizes readiness"
+}
+
+# Fail closed means refusing promptly: a CI query that never answers is
+# bounded, refuses within that bound, and leaves no query process behind.
+test_unanswered_ci_query_refuses_promptly() {
+  local d out rc start elapsed pid
+  d=$(new_ready_case ci-query-hang)
+  printf 'checks-passed\n' > "$d/fake-state/status-outcome"
+  : > "$d/fake-state/gh-hang"
+  start=$(date +%s)
+  out=$(FM_NM_REVIEW_GH_TIMEOUT=1 run_driver "$d" audit-ready 2>&1); rc=$?
+  elapsed=$(( $(date +%s) - start ))
+  [ "$rc" -ne 0 ] || fail "readiness was granted while the CI query never answered"
+  assert_contains "$out" 'did not answer within 1s' "unanswered-CI refusal was not explicit"
+  assert_not_contains "$out" 'ready:' "an unanswered CI query was visibly reported ready"
+  [ "$elapsed" -lt 15 ] || fail "an unanswered CI query held readiness for ${elapsed}s instead of refusing within its bound"
+  pid=$(cat "$d/fake-state/gh-hang.pid" 2>/dev/null || true)
+  [ -n "$pid" ] || fail "the hung CI query fixture did not start"
+  wait_process_gone "$pid"
+  pass "an unanswered CI query refuses within its bound and leaves nothing running"
 }
 
 test_terminal_outcomes_reject_stale_green_ci() {
@@ -1039,9 +1089,9 @@ test_gate_never_leaves_times_out_fail_closed_and_stays_reconcilable() {
   set_next "$d"
   printf '1\n' > "$d/fake-state/respond-nogate"
   printf '10\n' > "$d/fake-state/respond-sleep"
-  out=$(FM_NM_REVIEW_IPC_BUDGET=2 run_driver "$d" respond --fix stuck 2>&1); rc=$?
+  out=$(FM_NM_REVIEW_IPC_BUDGET=1 run_driver "$d" respond --fix stuck 2>&1); rc=$?
   [ "$rc" -ne 0 ] || fail "a response that no-mistakes never recorded was accepted as landed"
-  assert_contains "$out" 'did not land within 2s' "unrecorded-response timeout refusal was not actionable"
+  assert_contains "$out" 'did not land within 1s' "unrecorded-response timeout refusal was not actionable"
   [ "$(jq -r '.phase' "$(receipt_file "$d")")" = attempting ] \
     || fail "a timed-out response did not leave a reconcilable attempting receipt"
   pid=$(receipt_client_pid "$d")
@@ -1913,6 +1963,7 @@ test_post_review_pipeline_commit_refuses_readiness
 test_no_ci_checks_refuses_readiness
 test_checks_passed_requires_public_green_ci
 test_declared_no_ci_monitor_line_refuses_readiness
+test_unanswered_ci_query_refuses_promptly
 test_terminal_outcomes_reject_stale_green_ci
 test_run_and_head_mismatch_are_refused
 test_idempotent_replay_does_not_reinvoke
@@ -1936,3 +1987,4 @@ test_orphaned_client_blocks_only_its_retry_until_proven_stopped
 test_crash_before_client_identity_never_responds
 test_landed_round_is_never_answered_twice
 test_stale_ledger_commit_cannot_clobber_concurrent_append
+[ ! -s "$HUNG_LOG" ] || fail "guarded invocations hung past ${DRIVER_TIMEOUT}s: $(tr '\n' ';' < "$HUNG_LOG")"

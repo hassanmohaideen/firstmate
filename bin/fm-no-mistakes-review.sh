@@ -186,9 +186,11 @@
 # it must be open with headRefOid equal to the authoritative head and report at
 # least one check; every entry must be completed (a pending or queued rerun
 # refuses whatever its timestamp), the latest completed result of every check
-# name must be successful, neutral, or skipped, with at least one success; and a rollup of 100
-# or more entries refuses as possibly truncated. Absent, unreadable, pending,
-# failing, or zero-check evidence refuses, including a trusted no_ci declaration.
+# name must be successful, neutral, or skipped, with at least one success; and a
+# rollup of 100 or more entries refuses as possibly truncated. The gh query is
+# bounded by FM_NM_REVIEW_GH_TIMEOUT, so evidence that never arrives refuses
+# promptly. Absent, unreadable, unanswered, pending, failing, or zero-check
+# evidence refuses, including a trusted no_ci declaration.
 # Historical clean reviews, tests, and CI never imply approval or rejection.
 # If the full structured review history or any required context is absent or
 # unparsable, the command exits nonzero with an actionable diagnostic.
@@ -209,6 +211,9 @@
 #                                    authoritative record of a response before
 #                                    stopping its client and refusing closed; the
 #                                    long push/PR/CI drive is never awaited
+#                                    (default: 60).
+#   FM_NM_REVIEW_GH_TIMEOUT          maximum whole seconds the readiness gh query
+#                                    may take before readiness refuses closed
 #                                    (default: 60).
 # Environment used by hermetic tests only:
 #   FM_NM_REVIEW_STATE_DIR           overrides the ledger directory.
@@ -256,6 +261,8 @@ CAPTURE_OUTCOME=
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 
 # The review lock lives on file descriptor 9 of this process, and every process
 # that inherits that descriptor shares the lock. These commands can start
@@ -1151,12 +1158,12 @@ stop_response_client() {
 }
 
 settle_response() {  # <round> <kind> <findings-csv>; leaves the final RESOLUTION
-  # Wait for the round's authoritative resolution, bounded by the IPC budget, or
-  # a short grace once the client has exited on its own. The client's exit status
-  # is recorded for diagnostics only; it never decides whether the response landed.
+  # Poll the round's authoritative resolution every 0.1s, bounded by the IPC
+  # budget, or for a one-second grace once the client has exited on its own. The
+  # client's exit status is recorded for diagnostics only; it never decides
+  # whether the response landed.
   local round=$1 kind=$2 selected_csv=$3 polls=0 max grace=0 rc
-  max=$((IPC_BUDGET * 5))
-  [ "$max" -ge 1 ] || max=1
+  max=$((IPC_BUDGET * 10))
   CLIENT_RC=
   while :; do
     review_round_resolution "$round"
@@ -1175,7 +1182,7 @@ settle_response() {  # <round> <kind> <findings-csv>; leaves the final RESOLUTIO
       polls=$((polls + 1))
       [ "$polls" -lt "$max" ] || break
     fi
-    sleep 0.2
+    sleep 0.1
   done
   stop_response_client
   review_round_resolution "$round"
@@ -1337,11 +1344,17 @@ EOF
 require_public_green_ci() {
   # Independent public CI evidence from the PR itself, bound to the
   # authoritative head. Every absent, unreadable, or non-green fact refuses.
-  local head_full view verdict
+  local head_full view verdict rc=0
   [ -n "$(type -P gh 2>/dev/null)" ] || die "gh is required to verify public CI evidence for readiness"
   head_full=$(git rev-parse --verify "${CAPTURE_HEAD}^{commit}" 2>/dev/null) \
     || die "cannot resolve the authoritative head $CAPTURE_HEAD for CI verification"
-  view=$(gh pr view "$CAPTURE_PR" --json headRefOid,state,statusCheckRollup 2>/dev/null) \
+  # Bounded, so evidence that never arrives refuses promptly instead of blocking.
+  # bin/fm-timeout-lib.sh owns the bound; the lock descriptor stays closed.
+  view=$(fm_run_timed "$GH_TIMEOUT" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh pr view "$CAPTURE_PR" --json headRefOid,state,statusCheckRollup 2>/dev/null 9>&-) || rc=$?
+  [ "$rc" -ne 124 ] \
+    || die "public CI evidence for $CAPTURE_PR did not answer within ${GH_TIMEOUT}s; readiness requires verified green checks"
+  [ "$rc" -eq 0 ] \
     || die "cannot read public CI evidence for $CAPTURE_PR; readiness requires verified green checks"
   verdict=$(printf '%s' "$view" | jq -r --arg head "$head_full" '
     def name: .name // .context // "";
@@ -1514,6 +1527,11 @@ case "$IPC_BUDGET" in
   ''|*[!0-9]*) die "FM_NM_REVIEW_IPC_BUDGET must be a whole number of seconds" ;;
 esac
 [ "$IPC_BUDGET" -ge 1 ] || die "FM_NM_REVIEW_IPC_BUDGET must be at least 1 second"
+GH_TIMEOUT=${FM_NM_REVIEW_GH_TIMEOUT:-60}
+case "$GH_TIMEOUT" in
+  ''|*[!0-9]*) die "FM_NM_REVIEW_GH_TIMEOUT must be a whole number of seconds" ;;
+esac
+[ "$GH_TIMEOUT" -ge 1 ] || die "FM_NM_REVIEW_GH_TIMEOUT must be at least 1 second"
 
 case "${1:-}" in
   respond)
